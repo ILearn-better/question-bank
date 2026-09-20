@@ -1,0 +1,711 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>专属题库工具 · 试卷分割录入</title>
+<link rel="stylesheet" href="https://unpkg.com/element-plus/dist/index.css">
+<link rel="stylesheet" href="https://unpkg.com/katex@0.16.9/dist/katex.min.css">
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #f0f2f5; font-family: "PingFang SC", "Microsoft YaHei", sans-serif; }
+  .topbar {
+    display: flex; align-items: center; gap: 16px;
+    background: #fff; padding: 12px 24px; box-shadow: 0 1px 4px rgba(0,0,0,.08);
+    position: sticky; top: 0; z-index: 10;
+  }
+  .topbar h1 { font-size: 17px; margin: 0; color: #303133; }
+  .topbar .sub { color: #909399; font-size: 12px; }
+  .main { max-width: 1400px; margin: 16px auto; padding: 0 16px; }
+  .panel-title { font-size: 14px; font-weight: 600; color: #303133; margin: 0 0 10px; }
+  .hint { color: #909399; font-size: 12px; line-height: 1.8; }
+  .block-card {
+    background: #fff; border: 1px solid #e4e7ed; border-radius: 6px;
+    padding: 8px 12px; margin-bottom: 8px; cursor: pointer; transition: all .15s;
+    display: flex; gap: 10px; align-items: flex-start;
+  }
+  .block-card:hover { border-color: #c0c4cc; }
+  .block-card.in-range { background: #ecf5ff; border-color: #a0cfff; }
+  .block-card.edge { background: #d9ecff; border-color: #409eff; box-shadow: 0 0 0 1px #409eff; }
+  .block-idx {
+    flex: none; width: 34px; text-align: center; font-size: 12px; font-weight: 700;
+    color: #409eff; background: #ecf5ff; border-radius: 4px; padding: 2px 0; margin-top: 2px;
+  }
+  .block-card.edge .block-idx { background: #409eff; color: #fff; }
+  .block-text { font-size: 13px; color: #303133; line-height: 1.7; white-space: pre-wrap; word-break: break-all; flex: 1; }
+  .block-tag { flex: none; margin-top: 2px; }
+  .qform { background: #fff; border: 1px solid #e4e7ed; border-radius: 8px; padding: 16px; }
+  .preview-box {
+    background: #fafafa; border: 1px dashed #dcdfe6; border-radius: 6px;
+    padding: 12px 14px; min-height: 72px; max-height: 320px; overflow: auto;
+    font-size: 14px; line-height: 1.9; color: #303133; white-space: pre-wrap;
+  }
+  .saved-item {
+    background: #fff; border: 1px solid #e4e7ed; border-radius: 6px;
+    padding: 10px 12px; margin-bottom: 8px; font-size: 13px;
+  }
+  .saved-item .content { color: #303133; margin: 6px 0; line-height: 1.6;
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+  .saved-item .meta { color: #909399; font-size: 12px; display: flex; flex-wrap: wrap; gap: 6px; }
+  .empty-block { color: #c0c4cc; text-align: center; padding: 40px 0; font-size: 13px; }
+
+  /* ===== 页面分割视图 ===== */
+  .page-wrap { margin-bottom: 20px; }
+  .page-no-label { font-size: 12px; color: #909399; margin-bottom: 6px; }
+  .page-box {
+    position: relative; user-select: none; -webkit-user-select: none;
+    border: 1px solid #e4e7ed; border-radius: 4px; overflow: hidden;
+    background: #fff; line-height: 0;
+  }
+  .page-box img { width: 100%; display: block; pointer-events: none; }
+  .page-box.tool-crop { cursor: crosshair; }
+  .page-box.tool-divider { cursor: copy; }
+  .seg-band { position: absolute; left: 0; right: 0; pointer-events: none; }
+  .seg-band.odd { background: rgba(64, 158, 255, .05); }
+  .seg-band.even { background: rgba(230, 162, 60, .06); }
+  .seg-band.sel { background: rgba(64, 158, 255, .18); box-shadow: inset 0 0 0 2px #409eff; }
+  .seg-chip {
+    position: absolute; left: 4px; top: 2px; pointer-events: auto; cursor: pointer;
+    font-size: 11px; line-height: 1; padding: 3px 7px; border-radius: 10px;
+    background: #409eff; color: #fff; opacity: .85;
+  }
+  .seg-chip:hover { opacity: 1; }
+  .seg-band.sel .seg-chip { background: #f56c6c; }
+  .divider {
+    position: absolute; left: 0; right: 0; height: 0; z-index: 5;
+    border-top: 2px dashed #f56c6c; cursor: ns-resize;
+  }
+  .divider .dv-x {
+    position: absolute; left: 2px; top: -9px; width: 18px; height: 18px;
+    border-radius: 50%; background: #f56c6c; color: #fff; font-size: 12px;
+    display: flex; align-items: center; justify-content: center; cursor: pointer;
+    line-height: 1;
+  }
+  .crop-rect {
+    position: absolute; z-index: 6; border: 2px solid #00a870; background: rgba(0, 168, 112, .12);
+    pointer-events: none;
+  }
+  .thumb { max-width: 100%; max-height: 140px; border: 1px solid #e4e7ed; border-radius: 4px; margin: 6px 0; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div class="topbar">
+    <h1>专属题库工具</h1>
+    <span class="sub">试卷分割录入</span>
+    <div style="flex:1"></div>
+    <el-select v-if="docs.length" v-model="currentDocId" placeholder="切换历史文档" size="default"
+               style="width: 280px" @change="loadDoc">
+      <el-option v-for="d in docs" :key="d.id" :value="d.id"
+                 :label="d.filename + (d.scanned ? '（扫描版·截图）' : '（' + d.block_count + ' 块）')"></el-option>
+    </el-select>
+    <el-upload :show-file-list="false" accept=".pdf,.docx" :http-request="uploadFile">
+      <el-button type="primary">上传 PDF / Word</el-button>
+    </el-upload>
+  </div>
+
+  <div class="main">
+    <el-row :gutter="16">
+      <!-- 左侧：文档视图 -->
+      <el-col :span="14">
+        <el-card shadow="never">
+          <template #header>
+            <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+              <p class="panel-title" style="margin:0">📄 文档</p>
+              <el-tag v-if="doc" size="small" type="info">{{ doc.filename }}</el-tag>
+              <el-tag v-if="isScanned" size="small" type="warning">扫描版</el-tag>
+              <el-radio-group v-if="isPdf && !isScanned" v-model="viewMode" size="small">
+                <el-radio-button value="page">页面分割</el-radio-button>
+                <el-radio-button value="blocks">内容块</el-radio-button>
+              </el-radio-group>
+              <div style="flex:1"></div>
+              <el-button v-if="doc && viewMode==='blocks'" size="small" @click="resetSel">重置选择</el-button>
+            </div>
+          </template>
+
+          <div v-if="!doc" class="empty-block">上传一份 PDF 或 Word 试卷开始使用</div>
+
+          <!-- 页面分割视图（仅 PDF） -->
+          <template v-else-if="viewMode==='page'">
+            <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap">
+              <el-radio-group v-model="tool" size="small" v-if="!isScanned">
+                <el-radio-button value="divider">✂️ 分界线</el-radio-button>
+                <el-radio-button value="crop">📷 框选截图</el-radio-button>
+              </el-radio-group>
+              <el-tag v-else type="warning" effect="plain" size="small">📷 截图模式</el-tag>
+              <el-button v-if="!isScanned" size="small" @click="autoSegment">自动识别题号</el-button>
+              <el-button v-if="!isScanned" size="small" type="danger" plain @click="clearDividers">清空分界线</el-button>
+              <span v-if="!isScanned" class="hint" style="margin:0">已选 {{ selectedSegs.length }} 段</span>
+            </div>
+            <div class="hint" style="margin-bottom:10px" v-if="isScanned">
+              该 PDF 是<b>扫描版</b>（无文字层），已跳过文字解析。直接在页面上<b>拖拽矩形</b>框住一道题，
+              松手后自动截取高清图作为图片题入库。
+            </div>
+            <div class="hint" style="margin-bottom:10px" v-else-if="tool==='divider'">
+              <b>点击页面</b>插入分界线（自动吸附行间隙，点已有线附近可删除，拖动红线微调）；
+              <b>点击左侧「页-序号」小标签</b>选中该段（可多选、跨页），右侧自动生成题目 → 填标签保存。
+            </div>
+            <div class="hint" style="margin-bottom:10px" v-else>
+              在页面上<b>拖拽矩形</b>罩住一道题（图形题/公式题适用），松手后自动截取高清图作为图片题。
+            </div>
+            <div style="max-height: 66vh; overflow: auto; padding-right: 4px;">
+              <div v-for="pno in pageList" :key="pno" class="page-wrap">
+                <div class="page-no-label">第 {{ pno }} 页 · {{ segsOf(pno).length }} 段</div>
+                <div class="page-box" :id="'pg'+pno"
+                     :class="{ 'tool-crop': tool==='crop', 'tool-divider': tool==='divider' }"
+                     @pointerdown="onOverlayDown(pno, $event)">
+                  <img :src="pageImg(pno)" alt="" draggable="false">
+                  <template v-if="!isScanned">
+                  <div v-for="(sg, si) in segsOf(pno)" :key="si"
+                       class="seg-band" :class="[si%2 ? 'even' : 'odd', { sel: segSelected(pno, sg.idx) }]"
+                       :style="bandStyle(pno, sg)">
+                    <span class="seg-chip" @pointerdown.stop @click.stop="toggleSeg(pno, sg.idx)">
+                      {{ pno }}-{{ sg.idx + 1 }}
+                    </span>
+                  </div>
+                  <div v-for="(dy, di) in dividers[pno] || []" :key="'d'+di" v-show="tool==='divider'"
+                       class="divider" :style="{ top: pctY(pno, dy) }"
+                       @pointerdown.stop="startDragDivider(pno, di, $event)">
+                    <span class="dv-x" @pointerdown.stop.prevent @click.stop="removeDivider(pno, di)">×</span>
+                  </div>
+                  </template>
+                  <div v-if="cropDraft && cropDraft.page===pno" class="crop-rect" :style="cropStyle(pno)"></div>
+                </div>
+              </div>
+            </div>
+          </template>
+
+          <!-- 内容块视图（docx / 兼容模式） -->
+          <template v-else>
+            <div class="hint" style="margin-bottom:10px">
+              操作方式：<b>点击一个块设为题目起点</b> → 再<b>点击另一个块设为终点</b>，中间所有块自动选中；再次点击重新开始。
+            </div>
+            <div style="max-height: 68vh; overflow: auto; padding-right: 4px;">
+              <div v-for="(b, i) in doc.blocks" :key="i"
+                   class="block-card"
+                   :class="{ 'in-range': inRange(i), 'edge': isEdge(i) }"
+                   @click="clickBlock(i)">
+                <span class="block-idx">{{ i }}</span>
+                <span class="block-text">{{ b.text }}</span>
+                <span class="block-tag">
+                  <el-tag v-if="b.page" size="small" type="info" effect="plain">P{{ b.page }}</el-tag>
+                  <el-tag v-else-if="b.type !== 'text'" size="small" type="warning" effect="plain">{{ b.type === 'image' ? '图' : '表' }}</el-tag>
+                </span>
+              </div>
+            </div>
+          </template>
+        </el-card>
+      </el-col>
+
+      <!-- 右侧：题目编辑与保存 -->
+      <el-col :span="10">
+        <el-card shadow="never" class="qform-card">
+          <template #header>
+            <p class="panel-title" style="margin:0">✏️ 题目预览与入库</p>
+          </template>
+          <div class="qform">
+            <div class="hint" style="margin-bottom:6px">题目内容（自动渲染 $ 公式 $）</div>
+            <div class="preview-box" ref="previewBox">
+              <img v-if="form.image" :src="form.image" style="max-width:100%" alt="题目截图">
+              <template v-else>{{ form.content || '在左侧选择内容块 / 页面段落 / 框选截图后，这里生成题目预览…' }}</template>
+            </div>
+            <div v-if="form.image" style="margin-top:6px;display:flex;gap:8px">
+              <el-button size="small" type="danger" text @click="form.image=''">清除截图</el-button>
+            </div>
+
+            <el-form label-position="top" style="margin-top:14px">
+              <el-row :gutter="10">
+                <el-col :span="12">
+                  <el-form-item label="题型">
+                    <el-select v-model="form.qtype" style="width:100%">
+                      <el-option v-for="t in qtypes" :key="t" :label="t" :value="t"></el-option>
+                    </el-select>
+                  </el-form-item>
+                </el-col>
+                <el-col :span="12">
+                  <el-form-item label="难度">
+                    <el-select v-model="form.difficulty" style="width:100%">
+                      <el-option v-for="d in difficulties" :key="d" :label="d" :value="d"></el-option>
+                    </el-select>
+                  </el-form-item>
+                </el-col>
+              </el-row>
+              <el-form-item label="知识点（可多选，来自数学知识树）">
+                <el-cascader v-model="form.knowledge_points" :options="treeOptions"
+                             :props="{ multiple: true }" placeholder="选择知识点"
+                             clearable filterable style="width:100%"></el-cascader>
+              </el-form-item>
+              <el-form-item label="答案（支持 $ 公式 $）">
+                <el-input v-model="form.answer" type="textarea" :rows="2" placeholder="标准答案"></el-input>
+              </el-form-item>
+              <el-form-item label="解析">
+                <el-input v-model="form.analysis" type="textarea" :rows="2" placeholder="解题步骤（可选）"></el-input>
+              </el-form-item>
+              <div style="display:flex;gap:8px">
+                <el-button v-if="viewMode==='page' && selectedSegs.length" size="default" plain
+                           style="flex:1" @click="attachCrop">📷 附加原貌截图</el-button>
+                <el-button type="primary" style="flex:2" :disabled="!(form.content || form.image)"
+                           :loading="saving" @click="saveQuestion">保存到题库</el-button>
+              </div>
+            </el-form>
+          </div>
+        </el-card>
+
+        <el-card shadow="never" style="margin-top:16px">
+          <template #header>
+            <div style="display:flex;align-items:center;gap:10px">
+              <p class="panel-title" style="margin:0">📚 已录入题目</p>
+              <el-tag size="small">{{ questions.length }} 题</el-tag>
+              <div style="flex:1"></div>
+              <el-button size="small" :disabled="!questions.length" @click="exportJson">导出 JSON</el-button>
+            </div>
+          </template>
+          <div v-if="!questions.length" class="empty-block">还没有录入题目</div>
+          <div v-for="q in questions" :key="q.id" class="saved-item">
+            <div style="display:flex;gap:6px;align-items:center">
+              <el-tag size="small">{{ q.qtype }}</el-tag>
+              <el-tag size="small" :type="diffTag(q.difficulty)">{{ q.difficulty }}</el-tag>
+              <el-tag v-if="q.image" size="small" type="success" effect="plain">📷 图片题</el-tag>
+              <span style="flex:1"></span>
+              <el-button size="small" text type="danger" @click="del(q.id)">删除</el-button>
+            </div>
+            <div v-if="q.image"><img :src="q.image" class="thumb" alt=""></div>
+            <div v-if="q.content" class="content">{{ q.content }}</div>
+            <div class="meta">
+              <el-tag v-for="kp in q.knowledge_points" :key="kp" size="small" type="info" effect="plain">{{ kp }}</el-tag>
+            </div>
+          </div>
+        </el-card>
+      </el-col>
+    </el-row>
+  </div>
+</div>
+
+<script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+<script src="https://unpkg.com/element-plus/dist/index.full.min.js"></script>
+<script src="https://unpkg.com/katex@0.16.9/dist/katex.min.js"></script>
+<script src="https://unpkg.com/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
+<script>
+const { createApp } = Vue;
+const QNUM_RE = /^\s*\d{1,3}\s*[.、．]|[（(]\s*\d{1,3}\s*[)）]/;
+
+const app = createApp({
+  data() {
+    return {
+      docs: [],
+      currentDocId: null,
+      doc: null,
+      // 内容块模式
+      selStart: null,
+      selEnd: null,
+      // 页面分割模式
+      viewMode: 'blocks',
+      tool: 'divider',
+      pv: { count: 0, pages: {} },   // pv.pages[n] = {page,width,height,lines}
+      dividers: {},                  // { pageNo: [y_pdf, ...] }
+      selectedSegs: [],              // ["页:段序号", ...] 按点击顺序
+      cropDraft: null,               // {page,x0,y0,x1,y1}
+      cropBusy: false,
+      // 表单
+      qtypes: ['选择题', '填空题', '解答题', '判断题', '证明题', '应用题', '图片题'],
+      difficulties: ['基础', '中档', '拔高'],
+      treeOptions: [],
+      form: { content: '', qtype: '解答题', difficulty: '中档', knowledge_points: [], answer: '', analysis: '', image: '' },
+      questions: [],
+      saving: false,
+      uploading: false
+    };
+  },
+  computed: {
+    isPdf() { return this.doc && this.doc.filetype === '.pdf'; },
+    isScanned() { return this.isPdf && !!this.doc.scanned; },
+    pageList() { return this.pv.count ? Array.from({ length: this.pv.count }, (_, i) => i + 1) : []; }
+  },
+  mounted() {
+    this.loadDocs();
+    this.loadTree();
+    this.loadQuestions();
+  },
+  methods: {
+    async api(url, opt) {
+      const res = await fetch(url, opt);
+      if (!res.ok) {
+        let msg = '请求失败 ' + res.status;
+        try { msg = (await res.json()).detail || msg; } catch (e) {}
+        throw new Error(msg);
+      }
+      return res.json();
+    },
+    async loadDocs() {
+      this.docs = await this.api('/api/documents');
+      if (this.docs.length && !this.currentDocId) {
+        this.currentDocId = this.docs[0].id;
+        this.loadDoc(this.currentDocId);
+      }
+    },
+    async loadDoc(id) {
+      this.doc = await this.api('/api/documents/' + id);
+      this.resetSel();
+      this.loadQuestions();
+      if (this.doc.filetype === '.pdf') {
+        this.viewMode = 'page';
+        this.tool = this.doc.scanned ? 'crop' : 'divider';
+        try {
+          const meta = await this.api('/api/documents/' + id + '/pages');
+          const list = await Promise.all(
+            Array.from({ length: meta.page_count }, (_, i) =>
+              this.api('/api/documents/' + id + '/pages/' + (i + 1) + '/lines'))
+          );
+          const pages = {};
+          list.forEach(l => { pages[l.page] = l; });
+          this.pv = { count: meta.page_count, pages };
+          this.dividers = {};
+          if (!this.doc.scanned) this.autoSegment(true);
+        } catch (e) {
+          ElementPlus.ElMessage.warning(e.message + '，已切回内容块模式');
+          this.viewMode = 'blocks';
+        }
+      } else {
+        this.viewMode = 'blocks';
+      }
+    },
+    async loadTree() { this.treeOptions = await this.api('/api/tree'); },
+    async loadQuestions() {
+      const qs = await this.api('/api/questions');
+      this.questions = this.doc ? qs.filter(q => q.document_id === this.doc.id) : qs;
+    },
+    async uploadFile(opt) {
+      const fd = new FormData();
+      fd.append('file', opt.file);
+      this.uploading = true;
+      try {
+        const d = await this.api('/api/documents', { method: 'POST', body: fd });
+        this.docs.unshift({ id: d.id, filename: d.filename, filetype: d.filetype, block_count: d.block_count, scanned: d.scanned });
+        this.currentDocId = d.id;
+        this.doc = d;
+        this.resetSel();
+        this.loadQuestions();
+        ElementPlus.ElMessage.success(
+          d.scanned ? '检测到扫描版 PDF，已进入截图模式' : '解析成功：' + d.block_count + ' 个内容块');
+        this.loadDoc(d.id);
+      } catch (e) {
+        ElementPlus.ElMessage.error(e.message);
+      } finally { this.uploading = false; }
+    },
+
+    /* ===== 页面分割：几何工具 ===== */
+    pageImg(pno) { return '/api/documents/' + this.doc.id + '/pages/' + pno + '/image'; },
+    pctY(pno, y) { const pg = this.pv.pages[pno]; return pg ? (y / pg.height * 100) + '%' : '0'; },
+    segsOf(pno) {
+      const pg = this.pv.pages[pno];
+      if (!pg) return [];
+      const bs = [0, ...(this.dividers[pno] || []).slice().sort((a, b) => a - b), pg.height];
+      const segs = [];
+      for (let i = 0; i < bs.length - 1; i++) {
+        if (bs[i + 1] - bs[i] > 2) segs.push({ y0: bs[i], y1: bs[i + 1], idx: i });
+      }
+      return segs;
+    },
+    bandStyle(pno, sg) {
+      const pg = this.pv.pages[pno];
+      return {
+        top: (sg.y0 / pg.height * 100) + '%',
+        height: ((sg.y1 - sg.y0) / pg.height * 100) + '%'
+      };
+    },
+    cropStyle(pno) {
+      const pg = this.pv.pages[pno], c = this.cropDraft;
+      if (!pg || !c) return {};
+      const x0 = Math.min(c.x0, c.x1), x1 = Math.max(c.x0, c.x1);
+      const y0 = Math.min(c.y0, c.y1), y1 = Math.max(c.y0, c.y1);
+      return {
+        left: (x0 / pg.width * 100) + '%', top: (y0 / pg.height * 100) + '%',
+        width: ((x1 - x0) / pg.width * 100) + '%', height: ((y1 - y0) / pg.height * 100) + '%'
+      };
+    },
+    snapY(pno, y) {
+      const pg = this.pv.pages[pno], lines = pg.lines;
+      const cands = [0, pg.height];
+      for (let i = 0; i < lines.length - 1; i++) {
+        cands.push((lines[i].bbox[3] + lines[i + 1].bbox[1]) / 2);
+      }
+      let best = cands[0];
+      for (const c of cands) if (Math.abs(c - y) < Math.abs(best - y)) best = c;
+      return Math.round(best * 10) / 10;
+    },
+    toPdfXY(pno, ev) {
+      const box = document.getElementById('pg' + pno);
+      const r = box.getBoundingClientRect();
+      const pg = this.pv.pages[pno];
+      return {
+        x: (ev.clientX - r.left) / r.width * pg.width,
+        y: (ev.clientY - r.top) / r.height * pg.height
+      };
+    },
+
+    /* ===== 页面分割：分界线交互 ===== */
+    onOverlayDown(pno, e) {
+      if (e.button !== 0) return;
+      if (this.tool === 'crop') { this.startCrop(pno, e); return; }
+      // 分界线工具：点击空白处插入/删除分界线
+      const pg = this.pv.pages[pno];
+      const { y } = this.toPdfXY(pno, e);
+      const dv = this.dividers[pno] || (this.dividers[pno] = []);
+      // 距离已有分界线很近 → 删除它
+      let nearIdx = -1, nearDist = pg.height * 0.025;
+      dv.forEach((d, i) => { const dist = Math.abs(d - y); if (dist < nearDist) { nearDist = dist; nearIdx = i; } });
+      if (nearIdx >= 0) {
+        dv.splice(nearIdx, 1);
+      } else {
+        const sy = this.snapY(pno, y);
+        if (!dv.includes(sy)) dv.push(sy);
+        dv.sort((a, b) => a - b);
+      }
+      this.selectedSegs = [];
+      this.updatePreview();
+    },
+    startDragDivider(pno, di, e) {
+      if (this.tool !== 'divider' || e.button !== 0) return;
+      e.preventDefault();
+      const onMove = (ev) => {
+        const { y } = this.toPdfXY(pno, ev);
+        this.dividers[pno][di] = this.snapY(pno, Math.max(0, Math.min(this.pv.pages[pno].height, y)));
+      };
+      const onUp = () => {
+        window.removeEventListener('pointermove', onMove);
+        window.removeEventListener('pointerup', onUp);
+        this.dividers[pno] = [...new Set(this.dividers[pno])].sort((a, b) => a - b);
+        this.selectedSegs = [];
+        this.updatePreview();
+      };
+      window.addEventListener('pointermove', onMove);
+      window.addEventListener('pointerup', onUp);
+    },
+    removeDivider(pno, di) {
+      this.dividers[pno].splice(di, 1);
+      this.selectedSegs = [];
+      this.updatePreview();
+    },
+    clearDividers() {
+      this.dividers = {};
+      this.selectedSegs = [];
+      this.updatePreview();
+    },
+    autoSegment(silent) {
+      const total = {};
+      Object.keys(this.pv.pages).forEach(pno => {
+        const pg = this.pv.pages[pno];
+        const dv = [];
+        for (let i = 0; i < pg.lines.length; i++) {
+          const ln = pg.lines[i];
+          if (!QNUM_RE.test(ln.text)) continue;
+          // 分界线放在本题第一行上方（上一行底部与该行顶部的中点）
+          const prev = pg.lines[i - 1];
+          const gap = prev ? (prev.bbox[3] + ln.bbox[1]) / 2 : 0;
+          if (gap > 2 && !dv.includes(gap)) dv.push(Math.round(gap * 10) / 10);
+        }
+        if (dv.length) total[pno] = dv.sort((a, b) => a - b);
+      });
+      this.dividers = total;
+      this.selectedSegs = [];
+      this.updatePreview();
+      const n = Object.values(total).reduce((s, a) => s + a.length, 0);
+      if (!silent) ElementPlus.ElMessage.success('已按题号放置 ' + n + ' 条分界线，请微调后点击段落标签选择题目');
+    },
+
+    /* ===== 页面分割：段落选择 ===== */
+    segSelected(pno, idx) { return this.selectedSegs.includes(pno + ':' + idx); },
+    toggleSeg(pno, idx) {
+      const key = pno + ':' + idx;
+      const i = this.selectedSegs.indexOf(key);
+      if (i >= 0) this.selectedSegs.splice(i, 1);
+      else this.selectedSegs.push(key);
+      this.updatePreview();
+    },
+    segText(pno, idx) {
+      const pg = this.pv.pages[pno];
+      const sg = this.segsOf(pno).find(s => s.idx === idx);
+      if (!sg) return '';
+      return pg.lines
+        .filter(l => { const cy = (l.bbox[1] + l.bbox[3]) / 2; return cy >= sg.y0 && cy <= sg.y1; })
+        .map(l => l.text).join('\n');
+    },
+
+    /* ===== 页面分割：截图 ===== */
+    startCrop(pno, e) {
+      if (this.cropBusy) return;
+      const p = this.toPdfXY(pno, e);
+      this.cropDraft = { page: pno, x0: p.x, y0: p.y, x1: p.x, y1: p.y };
+      const onMove = (ev) => {
+        const q = this.toPdfXY(pno, ev);
+        this.cropDraft.x1 = q.x; this.cropDraft.y1 = q.y;
+      };
+      const onUp = async () => {
+        window.removeEventListener('pointermove', onMove);
+        window.removeEventListener('pointerup', onUp);
+        const c = this.cropDraft;
+        this.cropDraft = null;
+        const pg = this.pv.pages[pno];
+        if (!c || Math.abs(c.x1 - c.x0) < pg.width * 0.03 || Math.abs(c.y1 - c.y0) < pg.height * 0.01) return;
+        this.cropBusy = true;
+        try {
+          const r = await this.api('/api/documents/' + this.doc.id + '/crop', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ page: pno, x0: c.x0, y0: c.y0, x1: c.x1, y1: c.y1 })
+          });
+          this.form.image = r.url;
+          this.form.qtype = '图片题';
+          ElementPlus.ElMessage.success('截图完成，已放入右侧预览');
+        } catch (err) {
+          ElementPlus.ElMessage.error(err.message);
+        } finally { this.cropBusy = false; }
+      };
+      window.addEventListener('pointermove', onMove);
+      window.addEventListener('pointerup', onUp);
+    },
+    async attachCrop() {
+      // 把当前选中段落（同一页）合并 bbox 截一张原貌存档图
+      if (!this.selectedSegs.length) return;
+      const pno = parseInt(this.selectedSegs[0].split(':')[0], 10);
+      const pg = this.pv.pages[pno];
+      const idxs = this.selectedSegs.filter(k => parseInt(k.split(':')[0], 10) === pno)
+        .map(k => parseInt(k.split(':')[1], 10));
+      const segs = idxs.map(i => this.segsOf(pno).find(s => s.idx === i)).filter(Boolean);
+      const lines = pg.lines.filter(l => {
+        const cy = (l.bbox[1] + l.bbox[3]) / 2;
+        return segs.some(s => cy >= s.y0 && cy <= s.y1);
+      });
+      if (!lines.length) { ElementPlus.ElMessage.warning('选中段落里没有文字行'); return; }
+      const pad = 6;
+      const y0 = Math.max(0, Math.min(...lines.map(l => l.bbox[1])) - pad);
+      const y1 = Math.min(pg.height, Math.max(...lines.map(l => l.bbox[3])) + pad);
+      const x0 = Math.max(0, Math.min(...lines.map(l => l.bbox[0])) - pad);
+      const x1 = Math.min(pg.width, Math.max(...lines.map(l => l.bbox[2])) + pad);
+      try {
+        const r = await this.api('/api/documents/' + this.doc.id + '/crop', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ page: pno, x0, y0, x1, y1 })
+        });
+        this.form.image = r.url;
+        ElementPlus.ElMessage.success('原貌截图已附加（保存时随题目一起入库）');
+      } catch (e) {
+        ElementPlus.ElMessage.error(e.message);
+      }
+    },
+
+    /* ===== 内容块模式（保留） ===== */
+    clickBlock(i) {
+      if (this.selStart === null) { this.selStart = i; this.selEnd = null; }
+      else if (this.selEnd === null) {
+        if (i === this.selStart) { this.selEnd = null; } else { this.selEnd = i; }
+      } else { this.selStart = i; this.selEnd = null; }
+      this.updatePreview();
+    },
+    inRange(i) {
+      if (this.selStart === null) return false;
+      const end = this.selEnd === null ? this.selStart : this.selEnd;
+      const lo = Math.min(this.selStart, end), hi = Math.max(this.selStart, end);
+      return i >= lo && i <= hi;
+    },
+    isEdge(i) { return i === this.selStart || i === this.selEnd; },
+
+    /* ===== 通用 ===== */
+    resetSel() {
+      this.selStart = this.selEnd = null;
+      this.selectedSegs = [];
+      this.cropDraft = null;
+      this.form.content = '';
+      this.form.image = '';
+      this.form.knowledge_points = [];
+      this.form.answer = '';
+      this.form.analysis = '';
+      this.renderMath();
+    },
+    updatePreview() {
+      if (this.viewMode === 'page') {
+        this.form.content = this.selectedSegs.map(k => {
+          const [pno, idx] = k.split(':');
+          return this.segText(parseInt(pno, 10), parseInt(idx, 10));
+        }).filter(Boolean).join('\n');
+      } else if (this.selStart !== null) {
+        const end = this.selEnd === null ? this.selStart : this.selEnd;
+        const lo = Math.min(this.selStart, end), hi = Math.max(this.selStart, end);
+        this.form.content = this.doc.blocks.slice(lo, hi + 1).map(b => b.text).join('\n');
+      } else {
+        this.form.content = '';
+      }
+      this.renderMath();
+    },
+    renderMath() {
+      this.$nextTick(() => {
+        if (window.renderMathInElement && this.$refs.previewBox && !this.form.image) {
+          renderMathInElement(this.$refs.previewBox, {
+            delimiters: [
+              { left: '$$', right: '$$', display: true },
+              { left: '$', right: '$', display: false }
+            ],
+            throwOnError: false
+          });
+        }
+      });
+    },
+    async saveQuestion() {
+      if (!(this.form.content || this.form.image) || !this.doc) return;
+      const inPageMode = this.viewMode === 'page';
+      const end = this.selEnd === null ? this.selStart : this.selEnd;
+      this.saving = true;
+      try {
+        await this.api('/api/questions', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            document_id: this.doc.id,
+            doc_filename: this.doc.filename,
+            start_block: inPageMode ? -1 : (this.selStart === null ? -1 : Math.min(this.selStart, end)),
+            end_block: inPageMode ? -1 : (end === null ? -1 : Math.max(this.selStart, end)),
+            content: inPageMode ? this.form.content : this.form.content,
+            qtype: this.form.qtype,
+            difficulty: this.form.difficulty,
+            knowledge_points: this.form.knowledge_points,
+            answer: this.form.answer,
+            analysis: this.form.analysis,
+            image: this.form.image
+          })
+        });
+        ElementPlus.ElMessage.success('已保存到题库');
+        if (inPageMode) {
+          this.selectedSegs = [];
+          this.form.content = ''; this.form.image = '';
+          this.form.answer = ''; this.form.analysis = '';
+          this.form.knowledge_points = [];
+        } else {
+          this.resetSel();
+        }
+        this.loadQuestions();
+      } catch (e) {
+        ElementPlus.ElMessage.error(e.message);
+      } finally { this.saving = false; }
+    },
+    async del(id) {
+      await this.api('/api/questions/' + id, { method: 'DELETE' });
+      this.loadQuestions();
+    },
+    diffTag(d) { return d === '基础' ? 'success' : d === '拔高' ? 'danger' : 'warning'; },
+    exportJson() {
+      const blob = new Blob([JSON.stringify(this.questions, null, 2)], { type: 'application/json' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = 'questions.json';
+      a.click();
+      URL.revokeObjectURL(a.href);
+    }
+  }
+});
+
+app.use(ElementPlus);
+app.mount('#app');
+</script>
+</body>
+</html>

@@ -1,0 +1,22 @@
+# 数据库（录入的题目数据，不同步）
+backend/app.db
+*.db
+*.sqlite3
+
+# 运行时产物
+backend/uploads/
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# 环境与密钥
+.env
+*.key
+cookies.json
+
+# 编辑器/系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
