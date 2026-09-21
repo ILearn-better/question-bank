@@ -78,6 +78,14 @@ export const curriculumApi = {
   nodes: (id) => api.get(`/api/curricula/${id}/nodes`),
 };
 
+export const papersApi = {
+  /** 筛题库。响应是 {total, items}，与录题页在用的 GET /questions（纯数组）不同。 */
+  search: (params) => api.get('/api/questions/search', params),
+  /** 导出/预览合成一个 URL：HTML 是 inline（直接看），Word/PDF 是下载。
+   *  这样前端只要 window.open，不用把二进制读进 fetch 再自己造 Blob。 */
+  exportUrl: (params) => '/api/papers/export' + qs(params),
+};
+
 export const abilityApi = {
   dims: () => api.get('/api/ability-dims'),
   createDim: (body) => api.post('/api/ability-dims', body),

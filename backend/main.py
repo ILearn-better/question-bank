@@ -29,6 +29,7 @@ from app.routers import (                                   # noqa: E402
     documents,
     feedbacks,
     lessons,
+    papers,
     questions,
     students,
     system,
@@ -73,6 +74,7 @@ app.include_router(lessons.router)
 app.include_router(feedbacks.router)
 app.include_router(curriculum.router)
 app.include_router(questions.router)
+app.include_router(papers.router)
 app.include_router(documents.router)
 app.include_router(system.router)
 

@@ -27,6 +27,7 @@ export default {
         <router-link to="/students">学生</router-link>
         <router-link to="/schedule">课表与课时费</router-link>
         <a href="/entry.html">题库录题</a>
+        <router-link to="/papers">出卷</router-link>
         <router-link to="/settings">设置</router-link>
       </nav>
       <div class="foot">

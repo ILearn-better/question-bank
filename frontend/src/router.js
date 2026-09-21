@@ -31,6 +31,12 @@ const routes = [
     meta: { title: '课表与课时费' },
   },
   {
+    path: '/papers',
+    name: 'papers',
+    component: () => import('./views/Papers.js'),
+    meta: { title: '出卷' },
+  },
+  {
     path: '/settings',
     name: 'settings',
     component: () => import('./views/Settings.js'),

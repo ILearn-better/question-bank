@@ -6,13 +6,13 @@ import json
 import uuid
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import delete, select
+from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy import and_, delete, func, or_, select
 from sqlalchemy.orm import Session
 
 from .. import config
 from ..db import get_db
-from ..models import Question, QuestionNode
+from ..models import Node, Question, QuestionNode
 from ..schemas import QuestionIn
 
 router = APIRouter(prefix="/api", tags=["questions"])
@@ -107,6 +107,91 @@ def list_questions(
     if curriculum_id:
         stmt = stmt.where(Question.curriculum_id == curriculum_id)
     return [_serialize(q) for q in db.scalars(stmt).all()]
+
+
+def _subtree_ids(db: Session, root_id: int) -> list[int]:
+    """一棵知识点的子树 id（含自己）。按「章节」筛也能筛出它下面小节的题，
+    否则老师得把整棵子树逐个勾一遍。"""
+    rows = db.execute(select(Node.id, Node.parent_id)).all()
+    kids: dict[int | None, list[int]] = {}
+    for nid, pid in rows:
+        kids.setdefault(pid, []).append(nid)
+    out: list[int] = []
+    stack = [root_id]
+    while stack:
+        cur = stack.pop()
+        if cur in out:
+            continue
+        out.append(cur)
+        stack.extend(kids.get(cur, []))
+    return out
+
+
+@router.get("/questions/search")
+def search_questions(
+    keyword: str | None = None,
+    curriculum_id: int | None = None,
+    node_id: int | None = None,
+    qtype: str | None = None,
+    difficulty: str | None = None,
+    has_image: bool | None = None,
+    with_answer: bool | None = None,
+    sort: str = Query("created", description="created / oldest / usage"),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+):
+    """按条件筛题库（出卷用），响应 {total, items}。
+
+    与 GET /questions 的区别：多了题型/难度/知识点/关键词等条件、分页、以及排序，
+    因为出卷页要显示「共 N 题」并翻页。**旧接口一行没动**，录题页不受影响。
+    """
+    conds = []
+    kw = (keyword or "").strip()
+    if kw:
+        like = f"%{kw}%"
+        conds.append(or_(
+            Question.content.like(like),
+            Question.answer.like(like),
+            Question.source.like(like),
+            Question.doc_filename.like(like),
+        ))
+    if curriculum_id:
+        conds.append(Question.curriculum_id == curriculum_id)
+    if node_id:
+        ids = _subtree_ids(db, node_id)
+        linked = select(QuestionNode.question_id).where(QuestionNode.node_id.in_(ids))
+        conds.append(or_(Question.node_id.in_(ids), Question.id.in_(linked)))
+    if qtype:
+        conds.append(Question.qtype == qtype)
+    if difficulty:
+        conds.append(Question.difficulty == difficulty)
+    if has_image is not None:
+        # coalesce 是为了 NULL 安全：老数据里 image 可能是 NULL
+        cond = func.coalesce(Question.image, "") != ""
+        conds.append(cond if has_image else ~cond)
+    if with_answer is not None:
+        has_ans = or_(
+            func.coalesce(Question.answer, "") != "",
+            func.coalesce(Question.answer_image, "") != "",
+        )
+        conds.append(has_ans if with_answer else ~has_ans)
+
+    total = db.scalar(select(func.count()).select_from(Question).where(*conds)) or 0
+
+    order = {
+        "created": Question.created_at.desc(),
+        "oldest": Question.created_at.asc(),
+        # 少用的排前面：出过卷的题尽量别再出，usage_count 就是为这个留的
+        "usage": func.coalesce(Question.usage_count, 0).asc(),
+    }.get(sort, Question.created_at.desc())
+
+    rows = db.scalars(
+        select(Question).where(*conds)
+        .order_by(order, Question.created_at.desc())
+        .limit(limit).offset(offset)
+    ).all()
+    return {"total": total, "items": [_serialize(q) for q in rows]}
 
 
 @router.delete("/questions/{qid}")
