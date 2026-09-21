@@ -1,22 +1,17 @@
 # -*- coding: utf-8 -*-
-"""文档解析器：把 PDF / Word 试卷解析成内容块序列，供前端手动分割成题目。"""
-import pymupdf  # PyMuPDF
+"""文档解析器：把 PDF / Word 试卷解析成内容块序列，供前端手动分割成题目。
+
+说明：PDF 部分已下沉到 `app.adapters.pdf`（PyMuPDF 的唯一出入口）。
+      本模块保留 Word 解析，并对外维持原函数签名，兼容既有脚本。
+"""
 from docx import Document as DocxDocument
+
+from app.adapters.pdf import parse_blocks as _pdf_parse_blocks
 
 
 def parse_pdf(path: str) -> list:
-    """解析 PDF：按 PyMuPDF 的文本块切分，保留页码，图片块标记占位。"""
-    blocks = []
-    with pymupdf.open(path) as doc:
-        for pno, page in enumerate(doc, start=1):
-            for b in page.get_text("blocks"):
-                # b = (x0, y0, x1, y1, text, block_no, block_type)  block_type: 0=文本 1=图片
-                text = (b[4] or "").strip()
-                if b[6] == 1:
-                    blocks.append({"page": pno, "type": "image", "text": "[图片]"})
-                elif text:
-                    blocks.append({"page": pno, "type": "text", "text": text})
-    return blocks
+    """解析 PDF：按文本块切分，保留页码，图片块标记占位。"""
+    return _pdf_parse_blocks(path)
 
 
 def parse_docx(path: str) -> list:

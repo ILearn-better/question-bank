@@ -1,9 +1,16 @@
 # 数据库（录入的题目数据，不同步）
+# SQLite 开了 WAL 还会留 .db-wal / .db-shm 两个伴生文件，只写 *.db 挡不住。
+# 另注意：.gitignore **不支持行尾注释**，注释必须单独占一行，否则整条规则作废。
 backend/app.db
 *.db
+*.db-wal
+*.db-shm
 *.sqlite3
 
 # 运行时产物
+# backend/data/ 是本机数据：上传的原卷、页面渲染缓存、截图、备份、导出。
+# 注意路径是 backend/data/uploads 而不是 backend/uploads —— 写错等于没忽略。
+backend/data/
 backend/uploads/
 __pycache__/
 *.pyc

@@ -1,0 +1,161 @@
+# -*- coding: utf-8 -*-
+"""请求 / 响应模型。输入一律用 Pydantic 校验，输出为便于前端消费的字典结构。"""
+from __future__ import annotations
+
+from typing import List, Optional
+
+from pydantic import BaseModel, Field, field_validator
+
+
+# ============================================================ 文档 / 题目
+class CropIn(BaseModel):
+    page: int
+    x0: float
+    y0: float
+    x1: float
+    y1: float
+
+
+class CropStripIn(BaseModel):
+    """把多个区域竖着拼成一张图（跨页题目的原貌图）。"""
+
+    regions: List[CropIn]
+    gap: int = 14
+
+
+class QuestionIn(BaseModel):
+    document_id: str
+    doc_filename: str = ""
+    start_block: int = -1
+    end_block: int = -1
+    content: str = ""
+    qtype: str = "解答题"
+    difficulty: str = "中档"
+    knowledge_points: List[str] = Field(default_factory=list)
+    answer: str = ""
+    answer_image: str = ""
+    analysis: str = ""
+    image: str = ""
+    # 新增（多体系）
+    curriculum_id: Optional[int] = None
+    node_id: Optional[int] = None
+    source: Optional[str] = None
+    year: Optional[int] = None
+    stem_format: str = "text"
+
+    @field_validator("content", "answer", "answer_image", "analysis", "image", "doc_filename", mode="before")
+    @classmethod
+    def _none_to_empty(cls, v):  # noqa: ANN001
+        return "" if v is None else v
+
+
+# ============================================================ 体系 / 知识点
+class CurriculumIn(BaseModel):
+    code: str
+    name: str
+    region: Optional[str] = None
+    stage: Optional[str] = None
+    subject: str = "math"
+    color: Optional[str] = None
+    sort_order: int = 0
+
+
+class NodeIn(BaseModel):
+    name: str
+    parent_id: Optional[int] = None
+    level: Optional[int] = None
+    code: Optional[str] = None
+    sort_order: int = 0
+
+
+class TreeImportIn(BaseModel):
+    """从 JSON 树批量导入（保留原有单体系树的可迁移性）。"""
+
+    tree: dict
+
+
+# ============================================================ 学生
+class StudentIn(BaseModel):
+    name: str
+    nickname: Optional[str] = None
+    grade: Optional[str] = None
+    school: Optional[str] = None
+    contact: Optional[str] = None
+    parent_contact: Optional[str] = None
+    hourly_rate: Optional[float] = None
+    rate_unit: str = "hour"
+    status: str = "active"
+    started_at: Optional[str] = None
+    ended_at: Optional[str] = None
+    remark: Optional[str] = None
+    curriculum_ids: List[int] = Field(default_factory=list)
+    primary_curriculum_id: Optional[int] = None
+
+
+class StudentPatch(BaseModel):
+    name: Optional[str] = None
+    nickname: Optional[str] = None
+    grade: Optional[str] = None
+    school: Optional[str] = None
+    contact: Optional[str] = None
+    parent_contact: Optional[str] = None
+    hourly_rate: Optional[float] = None
+    rate_unit: Optional[str] = None
+    status: Optional[str] = None
+    started_at: Optional[str] = None
+    ended_at: Optional[str] = None
+    remark: Optional[str] = None
+    curriculum_ids: Optional[List[int]] = None
+    primary_curriculum_id: Optional[int] = None
+
+
+# ============================================================ 课时
+class LessonIn(BaseModel):
+    student_id: int
+    curriculum_id: Optional[int] = None
+    start_at: str                                   # '2026-09-20T19:00'
+    duration_min: int = 60
+    status: str = "scheduled"
+    mode: Optional[str] = None
+    location: Optional[str] = None
+    rate: Optional[float] = None                    # 不传则取学生当前单价快照
+    billable: int = 1
+    topic: Optional[str] = None
+    node_ids: List[int] = Field(default_factory=list)
+
+
+class LessonPatch(BaseModel):
+    curriculum_id: Optional[int] = None
+    start_at: Optional[str] = None
+    duration_min: Optional[int] = None
+    status: Optional[str] = None
+    mode: Optional[str] = None
+    location: Optional[str] = None
+    rate: Optional[float] = None
+    billable: Optional[int] = None
+    topic: Optional[str] = None
+    node_ids: Optional[List[int]] = None
+
+
+# ============================================================ 反馈
+class AbilityScoreIn(BaseModel):
+    dim_id: int
+    score: int = Field(ge=1, le=5)
+
+
+class FeedbackIn(BaseModel):
+    """课后反馈。刻意全部可选 —— 允许只写一句话就存，记录成本是生命线。"""
+
+    performance: Optional[str] = None
+    problems: Optional[str] = None
+    homework: Optional[str] = None
+    next_plan: Optional[str] = None
+    rating: Optional[int] = Field(default=None, ge=1, le=5)
+    share_to_parent: int = 0
+    ability_scores: List[AbilityScoreIn] = Field(default_factory=list)
+
+
+class DimIn(BaseModel):
+    name: str
+    curriculum_id: Optional[int] = None
+    sort_order: int = 0

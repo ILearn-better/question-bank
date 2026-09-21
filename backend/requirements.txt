@@ -3,3 +3,8 @@ uvicorn[standard]>=0.29
 python-multipart>=0.0.9
 PyMuPDF>=1.24
 python-docx>=1.1
+SQLAlchemy>=2.0
+alembic>=1.13
+# Word 页面视图：调用本机 Microsoft Word 把 .docx 导出成带版式的 PDF。
+# 仅 Windows 需要（且仅当要录入 Word 试卷时需要）；缺失时 Word 文档自动回退内容块模式。
+pywin32>=306; sys_platform == "win32"
