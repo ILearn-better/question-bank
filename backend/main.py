@@ -79,6 +79,24 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@app.middleware("http")
+async def add_revalidate_header(request, call_next):
+    """所有响应都带 `Cache-Control: no-cache`（意思是"每次都回来校验"）。
+
+    `StaticFiles` 只发 ETag / Last-Modified，不发 Cache-Control —— 于是浏览器自己
+    按启发式规则决定这些 JS 能直接用多久，改了前端按 F5 都可能还是旧页面。
+    踩过好几次：侧栏加了「笔记」，界面上就是不出现（hash 路由切页不会重新拉 App.js，
+    整个文档一直是旧的）。
+
+    `no-cache` 不是"不缓存"，而是"每次带 ETag 问一下"：没变 → 304（几乎不耗流量），
+    变了 → 200 新内容。本地自用场景这是唯一不会出错的策略。
+    """
+    response = await call_next(request)
+    response.headers.setdefault("Cache-Control", "no-cache")
+    return response
+
+
 # ---- API 路由（按模块拆分）----
 app.include_router(dashboard.router)
 app.include_router(students.router)
