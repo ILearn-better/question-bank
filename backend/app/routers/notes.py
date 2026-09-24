@@ -18,17 +18,19 @@ import re
 import uuid
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import quote
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile
 from fastapi.responses import FileResponse
 from sqlalchemy import delete, or_, select
 from sqlalchemy.orm import Session
 
 from .. import config
+from ..adapters import notes_math, office
 from ..db import get_db
 from ..models import Note
 from ..schemas import NoteIn, NotePatch
-from ..services import images
+from ..services import images, notes_export
 
 router = APIRouter(prefix="/api/notes", tags=["notes"])
 
@@ -189,3 +191,71 @@ def get_file(name: str):
     # 按扩展名给 MIME，不写死 png —— 目录里混进别的格式也不用改这里
     media = mimetypes.guess_type(p.name)[0] or "image/png"
     return FileResponse(str(p), media_type=media)
+
+
+# ---------------------------------------------------------------- 导出 Word / PDF
+DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+
+# 支持导出的格式 -> MIME
+EXPORT_FORMATS = {"docx": DOCX_MIME, "pdf": "application/pdf"}
+
+
+@router.get("/export/caps")
+def export_caps():
+    """导出能力探测。
+
+    为什么要单独问一次：PDF 依赖本机 Word、公式渲染依赖 node + Office 的 XSLT，
+    这些条件不满足时**导出会失败或降级**。事先问一下，前端就能把按钮的状态和
+    原因直接写在界面上，而不是让用户点了之后看到一段报错。
+    """
+    formula_ok, formula_reason = notes_math.availability()
+    pdf_ok = office.is_available()
+    return {
+        "formats": sorted(EXPORT_FORMATS),
+        "pdf": pdf_ok,
+        "pdf_reason": "" if pdf_ok else office.availability_note(),
+        "formula": formula_ok,
+        "formula_reason": formula_reason,
+    }
+
+
+@router.get("/{nid}/export")
+def export_note(
+    nid: str,
+    format: str = Query("docx", description="docx / pdf"),
+    ink: bool = Query(True, description="是否附上板书（手写标注）"),
+    db: Session = Depends(get_db),
+):
+    fmt = (format or "docx").lower()
+    if fmt not in EXPORT_FORMATS:
+        raise HTTPException(422, f"不支持的格式 {format}（可选 docx / pdf）")
+
+    n = _note_or_404(db, nid)
+    note = {
+        "title": n.title,
+        "content": n.content or "",
+        "ink": _parse_ink(n.ink),
+        "updated_at": n.updated_at,
+    }
+
+    try:
+        if fmt == "docx":
+            body, _info = notes_export.build_docx(note, include_ink=ink)
+        else:
+            body, _info = notes_export.build_pdf(note, include_ink=ink)
+    except notes_export.PdfUnavailable as e:
+        # 503：本机能力不足（不是请求错），前端据此提示"先导 Word 再另存为 PDF"
+        raise HTTPException(503, str(e)) from e
+
+    fname = notes_export.safe_filename(n.title, fmt)
+    return Response(
+        content=body,
+        media_type=EXPORT_FORMATS[fmt],
+        headers={
+            # 中文文件名给 filename*（RFC 5987），同时留 ASCII 兜底给老客户端
+            "Content-Disposition": (
+                f'attachment; filename="note.{fmt}"; '
+                f"filename*=UTF-8''{quote(fname)}"
+            )
+        },
+    )

@@ -13,6 +13,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router';
 import { notesApi } from '../api.js';
 import { fail, ok, warn } from '../store.js';
+import Modal from '../components/Modal.js';
 
 const SAMPLE = `# 新笔记
 
@@ -157,6 +158,7 @@ const SNIPPETS = [
 
 export default {
   name: 'Notes',
+  components: { Modal },
   setup() {
     const route = useRoute();
     const router = useRouter();
@@ -192,6 +194,38 @@ export default {
     const hasNote = computed(() => !!cur.value);
     const libState = ref('idle');           // idle | loading | ready | error
     const markdownReady = computed(() => libState.value === 'ready');
+
+    // ---- 导出（Word / PDF）----
+    const showExport = ref(false);
+    const includeInk = ref(true);
+    const exporting = ref('');             // '' | 'docx' | 'pdf'：正在导出的格式
+    const caps = ref(null);                // 导出能力，见后端 /api/notes/export/caps
+
+    /** 先问一次后端能力：PDF 依赖本机 Word、公式渲染依赖 node + Office 的 XSLT。
+     *  拿到之后才能把「为什么这个按钮是灰的」直接写在界面上。 */
+    async function loadCaps() {
+      try {
+        caps.value = await notesApi.exportCaps();
+      } catch (e) { /* 探测失败不影响其它功能，导出时还会再报一次 */ }
+    }
+
+    async function doExport(fmt) {
+      if (!cur.value || exporting.value) return;
+      // 先落盘再导：防抖还没发出去的改动如果不刷，导出的会是**改之前**的版本
+      await flushSave();
+      exporting.value = fmt;
+      const base = (cur.value.title || '笔记').replace(/[\\/:*?"<>|]+/g, '_').slice(0, 60) || '笔记';
+      const filename = `${base}.${fmt}`;
+      try {
+        await notesApi.downloadExport(cur.value.id, { format: fmt, ink: includeInk.value }, filename);
+        ok(`已导出 ${fmt === 'pdf' ? 'PDF' : 'Word'}：${filename}`);
+        showExport.value = false;
+      } catch (e) {
+        fail(e.message);
+      } finally {
+        exporting.value = '';
+      }
+    }
 
     /* ================= 列表 ================= */
     async function loadList() {
@@ -570,6 +604,8 @@ export default {
 
       await loadList();
       if (route.params.id) await open(route.params.id);
+      // 导出能力探测和主流程无关，不 await，避免拖慢首屏
+      loadCaps();
       window.addEventListener('resize', onResize);
     });
 
@@ -603,6 +639,7 @@ export default {
       onEdit, onTitleInput, render, scrollToHeading, onPreviewScroll,
       insertSnippet, pickImage, onImageFile, onPaste,
       toggleInk, inkDown, inkMove, inkUp, undoInk, clearInk,
+      showExport, includeInk, exporting, caps, doExport,
       saveNow: flushSave,
     };
   },
@@ -674,6 +711,7 @@ export default {
             <button class="btn sm" :class="{ primary: showFormula }" @click="showFormula = !showFormula">
               公式速查
             </button>
+            <button class="btn sm" @click="showExport = true">导出</button>
             <span style="flex:1"></span>
             <span class="muted" style="font-size:12px">
               <span v-if="saveState === 'dirty'">未保存</span>
@@ -739,5 +777,49 @@ export default {
         </div>
       </div>
     </div>
+
+    <!-- ============ 导出 Word / PDF ============ -->
+    <Modal v-if="showExport" title="导出这篇笔记" @close="showExport = false">
+      <p class="muted" style="margin-top:0">
+        正文里的公式会转成 <strong>Word 原生公式</strong>（在 Word 里还能双击修改），
+        插图一并带上；板书作为一页手写图层附在文末。
+      </p>
+
+      <div class="row" style="align-items:center;gap:10px;margin:10px 0">
+        <label style="display:flex;align-items:center;gap:6px;cursor:pointer"
+               :class="{ muted: !cur || !cur.ink || !cur.ink.length }">
+          <input type="checkbox" v-model="includeInk"
+                 :disabled="!cur || !cur.ink || !cur.ink.length" style="width:auto">
+          附上板书（{{ cur && cur.ink ? cur.ink.length : 0 }} 笔）
+        </label>
+      </div>
+
+      <div class="row" style="gap:10px;margin-top:4px">
+        <button class="btn primary" :disabled="!!exporting" @click="doExport('docx')">
+          {{ exporting === 'docx' ? '正在生成…' : '导出 Word（.docx）' }}
+        </button>
+        <button class="btn" :disabled="!!exporting || (caps && !caps.pdf)"
+                :title="caps && !caps.pdf ? caps.pdf_reason : '用本机 Word 排版后导出 PDF，公式与分页最准'"
+                @click="doExport('pdf')">
+          {{ exporting === 'pdf' ? '正在生成…（Word 启动稍几秒）' : '导出 PDF' }}
+        </button>
+      </div>
+
+      <div v-if="caps && !caps.pdf" class="muted" style="font-size:12px;margin-top:10px">
+        ⚠️ 本机不能直接导 PDF：{{ caps.pdf_reason }}<br>
+        可以先「导出 Word」，再用 Word 另存为 PDF。
+      </div>
+      <div v-else-if="caps && !caps.formula" class="muted" style="font-size:12px;margin-top:10px">
+        ⚠️ 公式只能按 <code>$…$</code> 原文导出：{{ caps.formula_reason }}<br>
+        正文、插图、板书不受影响。
+      </div>
+      <div v-else-if="exporting === 'pdf'" class="muted" style="font-size:12px;margin-top:10px">
+        正在调用本机 Word 排版，首次可能要等十几秒，请不要关页面。
+      </div>
+
+      <template #foot>
+        <button class="btn ghost" @click="showExport = false">关闭</button>
+      </template>
+    </Modal>
   </div>`,
 };

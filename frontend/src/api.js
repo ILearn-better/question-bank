@@ -34,6 +34,40 @@ function qs(params) {
   return usable.length ? '?' + usable.map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join('&') : '';
 }
 
+/** 下载类接口（导出文件）：fetch 成 Blob 再触发保存。
+ *
+ * 为什么不用 window.open（出卷那里就是这么干的）：
+ *   导出失败时后端返回的是 JSON 报错（比如导出 PDF 需要本机 Word 但没有），
+ *   window.open 会在新标签页里摊开一段 JSON，用户看不懂也不知道该怎么处理。
+ *   走 fetch 就能把它变成一条提示。
+ */
+export async function download(path, filename) {
+  let res;
+  try {
+    res = await fetch(BASE + path);
+  } catch (e) {
+    throw new Error('连不上后端服务，请确认服务已启动');
+  }
+  if (!res.ok) {
+    let msg = `导出失败 ${res.status}`;
+    try {
+      const data = await res.json();
+      if (data && data.detail) {
+        msg = typeof data.detail === 'string' ? data.detail : JSON.stringify(data.detail);
+      }
+    } catch (e) { /* 不是 JSON，保留默认文案 */ }
+    throw new Error(msg);
+  }
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 1000);
+}
+
 export const api = {
   get: (p, params) => request(p + qs(params)),
   post: (p, body) => request(p, { method: 'POST', body: JSON.stringify(body ?? {}) }),
@@ -98,6 +132,12 @@ export const notesApi = {
   update: (id, body) => api.patch(`/api/notes/${id}`, body),
   remove: (id) => api.del(`/api/notes/${id}`),
   uploadImage: (formData) => api.upload('/api/notes/image', formData),
+  /** 导出能力：PDF 要本机有 Word、公式渲染要 node + Office 的 XSLT。
+   *  先问一次，界面上就能把按钮状态和原因写清楚，而不是等用户点了才报错。 */
+  exportCaps: () => api.get('/api/notes/export/caps'),
+  /** 导出单篇笔记。Word / PDF 都是服务端生成，这里只管下载。 */
+  downloadExport: (id, params, filename) =>
+    download(`/api/notes/${id}/export` + qs(params), filename),
 };
 
 export const abilityApi = {
