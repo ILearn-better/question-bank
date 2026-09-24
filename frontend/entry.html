@@ -4,8 +4,11 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>拾课 · 试卷分割录入</title>
-<link rel="stylesheet" href="https://unpkg.com/element-plus/dist/index.css">
-<link rel="stylesheet" href="https://unpkg.com/katex@0.16.9/dist/katex.min.css">
+<!-- 依赖全部走本地 vendor（Element Plus 2.14.6 / KaTeX 0.16.9）：
+     实测这台机器冷启动拉 unpkg 要 29s 且经常直接超时，录题页会长时间白屏。
+     文件在 frontend/vendor/ 下，随仓库一起走，离线也能用。 -->
+<link rel="stylesheet" href="/vendor/element-plus/index.css">
+<link rel="stylesheet" href="/vendor/katex/katex.min.css">
 <style>
   * { box-sizing: border-box; }
   body { margin: 0; background: #f0f2f5; font-family: "PingFang SC", "Microsoft YaHei", sans-serif; }
@@ -555,10 +558,13 @@
   </el-dialog>
 </div>
 
-<script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
-<script src="https://unpkg.com/element-plus/dist/index.full.min.js"></script>
-<script src="https://unpkg.com/katex@0.16.9/dist/katex.min.js"></script>
-<script src="https://unpkg.com/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
+<!-- Vue 3.5.43 的 global 构建（**含模板编译器**，本页用运行时模板，不能换成 runtime-only）；
+     与工作台 SPA 那份 3.4.38 是各自的构建产物，两个页面分开加载、互不影响。
+     脚本按顺序执行，auto-render 排在 katex 之后是对的，不要并行化。 -->
+<script src="/vendor/vue.global.prod.js"></script>
+<script src="/vendor/element-plus/index.full.min.js"></script>
+<script src="/vendor/katex/katex.min.js"></script>
+<script src="/vendor/katex/auto-render.min.js"></script>
 <script>
 const { createApp } = Vue;
 const QNUM_RE = /^\s*\d{1,3}\s*[.、．]|[（(]\s*\d{1,3}\s*[)）]/;
