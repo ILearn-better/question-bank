@@ -39,8 +39,10 @@ LEGACY_TREE_PATH = ROOT_DIR / "data" / "math-knowledge-tree.json"
 OWNER_ID = int(os.getenv("SHIKE_OWNER_ID", "1"))
 
 # ---------- 行为开关 ----------
-# 启动时自动备份数据库（Phase 0.8）：每次启动留一份，保留最近 N 份
+# 迁移前自动备份数据库。注意「只在库结构确实要升级时才触发」，不是每次启动都备份。
+# 设 SHIKE_AUTO_BACKUP=0 可关掉它；「设置」页里的手工备份不受这个开关影响。
 AUTO_BACKUP = os.getenv("SHIKE_AUTO_BACKUP", "1") != "0"
+# 备份保留份数，超出后从最旧的开始删
 BACKUP_KEEP = int(os.getenv("SHIKE_BACKUP_KEEP", "10"))
 # 启动时自动把库升到最新结构（自用单机形态下比手工跑 alembic 更合适）
 AUTO_MIGRATE = os.getenv("SHIKE_AUTO_MIGRATE", "1") != "0"

@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+import json
 import re
 from datetime import datetime
 from urllib.parse import quote
@@ -36,6 +37,19 @@ def _safe_name(title: str) -> str:
     """文件名去掉路径分隔符等非法字符，免得下载时出现怪名字。"""
     name = re.sub(r'[\\/:*?"<>|\r\n\t]+', "_", (title or "试卷")).strip(" .") or "试卷"
     return name[:60]
+
+
+def _tags_of(raw: str | None) -> list[str]:
+    """解析 tags 的 JSON 数组。
+
+    没去 import questions.py 里的同名函数：两个 router 互相 import 容易绕成环，
+    而这只是个 4 行的容错解析，不值得为此建一层公共模块。
+    """
+    try:
+        v = json.loads(raw or "[]")
+    except json.JSONDecodeError:
+        return []
+    return [str(t) for t in v] if isinstance(v, list) else []
 
 
 @router.get("/papers/export")
@@ -76,6 +90,7 @@ def export_paper(
             "answer_image": rows[qid].answer_image or "",
             "analysis": rows[qid].analysis,
             "source": rows[qid].source,
+            "tags": _tags_of(rows[qid].tags),
         }
         for n, qid in enumerate(qids, start=1)
     ]

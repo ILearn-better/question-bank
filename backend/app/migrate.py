@@ -16,6 +16,7 @@ from pathlib import Path
 
 from alembic import command
 from alembic.config import Config
+from alembic.script import ScriptDirectory
 
 from . import config
 
@@ -96,11 +97,20 @@ def run_migrations(verbose: bool = True) -> dict:
     legacy = is_legacy_db()
     result["legacy"] = legacy
 
-    if not is_fresh_db():
-        path = backup_db(tag="before-migrate")
-        result["backup"] = str(path) if path else None
-
     cfg = _alembic_config()
+
+    # 只在「结构真的要动」时才备份。
+    # 这里以前是 `if not is_fresh_db()` —— 只要库不是空的就备份，于是每次启动
+    # 都白存一份 before-migrate，backups/ 里堆成一片，看着像迁移在反复跑。
+    # 实际情况是绝大多数启动都已经在 head 上，根本不会改一行结构。
+    # SHIKE_AUTO_BACKUP=0 可以连这个自动备份一起关掉（「设置」页的手工备份不受影响）。
+    if not is_fresh_db() and (legacy or _needs_upgrade(cfg)):
+        if config.AUTO_BACKUP:
+            path = backup_db(tag="before-migrate")
+            result["backup"] = str(path) if path else None
+        else:
+            result["auto_backup_off"] = True
+
     if legacy:
         # 老库已经在「0001 基线」描述的状态上，标记它，不要重跑建表
         command.stamp(cfg, "0001")
@@ -124,3 +134,17 @@ def current_revision() -> str | None:
         return None
     finally:
         con.close()
+
+
+def _needs_upgrade(cfg: Config) -> bool:
+    """库的结构是否真的落后于 alembic 的 head。
+
+    「库存在」不等于「要迁移」—— 平时启动都已经在 head 上，那种时候备份毫无意义。
+    取不到 head 时返回 True：宁可多备份一份，也不要漏备份（真有问题的话，
+    紧接着的 upgrade 会自己报出来，不会被这里吞掉）。
+    """
+    try:
+        head = ScriptDirectory.from_config(cfg).get_current_head()
+    except Exception:
+        return True
+    return current_revision() != head if head else True

@@ -42,11 +42,36 @@ class QuestionIn(BaseModel):
     source: Optional[str] = None
     year: Optional[int] = None
     stem_format: str = "text"
+    tags: List[str] = Field(default_factory=list)
 
     @field_validator("content", "answer", "answer_image", "analysis", "image", "doc_filename", mode="before")
     @classmethod
     def _none_to_empty(cls, v):  # noqa: ANN001
         return "" if v is None else v
+
+
+class QuestionPatch(BaseModel):
+    """部分更新：给已录的题补答案 / 改标签 / 补知识点。
+
+    全部 Optional 且默认 None，路由层用 model_dump(exclude_unset=True) 取值，
+    所以「没传」和「传了 null」是两回事：
+      · 没传某个字段      -> 保持原样（不会把已有的答案图误抹）
+      · 显式传 null/空串  -> 清空该字段
+    """
+
+    content: Optional[str] = None
+    qtype: Optional[str] = None
+    difficulty: Optional[str] = None
+    answer: Optional[str] = None
+    answer_image: Optional[str] = None
+    analysis: Optional[str] = None
+    image: Optional[str] = None
+    tags: Optional[List[str]] = None
+    knowledge_points: Optional[List[str]] = None
+    curriculum_id: Optional[int] = None
+    node_id: Optional[int] = None
+    source: Optional[str] = None
+    year: Optional[int] = None
 
 
 # ============================================================ 体系 / 知识点

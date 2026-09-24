@@ -12,9 +12,10 @@ const DIFFS = ['基础', '中档', '拔高'];
 const PAGE = 20;
 
 // 下拉里的「全部」统一用空串：qs() 会把空串过滤掉，不用再转 undefined
+// 注意 tags 是数组，reset 时要重新给一份空数组（不然会共用同一个引用）
 const EMPTY_FILTER = {
-  keyword: '', curriculum_id: '', node_id: '',
-  qtype: '', difficulty: '', has_image: false, with_answer: false, sort: 'created',
+  keyword: '', curriculum_id: '', kp: '',
+  qtype: '', difficulty: '', has_image: false, with_answer: false, sort: 'created', tags: [],
 };
 
 function todayTitle() {
@@ -31,33 +32,40 @@ export default {
     const total = ref(0);
     const offset = ref(0);
     const loading = ref(false);
-    const nodes = ref([]);            // 当前体系的知识点树
+    const kpGroups = ref([]);         // [{label, options:[{value,label}]}] 所有体系的知识点
+    const tagOptions = ref([]);       // 库里实际用过的标签
     const picked = ref([]);           // 已选题目，顺序即卷面顺序
     const title = ref(todayTitle());
     const opts = reactive({
       show_answer: true, show_analysis: false, show_tags: true, show_meta: true,
     });
 
-    // 知识点树压成带缩进的平铺选项 —— 原生 select 就能表达层级，不必引组件库
-    const nodeOptions = computed(() => {
-      const out = [];
-      const walk = (list, depth) => (list || []).forEach((n) => {
-        out.push({ id: n.id, label: '\u3000'.repeat(depth) + n.name });
-        walk(n.children, depth + 1);
-      });
-      walk(nodes.value, 0);
-      return out;
-    });
-
-    async function loadNodes() {
-      nodes.value = [];
-      filter.node_id = '';
-      if (!filter.curriculum_id) return;
+    /** 知识点选项：**所有**体系的节点（按体系分组）+ 题库里已用过的名字。
+     *
+     * 为什么不再跟着「体系」走：现在只有国内高中数学有知识树（119 个节点），
+     * 初中等体系是空的 —— 跟着走的话选了初中就是一个空下拉，根本没法筛。
+     * 选项值用**名字**（不是 node id），后端会同时匹配「文本知识点」和「同名节点子树」。 */
+    async function loadKpOptions() {
+      const groups = [];
       try {
-        nodes.value = await curriculumApi.nodes(filter.curriculum_id);
+        const used = await papersApi.knowledgePoints();
+        if (used.items.length) {
+          groups.push({ label: '题库里已用过的', options: used.items.map(i => ({ value: i.kp, label: i.kp })) });
+        }
+        for (const c of state.curricula || []) {
+          const tree = await curriculumApi.nodes(c.id);
+          const options = [];
+          const walk = (list, depth) => (list || []).forEach((n) => {
+            options.push({ value: n.name, label: '\u3000'.repeat(depth) + n.name });
+            walk(n.children, depth + 1);
+          });
+          walk(tree, 0);
+          if (options.length) groups.push({ label: c.name, options });
+        }
       } catch (e) {
         fail(e.message);
       }
+      kpGroups.value = groups;
     }
 
     async function search(reset = true) {
@@ -67,9 +75,11 @@ export default {
         const r = await papersApi.search({
           keyword: filter.keyword.trim(),
           curriculum_id: filter.curriculum_id,
-          node_id: filter.node_id,
+          kp: filter.kp,
           qtype: filter.qtype,
           difficulty: filter.difficulty,
+          // 多选标签 = 任一命中（后端也按这个语义）
+          tags: filter.tags.length ? filter.tags.join(',') : undefined,
           has_image: filter.has_image ? true : undefined,
           with_answer: filter.with_answer ? true : undefined,
           sort: filter.sort,
@@ -85,9 +95,23 @@ export default {
       }
     }
 
+    async function loadTags() {
+      try {
+        const r = await papersApi.tags();
+        tagOptions.value = r.items;
+      } catch (e) {
+        fail(e.message);
+      }
+    }
+
+    /** 标签多选：点一下切一个，点已选中的取消。 */
+    function toggleTag(t) {
+      const i = filter.tags.indexOf(t);
+      if (i >= 0) filter.tags.splice(i, 1); else filter.tags.push(t);
+    }
+
     function resetFilter() {
-      Object.assign(filter, EMPTY_FILTER);
-      nodes.value = [];
+      Object.assign(filter, { ...EMPTY_FILTER, tags: [] });
       search();
     }
 
@@ -156,8 +180,8 @@ export default {
 
     // 条件一改就重筛 —— 让老师每改一次都再点一下「筛选」太多余。
     watch(
-      () => [filter.curriculum_id, filter.node_id, filter.qtype, filter.difficulty,
-             filter.has_image, filter.with_answer, filter.sort],
+      () => [filter.curriculum_id, filter.kp, filter.qtype, filter.difficulty,
+             filter.has_image, filter.with_answer, filter.sort, filter.tags.join(',')],
       () => search(),
     );
     // 关键词单独防抖：不能每敲一个字就发一次请求
@@ -169,14 +193,16 @@ export default {
 
     onMounted(async () => {
       await loadCurricula();
+      loadKpOptions();
+      loadTags();
       search();
     });
 
     return {
-      state, filter, rows, total, loading, nodeOptions, picked, pickedIds,
-      title, opts, QTYPES, DIFFS, pageNo, pageCount,
-      loadNodes, search, resetFilter, add, addPage, remove, clearPicked, move,
-      isPicked, open, brief, prev, next,
+      state, filter, rows, total, loading, kpGroups, picked, pickedIds,
+      title, opts, QTYPES, DIFFS, pageNo, pageCount, tagOptions,
+      search, resetFilter, add, addPage, remove, clearPicked, move,
+      isPicked, open, brief, prev, next, toggleTag,
     };
   },
   template: `
@@ -197,16 +223,18 @@ export default {
             </div>
             <div class="field">
               <label>体系</label>
-              <select v-model="filter.curriculum_id" @change="loadNodes">
+              <select v-model="filter.curriculum_id">
                 <option value="">全部体系</option>
                 <option v-for="c in state.curricula" :key="c.id" :value="c.id">{{ c.name }}</option>
               </select>
             </div>
             <div class="field">
               <label>知识点（含子节点）</label>
-              <select v-model="filter.node_id" :disabled="!filter.curriculum_id">
+              <select v-model="filter.kp">
                 <option value="">全部知识点</option>
-                <option v-for="n in nodeOptions" :key="n.id" :value="n.id">{{ n.label }}</option>
+                <optgroup v-for="g in kpGroups" :key="g.label" :label="g.label">
+                  <option v-for="n in g.options" :key="n.value" :value="n.value">{{ n.label }}</option>
+                </optgroup>
               </select>
             </div>
           </div>
@@ -226,6 +254,22 @@ export default {
                 <span class="chip" :class="{ on: !filter.difficulty }" @click="filter.difficulty = ''">不限</span>
                 <span class="chip" v-for="d in DIFFS" :key="d"
                       :class="{ on: filter.difficulty === d }" @click="filter.difficulty = d">{{ d }}</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="row" style="align-items:flex-start">
+            <div class="field">
+              <label>标签（多选 = 任一命中，括号里是题数）</label>
+              <div class="chips" style="max-height:80px;overflow:auto">
+                <span class="chip" :class="{ on: !filter.tags.length }" @click="filter.tags = []">不限</span>
+                <span class="chip" v-for="t in tagOptions" :key="t.tag"
+                      :class="{ on: filter.tags.includes(t.tag) }" @click="toggleTag(t.tag)">
+                  {{ t.tag }} <span class="muted">{{ t.count }}</span>
+                </span>
+                <span v-if="!tagOptions.length" class="muted" style="font-size:12px">
+                  还没有标签 —— 到录题页给题目打上标签，这里就会出现
+                </span>
               </div>
             </div>
           </div>
@@ -272,6 +316,7 @@ export default {
               <div style="margin-top:5px;display:flex;gap:5px;flex-wrap:wrap">
                 <span class="tag blue">{{ q.qtype }}</span>
                 <span class="tag">{{ q.difficulty }}</span>
+                <span v-for="t in (q.tags || [])" :key="'tag' + t" class="tag">🏷 {{ t }}</span>
                 <span v-if="q.image" class="tag green">有图</span>
                 <span v-if="q.answer || q.answer_image" class="tag">有答案</span>
                 <span v-if="q.usage_count" class="tag orange">用过 {{ q.usage_count }} 次</span>
@@ -311,7 +356,7 @@ export default {
               <span class="chip" :class="{ on: opts.show_analysis }"
                     @click="opts.show_analysis = !opts.show_analysis">答案带解析</span>
               <span class="chip" :class="{ on: opts.show_tags }"
-                    @click="opts.show_tags = !opts.show_tags">标注题型难度</span>
+                    @click="opts.show_tags = !opts.show_tags">标注题型·难度·标签</span>
               <span class="chip" :class="{ on: opts.show_meta }"
                     @click="opts.show_meta = !opts.show_meta">留姓名日期栏</span>
             </div>

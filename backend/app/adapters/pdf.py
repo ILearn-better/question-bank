@@ -26,6 +26,21 @@ def page_count(path: str | os.PathLike) -> int:
         return doc.page_count
 
 
+def _page(doc, pno: int):
+    """取第 pno 页（1-based），**显式校验范围**，越界统一抛 ValueError。
+
+    为什么必须自己校验（踩过）：
+      · pymupdf 的 `doc[i]` 对负索引走 Python 语义 —— `doc[-1]` 是最后一页。
+        所以 pno=0 / 负数**不报错**，而是悄悄返回另一页；更糟的是渲染结果照样
+        按 `p{pno}.png` 落进页面缓存，污染磁盘。
+      · 超出上界则抛 IndexError，没人接就是 HTTP 500 + 一屏 traceback。
+    两种结果都不对：越界就该明确报错，由路由层翻译成 422。
+    """
+    if not (1 <= pno <= doc.page_count):
+        raise ValueError(f"页码 {pno} 超出范围（本文档共 {doc.page_count} 页）")
+    return doc[pno - 1]
+
+
 def render_page(path: str | os.PathLike, pno: int, cache_dir: str | os.PathLike, zoom: float = 2.0) -> str:
     """渲染第 pno 页（1-based）为 PNG，带磁盘缓存。返回 PNG 文件路径。"""
     os.makedirs(cache_dir, exist_ok=True)
@@ -33,7 +48,7 @@ def render_page(path: str | os.PathLike, pno: int, cache_dir: str | os.PathLike,
     if os.path.exists(out):
         return out
     with pymupdf.open(path) as doc:
-        page = doc[pno - 1]
+        page = _page(doc, pno)
         pix = page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom))
         pix.save(out)
     return out
@@ -42,7 +57,7 @@ def render_page(path: str | os.PathLike, pno: int, cache_dir: str | os.PathLike,
 def page_lines(path: str | os.PathLike, pno: int) -> dict:
     """提取第 pno 页所有文字行及 bbox，供前端吸附分界线与拼接题目文本。"""
     with pymupdf.open(path) as doc:
-        page = doc[pno - 1]
+        page = _page(doc, pno)
         d = page.get_text("dict")
         lines = []
         for block in d.get("blocks", []):
@@ -76,7 +91,7 @@ def crop_region(
     x0, y0, x1, y1 = rect
     clip = pymupdf.Rect(min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1))
     with pymupdf.open(path) as doc:
-        page = doc[pno - 1]
+        page = _page(doc, pno)
         clip = clip & page.rect          # 限制在页面范围内
         if clip.is_empty:
             raise ValueError("裁剪区域为空")

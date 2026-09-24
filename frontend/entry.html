@@ -141,6 +141,27 @@
   .stage-chip.on { background: #ecf5ff; color: #409eff; border-color: #b3d8ff; font-weight: 600; }
   .stage-chip.done { background: #f0f9eb; color: #67c23a; border-color: #c2e7b0; }
   .stage-arrow { color: #c0c4cc; font-size: 12px; }
+  /* 补答案：题目挑选列表 */
+  .pick-list { max-height: 240px; overflow: auto; border: 1px solid #ebeef5; border-radius: 4px; }
+  .pick-item {
+    display: flex; align-items: center; gap: 6px; padding: 6px 8px;
+    border-bottom: 1px solid #f5f5f5; cursor: pointer; font-size: 13px;
+  }
+  .pick-item:hover { background: #f5f7fa; }
+  .pick-item.on { background: #ecf5ff; }
+  .pick-text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* 从已有截图里挑 */
+  .crop-grid {
+    display: grid; gap: 8px; max-height: 56vh; overflow: auto;
+    grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  }
+  .crop-cell { border: 1px solid #ebeef5; border-radius: 4px; padding: 4px; cursor: pointer; }
+  .crop-cell:hover { border-color: #409eff; }
+  .crop-cell img { width: 100%; height: 90px; object-fit: contain; display: block; background: #fafafa; }
+  .crop-meta {
+    display: flex; align-items: center; justify-content: space-between;
+    font-size: 11px; color: #909399; margin-top: 4px;
+  }
 </style>
 </head>
 <body>
@@ -149,6 +170,10 @@
     <h1>试卷分割录入</h1>
     <span class="sub">拾课 · 题库</span>
     <a class="back-link" href="/">← 回到工作台</a>
+    <el-radio-group v-model="answerMode" size="small" style="margin-left:8px" @change="onModeChange">
+      <el-radio-button :value="false">录新题</el-radio-button>
+      <el-radio-button :value="true">补答案</el-radio-button>
+    </el-radio-group>
     <div style="flex:1"></div>
     <el-select v-if="docs.length" v-model="currentDocId" placeholder="切换历史文档" size="default"
                style="width: 280px" @change="loadDoc">
@@ -330,10 +355,10 @@
         <el-card shadow="never" class="qform-card">
           <template #header>
             <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
-              <p class="panel-title" style="margin:0">✏️ 题目预览与入库</p>
+              <p class="panel-title" style="margin:0">{{ answerMode ? '🔧 给已录题目补答案' : '✏️ 题目预览与入库' }}</p>
               <div style="flex:1"></div>
               <!-- 两步走：先在左侧圈题目，确认后再圈答案。点一下可来回切 -->
-              <div class="stage-bar">
+              <div class="stage-bar" v-if="!answerMode">
                 <span class="stage-chip" :class="{ on: stage==='question', done: stage==='answer' }"
                       @click="goStage('question')">① 选题目</span>
                 <span class="stage-arrow">→</span>
@@ -343,6 +368,39 @@
             </div>
           </template>
           <div class="qform">
+            <!-- 补答案：先挑一道已录的题，再给它补答案 -->
+            <template v-if="answerMode">
+              <div class="hint" style="margin-bottom:8px">
+                <b>① 先选一道题</b> → <b>② 给它补答案</b>：可以在左侧页面里圈出答案（切到答案文档也能圈），
+                也可以直接「从电脑选图片」或「从已有截图选」。
+              </div>
+              <div style="display:flex;gap:8px;margin-bottom:8px">
+                <el-input v-model="pickKeyword" placeholder="搜题干 / 答案关键字，留空列最近录入的"
+                          clearable @keyup.enter="searchQuestions" @clear="searchQuestions"></el-input>
+                <el-button :loading="pickLoading" @click="searchQuestions">搜索</el-button>
+              </div>
+              <div style="margin-bottom:8px">
+                <el-checkbox v-model="onlyMissing" @change="searchQuestions" size="small">
+                  只看还没答案的
+                </el-checkbox>
+              </div>
+              <div class="pick-list">
+                <div v-for="q in pickList" :key="q.id" class="pick-item"
+                     :class="{ on: q.id === editingId }" @click="pickQuestion(q)">
+                  <span class="pick-text">{{ briefQ(q) }}</span>
+                  <el-tag v-if="q.answer || q.answer_image" size="small" type="success" effect="plain">已答</el-tag>
+                  <el-tag v-else size="small" type="warning" effect="plain">待补</el-tag>
+                </div>
+                <div v-if="!pickLoading && !pickList.length" class="empty-block">没有符合条件的题目</div>
+              </div>
+              <div v-if="editingId" class="hint" style="margin:10px 0;color:#409eff">
+                正在补答案：{{ briefQ({ content: editingStem }) }}
+                <img v-if="editingImage" :src="editingImage" alt="题目原貌图"
+                     style="max-width:100%;margin-top:6px;border:1px solid #ebeef5;border-radius:4px">
+              </div>
+            </template>
+            <!-- 题目预览只在录新题模式下有意义；补答案模式下题干在题目列表里已经显示了 -->
+            <template v-if="!answerMode">
             <div class="hint" style="margin-bottom:6px">题目预览（文字与原貌图可同时存，公式自动渲染 $…$）</div>
             <div class="preview-box">
               <!-- 预览文字刻意交给 renderMath() 直接写 DOM，不走 Vue 插值。
@@ -357,6 +415,7 @@
             <div v-if="form.image" style="margin-top:6px;display:flex;gap:8px">
               <el-button size="small" type="danger" text @click="clearFigure">清除原貌图</el-button>
             </div>
+            </template>
 
             <el-form label-position="top" style="margin-top:14px">
               <el-row :gutter="10">
@@ -375,11 +434,47 @@
                   </el-form-item>
                 </el-col>
               </el-row>
+              <el-row :gutter="10">
+                <el-col :span="12">
+                  <el-form-item label="体系">
+                    <el-select v-model="form.curriculum_id" style="width:100%" clearable placeholder="不指定">
+                      <el-option v-for="c in curricula" :key="c.id" :label="c.name" :value="c.id"></el-option>
+                    </el-select>
+                  </el-form-item>
+                </el-col>
+                <el-col :span="12">
+                  <el-form-item label="知识点（可选多个，也能自己敲）">
+                    <el-select v-model="form.knowledge_points" style="width:100%" multiple filterable
+                               allow-create default-first-option collapse-tags collapse-tags-tooltip
+                               placeholder="从知识树选，或直接输入">
+                      <el-option-group v-for="g in kpGroups" :key="g.label" :label="g.label">
+                        <el-option v-for="n in g.options" :key="n.value" :label="n.label" :value="n.value"></el-option>
+                      </el-option-group>
+                    </el-select>
+                  </el-form-item>
+                </el-col>
+              </el-row>
+              <el-form-item label="标签（回车确认，可新建）">
+                <el-select v-model="form.tags" style="width:100%" multiple filterable allow-create
+                           default-first-option placeholder="如：期中真题、压轴、易错">
+                  <el-option v-for="t in tagOptions" :key="t" :label="t" :value="t"></el-option>
+                </el-select>
+              </el-form-item>
               <el-form-item label="答案（支持 $ 公式 $）">
                 <el-input v-model="form.answer" type="textarea" :rows="2"
                           placeholder="标准答案（也可以走到第 ② 步，在页面上圈出答案图）"></el-input>
                 <img v-if="form.answer_image" :src="form.answer_image" alt="答案图"
                      style="max-width:100%;margin-top:6px;border:1px solid #ebeef5;border-radius:4px">
+                <div style="margin-top:6px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+                  <el-button size="small" plain @click="pickLocalImage">📁 从电脑选图片</el-button>
+                  <el-button size="small" plain @click="openCropPicker">🖼 从已有截图选</el-button>
+                  <el-button v-if="form.image && !form.answer_image" size="small" text
+                             @click="copyToAnswer(form.image)">用题目图</el-button>
+                  <el-button v-if="form.answer_image" size="small" text type="danger"
+                             @click="clearAnswerImage">清除答案图</el-button>
+                </div>
+                <!-- 选本地图片：用隐藏 input 触发，不走 el-upload（这里不需要上传列表） -->
+                <input ref="localImg" type="file" accept="image/*" style="display:none" @change="onLocalImage">
               </el-form-item>
               <el-form-item label="解析">
                 <el-input v-model="form.analysis" type="textarea" :rows="2" placeholder="解题步骤（可选）"></el-input>
@@ -393,17 +488,16 @@
                            :disabled="!(form.content || form.image)"
                            @click="confirmQuestion">确认题目，去选答案 →</el-button>
                 <el-button v-else type="primary" style="flex:2"
-                           :disabled="!(form.content || form.image)" :loading="saving"
-                           @click="saveQuestion">保存到题库</el-button>
+                           :disabled="answerMode ? !editingId : !(form.content || form.image)" :loading="saving"
+                           @click="answerMode ? saveAnswer() : saveQuestion()">
+                  {{ answerMode ? '保存答案' : '保存到题库' }}</el-button>
               </div>
-              <div style="display:flex;gap:8px;margin-top:8px;align-items:center;flex-wrap:wrap">
+              <div v-if="!answerMode" style="display:flex;gap:8px;margin-top:8px;align-items:center;flex-wrap:wrap">
                 <el-button v-if="stage === 'question'" size="small" text
                            :disabled="!(form.content || form.image)" :loading="saving"
                            @click="saveQuestion">跳过答案，直接保存</el-button>
                 <template v-else>
                   <el-button size="small" text @click="goStage('question')">← 重选题目</el-button>
-                  <el-button v-if="form.answer_image" size="small" text type="danger"
-                             @click="clearAnswerImage">清除答案图</el-button>
                 </template>
               </div>
             </el-form>
@@ -426,6 +520,7 @@
               <el-tag size="small" :type="diffTag(q.difficulty)">{{ q.difficulty }}</el-tag>
               <el-tag v-if="q.image" size="small" type="success" effect="plain">📷 图片题</el-tag>
               <span style="flex:1"></span>
+              <el-button size="small" text type="primary" @click="startAnswerFor(q)">补答案</el-button>
               <el-button size="small" text type="danger" @click="del(q.id)">删除</el-button>
             </div>
             <div v-if="q.image"><img :src="q.image" class="thumb" alt=""></div>
@@ -436,12 +531,28 @@
             </div>
             <div class="meta">
               <el-tag v-for="kp in q.knowledge_points" :key="kp" size="small" type="info" effect="plain">{{ kp }}</el-tag>
+              <el-tag v-for="t in (q.tags || [])" :key="'tag' + t" size="small" effect="plain">{{ t }}</el-tag>
             </div>
           </div>
         </el-card>
       </el-col>
     </el-row>
   </div>
+
+  <!-- 从已有截图里挑一张当答案图 -->
+  <el-dialog v-model="cropPicker" title="选择已有截图" width="720px">
+    <div v-if="cropListLoading" class="empty-block">加载中…</div>
+    <div v-else-if="!cropList.length" class="empty-block">目录里还没有截图</div>
+    <div v-else class="crop-grid">
+      <div v-for="c in cropList" :key="c.name" class="crop-cell" @click="useCrop(c.url)">
+        <img :src="c.url" alt="" loading="lazy">
+        <div class="crop-meta">
+          <span>{{ Math.round(c.size_bytes / 1024) }} KB</span>
+          <el-tag v-if="c.uploaded" size="small" type="success" effect="plain">上传</el-tag>
+        </div>
+      </div>
+    </div>
+  </el-dialog>
 </div>
 
 <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
@@ -482,7 +593,26 @@ const app = createApp({
       qtypes: ['选择题', '填空题', '解答题', '判断题', '证明题', '应用题', '图片题'],
       difficulties: ['基础', '中档', '拔高'],
       treeOptions: [],
-      form: { content: '', qtype: '解答题', difficulty: '中档', knowledge_points: [], answer: '', answer_image: '', analysis: '', image: '' },
+      form: { content: '', qtype: '解答题', difficulty: '中档', knowledge_points: [], answer: '', answer_image: '', analysis: '', image: '',
+              tags: [], curriculum_id: null },
+      curricula: [],
+      // 知识点选项：**所有**体系的节点（按体系分组）+ 题库里已用过的名字。
+      // 刻意不跟着「体系」走 —— 目前只有国内高中数学有知识树，跟着走的话
+      // 选了初中就是个空下拉，老师只能把知识点写进标签框（真发生过）
+      kpGroups: [],
+      tagOptions: [],               // 库里实际用过的标签，供输入时自动补全
+      // 补答案模式：给已录的题补答案（而不是录新题）
+      answerMode: false,
+      editingId: null,
+      editingStem: '',
+      editingImage: '',
+      pickKeyword: '',
+      pickList: [],
+      pickLoading: false,
+      onlyMissing: false,           // 只看还没答案的（补答案时最常用）
+      cropPicker: false,
+      cropList: [],
+      cropListLoading: false,
       questions: [],
       saving: false,
       uploading: false
@@ -514,7 +644,8 @@ const app = createApp({
   },
   mounted() {
     this.loadDocs();
-    this.loadTree();
+    this.loadCurricula().then(() => this.loadKpOptions());
+    this.loadTags();
     this.loadQuestions();
   },
   methods: {
@@ -615,7 +746,36 @@ const app = createApp({
         ElementPlus.ElMessage.error(e.message);
       } finally { this.building = false; }
     },
-    async loadTree() { this.treeOptions = await this.api('/api/tree'); },
+    async loadCurricula() {
+      this.curricula = await this.api('/api/curricula');
+    },
+    /** 知识点选项：每个体系的节点（带缩进分组）+ 题库里已用过的名字。
+     *  value 一律用**节点名字**而不是 id —— 这样「手填的名字」和「树里选的」走同一条路，
+     *  由服务端去认：认得出同名节点就顺便把关系也建上，认不出就纯文本存着。 */
+    async loadKpOptions() {
+      const groups = [];
+      try {
+        const used = await this.api('/api/questions/knowledge-points');
+        if (used.items.length) {
+          groups.push({ label: '题库里已用过的', options: used.items.map(i => ({ value: i.kp, label: i.kp })) });
+        }
+      } catch (e) { /* 拿不到就算了，不影响从知识树里选 */ }
+      for (const c of this.curricula) {
+        const tree = await this.api('/api/curricula/' + c.id + '/nodes');
+        const options = [];
+        const walk = (list, depth) => (list || []).forEach(n => {
+          options.push({ value: n.name, label: '\u3000'.repeat(depth) + n.name });
+          walk(n.children, depth + 1);
+        });
+        walk(tree, 0);
+        if (options.length) groups.push({ label: c.name, options });
+      }
+      this.kpGroups = groups;
+    },
+    async loadTags() {
+      const r = await this.api('/api/questions/tags');
+      this.tagOptions = r.items.map(i => i.tag);
+    },
     async loadQuestions() {
       const qs = await this.api('/api/questions');
       this.questions = this.doc ? qs.filter(q => q.document_id === this.doc.id) : qs;
@@ -879,6 +1039,7 @@ const app = createApp({
     /** 切阶段。切的时候清掉左侧选区（否则下一阶段一动线就改坏了上一阶段的图），
      *  但**不动已经截好的图** —— 所以来回切不会把题目图弄丢。 */
     goStage(s) {
+      if (this.answerMode) s = 'answer';       // 补答案模式只有「选答案」这一步
       if (s === this.stage) return;
       if (s === 'answer' && !(this.form.image || this.form.content)) {
         ElementPlus.ElMessage.warning('先在左侧圈出题目范围，再选答案');
@@ -891,6 +1052,131 @@ const app = createApp({
       this.selectedSegs = [];
     },
     confirmQuestion() { this.goStage('answer'); },
+
+    /* ===== 补答案：给已录的题补答案 ===== */
+    onModeChange() {
+      this.resetSel();
+      this.editingId = null;
+      this.editingStem = '';
+      this.editingImage = '';
+      this.pickKeyword = '';
+      this.pickList = [];
+      if (this.answerMode) {
+        this.stage = 'answer';       // 左侧圈什么都会写进答案图
+        this.searchQuestions();
+      }
+    },
+    /** 列出可补答案的题。勾了「只看还没答案的」就只列缺答案的 —— 补答案时最想找的就是它们。 */
+    async searchQuestions() {
+      this.pickLoading = true;
+      try {
+        const p = new URLSearchParams({ limit: '50' });
+        if (this.pickKeyword.trim()) p.set('keyword', this.pickKeyword.trim());
+        if (this.onlyMissing) p.set('with_answer', 'false');
+        const r = await this.api('/api/questions/search?' + p.toString());
+        this.pickList = r.items;
+      } catch (e) {
+        ElementPlus.ElMessage.error(e.message);
+      } finally {
+        this.pickLoading = false;
+      }
+    },
+    briefQ(q) {
+      const t = (q.content || '').replace(/\s+/g, ' ').trim();
+      if (!t) return '（图片题）';
+      return t.length > 46 ? t.slice(0, 46) + '…' : t;
+    },
+    /** 选中一道已录的题 —— 把它现有的答案/标签/知识点读进表单，接着补。 */
+    pickQuestion(q) {
+      this.editingId = q.id;
+      this.editingStem = q.content || '';
+      this.editingImage = q.image || '';
+      this.form.answer = q.answer || '';
+      this.form.analysis = q.analysis || '';
+      this.form.answer_image = q.answer_image || '';
+      this.form.tags = (q.tags || []).slice();
+      this.form.qtype = q.qtype || this.form.qtype;
+      this.form.difficulty = q.difficulty || this.form.difficulty;
+      this.form.curriculum_id = q.curriculum_id || null;
+      this.form.knowledge_points = (q.knowledge_points || []).slice();
+      this.stage = 'answer';
+    },
+    /** 保存答案：走 PATCH，**只提交答案相关字段** —— 不碰题干，也不会误删题干图。 */
+    async saveAnswer() {
+      if (!this.editingId) { ElementPlus.ElMessage.warning('先在上面选一道题'); return; }
+      this.saving = true;
+      try {
+        await this.api('/api/questions/' + this.editingId, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            answer: this.form.answer,
+            answer_image: this.form.answer_image,
+            analysis: this.form.analysis,
+            tags: this.form.tags,
+            qtype: this.form.qtype,
+            difficulty: this.form.difficulty,
+            curriculum_id: this.form.curriculum_id,
+            knowledge_points: this.form.knowledge_points
+          })
+        });
+        ElementPlus.ElMessage.success('答案已保存');
+        this.loadTags();          // 可能新增了标签
+        this.loadKpOptions();     // 也可能新增了知识点
+        this.searchQuestions();
+        this.loadQuestions();
+      } catch (e) {
+        ElementPlus.ElMessage.error(e.message);
+      } finally {
+        this.saving = false;
+      }
+    },
+    /** 从电脑里选一张图片当答案图 */
+    pickLocalImage() { this.$refs.localImg.click(); },
+    async onLocalImage(e) {
+      const f = e.target.files && e.target.files[0];
+      e.target.value = '';                    // 清掉，否则同一个文件选第二次不触发
+      if (!f) return;
+      const fd = new FormData();
+      fd.append('file', f);
+      try {
+        const r = await this.api('/api/uploads/image', { method: 'POST', body: fd });
+        this.form.answer_image = r.url;
+        ElementPlus.ElMessage.success('已设为答案图');
+      } catch (err) {
+        ElementPlus.ElMessage.error(err.message);
+      }
+    },
+    /** 从库里已有的截图里挑一张当答案图（框选出来的、以前上传过的都在里面） */
+    async openCropPicker() {
+      this.cropPicker = true;
+      this.cropListLoading = true;
+      try {
+        const r = await this.api('/api/uploads/images?limit=200');
+        this.cropList = r.items;
+      } catch (e) {
+        ElementPlus.ElMessage.error(e.message);
+      } finally {
+        this.cropListLoading = false;
+      }
+    },
+    useCrop(url) {
+      this.form.answer_image = url;
+      this.cropPicker = false;
+      ElementPlus.ElMessage.success('已设为答案图');
+    },
+    copyToAnswer(imgUrl) {
+      // 题干图直接拿来当答案图（有些题题干本身就是答案的载体）
+      this.form.answer_image = imgUrl;
+      ElementPlus.ElMessage.success('已把题目图设为答案图');
+    },
+    /** 点「已录入题目」里某一题的「补答案」——直接切到补答案模式并选中它。 */
+    startAnswerFor(q) {
+      this.answerMode = true;
+      this.stage = 'answer';
+      this.searchQuestions();
+      this.pickQuestion(q);
+    },
 
     /* ===== Word 页面视图：行标记（画线） / 图片选择 ===== */
     /** 本页要画的两条线：起点线 / 终点线落在哪页就画在哪页。 */
@@ -1031,8 +1317,13 @@ const app = createApp({
       this.form.knowledge_points = [];
       this.form.answer = '';
       this.form.answer_image = '';
-      this.stage = 'question';      // 一题录完，回到第①步等下一条
       this.form.analysis = '';
+      // 标签与知识点也一并清掉：一题一个知识点，留着上一题的容易张冠李戴。
+      // 体系（curriculum_id）刻意保留 —— 同一份卷子基本同体系，省得反复选。
+      this.form.tags = [];
+      this.form.knowledge_points = [];
+      // 补答案模式下没有「第①步」，别把阶段打回去
+      this.stage = this.answerMode ? 'answer' : 'question';
       this.renderMath();
     },
     updatePreview() {
@@ -1099,10 +1390,15 @@ const app = createApp({
             answer: this.form.answer,
             answer_image: this.form.answer_image,
             analysis: this.form.analysis,
-            image: this.form.image
+            image: this.form.image,
+            tags: this.form.tags,
+            curriculum_id: this.form.curriculum_id,
+            node_id: null
           })
         });
         ElementPlus.ElMessage.success('已保存到题库');
+        this.loadTags();          // 可能有新标签，补全列表要跟着更新
+        this.loadKpOptions();     // 知识点同理
         this.resetSel();          // 分界线等版面设置不在 resetSel 范围内，不会丢
         this.loadQuestions();
       } catch (e) {

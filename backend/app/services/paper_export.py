@@ -75,6 +75,19 @@ def _stem_text(it: dict) -> str:
     return _LEADING_NO.sub("", s, count=1)
 
 
+def _tag_line(it: dict) -> str:
+    """题号后面那行小字：题型·难度，有标签再挂上去。
+
+    抽成函数是因为 HTML / DOCX / PDF 三处都要用 —— 各写一遍迟早不一致
+    （出卷选项写的是「标注题型·难度·标签」，三处输出必须一样）。
+    """
+    line = "·".join(b for b in (it.get("qtype"), it.get("difficulty")) if b)
+    tags = [t for t in (it.get("tags") or []) if t]
+    if tags:
+        line = f"{line}｜{'/'.join(tags)}" if line else "/".join(tags)
+    return line
+
+
 # ================================================================ HTML
 # ⚠️ 下面两个模板是给 str.format() 用的：CSS / JS 里的花括号**必须写成双份**，
 #    漏一个就会抛 "unexpected '{' in field name"。改样式时别忘了这条。
@@ -140,9 +153,9 @@ def build_html(title: str, items: list[dict], opts: dict) -> str:
         out.append('<div class="q">')
         tag = ""
         if opts.get("show_tags", True):
-            bits = [b for b in (it.get("qtype"), it.get("difficulty")) if b]
-            if bits:
-                tag = f' <span class="tag">（{"·".join(_esc(b) for b in bits)}）</span>'
+            line = _tag_line(it)
+            if line:
+                tag = f' <span class="tag">（{_esc(line)}）</span>'
         stem = _esc(_stem_text(it))
         out.append(f'<div class="stem"><b>{it["n"]}.</b> {stem}{tag}</div>')
         p = image_path(it.get("image"))
@@ -206,9 +219,9 @@ def build_docx(title: str, items: list[dict], opts: dict) -> bytes:
     for it in items:
         tag = ""
         if opts.get("show_tags", True):
-            bits = [b for b in (it.get("qtype"), it.get("difficulty")) if b]
-            if bits:
-                tag = f'（{"·".join(bits)}）'
+            line = _tag_line(it)
+            if line:
+                tag = f'（{line}）'
         doc.add_paragraph(f'{it["n"]}. {_stem_text(it)}{tag}')
         p = image_path(it.get("image"))
         if p:
@@ -309,9 +322,9 @@ def build_pdf(title: str, items: list[dict], opts: dict) -> bytes:
     for it in items:
         tag = ""
         if opts.get("show_tags", True):
-            bits = [b for b in (it.get("qtype"), it.get("difficulty")) if b]
-            if bits:
-                tag = f'（{"·".join(bits)}）'
+            line = _tag_line(it)
+            if line:
+                tag = f'（{line}）'
         write(f'{it["n"]}. {_stem_text(it)}{tag}')
         p = image_path(it.get("image"))
         if p:

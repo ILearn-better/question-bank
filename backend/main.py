@@ -33,6 +33,7 @@ from app.routers import (                                   # noqa: E402
     questions,
     students,
     system,
+    uploads,
 )
 
 
@@ -63,8 +64,18 @@ app = FastAPI(
     description="学生情况记录 · 教学规划 · 家长可视化 —— 本地部署，数据在自己电脑上",
     lifespan=lifespan,
 )
+# 前端就是本服务托管的（同源），本来用不上 CORS；留着是为了「换个端口起前端」
+# （比如用 VS Code 的 Live Preview 预览 frontend/）时不至于打不开。
+#
+# ⚠️ 但**绝不能放成 `allow_origins=["*"]`**：本服务没有任何鉴权，放开通配符等于
+#    声明「任何网页都可以读我的响应」—— 你浏览器里只要打开一个恶意/被挂马的页面，
+#    它就能 fetch 本机数据（学生、家长反馈、课时费、题库），而且**读得到内容**。
+#    限制成回环地址即可：外站拿不到 localhost 这个 Origin。
 app.add_middleware(
-    CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
+    CORSMiddleware,
+    allow_origin_regex=r"^http://(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$",
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # ---- API 路由（按模块拆分）----
@@ -77,6 +88,7 @@ app.include_router(questions.router)
 app.include_router(papers.router)
 app.include_router(documents.router)
 app.include_router(system.router)
+app.include_router(uploads.router)
 
 # ---- 前端静态资源（必须最后挂，否则会吃掉 /api/*）----
 if config.FRONTEND_DIR.exists():

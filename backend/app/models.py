@@ -139,7 +139,12 @@ class Document(Base):
 
 
 class Question(Base):
-    """题目。knowledge_points(JSON) 为兼容旧数据保留，新关系走 question_nodes。"""
+    """题目。knowledge_points(JSON) 为兼容旧数据保留，新关系走 question_nodes。
+
+    tags 是自由标签（JSON 数组），存字符串而不建表的原因：标签是「随手打的分类」，
+    没有层级、没有权重，出卷筛选只按「任一命中」。等哪天要做重命名/合并/统计，
+    再升级成表也不迟（数据迁移很简单）。
+    """
 
     __tablename__ = "questions"
 
@@ -166,6 +171,7 @@ class Question(Base):
     usage_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     last_used_at: Mapped[str | None] = mapped_column(Text)
     stem_format: Mapped[str] = mapped_column(String, default="text", server_default="text")
+    tags: Mapped[str] = mapped_column(Text, default="[]", server_default="[]")
 
     __table_args__ = (Index("idx_questions_curr", "curriculum_id", "node_id"),)
 

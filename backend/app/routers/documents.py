@@ -264,13 +264,20 @@ def doc_page_count(doc_id: str, db: Session = Depends(get_db)):
 def doc_page_image(doc_id: str, pno: int, db: Session = Depends(get_db)):
     path = _page_source(db, doc_id)
     cache = config.PAGES_CACHE / doc_id
-    return FileResponse(pdf_adapter.render_page(str(path), pno, str(cache)), media_type="image/png")
+    try:
+        png = pdf_adapter.render_page(str(path), pno, str(cache))
+    except ValueError as e:            # 页码越界，见 adapters/pdf.py 的 _page()
+        raise HTTPException(422, str(e)) from e
+    return FileResponse(png, media_type="image/png")
 
 
 @router.get("/documents/{doc_id}/pages/{pno}/lines")
 def doc_page_lines(doc_id: str, pno: int, db: Session = Depends(get_db)):
     """返回该页所有文字行及 bbox —— 前端「文本选择」靠它在框选区域里取文字。"""
-    return pdf_adapter.page_lines(str(_page_source(db, doc_id)), pno)
+    try:
+        return pdf_adapter.page_lines(str(_page_source(db, doc_id)), pno)
+    except ValueError as e:            # 同上：页码越界
+        raise HTTPException(422, str(e)) from e
 
 
 @router.post("/documents/{doc_id}/crop")
