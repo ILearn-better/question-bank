@@ -221,7 +221,12 @@ export default {
         ok(`已导出 ${fmt === 'pdf' ? 'PDF' : 'Word'}：${filename}`);
         showExport.value = false;
       } catch (e) {
-        fail(e.message);
+        if (isNoteGone(e)) {
+          showExport.value = false;
+          await handleNoteGone('导出');
+        } else {
+          fail('导出失败：' + e.message);
+        }
       } finally {
         exporting.value = '';
       }
@@ -292,6 +297,20 @@ export default {
       }
     }
 
+    /** 笔记在服务端已经不存在了（被删了，或者本地还留着一条过期的）。
+     *  这时必须清掉当前对象并重拉列表 —— 否则用户会一直对着一个「幽灵笔记」操作，
+     *  每按一次自动保存或导出都只收到一句 404，看着就像功能坏了。 */
+    async function handleNoteGone(action) {
+      fail(`这篇笔记在服务端已不存在（可能已被删除），${action}没有完成。列表已刷新，请重新打开一篇。`);
+      cur.value = null;
+      await loadList();
+      if (route.params.id) router.replace('/notes');
+    }
+
+    function isNoteGone(e) {
+      return !!e && (e.status === 404 || /不存在/.test(e.message || ''));
+    }
+
     /** 攒着改动，防抖提交 —— 打字过程中不该每敲一下发一个请求。 */
     function scheduleSave(patch) {
       if (!cur.value || !cur.value.id) return;
@@ -315,7 +334,8 @@ export default {
         if (i >= 0) notes.value[i] = brief;
       } catch (e) {
         saveState.value = 'error';
-        fail('保存失败：' + e.message);
+        if (isNoteGone(e)) await handleNoteGone('保存');
+        else fail('保存失败：' + e.message);
       }
     }
 

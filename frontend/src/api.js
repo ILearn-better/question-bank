@@ -23,7 +23,10 @@ async function request(path, options = {}) {
         msg = typeof data.detail === 'string' ? data.detail : JSON.stringify(data.detail);
       }
     } catch (e) { /* 响应不是 JSON，保留默认文案 */ }
-    throw new Error(msg);
+    // 把状态码带上：调用方需要区分「参数错」「对象已被删」这类情况
+    const err = new Error(msg);
+    err.status = res.status;
+    throw err;
   }
   if (res.status === 204) return null;
   return res.json();
@@ -56,7 +59,9 @@ export async function download(path, filename) {
         msg = typeof data.detail === 'string' ? data.detail : JSON.stringify(data.detail);
       }
     } catch (e) { /* 不是 JSON，保留默认文案 */ }
-    throw new Error(msg);
+    const err = new Error(msg);
+    err.status = res.status;
+    throw err;
   }
   const blob = await res.blob();
   const url = URL.createObjectURL(blob);
