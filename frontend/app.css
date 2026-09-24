@@ -276,6 +276,31 @@ table.tbl tr.clickable:hover { background: var(--panel-2); cursor: pointer; }
 .ink-canvas { position: absolute; left: 0; top: 0; z-index: 3; pointer-events: none; touch-action: none; }
 .ink-canvas.on { pointer-events: auto; cursor: crosshair; }
 
+/* ---- 笔记「全屏」：只留 Markdown 代码与预览 ----
+   为什么挂在 body 上：工作台的左侧导航在 App 里，笔记视图改不到它，
+   只能由视图给 body 挂个类，这里统一收拾（离开笔记页时视图会把类摘掉）。
+   工具栏保留 —— 退出全屏、切编辑/分栏/预览、看保存状态都要用它。 */
+body.notes-zen .sidebar { display: none; }
+body.notes-zen .content { padding: 0; }
+body.notes-zen .notes-grid,
+body.notes-zen .notes-grid.with-formula { grid-template-columns: minmax(0, 1fr); gap: 0; }
+body.notes-zen .notes-main {
+  border: none; border-radius: 0; box-shadow: none; background: var(--panel);
+  min-height: 100vh; display: flex; flex-direction: column;
+}
+body.notes-zen .notes-toolbar {
+  margin: 0; padding: 8px 14px; border-bottom: 1px solid var(--border); flex: none;
+}
+body.notes-zen .notes-body { flex: 1; min-height: 0; grid-template-rows: minmax(0, 1fr); }
+body.notes-zen .notes-editor {
+  height: 100%; min-height: 0; resize: none; border: none; border-radius: 0; padding: 14px 16px;
+}
+body.notes-zen .notes-editor:focus { box-shadow: none; }
+body.notes-zen .notes-preview-wrap {
+  height: 100%; max-height: none; border: none; border-radius: 0;
+}
+body.notes-zen .notes-preview { min-height: 0; padding: 14px 18px; }
+
 /* Markdown 正文样式 —— 只覆盖必要的，不引第三方主题 */
 .notes-preview h1, .notes-preview h2, .notes-preview h3, .notes-preview h4 {
   margin: 18px 0 8px; line-height: 1.45; font-weight: 600; }

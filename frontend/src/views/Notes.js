@@ -201,6 +201,23 @@ export default {
     const exporting = ref('');             // '' | 'docx' | 'pdf'：正在导出的格式
     const caps = ref(null);                // 导出能力，见后端 /api/notes/export/caps
 
+    // ---- 全屏（专注）模式：只留 Markdown 代码与预览 ----
+    const zen = ref(false);
+
+    function toggleZen() {
+      zen.value = !zen.value;
+    }
+
+    /** 进入/退出全屏后布局变了，但窗口尺寸没变 —— resize 事件不会触发，
+     *  所以笔画 canvas 必须手动重新量一次，否则笔画会错位。 */
+    function refreshCanvasLater() {
+      nextTick(() => { sizeCanvas(); redraw(); });
+    }
+
+    function onZenKey(e) {
+      if (e.key === 'Escape' && zen.value) zen.value = false;
+    }
+
     /** 先问一次后端能力：PDF 依赖本机 Word、公式渲染依赖 node + Office 的 XSLT。
      *  拿到之后才能把「为什么这个按钮是灰的」直接写在界面上。 */
     async function loadCaps() {
@@ -627,6 +644,13 @@ export default {
       // 导出能力探测和主流程无关，不 await，避免拖慢首屏
       loadCaps();
       window.addEventListener('resize', onResize);
+      window.addEventListener('keydown', onZenKey);
+    });
+
+    watch(zen, (v) => {
+      // body 上的类是给全局 CSS 用的（要藏掉 App 里的左侧导航）
+      document.body.classList.toggle('notes-zen', v);
+      refreshCanvasLater();
     });
 
     // 预览元素是随「是否打开笔记 / 模式切换」出现或消失的，所以观察器要跟着它走 ——
@@ -645,6 +669,9 @@ export default {
       flushSave();
       if (ro) ro.disconnect();
       window.removeEventListener('resize', onResize);
+      window.removeEventListener('keydown', onZenKey);
+      // 必须摘掉：否则离开笔记页后整个工作台会一直少一个侧边栏
+      document.body.classList.remove('notes-zen');
     });
 
     watch(() => route.params.id, (id) => {
@@ -660,19 +687,20 @@ export default {
       insertSnippet, pickImage, onImageFile, onPaste,
       toggleInk, inkDown, inkMove, inkUp, undoInk, clearInk,
       showExport, includeInk, exporting, caps, doExport,
+      zen, toggleZen,
       saveNow: flushSave,
     };
   },
   template: `
   <div>
-    <div class="page-head">
+    <div class="page-head" v-if="!zen">
       <h1>笔记</h1>
       <span class="sub">Markdown 正文 · 公式实时渲染 · 插图 · 板书笔画</span>
     </div>
 
-    <div class="notes-grid" :class="{ 'with-formula': showFormula && hasNote }">
+    <div class="notes-grid" :class="{ zen, 'with-formula': showFormula && hasNote && !zen }">
       <!-- ============ 左：列表 + 目录 ============ -->
-      <div class="notes-side">
+      <div class="notes-side" v-if="!zen">
         <div class="card">
           <div style="display:flex;gap:8px;margin-bottom:10px">
             <button class="btn primary sm" @click="createNote">新建笔记</button>
@@ -732,6 +760,10 @@ export default {
               公式速查
             </button>
             <button class="btn sm" @click="showExport = true">导出</button>
+            <button class="btn sm" :class="{ primary: zen }" @click="toggleZen"
+                    :title="zen ? '退出全屏（Esc）' : '全屏：只留 Markdown 代码与预览'">
+              {{ zen ? '退出全屏' : '全屏' }}
+            </button>
             <span style="flex:1"></span>
             <span class="muted" style="font-size:12px">
               <span v-if="saveState === 'dirty'">未保存</span>
@@ -784,7 +816,7 @@ export default {
       </div>
 
       <!-- ============ 右：公式速查 ============ -->
-      <div v-if="showFormula && hasNote" class="card notes-formula">
+      <div v-if="showFormula && hasNote && !zen" class="card notes-formula">
         <h2>公式速查</h2>
         <div class="muted" style="font-size:11.5px;margin-bottom:10px">
           点一下就插到光标处，光标停在空位上。行内用 <code>$…$</code>，独立一行用 <code>$$…$$</code>。
