@@ -343,3 +343,30 @@ class Feedback(Base):
         UniqueConstraint("lesson_id", name="uq_feedback_lesson"),
         Index("idx_feedbacks_student", "student_id"),
     )
+
+
+# ============================================================
+# M4 笔记（Markdown 正文 + 一层板书笔画）
+# ============================================================
+class Note(Base):
+    """一页笔记：Markdown 正文 + 一层矢量笔画。
+
+    为什么笔画存 JSON 而不渲染成 PNG 再存图片：
+      橡皮、换颜色、调粗细、撤销，本质都是「把已画的线按新状态重画一遍」。
+      存成位图就只能整张重来，也存不了「这条线是什么颜色多粗」。
+      矢量数据本身很小（一页板书通常几十 KB），而且换窗口大小、缩放都不糊。
+    坐标按内容框归一化到 0~1，所以窗口尺寸/字号变化时笔画不会跑位。
+    """
+
+    __tablename__ = "notes"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    owner_id: Mapped[int] = mapped_column(Integer, nullable=False, default=OWNER_ID, server_default=str(OWNER_ID))
+    title: Mapped[str] = mapped_column(String, nullable=False, default="未命名笔记", server_default="未命名笔记")
+    content: Mapped[str] = mapped_column(Text, default="", server_default="")
+    ink: Mapped[str] = mapped_column(Text, default="[]", server_default="[]")     # 笔画数组（JSON）
+    pinned: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    created_at: Mapped[str] = mapped_column(Text, default=_now, server_default=NOW)
+    updated_at: Mapped[str] = mapped_column(Text, default=_now, server_default=NOW)
+
+    __table_args__ = (Index("idx_notes_updated", "updated_at"),)

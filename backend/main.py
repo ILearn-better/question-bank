@@ -29,6 +29,7 @@ from app.routers import (                                   # noqa: E402
     documents,
     feedbacks,
     lessons,
+    notes,
     papers,
     questions,
     students,
@@ -89,6 +90,7 @@ app.include_router(papers.router)
 app.include_router(documents.router)
 app.include_router(system.router)
 app.include_router(uploads.router)
+app.include_router(notes.router)
 
 # ---- 前端静态资源（必须最后挂，否则会吃掉 /api/*）----
 if config.FRONTEND_DIR.exists():

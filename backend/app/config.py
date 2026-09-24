@@ -28,6 +28,7 @@ UPLOAD_DIR = DATA_DIR / "uploads"
 PAGES_CACHE = UPLOAD_DIR / "pages"      # PDF 页面渲染图缓存
 CROPS_DIR = UPLOAD_DIR / "crops"        # 框选截图 / 区域存档
 CONVERTED_DIR = UPLOAD_DIR / "converted"  # Word 转出的 PDF（页面视图的数据源）
+NOTES_DIR = UPLOAD_DIR / "notes"        # 笔记里插入的图片
 EXPORT_DIR = DATA_DIR / "exports"
 BACKUP_DIR = DATA_DIR / "backups"
 
@@ -49,7 +50,8 @@ AUTO_MIGRATE = os.getenv("SHIKE_AUTO_MIGRATE", "1") != "0"
 
 
 def ensure_dirs() -> None:
-    for d in (DATA_DIR, UPLOAD_DIR, PAGES_CACHE, CROPS_DIR, CONVERTED_DIR, EXPORT_DIR, BACKUP_DIR):
+    for d in (DATA_DIR, UPLOAD_DIR, PAGES_CACHE, CROPS_DIR, CONVERTED_DIR, EXPORT_DIR,
+              BACKUP_DIR, NOTES_DIR):
         d.mkdir(parents=True, exist_ok=True)
 
 

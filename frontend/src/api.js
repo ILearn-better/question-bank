@@ -90,6 +90,16 @@ export const papersApi = {
   exportUrl: (params) => '/api/papers/export' + qs(params),
 };
 
+export const notesApi = {
+  list: (params) => api.get('/api/notes', params),
+  get: (id) => api.get(`/api/notes/${id}`),
+  create: (body) => api.post('/api/notes', body),
+  /** 自动保存走这个：只传改动过的字段。 */
+  update: (id, body) => api.patch(`/api/notes/${id}`, body),
+  remove: (id) => api.del(`/api/notes/${id}`),
+  uploadImage: (formData) => api.upload('/api/notes/image', formData),
+};
+
 export const abilityApi = {
   dims: () => api.get('/api/ability-dims'),
   createDim: (body) => api.post('/api/ability-dims', body),

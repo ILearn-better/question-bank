@@ -16,56 +16,27 @@
 """
 from __future__ import annotations
 
-import uuid
 from datetime import datetime
 
 from fastapi import APIRouter, File, HTTPException, Query, UploadFile
 
 from .. import config
+from ..services import images
 
 router = APIRouter(prefix="/api", tags=["uploads"])
 
-MAX_IMAGE_BYTES = 20 * 1024 * 1024
 LIST_LIMIT = 300
-
-# 只认魔数，不信任扩展名：若按扩展名判断，把任意文件改名成 .png 就能存进来，
-# 而 GET /api/crops/{name} 会按扩展名猜 MIME 把它原样发出去。
-_SIGNATURES: tuple[tuple[bytes, str], ...] = (
-    (b"\x89PNG\r\n\x1a\n", ".png"),
-    (b"\xff\xd8\xff", ".jpg"),
-    (b"GIF87a", ".gif"),
-    (b"GIF89a", ".gif"),
-    (b"BM", ".bmp"),
-)
-
-
-def _sniff_ext(head: bytes) -> str | None:
-    """按文件头判断真实格式，返回扩展名；认不出来返回 None。"""
-    for sig, ext in _SIGNATURES:
-        if head.startswith(sig):
-            return ext
-    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":     # WEBP: RIFF....WEBP
-        return ".webp"
-    return None
 
 
 @router.post("/uploads/image")
 async def upload_image(file: UploadFile = File(...)):
     """上传一张本地图片，返回可直接当 image / answer_image 用的 URL。"""
-    data = await file.read(MAX_IMAGE_BYTES + 1)
-    if not data:
-        raise HTTPException(422, "文件是空的")
-    if len(data) > MAX_IMAGE_BYTES:
-        raise HTTPException(413, f"图片不能超过 {MAX_IMAGE_BYTES // 1024 // 1024} MB")
-
-    ext = _sniff_ext(data[:16])
-    if ext is None:
-        raise HTTPException(422, "这不是可识别的图片（支持 PNG / JPG / GIF / WEBP / BMP）")
-
-    config.CROPS_DIR.mkdir(parents=True, exist_ok=True)
-    name = f"up_{uuid.uuid4().hex[:12]}{ext}"
-    (config.CROPS_DIR / name).write_bytes(data)
-    return {"url": f"/api/crops/{name}", "name": name, "size_bytes": len(data)}
+    data = await file.read(images.MAX_IMAGE_BYTES + 1)
+    try:
+        saved = images.save_image(data, config.CROPS_DIR, prefix="up")
+    except images.ImageRejected as e:
+        raise HTTPException(422, str(e)) from e
+    return {"url": f"/api/crops/{saved['name']}", **saved}
 
 
 @router.get("/uploads/images")

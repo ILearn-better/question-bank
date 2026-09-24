@@ -74,6 +74,24 @@ class QuestionPatch(BaseModel):
     year: Optional[int] = None
 
 
+# ============================================================ 笔记
+class NoteIn(BaseModel):
+    title: str = "未命名笔记"
+    content: str = ""
+    ink: List[dict] = Field(default_factory=list)
+    pinned: bool = False
+
+
+class NotePatch(BaseModel):
+    """部分更新（笔记的自动保存走这个）。语义同 QuestionPatch：
+    「没传」= 保持原样，「显式传空」= 清空。"""
+
+    title: Optional[str] = None
+    content: Optional[str] = None
+    ink: Optional[List[dict]] = None
+    pinned: Optional[bool] = None
+
+
 # ============================================================ 体系 / 知识点
 class CurriculumIn(BaseModel):
     code: str

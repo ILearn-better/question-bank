@@ -37,6 +37,14 @@ const routes = [
     meta: { title: '出卷' },
   },
   {
+    // 用**一条带可选参数**的路由，而不是 /notes + /notes/:id 两条：
+    // 两条记录之间跳转会重新挂载组件，切笔记时状态和光标都得重建。
+    path: '/notes/:id?',
+    name: 'notes',
+    component: () => import('./views/Notes.js'),
+    meta: { title: '笔记' },
+  },
+  {
     path: '/settings',
     name: 'settings',
     component: () => import('./views/Settings.js'),
