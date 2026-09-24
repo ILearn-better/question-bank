@@ -7,8 +7,14 @@
 - **题库与出卷** —— 多条件筛题（体系 / 知识点 / 标签 / 题型 / 难度 / 有无图）、组卷调序、导出 HTML / Word / PDF
 - **学生管理** —— 学生档案、能力维度与雷达图
 - **课表与课时费** —— 课时排期、课时费结算、家长反馈
+- **笔记** —— Markdown 正文 + 公式实时渲染 + Ctrl+V 贴图 + 板书笔画（红黄蓝 / 橡皮 / 粗细 / 撤销）、
+  全屏专注模式；可导出 Word / PDF（**公式转成 Word 原生公式**，导出后还能双击编辑）
 
-> 详细技术选型、数据库设计、OCR 管线与开发计划见 [docs/技术方案设计.md](docs/技术方案设计.md)
+> 文档都在 `docs/`：
+>
+> - [技术方案设计.md](docs/技术方案设计.md) —— 技术选型、系统架构、数据库设计、开发计划
+> - [模块化教学管理系统-调研与开发文档.md](docs/模块化教学管理系统-调研与开发文档.md) —— 早期调研
+> - [版面识别方案调研.md](docs/版面识别方案调研.md) —— 版面分析 / 题目切分选型对比与成本（与 V1.5 相关）
 
 ## 开发路线
 
@@ -18,7 +24,8 @@
 | M0–M3 | 共享内核、题库多体系化、学生管理、课表与课时费 | ✅ 已完成 |
 | MVP-2 | 题库浏览 / 筛选（体系、知识点、题型、难度） | ✅ 已完成（出卷页 + `GET /api/questions/search`） |
 | MVP-3 | 筛选组卷 + 导出 HTML / Word / PDF | ✅ 已完成（`/papers`）；「作业布置」尚未做 |
-| V1.5 | OCR 通道（扫描版自动识别） | 待开发（扫描版目前走纯截图模式，可用） |
+| MVP-4 | 笔记（Markdown + 公式 + 插图 + 板书，导出 Word / PDF） | ✅ 已完成（`/notes`） |
+| V1.5 | OCR 通道（扫描版自动识别） | 待开发（扫描版目前走纯截图模式，可用）；选型见 [docs/版面识别方案调研.md](docs/版面识别方案调研.md) |
 | V2 | 智能组卷、错题本、薄弱点推题 | 待开发（`resources` 表已建好，暂无接口） |
 
 ## 项目结构
@@ -31,11 +38,13 @@ question-bank/
 │   │   ├── config.py           # 路径与开关集中处（环境变量统一 SHIKE_ 前缀）
 │   │   ├── db.py               # 全项目唯一 SQLite 接入点（WAL / 外键 PRAGMA）
 │   │   ├── models.py  schemas.py  migrate.py  seed.py
-│   │   ├── adapters/           # pdf.py（全项目唯一 import pymupdf 处）、office.py（Word COM）
-│   │   ├── routers/            # dashboard / students / lessons / feedbacks / curriculum
-│   │   │                       # questions / papers / documents / system
+│   │   ├── adapters/           # pdf.py（唯一 import pymupdf）/ office.py（Word COM，唯一 import win32com）
+│   │   │                       # notes_math.py + katex_mathml.js（公式 → Word 原生公式 OMML）
+│   │   ├── routers/            # dashboard / students / lessons / feedbacks / curriculum / questions
+│   │   │                       # papers / documents / notes / uploads / system
 │   │   └── services/           # billing（课时费）/ mastery（掌握度）/ paper_export（出卷排版）
-│   ├── alembic/versions/       # 0001 … 0007
+│   │                           # images（按魔数校验图片）/ notes_export（笔记导出 Word/PDF）
+│   ├── alembic/versions/       # 0001 … 0009
 │   ├── doc_parser.py           # Word 解析（documents.py 延迟导入，仍在用）
 │   ├── requirements.txt
 │   ├── shike.db                # SQLite 主库（自动创建，已 gitignore）
@@ -44,10 +53,13 @@ question-bank/
 │       └── backups/            # 数据库备份，保留最近 10 份（SHIKE_BACKUP_KEEP 可改）
 ├── frontend/
 │   ├── index.html + src/       # 工作台 SPA（Vue3 零构建，走 import map → vendor/）
-│   ├── entry.html              # 题库录题页（单文件，Element Plus + KaTeX 走 CDN）
-│   └── app.css  vendor/
+│   ├── entry.html              # 题库录题页（单文件，Element Plus + KaTeX）
+│   └── app.css  vendor/        # 依赖**全部本地化**（Vue / Element Plus / KaTeX / marked / DOMPurify）
+│                               # 不引任何 CDN：实测本机冷启动拉 unpkg 要 29s 且经常超时
 ├── docs/
-│   └── 技术方案设计.md          # 技术选型、系统架构、数据库设计、OCR 管线、开发计划
+│   ├── 技术方案设计.md          # 技术选型、系统架构、数据库设计、开发计划
+│   ├── 模块化教学管理系统-调研与开发文档.md
+│   └── 版面识别方案调研.md      # 版面分析 / 题目切分选型对比与成本（与 V1.5 相关）
 ├── data/
 │   └── math-knowledge-tree.json   # 高中数学知识点树（13 板块，导入库后共 119 个节点）
 └── samples/                    # 样例试卷（正常 PDF/docx + 扫描版）
