@@ -27,3 +27,8 @@ cookies.json
 .idea/
 .DS_Store
 Thumbs.db
+
+# 临时 / 调试文件
+# 提交时用 git add -A 很容易把它们误带进仓库（真发生过：_debug.html 被提交了一次）。
+_debug.html
+_commitmsg.txt
