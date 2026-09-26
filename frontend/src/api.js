@@ -126,6 +126,10 @@ export const feedbackApi = {
   uploadImage: (lessonId, formData) =>
     api.upload(`/api/feedbacks/image` + qs({ lesson_id: lessonId }), formData),
 
+  /** 真删一张配图（连磁盘上的文件一起）。已保存的反馈若还在引用它，服务端会拒绝删。 */
+  deleteImage: (lessonId, url) =>
+    api.post('/api/feedbacks/image/remove', { lesson_id: lessonId, url }),
+
   /** AI 整篇润色：四段记录进去，一整篇文档出来（建议稿，需老师确认）。
    *  注意：会把内容发到第三方 AI 服务，界面必须先提示。 */
   polish: (lessonId, body) => api.post(`/api/lessons/${lessonId}/feedback/polish`, body),

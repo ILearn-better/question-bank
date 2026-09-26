@@ -344,3 +344,16 @@ body.notes-zen .notes-preview { min-height: 0; padding: 14px 18px; }
 .ink-swatch.on { box-shadow: 0 0 0 2px var(--primary); }
 .ink-width { width: 76px; }
 
+/* 附图缩略图 + 图角上的删除按钮。
+   为什么不用现成的 .btn.ghost：图大多是深色的（截图、板书照），淡色按钮压在上面
+   几乎看不出来，用户会以为「贴了删不掉」（真实反馈）。所以给一个实心、始终可见的圆按钮，
+   并且放在图的内部四角 —— 放到图外面（负偏移）容易被上面的标签行压住。 */
+.img-cell { position: relative; line-height: 0; }
+.img-thumb { display: block; height: 74px; border: 1px solid var(--border);
+             border-radius: var(--radius-sm); }
+.img-del { position: absolute; top: 4px; right: 4px; width: 22px; height: 22px; padding: 0;
+           display: flex; align-items: center; justify-content: center;
+           border: none; border-radius: 50%; cursor: pointer;
+           background: rgba(15, 23, 42, .68); color: #fff; font-size: 14px; line-height: 1; }
+.img-del:hover { background: var(--danger); }
+

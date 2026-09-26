@@ -38,6 +38,7 @@ from ..schemas import (
     DimIn,
     DocTemplateIn,
     FeedbackIn,
+    ImageRemoveIn,
     PolishIn,
     TemplateIn,
 )
@@ -425,6 +426,37 @@ async def upload_feedback_image(file: UploadFile = File(...), lesson_id: int = Q
         raise HTTPException(422, str(e)) from e
     rel = storage.rel(storage.dir_for(stu, ls) / saved["name"])
     return {"url": f"/api/feedbacks/files/{rel}", "path": rel, **saved}
+
+
+@router.post("/feedbacks/image/remove")
+def remove_feedback_image(payload: ImageRemoveIn, db: Session = Depends(get_db)):
+    """真删掉一张配图。界面上的「×」和「贴完又取消弹窗」都会调它。
+
+    为什么必须有这个接口：配图是「上传即落盘、保存反馈才登记」的 —— 老师贴完图又不想用了，
+    只在界面上把它从列表里拿掉是**没用的**，文件会一直躺在硬盘上：既不在资料清单里
+    （清单读的是数据库），也不会被任何清理碰到（清理只删数据库引用得到的文件）。
+    「能贴就得能删」，所以这里真的去删文件。
+
+    删之前的三道闸：
+      · 只认本项目自己的图片 URL（storage.url_to_rel），且要过 safe_join（拒 .. 与越界）
+      · 路径必须落在**这节课的学生**目录里 —— 不能拿别人的 URL 把别人的文件删了
+      · **还有别的已保存反馈在引用就绝不删**：界面上点「×」只是「这次不想带它」，
+        而已保存的反馈是数据，数据优先（那种情况留到保存时按引用计数清，见 upsert_feedback）
+    """
+    ls = _lesson_or_404(db, payload.lesson_id)
+    stu = db.get(Student, ls.student_id)
+    if stu is None:
+        raise HTTPException(404, "这节课的学生不存在")
+
+    rel = storage.url_to_rel(payload.url or "")
+    if not rel or storage.safe_join(rel) is None:
+        raise HTTPException(422, "这不是本项目的图片地址")
+    # 用「u<id>_」前缀而不是完整目录名：学生改名后旧目录名对不上，但 id 永远对得上
+    if not rel.startswith(f"students/u{stu.id}_"):
+        raise HTTPException(422, "这张图不属于这节课的学生")
+    if rel in _used_feedback_images(db):
+        return {"deleted": False, "reason": "referenced"}
+    return {"deleted": bool(storage.unlink_rels([rel]))}
 
 
 # 这里曾经有一个 _fetch_image_bytes() + POST /feedbacks/image-from-url：让服务端顺着

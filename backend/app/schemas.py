@@ -240,6 +240,13 @@ class AiSettingIn(BaseModel):
     clear_key: bool = False
 
 
+class ImageRemoveIn(BaseModel):
+    """删掉一张配图。url 是上传接口返回的那个本项 URL。"""
+
+    lesson_id: int
+    url: str
+
+
 class PolishIn(BaseModel):
     """整篇润色请求。
 

@@ -61,6 +61,9 @@ export default {
 
     // ---- 配图 ----
     const images = ref([]);
+    // 本次打开弹窗「新贴/新选」进来的图。取消关窗时要把它们从硬盘上收掉：
+    // 配图是上传即落盘的，只从界面上拿掉的话文件会永远留着（既不在资料清单里，也没人清理）。
+    const addedImages = ref([]);
     const fileEl = ref(null);
     const uploading = ref(false);
 
@@ -164,7 +167,16 @@ export default {
       savedDoc.value = doc.value;
     });
 
-    onBeforeUnmount(() => window.removeEventListener('paste', onPaste));
+    onBeforeUnmount(() => {
+      window.removeEventListener('paste', onPaste);
+      // 贴了图又没保存就关窗：把这次贴进来的文件删掉。
+      // 不这么做的后果很具体：那几张图会永远躺在硬盘上 —— 界面里看不到、资料清单里也没有，
+      // 只有翻文件夹才会发现。「能贴」的另一半就是「能删」。
+      // 已保存的反馈若引用着它们，服务端会拒绝删（见 /feedbacks/image/remove），所以这里不用再判断。
+      for (const u of addedImages.value) {
+        feedbackApi.deleteImage(props.lesson.id, u).catch(() => {});
+      }
+    });
 
     function insert(field, text) {
       const cur = form[field] || '';
@@ -199,6 +211,8 @@ export default {
         await feedbackApi.save(props.lesson.id, payload);
         savedSnap.value = snapshot();     // 存成功了才算「已保存」
         savedDoc.value = doc.value;
+        // 存进去了就不再是「这次贴进来还没安顿好的图」，取消关窗时不该再去动它们
+        addedImages.value = [];
         return true;
       } catch (e) {
         fail(e.message);
@@ -288,6 +302,18 @@ export default {
       }
     }
 
+    /** 关窗前最后问一句：刚贴进来的图还没保存，关掉会连磁盘上的文件一起删掉。
+     *  删不掉的文件最招人烦，但「删得悄无声息」也一样 —— 先说一声，让他自己决定。
+     *  没有这种情况就直接关，不添麻烦。 */
+    function guardClose() {
+      if (addedImages.value.length &&
+          !window.confirm('刚贴的 ' + addedImages.value.length +
+                          ' 张图还没有保存，关掉窗口会把它们一起删掉。\n确定关闭吗？')) {
+        return;
+      }
+      emit('close');
+    }
+
     /* ================= 配图 ================= */
     function pickImage() { fileEl.value && fileEl.value.click(); }
 
@@ -299,6 +325,7 @@ export default {
         fd.append('file', file, file.name || 'paste.png');
         const r = await feedbackApi.uploadImage(props.lesson.id, fd);
         images.value = [...images.value, r.url];
+        addedImages.value.push(r.url);
       } catch (e) {
         fail(e.message);
       } finally {
@@ -400,7 +427,22 @@ export default {
       warn('剪贴板里没有可以直接用的图片。试试先用截图工具截一下，或点「＋ 贴图」选文件。');
     }
 
-    function removeImage(i) { images.value = images.value.filter((_, idx) => idx !== i); }
+    /** 从附图里拿掉一张，并且**把磁盘上的文件也真删掉**。
+     *  只改列表不删文件的话，图会一直堆在硬盘上（用户反馈原话：「能贴也要能删」）。 */
+    async function removeImage(i) {
+      const url = images.value[i];
+      images.value = images.value.filter((_, idx) => idx !== i);
+      addedImages.value = addedImages.value.filter((u) => u !== url);
+      try {
+        const r = await feedbackApi.deleteImage(props.lesson.id, url);
+        if (r && r.deleted === false && r.reason === 'referenced') {
+          // 已保存的反馈还引用着它 —— 那是数据，不能因为这次点了个 × 就删掉
+          warn('已从附图里拿掉；这张图还被已保存的反馈引用着，点「保存反馈」之后才会真正删掉。');
+        }
+      } catch (e) {
+        // 删文件失败不该挡住「从列表里拿掉」这件事，界面上已经拿掉了
+      }
+    }
 
     /* ================= 上课文件 ================= */
     async function loadFiles() {
@@ -646,7 +688,7 @@ export default {
              doc, copyDoc, clearDoc,
              files, fileInput, fileAccept, uploadingFile, fileNote, archiveDir,
              okFiles, badFiles, matChars, useFiles, pickFile, onFilePicked, removeFile, fmtBytes, rawUrl,
-             images, fileEl, uploading, pickImage, onImageFile, removeImage,
+             images, fileEl, uploading, pickImage, onImageFile, removeImage, guardClose,
              polishing, polishResult, polishText, openPolish, runPolish, adoptPolish, backToPolishConfig,
              showPolishAsk, polishStyle, polishError, willSend,
              docTemplates, docTemplateId, docTemplateContent, applyDocTemplate,
@@ -654,7 +696,7 @@ export default {
              showExport, exporting, exportSource, exportMode, doExport, dirty, docUnsaved, saveAndStay };
   },
   template: `
-  <Modal :title="'课后反馈 · ' + lesson.student_name" @close="$emit('close')">
+  <Modal :title="'课后反馈 · ' + lesson.student_name" @close="guardClose">
     <div class="small muted" style="margin:-6px 0 14px">
       {{ shortDate(lesson.start_at) }} {{ hhmm(lesson.start_at) }}
       <span v-if="lesson.topic"> · {{ lesson.topic }}</span>
@@ -692,10 +734,9 @@ export default {
         附图 <span class="muted small">（板书照片 / 作业截图；直接 Ctrl+V 也能贴，导出的 txt 不含图片）</span>
       </label>
       <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-        <div v-for="(u, i) in images" :key="u" style="position:relative">
-          <img :src="u" alt="" style="height:74px;border:1px solid var(--border);border-radius:var(--radius-sm)">
-          <button class="btn ghost sm" title="移除"
-                  style="position:absolute;top:-8px;right:-8px;padding:0 6px;line-height:18px"
+        <div v-for="(u, i) in images" :key="u" class="img-cell">
+          <img :src="u" alt="" class="img-thumb">
+          <button class="img-del" title="删除这张图（硬盘上的文件也一起删掉）"
                   @click="removeImage(i)">×</button>
         </div>
         <button class="btn sm" :disabled="uploading" @click="pickImage">
@@ -796,7 +837,7 @@ export default {
     </label>
 
     <template #foot>
-      <button class="btn" @click="$emit('close')">取消</button>
+      <button class="btn" @click="guardClose">取消</button>
       <button class="btn" :disabled="polishing" @click="openPolish">
         {{ polishing ? '润色中…' : 'AI 润色' }}
       </button>
