@@ -21,6 +21,7 @@ from ..models import (
 )
 from ..schemas import StudentIn, StudentPatch
 from ..services import mastery
+from . import lesson_files
 
 router = APIRouter(prefix="/api", tags=["students"])
 
@@ -128,6 +129,11 @@ def patch_student(sid: int, payload: StudentPatch, db: Session = Depends(get_db)
 @router.delete("/students/{sid}")
 def delete_student(sid: int, db: Session = Depends(get_db)):
     s = _student_or_404(db, sid)
+    # 删学生会级联删掉他的所有课时 —— 磁盘上的资料得先自己收（
+    # 数据库管不了文件系统，CASCADE 删完就再也查不到该删哪几个文件）
+    lesson_files.cleanup_for_lessons(
+        db, [r[0] for r in db.execute(select(Lesson.id).where(Lesson.student_id == sid)).all()]
+    )
     db.delete(s)
     db.commit()
     return {"ok": True}

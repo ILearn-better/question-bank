@@ -17,8 +17,8 @@ from __future__ import annotations
 import io
 import re
 
-from .. import config
 from ..adapters import office
+from . import storage
 
 # 反馈导出的四个字段：(键, 中文标题)
 SECTIONS = [
@@ -28,8 +28,8 @@ SECTIONS = [
     ("next_plan", "下次安排"),
 ]
 
-# 图片 URL 形如 /api/feedbacks/files/fb_ab12.png
-_IMG_URL_RE = re.compile(r"^/api/feedbacks/files/([A-Za-z0-9_.\-]+)$")
+# 反馈配图的 URL 形如 /api/feedbacks/files/students/u1_x/2026-09-26/fb_ab.png
+# （路径解析与越界防护统一在 services/storage.py）
 
 # 整篇正文里的栏目标题行：「【本次课堂内容】」
 _DOC_HEAD_RE = re.compile(r"^【.+】$")
@@ -182,14 +182,12 @@ def build_radar_png(dims: list[dict], size: int = 660, dpi: int = 200) -> bytes 
 
 
 def _image_paths(images: list[str]) -> list:
-    """把 URL 换成磁盘文件。只接受本项目自己的 /api/feedbacks/files/ 形式，防路径穿越。"""
+    """把 URL 换成磁盘文件。路径一律走 storage.safe_join（拒 .. / 越界），防路径穿越。"""
     out = []
     for url in images or []:
-        m = _IMG_URL_RE.match(url or "")
-        if not m:
-            continue
-        p = config.FEEDBACK_DIR / m.group(1)
-        if p.exists() and p.is_file():
+        rel = storage.url_to_rel(url)
+        p = storage.safe_join(rel) if rel else None
+        if p is not None and p.exists() and p.is_file():
             out.append(p)
     return out
 

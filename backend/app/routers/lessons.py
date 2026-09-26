@@ -14,6 +14,7 @@ from ..db import get_db
 from ..models import Curriculum, Feedback, Lesson, Student
 from ..schemas import LessonIn, LessonPatch
 from ..services import billing
+from . import lesson_files
 
 router = APIRouter(prefix="/api", tags=["lessons"])
 
@@ -130,6 +131,9 @@ def complete_lesson(lid: int, db: Session = Depends(get_db)):
 @router.delete("/lessons/{lid}")
 def delete_lesson(lid: int, db: Session = Depends(get_db)):
     ls = _lesson_or_404(db, lid)
+    # ⚠️ 必须在删行**之前**收材质：反馈配图与上课文件的行都会随外键 CASCADE 消失，
+    # 删完就查不到磁盘上该删哪几个文件了（数据库管不了文件系统）。
+    lesson_files.cleanup_for_lessons(db, [lid])
     db.delete(ls)
     db.commit()
     return {"ok": True}

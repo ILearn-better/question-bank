@@ -28,6 +28,7 @@ from app.routers import (                                   # noqa: E402
     dashboard,
     documents,
     feedbacks,
+    lesson_files,
     lessons,
     notes,
     papers,
@@ -102,6 +103,7 @@ app.include_router(dashboard.router)
 app.include_router(students.router)
 app.include_router(lessons.router)
 app.include_router(feedbacks.router)
+app.include_router(lesson_files.router)
 app.include_router(curriculum.router)
 app.include_router(questions.router)
 app.include_router(papers.router)

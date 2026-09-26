@@ -353,6 +353,41 @@ class Feedback(Base):
     )
 
 
+class LessonFile(Base):
+    """上课文件（讲义 / 课件 / 试卷），AI 润色时当参考资料用。
+
+    为什么存的是**抽出来的文字**而不是「把文件发给 AI」：
+      接的是 OpenAI 兼容的 /chat/completions，这是**纯文本**协议 ——
+      deepseek-chat、qwen-plus 这些主流模型都不接受文件本身。所以在本机把文字抽出来，
+      再把文字发出去：任何文本模型都能用，而且发出去的内容在界面上看得见。
+    原件也留一份（stored）：抽失败时能换个解析器重试，也算个出处。
+
+    status/reason 要如实记下「没抽出来」和原因 —— 一个静默失败的附件比报错更糟，
+    用户会以为 AI 已经读过那份材料了。
+    """
+
+    __tablename__ = "lesson_files"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    owner_id: Mapped[int] = mapped_column(Integer, nullable=False, default=OWNER_ID, server_default=str(OWNER_ID))
+    lesson_id: Mapped[int] = mapped_column(
+        ForeignKey("lessons.id", ondelete="CASCADE"), nullable=False
+    )
+    name: Mapped[str] = mapped_column(String, nullable=False)      # 原始文件名（给用户看的）
+    stored: Mapped[str] = mapped_column(String, default="", server_default="")   # 磁盘上的名字
+    kind: Mapped[str] = mapped_column(String, default="", server_default="")
+    size_bytes: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    pages: Mapped[int | None] = mapped_column(Integer)
+    chars: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    truncated: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    status: Mapped[str] = mapped_column(String, default="ok", server_default="ok")
+    reason: Mapped[str] = mapped_column(Text, default="", server_default="")
+    text: Mapped[str] = mapped_column(Text, default="", server_default="")
+    created_at: Mapped[str] = mapped_column(Text, default=_now, server_default=NOW)
+
+    __table_args__ = (Index("idx_lesson_files_lesson", "lesson_id", "id"),)
+
+
 # ============================================================
 # M4 笔记（Markdown 正文 + 一层板书笔画）
 # ============================================================

@@ -29,15 +29,20 @@ from ..models import (
     FeedbackDocTemplate,
     FeedbackTemplate,
     Lesson,
+    LessonFile,
     Student,
 )
 from ..schemas import AiSettingIn, AiTestIn, DimIn, DocTemplateIn, FeedbackIn, PolishIn, TemplateIn
-from ..services import ai_polish, feedback_export, images
+from ..services import ai_polish, feedback_export, images, storage
+from . import lesson_files
 
 router = APIRouter(prefix="/api", tags=["feedbacks"])
 
-# 反馈配图的 URL 形如 /api/feedbacks/files/fb_ab12cd34ef56.png
-_IMG_RE = re.compile(r"/api/feedbacks/files/([A-Za-z0-9_.\-]+)")
+# 反馈配图的 URL 形如
+# /api/feedbacks/files/students/u1_李芹旭/2026-09-26/fb_ab12cd34ef56.png
+# 路径里带子目录，所以这里要允许斜杠与中文 —— **安全性由 storage.safe_join 兜**
+# （拒绝 ..、解析后必须在 UPLOAD_DIR 之内），不靠正则把字符堵完。
+_IMG_RE = re.compile(r"/api/feedbacks/files/(.+)")
 
 
 def _lesson_or_404(db: Session, lid: int) -> Lesson:
@@ -56,10 +61,13 @@ def _parse_images(raw: str | None) -> list[str]:
 
 
 def _used_feedback_images(db: Session) -> set[str]:
-    """所有反馈引用到的配图文件名（引用计数的依据）。"""
+    """所有反馈引用到的配图**相对路径**（引用计数的依据）。"""
     used: set[str] = set()
     for (raw,) in db.execute(select(Feedback.images)).all():
-        used |= set(_IMG_RE.findall(raw or ""))
+        for u in _parse_images(raw):
+            rel = storage.url_to_rel(u)
+            if rel:
+                used.add(rel)
     return used
 
 
@@ -177,7 +185,7 @@ def upsert_feedback(lid: int, payload: FeedbackIn, db: Session = Depends(get_db)
     if fb is None:
         fb = Feedback(owner_id=config.OWNER_ID, lesson_id=lid, student_id=ls.student_id)
         db.add(fb)
-    old_images = _IMG_RE.findall(fb.images or "")
+    old_images = {rel for rel in (storage.url_to_rel(u) for u in _parse_images(fb.images)) if rel}
     fb.performance = payload.performance
     fb.problems = payload.problems
     fb.homework = payload.homework
@@ -189,18 +197,20 @@ def upsert_feedback(lid: int, payload: FeedbackIn, db: Session = Depends(get_db)
     # （旧前端、脚本）都会把用户辛苦整理出的整篇正文抹掉。
     if "doc" in payload.model_dump(exclude_unset=True):
         fb.doc = payload.doc or ""
-    # 只留本项目图片目录里的名字，其余 URL 一律丢弃（防把外部地址/路径写进去）
-    keep = [m.group(0) for m in (_IMG_RE.search(u) for u in payload.images) if m]
+    # 只留本项目目录内、且路径合法的图，**顺手把 URL 归一化**成服务端自己的写法；
+    # 其余一律丢弃（防把外部地址或 `../` 写进来）。
+    keep = []
+    for u in payload.images:
+        rel = storage.url_to_rel(u)
+        if rel and storage.safe_join(rel) is not None:
+            keep.append(f"/api/feedbacks/files/{rel}")
     fb.images = json.dumps(keep, ensure_ascii=False)
     db.flush()
 
     # 本次被移除的图片，如果已经没有其它反馈在引用，就从磁盘删掉（引用计数）。
     # 与「删题目清截图」「删笔记清配图」同一套路数：图不能被无限堆积。
-    for name in set(old_images) - _used_feedback_images(db):
-        try:
-            (config.FEEDBACK_DIR / name).unlink()
-        except OSError:
-            pass
+    for rel in set(old_images) - _used_feedback_images(db):
+        storage.unlink_rels([rel])
 
     # 能力评分整组替换：不用逐条 diff，语义更清楚，也不会留下上次多打的分数
     if payload.ability_scores:
@@ -384,25 +394,32 @@ def delete_doc_template(tid: int, db: Session = Depends(get_db)):
 
 # ---------------------------------------------------------------- 反馈配图
 @router.post("/feedbacks/image")
-async def upload_feedback_image(file: UploadFile = File(...)):
+async def upload_feedback_image(file: UploadFile = File(...), lesson_id: int = Query(...),
+                               db: Session = Depends(get_db)):
     """反馈配图上传。返回可直接写进 images 数组的 URL。
 
-    存单独的 FEEDBACK_DIR，不复用 CROPS_DIR —— 那边删题目时的「孤儿截图清理」
-    会把反馈的图当成无主文件删掉。
+    **必须带 lesson_id**：图片要归到「学生 / 上课日期」目录下（storage.py 那套布局），
+    没有课时就不知道往哪个学生的哪一天放。
+    存的地方不复用 CROPS_DIR —— 那边删题目时的「孤儿截图清理」会把反馈的图当成无主文件删掉。
     """
+    ls = _lesson_or_404(db, lesson_id)
+    stu = db.get(Student, ls.student_id)
+    if stu is None:
+        raise HTTPException(404, "这节课的学生不存在")
     data = await file.read(images.MAX_IMAGE_BYTES + 1)
     try:
-        saved = images.save_image(data, config.FEEDBACK_DIR, prefix="fb")
+        saved = images.save_image(data, storage.dir_for(stu, ls), prefix="fb")
     except images.ImageRejected as e:
         raise HTTPException(422, str(e)) from e
-    return {"url": f"/api/feedbacks/files/{saved['name']}", **saved}
+    rel = storage.rel(storage.dir_for(stu, ls) / saved["name"])
+    return {"url": f"/api/feedbacks/files/{rel}", "path": rel, **saved}
 
 
-@router.get("/feedbacks/files/{name}")
-def get_feedback_image(name: str):
-    """配图读取。只按文件名取（Path.name），防路径穿越。"""
-    p = config.FEEDBACK_DIR / Path(name).name
-    if not p.exists() or not p.is_file():
+@router.get("/feedbacks/files/{rel_path:path}")
+def get_feedback_image(rel_path: str):
+    """配图读取。路径由 storage.safe_join 校验（拒 .. / 越界），防路径穿越。"""
+    p = storage.safe_join(rel_path)
+    if p is None or not p.exists() or not p.is_file():
         raise HTTPException(404, "图片不存在")
     media = mimetypes.guess_type(p.name)[0] or "image/png"
     return FileResponse(str(p), media_type=media)
@@ -561,10 +578,27 @@ def polish_feedback(lid: int, payload: PolishIn, db: Session = Depends(get_db)):
         template_name = t.name
 
     draft = ai_polish.assemble_draft(payload.fields, ctx, payload.draft)
+
+    # 上课文件当参考资料。**只取抽出了文字的那些**，并在返回值里如实回报名单 ——
+    # 老师必须知道 AI 到底看到了哪些材料（没抽出来的那些更是要显眼地说）。
+    materials, mat_meta = "", {"files": [], "chars": 0, "dropped": []}
+    if payload.use_files:
+        stmt = select(LessonFile).where(LessonFile.lesson_id == lid)
+        if payload.file_ids:
+            stmt = stmt.where(LessonFile.id.in_(payload.file_ids))
+        rows = list(db.scalars(stmt.order_by(LessonFile.id)).all())
+        materials, mat_meta = lesson_files.collect_text(rows)
+        mat_meta["files"] = [
+            {"id": f.id, "name": f.name, "status": f.status, "chars": f.chars,
+             "reason": f.reason or "", "truncated": bool(f.truncated)}
+            for f in rows
+        ]
+
     try:
-        result = ai_polish.polish_document(db, draft, template_content, payload.style)
+        result = ai_polish.polish_document(db, draft, template_content, payload.style, materials)
     except ai_polish.AiError as e:
         raise HTTPException(502, str(e)) from e
     result["draft"] = draft          # 回传一份「到底发了什么」，方便界面如实展示
     result["template_name"] = template_name
+    result["materials"] = mat_meta
     return result

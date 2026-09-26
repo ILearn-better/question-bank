@@ -121,8 +121,10 @@ export const feedbackApi = {
   createDocTemplate: (body) => api.post('/api/feedback-doc-templates', body),
   removeDocTemplate: (id) => api.del(`/api/feedback-doc-templates/${id}`),
 
-  /** 反馈配图上传。返回可直接放进 images 数组的 URL。 */
-  uploadImage: (formData) => api.upload('/api/feedbacks/image', formData),
+  /** 反馈配图上传。返回可直接放进 images 数组的 URL。
+   *  **必须带 lessonId**：图片要归到「学生 / 上课日期」目录下（后端 services/storage.py）。 */
+  uploadImage: (lessonId, formData) =>
+    api.upload(`/api/feedbacks/image` + qs({ lesson_id: lessonId }), formData),
 
   /** AI 整篇润色：四段记录进去，一整篇文档出来（建议稿，需老师确认）。
    *  注意：会把内容发到第三方 AI 服务，界面必须先提示。 */
@@ -132,6 +134,17 @@ export const feedbackApi = {
    *  source：auto（默认，有整篇就导整篇）/ doc（强制整篇）/ fields（强制四段）。 */
   downloadExport: (lessonId, format, filename, source = 'auto') =>
     download(`/api/lessons/${lessonId}/feedback/export` + qs({ format, source }), filename),
+};
+
+/** 上课文件（讲义 / 课件 / 试卷）：上传后由后端在本机抽文字，供 AI 润色当参考资料。
+ *  ⚠️ 接的是纯文本接口，模型不收文件本身 —— 所以发出去的是**抽出来的文字**。 */
+export const lessonFilesApi = {
+  list: (lessonId) => api.get(`/api/lessons/${lessonId}/files`),
+  upload: (lessonId, formData) => api.upload(`/api/lessons/${lessonId}/files`, formData),
+  remove: (id) => api.del(`/api/lesson-files/${id}`),
+  rawUrl: (id) => `/api/lesson-files/${id}/raw`,
+  /** 某个学生的全部资料（按上课日期分组）+ 磁盘归档路径。做学生情况分析时用它。 */
+  byStudent: (studentId) => api.get(`/api/students/${studentId}/files`),
 };
 
 /** AI 润色的接口配置（地址 / 模型 / 密钥）。密钥只存本机，接口一律脱敏返回。 */

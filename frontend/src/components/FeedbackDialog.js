@@ -7,7 +7,7 @@
 //   · 能力评分「允许只打部分」，没打的下次仍按历史值算，绝不强制填满
 //   · 所有字段都可留空 —— 只写一句话也能存。卡住一次，这个工具就会被弃用。
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue';
-import { abilityApi, feedbackApi, studentsApi } from '../api.js';
+import { abilityApi, feedbackApi, lessonFilesApi, studentsApi } from '../api.js';
 import { fail, hhmm, ok, shortDate, warn } from '../store.js';
 import Modal from './Modal.js';
 
@@ -69,6 +69,22 @@ export default {
     // 两者并存：润色只写 doc，绝不动四段（老师写的东西不能被 AI 反向覆盖）。
     const doc = ref('');
 
+    // ---- 上课文件（给 AI 当参考资料） ----
+    // 接的是纯文本接口，模型不收文件本身 —— 所以后端在本机把文字抽出来，
+    // 发出去的是**文字**。抽不出来的（扫描件 / 纯图片课件）会带着原因显示出来，
+    // 绝不能默默跳过：那会让人以为 AI 已经看过那份材料了。
+    const files = ref([]);
+    const fileInput = ref(null);
+    const fileAccept = ref('.pdf,.docx,.doc,.pptx,.ppt,.rtf,.txt,.md');
+    const uploadingFile = ref(false);
+    const fileNote = ref('');            // 上传失败时的整条提示（比如格式不支持）
+    const archiveDir = ref('');          // 归档目录（给人看：按学生 / 上课日期）
+    const useFiles = ref(true);          // 润色时是否带上这些文件
+
+    const okFiles = computed(() => files.value.filter(f => f.status === 'ok' && f.chars > 0));
+    const badFiles = computed(() => files.value.filter(f => f.status !== 'ok' || !f.chars));
+    const matChars = computed(() => okFiles.value.reduce((n, f) => n + (f.chars || 0), 0));
+
     // ---- AI 润色 / 导出 ----
     const polishing = ref(false);
     const polishResult = ref(null);       // 整篇建议稿的完整响应（含 draft / usage / model）
@@ -123,6 +139,7 @@ export default {
             docTemplateContent.value = first.content || '';
           }
         } catch (e) { /* 忽略 */ }
+        await loadFiles();
         // 取该学生各维度的历史分数作为参照 —— 有锚点，打分标准才稳定，
         // 否则这周给 3 星、下周给 4 星可能只是手感不同，雷达图的「变化」就成了噪声。
         //
@@ -280,7 +297,7 @@ export default {
       try {
         const fd = new FormData();
         fd.append('file', file, file.name || 'paste.png');
-        const r = await feedbackApi.uploadImage(fd);
+        const r = await feedbackApi.uploadImage(props.lesson.id, fd);
         images.value = [...images.value, r.url];
       } catch (e) {
         fail(e.message);
@@ -307,6 +324,52 @@ export default {
     }
 
     function removeImage(i) { images.value = images.value.filter((_, idx) => idx !== i); }
+
+    /* ================= 上课文件 ================= */
+    async function loadFiles() {
+      try {
+        const r = await lessonFilesApi.list(props.lesson.id);
+        files.value = r.items || [];
+        if (r.accept) fileAccept.value = r.accept;
+        archiveDir.value = r.rel_dir || '';
+      } catch (e) { /* 拿不到不影响写反馈 */ }
+    }
+
+    function pickFile() { fileInput.value && fileInput.value.click(); }
+
+    async function onFilePicked(e) {
+      const f = e.target.files && e.target.files[0];
+      e.target.value = '';                     // 同一份文件连传两次也要能触发 change
+      if (!f) return;
+      uploadingFile.value = true;
+      fileNote.value = '';
+      try {
+        const r = await lessonFilesApi.upload(props.lesson.id,
+          (() => { const fd = new FormData(); fd.append('file', f, f.name); return fd; })());
+        files.value = [...files.value, r];
+        if (r.status === 'ok') ok(`已读入「${r.name}」，抽出 ${r.chars} 字`);
+        else warn(`「${r.name}」没读出文字：${r.reason}`);
+      } catch (err) {
+        fileNote.value = err.message;
+        fail(err.message);
+      } finally {
+        uploadingFile.value = false;
+      }
+    }
+
+    async function removeFile(f) {
+      if (!window.confirm(`移除「${f.name}」？归档里的原件也会一起删掉。`)) return;
+      try {
+        await lessonFilesApi.remove(f.id);
+        files.value = files.value.filter(x => x.id !== f.id);
+      } catch (e) {
+        fail(e.message);
+      }
+    }
+
+    const fmtBytes = (n) => (n >= 1024 * 1024 ? (n / 1024 / 1024).toFixed(1) + ' MB'
+                                              : Math.max(1, Math.round(n / 1024)) + ' KB');
+    const rawUrl = (id) => lessonFilesApi.rawUrl(id);
 
     /* ================= AI 润色（整篇） ================= */
     // 逻辑：四段记录拼成一篇「原始记录」→ 连同模板一起发给 AI → 拿回一整篇文档。
@@ -375,6 +438,8 @@ export default {
             return cur && cur !== ((t && t.content) || '').trim() ? cur : null;
           })(),
           style: polishStyle.value || '',
+          // 上课文件当参考资料。抽不出文字的那些后端会自动跳过，但会在返回值里点名。
+          use_files: useFiles.value && okFiles.value.length > 0,
         });
         polishResult.value = res;
         polishText.value = res.text || '';
@@ -502,6 +567,8 @@ export default {
              templates, templateId, phrases, applyTemplate, saveAsTemplate, deleteTemplate, currentTpl,
              showTplSave, tplName,
              doc, copyDoc, clearDoc,
+             files, fileInput, fileAccept, uploadingFile, fileNote, archiveDir,
+             okFiles, badFiles, matChars, useFiles, pickFile, onFilePicked, removeFile, fmtBytes, rawUrl,
              images, fileEl, uploading, pickImage, onImageFile, removeImage,
              polishing, polishResult, polishText, openPolish, runPolish, adoptPolish, backToPolishConfig,
              showPolishAsk, polishStyle, polishError, willSend,
@@ -558,6 +625,51 @@ export default {
           {{ uploading ? '上传中…' : '＋ 贴图' }}
         </button>
         <input ref="fileEl" type="file" accept="image/*" style="display:none" @change="onImageFile">
+      </div>
+    </div>
+
+    <!-- 上课文件：讲义 / 课件 / 试卷，上传后在本机转成文字，润色时当参考资料 -->
+    <div class="field">
+      <label>
+        上课文件
+        <span class="muted small">
+          （讲义 / 课件 / 试卷；在本机转成文字后用于 AI 润色，原文件也归档留底）
+        </span>
+      </label>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <button class="btn sm" :disabled="uploadingFile" @click="pickFile">
+          {{ uploadingFile ? '解析中…' : '＋ 添加文件' }}
+        </button>
+        <input ref="fileInput" type="file" style="display:none" :accept="fileAccept" @change="onFilePicked">
+        <span v-if="files.length" class="small muted">共 {{ files.length }} 份</span>
+      </div>
+
+      <div v-for="f in files" :key="f.id"
+           style="display:flex;gap:8px;align-items:flex-start;margin-top:8px">
+        <span class="tag" :class="f.status === 'ok' ? 'green' : 'red'" style="flex:none">
+          {{ f.status === 'ok' ? f.kind_cn : '读不出' }}
+        </span>
+        <div style="flex:1;min-width:0">
+          <a v-if="f.status === 'ok'" :href="rawUrl(f.id)" target="_blank" rel="noopener">{{ f.name }}</a>
+          <span v-else style="word-break:break-all">{{ f.name }}</span>
+          <span class="small muted">
+            · {{ fmtBytes(f.size_bytes) }}
+            <template v-if="f.status === 'ok'">
+              · 抽出 {{ f.chars }} 字<template v-if="f.pages">· {{ f.pages }} 页</template>
+            </template>
+            <template v-if="f.truncated"> · 太长已截断</template>
+          </span>
+          <!-- 读不出文字的原因必须显眼：默默跳过会让人以为 AI 已经读过了 -->
+          <div v-if="f.status !== 'ok'" class="small" style="color:var(--danger);margin-top:2px">
+            {{ f.reason }}
+          </div>
+        </div>
+        <button class="btn ghost sm" style="flex:none;color:var(--danger)" @click="removeFile(f)">删除</button>
+      </div>
+
+      <div v-if="fileNote" class="small" style="color:var(--danger);margin-top:6px">{{ fileNote }}</div>
+      <div v-if="archiveDir" class="small muted" style="margin-top:6px">
+        归档位置：<span class="mono">uploads/{{ archiveDir }}</span>（按「学生 / 上课日期」存放）
       </div>
     </div>
 
@@ -696,15 +808,29 @@ export default {
         <input type="text" v-model="polishStyle" placeholder="如：保持简洁，语气对家长友好" @keyup.enter="runPolish">
       </div>
 
-      <details>
-        <summary class="small muted" style="cursor:pointer">看看具体会发出去什么</summary>
-        <pre class="small" style="white-space:pre-wrap;margin:6px 0 0;background:var(--panel-2);border:1px solid var(--border);border-radius:var(--radius-sm);padding:8px;max-height:200px;overflow:auto">{{ willSend }}</pre>
-        <div class="small muted" style="margin-top:4px">（另外还会带上上面那份模板正文和额外要求。）</div>
-      </details>
+    <!-- 上课文件会一起发出去（纯文本接口收不了文件，这里发的是本机抽出的文字） -->
+    <div v-if="files.length" class="field">
+      <label class="small" style="display:flex;align-items:center;gap:6px;font-weight:400">
+        <input type="checkbox" v-model="useFiles" :disabled="!okFiles.length">
+        <span>
+          把上课文件一起发给 AI
+          <span class="muted">（{{ okFiles.length }} 份，共 {{ matChars }} 字）</span>
+        </span>
+      </label>
+      <div class="small muted" style="margin-top:4px">
+        {{ okFiles.map(f => f.name).join('、') || '（没有可读的文件）' }}
+      </div>
+      <div v-if="badFiles.length" class="small" style="color:var(--danger);margin-top:4px">
+        这几份读不出文字、不会被发送：{{ badFiles.map(f => f.name).join('、') }}
+      </div>
+    </div>
 
-      <!-- 等待状态留在原地，窗口不关 —— 关掉会让人以为丢失了内容 -->
-      <div v-if="polishing" class="small muted" style="margin-top:12px">
-        正在润色…整篇比四段长不少，通常要十几秒到一分钟，请稍等（窗口会自动出结果）。
+    <details>
+      <summary class="small muted" style="cursor:pointer">看看具体会发出去什么</summary>
+      <pre class="small" style="white-space:pre-wrap;margin:6px 0 0;background:var(--panel-2);border:1px solid var(--border);border-radius:var(--radius-sm);padding:8px;max-height:200px;overflow:auto">{{ willSend }}</pre>
+      <div class="small muted" style="margin-top:4px">
+        （另外还会带上上面那份模板正文<template v-if="useFiles && okFiles.length">、{{ okFiles.length }} 份上课文件的文字（共 {{ matChars }} 字）</template>和额外要求。）
+      </div>
       </div>
       <div v-if="polishError" class="small" style="margin-top:12px;color:var(--danger)">{{ polishError }}</div>
     </template>

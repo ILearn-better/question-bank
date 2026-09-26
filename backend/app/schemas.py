@@ -258,6 +258,11 @@ class PolishIn(BaseModel):
     template_id: Optional[int] = None
     template_content: Optional[str] = None
     style: Optional[str] = None
+    # 上课文件（讲义/课件）当参考资料。
+    # use_files=True 表示用这个课时下所有「抽出了文字」的文件；
+    # file_ids 给了就只用这几份（界面上可以让老师勾掉不相关的那份）。
+    use_files: bool = True
+    file_ids: Optional[List[int]] = None
 
 
 class AiTestIn(BaseModel):
