@@ -5,7 +5,7 @@ import { useRoute } from 'vue-router';
 import { studentsApi } from '../api.js';
 import AbilityRadar from '../components/AbilityRadar.js';
 import FeedbackDialog from '../components/FeedbackDialog.js';
-import { fail, hhmm, loadCurricula, money, ok, shortDate, STATUS_LABEL, STATUS_TAG } from '../store.js';
+import { fail, fmtBytes, hhmm, loadCurricula, money, ok, shortDate, STATUS_LABEL, STATUS_TAG } from '../store.js';
 
 export default {
   name: 'StudentDetail',
@@ -17,16 +17,35 @@ export default {
     const timeline = ref([]);
     const loading = ref(true);
     const feedbackLesson = ref(null);
+    // 归档文件夹：老师经常要直接翻（找讲义、看孩子这段时间留下了什么）
+    const folder = ref(null);
+    const openingFolder = ref(false);
 
     async function load() {
       loading.value = true;
       try {
         stu.value = await studentsApi.get(id);
         timeline.value = await studentsApi.timeline(id);
+        folder.value = await studentsApi.folder(id);
       } catch (e) {
         fail(e.message);
       } finally {
         loading.value = false;
+      }
+    }
+
+    /** 在资源管理器里打开这个学生的文件夹。
+     *  服务端就在本机，所以是真打开 —— 浏览器沙箱里做不到这种事。 */
+    async function openFolder() {
+      openingFolder.value = true;
+      try {
+        await studentsApi.openFolder(id);
+        // 顺手把统计刷新一下：老师刚往里拖过东西的话，数字要跟上
+        folder.value = await studentsApi.folder(id);
+      } catch (e) {
+        fail(e.message);
+      } finally {
+        openingFolder.value = false;
       }
     }
 
@@ -58,6 +77,7 @@ export default {
     return {
       stu, timeline, loading, feedbackLesson, pendingCount, abilityDims, hasAbility,
       openFeedback, onSaved, load, hhmm, money, shortDate, STATUS_LABEL, STATUS_TAG,
+      folder, openingFolder, openFolder, fmtBytes,
     };
   },
   template: `
@@ -120,6 +140,22 @@ export default {
               <tr><th>开始日期</th><td>{{ stu.started_at || '—' }}</td></tr>
               <tr><th>累计课时费</th><td>{{ money(stu.stats.amount_total) }}</td></tr>
               <tr><th>备注</th><td>{{ stu.remark || '—' }}</td></tr>
+              <tr>
+                <th>资料文件夹</th>
+                <td>
+                  <div class="mono small" style="word-break:break-all">{{ folder ? folder.rel_dir : '—' }}</div>
+                  <div class="small muted" style="margin-top:2px">
+                    <template v-if="folder && folder.file_count">
+                      共 {{ folder.file_count }} 个文件 · {{ fmtBytes(folder.total_bytes) }}
+                    </template>
+                    <template v-else>还没有资料（传讲义或贴配图就会建起来）</template>
+                  </div>
+                  <button class="btn sm" style="margin-top:6px"
+                          :disabled="openingFolder" @click="openFolder">
+                    {{ openingFolder ? '正在打开…' : '打开文件夹' }}
+                  </button>
+                </td>
+              </tr>
             </tbody>
           </table>
         </div>

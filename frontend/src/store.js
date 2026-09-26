@@ -79,6 +79,14 @@ export function shortDate(iso) {
   return `${iso.slice(5, 10)} 周${wk}`;
 }
 
+/** 文件大小给人看的写法（反馈弹窗的上课文件、学生文件夹都在用，所以放在公共处）。 */
+export function fmtBytes(n) {
+  if (!n) return '0 B';
+  return n >= 1024 * 1024 ? (n / 1024 / 1024).toFixed(1) + ' MB'
+    : n >= 1024 ? Math.round(n / 1024) + ' KB'
+      : n + ' B';
+}
+
 export const STATUS_LABEL = {
   scheduled: '已排课',
   done: '已完成',

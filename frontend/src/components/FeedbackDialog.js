@@ -8,7 +8,7 @@
 //   · 所有字段都可留空 —— 只写一句话也能存。卡住一次，这个工具就会被弃用。
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue';
 import { abilityApi, feedbackApi, lessonFilesApi, studentsApi } from '../api.js';
-import { fail, hhmm, ok, shortDate, warn } from '../store.js';
+import { fail, fmtBytes as fmtBytesShared, hhmm, ok, shortDate, warn } from '../store.js';
 import Modal from './Modal.js';
 
 // 四段字段的键与中文名。多处要用（拼原始记录、渲染、存模板），集中一份。
@@ -486,8 +486,7 @@ export default {
       }
     }
 
-    const fmtBytes = (n) => (n >= 1024 * 1024 ? (n / 1024 / 1024).toFixed(1) + ' MB'
-                                              : Math.max(1, Math.round(n / 1024)) + ' KB');
+    const fmtBytes = fmtBytesShared;
     const rawUrl = (id) => lessonFilesApi.rawUrl(id);
 
     /* ================= AI 润色（整篇） ================= */

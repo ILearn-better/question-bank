@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import delete, select
@@ -140,6 +141,66 @@ def delete_student(sid: int, db: Session = Depends(get_db)):
     db.delete(s)
     db.commit()
     return {"ok": True}
+
+
+# ---------------------------------------------------------------- 学生文件夹
+# 归档目录是「学生 / 上课日期」那套布局（services/storage.py）。老师常要直接翻文件夹
+# （找讲义、看看孩子这段时间留下了什么），所以给他一个能看见、能打开的入口。
+def _folder_usage(d) -> tuple[int, int]:
+    """数磁盘上实际有多少文件、共多大。
+
+    为什么不复用 /students/{sid}/files 的统计：那个清单读的是**数据库登记**，
+    上传了没保存的配图（见 feedbacks 的 image/remove）不在里面。
+    「这个文件夹里有什么」就得看文件夹本身，否则会告诉老师「0 个文件」而其实有东西。
+    """
+    n = total = 0
+    if d.is_dir():
+        for p in d.rglob("*"):
+            if p.is_file():
+                n += 1
+                try:
+                    total += p.stat().st_size
+                except OSError:
+                    pass
+    return n, total
+
+
+@router.get("/students/{sid}/folder")
+def student_folder_info(sid: int, db: Session = Depends(get_db)):
+    """这个学生的归档文件夹在哪、里面有多少东西。路径一律服务端算，不接受外部传入。"""
+    stu = _student_or_404(db, sid)
+    folder = storage.student_folder(stu)
+    d = config.STUDENTS_DIR / folder
+    n, total = _folder_usage(d)
+    return {
+        "student_id": sid,
+        "folder": folder,                        # u1_李芹旭
+        "rel_dir": f"students/{folder}",          # 相对 data/uploads，给人看的写法
+        "abs_dir": str(d),
+        "exists": d.is_dir(),
+        "file_count": n,
+        "total_bytes": total,
+    }
+
+
+@router.post("/students/{sid}/folder/open")
+def open_student_folder(sid: int, db: Session = Depends(get_db)):
+    """在资源管理器里打开这个学生的文件夹。
+
+    这是本机自用工具，服务端就跑在老师自己的电脑上，所以直接 os.startfile 就行；
+    路径由 student id 推出（过 safe_token），不接任何外部传入的路径。
+    还没传过资料的学生就先建出空文件夹 —— 打开一个空文件夹也是合理的。
+    """
+    stu = _student_or_404(db, sid)
+    d = config.STUDENTS_DIR / storage.student_folder(stu)
+    d.mkdir(parents=True, exist_ok=True)
+    if not hasattr(os, "startfile"):        # 非 Windows
+        raise HTTPException(400, "这个系统上不能自动打开文件夹，照上面的路径手动找一下吧")
+    try:
+        os.startfile(str(d))                 # noqa: S606 —— 本机自用工具，路径是我们自己拼的
+    except OSError as e:
+        raise HTTPException(500, f"打开文件夹失败：{e}") from e
+    return {"ok": True, "path": str(d)}
 
 
 # ---------------------------------------------------------------- 时间轴

@@ -94,6 +94,9 @@ export const studentsApi = {
   update: (id, body) => api.patch(`/api/students/${id}`, body),
   remove: (id) => api.del(`/api/students/${id}`),
   timeline: (id, limit = 100) => api.get(`/api/students/${id}/timeline`, { limit }),
+  /** 学生的归档文件夹在哪、里面有多少东西（数的是磁盘，不是数据库登记）。 */
+  folder: (id) => api.get(`/api/students/${id}/folder`),
+  openFolder: (id) => api.post(`/api/students/${id}/folder/open`),
 };
 
 export const lessonsApi = {
