@@ -48,6 +48,10 @@ export default {
     });
     const existing = ref(false);
     const lastScores = ref({});   // dim_id -> 该维度上一次的分数（打分的参照锚点）
+    // 「已保存的那份」的快照。导出读的是**库里**的数据而不是屏幕上这份，
+    // 所以必须知道当前有没有未保存的改动，否则会静默导出一份旧内容（真实反馈）。
+    const savedSnap = ref(null);
+    const savedDoc = ref('');
 
     // ---- 模板 ----
     const templates = ref([]);
@@ -102,8 +106,7 @@ export default {
           doc.value = fb.doc || '';
           images.value = fb.images || [];
           for (const s of fb.ability_scores || []) form.scores[s.dim_id] = s.score;
-        }
-        // 模板列表。问不到不算错 —— 没有模板照样能写反馈，不能因为模板接口挂了就录不了课。
+        }        // 模板列表。问不到不算错 —— 没有模板照样能写反馈，不能因为模板接口挂了就录不了课。
         try {
           const r = await feedbackApi.templates();
           templates.value = r.items || [];
@@ -139,6 +142,9 @@ export default {
       }
       // 贴图：直接 Ctrl+V 粘贴截图。挂在 window 上，弹窗卸载时摘掉。
       window.addEventListener('paste', onPaste);
+      // 记下「刚打开时是什么样」，用来判断之后有没有未保存的改动
+      savedSnap.value = snapshot();
+      savedDoc.value = doc.value;
     });
 
     onBeforeUnmount(() => window.removeEventListener('paste', onPaste));
@@ -153,7 +159,8 @@ export default {
       form.scores[dimId] = form.scores[dimId] === value ? undefined : value;
     }
 
-    async function save() {
+    /** 真正落库。返回是否成功 —— 调用方决定要不要顺手关窗。 */
+    async function persist() {
       saving.value = true;
       try {
         const payload = {
@@ -173,13 +180,29 @@ export default {
             .map(([dimId, score]) => ({ dim_id: Number(dimId), score })),
         };
         await feedbackApi.save(props.lesson.id, payload);
-        ok('反馈已保存');
-        emit('saved');
+        savedSnap.value = snapshot();     // 存成功了才算「已保存」
+        savedDoc.value = doc.value;
+        return true;
       } catch (e) {
         fail(e.message);
+        return false;
       } finally {
         saving.value = false;
       }
+    }
+
+    /** 页脚的「保存反馈」：存完通知外面（外层会关窗并刷新列表）。 */
+    async function save() {
+      if (!(await persist())) return;
+      ok('反馈已保存');
+      emit('saved');
+    }
+
+    /** 导出弹窗里的「先保存」：存完**不关窗** —— 用户就在这个弹窗里等着导出，
+     *  把整个弹窗关掉只会让他再点一遍「改反馈」。 */
+    async function saveAndStay() {
+      if (!(await persist())) return;
+      ok('已保存，现在导出就是最新内容');
     }
 
     /* ================= 模板 ================= */
@@ -428,6 +451,26 @@ export default {
     }
 
     /* ================= 导出 ================= */
+    /** 当前表单的「指纹」，用来和刚打开/刚保存时那份比对。 */
+    function snapshot() {
+      return JSON.stringify({
+        performance: form.performance || '',
+        problems: form.problems || '',
+        homework: form.homework || '',
+        next_plan: form.next_plan || '',
+        rating: form.rating || null,
+        doc: doc.value || '',
+        images: [...images.value].sort(),
+        scores: Object.entries(form.scores).filter(([, v]) => v).sort(),
+      });
+    }
+
+    /** 有改动还没保存。导出读的是库里的数据，所以这时候导出的文件**不是屏幕上这份**。 */
+    const dirty = computed(() => savedSnap.value !== null && snapshot() !== savedSnap.value);
+
+    /** 其中「整篇正文」是新的 —— 这个最坑：润色完没保存就导出，文件里就没有那一篇。 */
+    const docUnsaved = computed(() => dirty.value && (doc.value || '') !== (savedDoc.value || ''));
+
     function exportName(ext) {
       const stu = props.lesson.student_name || '学生';
       const when = (props.lesson.start_at || '').slice(0, 10);
@@ -464,7 +507,7 @@ export default {
              showPolishAsk, polishStyle, polishError, willSend,
              docTemplates, docTemplateId, docTemplateContent, applyDocTemplate,
              currentDocTpl, showDocTplSave, docTplName, saveDocTemplate, deleteDocTemplate, docTplPreview,
-             showExport, exporting, exportSource, exportMode, doExport };
+             showExport, exporting, exportSource, exportMode, doExport, dirty, docUnsaved, saveAndStay };
   },
   template: `
   <Modal :title="'课后反馈 · ' + lesson.student_name" @close="$emit('close')">
@@ -703,6 +746,16 @@ export default {
 
   <!-- 导出：先选导哪一份内容，再选格式 -->
   <Modal v-if="showExport" title="导出这条反馈" @close="showExport = false">
+    <!-- 导出读的是**库里**的数据，不是屏幕上这份 —— 不说清楚，
+         润色完没保存就导出，会以为导出坏了（真实反馈）。 -->
+    <div v-if="dirty" class="small"
+         style="margin-bottom:12px;padding:8px 10px;border:1px solid var(--warning, #d97706);border-radius:var(--radius-sm);color:var(--warning, #d97706)">
+      ⚠️ 有改动<strong>还没保存</strong>，导出的文件只会包含<strong>已保存</strong>的内容。
+      <span v-if="docUnsaved">「整篇正文」是新的 —— 不保存，它就不会出现在文件里。</span>
+      <button class="btn sm" style="margin-left:6px" :disabled="saving" @click="saveAndStay">
+        {{ saving ? '保存中…' : '先保存' }}
+      </button>
+    </div>
     <div class="field">
       <label>导出内容</label>
       <div v-if="doc.trim()" style="display:flex;gap:14px;flex-wrap:wrap">
@@ -736,6 +789,9 @@ export default {
     </div>
     <div v-if="images.length" class="small muted" style="margin-top:10px">
       这篇有 {{ images.length }} 张附图：Word / PDF 会带上，TXT 不会。
+    </div>
+    <div class="small muted" style="margin-top:6px">
+      Word / PDF 里会自动附上<strong>能力雷达图</strong>（本次一张；有历史记录时会多一条虚线做对比）。
     </div>
     <div class="small muted" style="margin-top:6px">
       PDF 需要本机装有 Microsoft Word（服务端用它排版）；没有的话请先导 Word 再另存为 PDF。

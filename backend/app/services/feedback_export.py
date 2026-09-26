@@ -36,6 +36,15 @@ _DOC_HEAD_RE = re.compile(r"^【.+】$")
 
 STAR_FULL, STAR_EMPTY = "★", "☆"
 
+MAX_SCORE = 5          # 能力维度满分（与前端评分控件的 1-5 对应）
+
+# 雷达图配色：和前端 components/AbilityRadar.js 保持一致 ——
+# 同一个学生、同一份数据，屏幕上和导出文件里应该是同一个样子。
+_R_CUR = (0.145, 0.388, 0.921)     # #2563eb 本次
+_R_PREV = (0.6, 0.63, 0.7)         # #98a2b3 上次
+_R_GRID = (0.894, 0.906, 0.925)    # #e4e7ec 网格
+_R_TEXT = (0.357, 0.392, 0.447)    # #5b6472 文字
+
 
 class PdfUnavailable(RuntimeError):
     """本机没有 Word，无法生成高保真 PDF。"""
@@ -63,9 +72,113 @@ def _meta_line(ctx: dict) -> str:
     return "　　".join(parts)
 
 
-def _score_lines(scores: list[dict]) -> list[str]:
-    return [f"{s.get('name') or ('#' + str(s.get('dim_id')))}：{s.get('score')} / 5"
-            for s in (scores or []) if s.get("score")]
+def _score_lines(scores: list[dict], prev: dict[int, int] | None = None) -> list[str]:
+    """「· 概念理解：4 / 5（上次 3）」。
+
+    带上「上次」很有必要：txt 版本没有雷达图，光列本次分数看不出变化。
+    """
+    out = []
+    for s in scores or []:
+        if not s.get("score"):
+            continue
+        name = s.get("name") or ("#" + str(s.get("dim_id")))
+        line = f"{name}：{s['score']} / {MAX_SCORE}"
+        before = (prev or {}).get(s.get("dim_id"))
+        if before:
+            line += f"（上次 {before}）"
+        out.append(line)
+    return out
+
+
+def build_radar_png(dims: list[dict], size: int = 660, dpi: int = 200) -> bytes | None:
+    """手绘能力雷达图 → PNG 字节；画不了就返回 None。
+
+    dims: [{"name": "概念理解", "latest": 4, "previous": 3}]，previous 可为 None。
+
+    为什么手绘而不是引图表库：本项目「零新依赖」是硬约束（venv 里没有 matplotlib），
+    而 PyMuPDF 本来就在用（探测图片尺寸），它能画线、能写中文（内置 china-s 字体）、
+    能导出 PNG —— 三样刚好都满足。
+
+    为什么必须有「上次」那条：一张孤立的雷达图家长看不出好坏，两条叠在一起
+    「变化」才看得见 —— 和界面上的 AbilityRadar 是同一个道理。
+    """
+    usable = [d for d in (dims or []) if d.get("latest")]
+    if len(usable) < 3:
+        return None          # 两个点的「雷达图」没有意义，不如只列数字
+    try:
+        import math
+
+        import pymupdf as fitz
+
+        font = fitz.Font("china-s")      # MuPDF 内置简体中文字体，不依赖系统装了什么
+        fs = 13
+        labels = [f"{d['name']} {d['latest']:g}" for d in usable]
+        # 半径按最宽的标签算，否则长维度名会顶出画布被截断（实测过）
+        max_w = max(font.text_length(t, fontsize=fs) for t in labels)
+        R = size / 2 - max_w - 40
+        if R < 40:
+            return None
+
+        page = fitz.open().new_page(width=size, height=size)
+        cx = cy = size / 2
+        n = len(usable)
+        has_prev = any(d.get("previous") for d in usable)
+
+        def pt(i: int, v: float):
+            a = -math.pi / 2 + 2 * math.pi * i / n
+            r = R * max(0.0, min(float(v), MAX_SCORE)) / MAX_SCORE
+            return fitz.Point(cx + r * math.cos(a), cy + r * math.sin(a))
+
+        # 网格：每 1 分一圈 + 从圆心发散的轴线
+        sh = page.new_shape()
+        for lvl in range(1, MAX_SCORE + 1):
+            sh.draw_polyline([pt(i, lvl) for i in range(n)])
+            sh.finish(color=_R_GRID, width=0.8, closePath=True)
+        for i in range(n):
+            sh.draw_line(fitz.Point(cx, cy), pt(i, MAX_SCORE))
+        sh.finish(color=_R_GRID, width=0.8)
+        sh.commit()
+
+        # 上次（灰虚线）先画，压在下面
+        if has_prev:
+            sh = page.new_shape()
+            sh.draw_polyline([pt(i, d.get("previous") or 0) for i, d in enumerate(usable)])
+            sh.finish(color=_R_PREV, fill=_R_PREV, fill_opacity=0.16,
+                      width=1.2, dashes="4 3", closePath=True)
+            sh.commit()
+
+        # 本次（蓝实线）
+        sh = page.new_shape()
+        sh.draw_polyline([pt(i, d["latest"]) for i, d in enumerate(usable)])
+        sh.finish(color=_R_CUR, fill=_R_CUR, fill_opacity=0.16, width=1.6, closePath=True)
+        sh.commit()
+
+        # 标签：PyMuPDF 没有 text-anchor，得自己按角度算对齐
+        for i, text in enumerate(labels):
+            a = -math.pi / 2 + 2 * math.pi * i / n
+            cos = math.cos(a)
+            lx = cx + (R + 30) * cos
+            ly = cy + (R + 30) * math.sin(a) + fs * 0.35
+            w = font.text_length(text, fontsize=fs)
+            if cos > 0.3:
+                x = lx                      # 右半边：左对齐
+            elif cos < -0.3:
+                x = lx - w                  # 左半边：右对齐
+            else:
+                x = lx - w / 2              # 顶/底：居中
+            page.insert_text((x, ly), text, fontsize=fs, fontname="china-s", color=_R_TEXT)
+
+        ly = size - 22
+        page.insert_text((cx - 78, ly), "■ 本次", fontsize=12, fontname="china-s", color=_R_CUR)
+        if has_prev:
+            page.insert_text((cx + 4, ly), "▨ 上次", fontsize=12, fontname="china-s", color=_R_PREV)
+
+        png = page.get_pixmap(dpi=dpi, alpha=False).tobytes("png")
+        page.parent.close()
+        return png
+    except Exception:  # noqa: BLE001
+        # 画不出来就退回文字列表 —— 绝不能因为一张图让整份反馈导不出来
+        return None
 
 
 def _image_paths(images: list[str]) -> list:
@@ -90,7 +203,7 @@ def build_txt(fb: dict, ctx: dict, doc: str | None = None) -> bytes:
     """
     if (doc or "").strip():
         lines: list[str] = [doc.strip(), ""]
-        scores_doc = _score_lines(fb.get("ability_scores") or [])
+        scores_doc = _score_lines(fb.get("ability_scores") or [], ctx.get("ability_prev"))
         if scores_doc:
             lines.append("【能力评分】")
             lines.extend("· " + s for s in scores_doc)
@@ -116,7 +229,7 @@ def build_txt(fb: dict, ctx: dict, doc: str | None = None) -> bytes:
         lines.extend(text.splitlines())
         lines.append("")
 
-    scores = _score_lines(fb.get("ability_scores") or [])
+    scores = _score_lines(fb.get("ability_scores") or [], ctx.get("ability_prev"))
     if scores:
         lines.append("【能力评分】")
         lines.extend("· " + s for s in scores)
@@ -185,7 +298,7 @@ def build_docx(fb: dict, ctx: dict, doc: str | None = None) -> bytes:
         # 整篇正文通常自带抬头（学生名-日期 课堂反馈 / 科目 / 上课时间…），
         # 所以不再另加标题，否则会变成「课后反馈」+ 学生自己那行抬头两个标题。
         _add_body(document, doc, Pt)
-        _append_docx_extras(document, fb, Pt, WD_ALIGN_PARAGRAPH, Cm)
+        _append_docx_extras(document, fb, ctx, Pt, WD_ALIGN_PARAGRAPH, Cm)
         buf_whole = io.BytesIO()
         document.save(buf_whole)
         return buf_whole.getvalue()
@@ -218,25 +331,32 @@ def build_docx(fb: dict, ctx: dict, doc: str | None = None) -> bytes:
             p = document.add_paragraph(line)
             p.paragraph_format.space_after = Pt(2)
 
-    _append_docx_extras(document, fb, Pt, WD_ALIGN_PARAGRAPH, Cm)
+    _append_docx_extras(document, fb, ctx, Pt, WD_ALIGN_PARAGRAPH, Cm)
     buf = io.BytesIO()
     document.save(buf)
     return buf.getvalue()
 
 
-def _append_docx_extras(document, fb: dict, Pt, WD_ALIGN_PARAGRAPH, Cm) -> None:
-    """两种模式共用的尾巴：能力评分 + 附图。"""
-    scores = _score_lines(fb.get("ability_scores") or [])
-    if scores:
+def _append_docx_extras(document, fb: dict, ctx: dict, Pt, WD_ALIGN_PARAGRAPH, Cm) -> None:
+    """两种模式共用的尾巴：能力评分（雷达图）+ 附图。"""
+    scores = _score_lines(fb.get("ability_scores") or [], ctx.get("ability_prev"))
+    radar = build_radar_png(ctx.get("ability_radar") or [])
+    if scores or radar:
         h = document.add_paragraph()
         h.paragraph_format.space_before = Pt(10)
         h.paragraph_format.space_after = Pt(2)
         hr = h.add_run("【能力评分】")
         hr.bold = True
         hr.font.size = Pt(12)
-        for s in scores:
-            p = document.add_paragraph("· " + s)
-            p.paragraph_format.space_after = Pt(0)
+        if radar:
+            # 图里的标签已经带了数值，不再重复罗列文字 —— 一份给家长的报告
+            # 同一件事说两遍反而显得啰嗦
+            document.add_picture(io.BytesIO(radar), width=Cm(11.5))
+            document.paragraphs[-1].alignment = WD_ALIGN_PARAGRAPH.CENTER
+        else:
+            for s in scores:
+                p = document.add_paragraph("· " + s)
+                p.paragraph_format.space_after = Pt(0)
 
     pics = _image_paths(fb.get("images") or [])
     if not pics:

@@ -86,7 +86,31 @@ def _serialize(fb: Feedback, scores: list[AbilityScore], dims: dict[int, str]) -
 
 
 def _dim_map(db: Session) -> dict[int, str]:
-    return {d.id: d.name for d in db.scalars(select(AbilityDim)).all()}
+    """维度 id -> 名称。按 sort_order 取，导出里雷达图的维度顺序才能和界面一致。"""
+    rows = db.scalars(select(AbilityDim).order_by(AbilityDim.sort_order, AbilityDim.id)).all()
+    return {d.id: d.name for d in rows}
+
+
+def _prev_scores(db: Session, ls: Lesson) -> dict[int, int]:
+    """每个能力维度在**本节之前**最近一次的分数 —— 雷达图画「变化」要靠它。
+
+    没有「上次」那条线，家长看到的是一张孤立的雷达图：看不出好坏，也看不出进步。
+    """
+    rows = db.execute(
+        select(AbilityScore.dim_id, AbilityScore.score)
+        .join(Lesson, Lesson.id == AbilityScore.lesson_id)
+        .where(
+            AbilityScore.student_id == ls.student_id,
+            AbilityScore.lesson_id != ls.id,
+            Lesson.start_at < ls.start_at,
+            AbilityScore.score.isnot(None),
+        )
+        .order_by(Lesson.start_at.desc(), AbilityScore.id.desc())
+    ).all()
+    out: dict[int, int] = {}
+    for dim_id, score in rows:      # 已按时间倒序：某维度第一次出现就是它最近的一次
+        out.setdefault(dim_id, score)
+    return out
 
 
 # ---------------------------------------------------------------- 能力维度
@@ -440,9 +464,21 @@ def export_feedback(
         raise HTTPException(422, "这条反馈还没有整篇正文，先点「AI 润色」生成一篇")
     use_doc = bool(whole) and src != "fields"
 
-    data = _serialize(fb, [], _dim_map(db))
+    # ⚠️ 这里曾经传的是空列表（_serialize(fb, [], ...)），接着又把 ctx 里算好的分数
+    #    覆盖成空 —— 结果「能力评分」在**所有**导出里静默消失，界面上却看不出来。
+    #    能力分必须走真实查出来的这一份。
+    dims_map = _dim_map(db)
+    scores = list(db.scalars(select(AbilityScore).where(AbilityScore.lesson_id == lid)).all())
+    data = _serialize(fb, scores, dims_map)
     ctx = _export_context(db, ls, fb)
     ctx["ability_scores"] = data["ability_scores"]
+    # 雷达图要「本次 vs 上次」才看得懂，上次的分数存在别的课时里
+    ctx["ability_prev"] = _prev_scores(db, ls)
+    ctx["ability_radar"] = [
+        {"name": s["name"], "latest": s["score"],
+         "previous": ctx["ability_prev"].get(s["dim_id"])}
+        for s in data["ability_scores"]
+    ]
     doc_arg = data["doc"] if use_doc else None
 
     try:
