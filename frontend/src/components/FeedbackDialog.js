@@ -77,6 +77,7 @@ export default {
     // 直接抛 “prompt() is not supported”，而且原生弹窗不可控、也不能写多行说明。
     const showPolishAsk = ref(false);
     const polishStyle = ref('');
+    const polishError = ref('');           // 出错就地显示，不再弹提示条让人找不到上下文
     const showTplSave = ref(false);
     const tplName = ref('');
     // ---- 润色模板（整篇文档的格式与文风） ----
@@ -316,18 +317,29 @@ export default {
       return o;
     };
 
-    /** 点「AI 润色」只开询问窗口（模板 + 隐私提醒），真正发请求在 runPolish()。 */
+    /** 点「AI 润色」只开弹窗（模板 + 隐私提醒），真正发请求在 runPolish()。
+     *  上一次没采用的结果会留着 —— 不小心关了窗口不至于把结果弄丢。 */
     function openPolish() {
       if (!Object.values(fieldsPayload()).some(v => (v || '').trim())) {
         return warn('四个字段都是空的，先写点内容再润色');
       }
+      polishError.value = '';
       showPolishAsk.value = true;
     }
 
-    /** 真正调 AI。拿回来的是**建议稿**，必须老师点「采用」才写进整篇正文。 */
+    /** 从结果回到配置，方便改模板重跑（不关窗口）。 */
+    function backToPolishConfig() {
+      polishResult.value = null;
+      polishError.value = '';
+    }
+
+    /** 真正调 AI。
+     *  ⚠️ 整个过程**不关窗口**：以前是先把配置窗关掉、跑完再弹一个结果窗，
+     *  窗口一关一开，老师会以为点错了、也看不到「刚才发的是什么」。
+     *  现在配置区原地变成等待文案，拿到结果后在同一窗口里左右对照。 */
     async function runPolish() {
-      showPolishAsk.value = false;
       polishing.value = true;
+      polishError.value = '';
       try {
         const res = await feedbackApi.polish(props.lesson.id, {
           fields: fieldsPayload(),
@@ -344,7 +356,8 @@ export default {
         polishResult.value = res;
         polishText.value = res.text || '';
       } catch (e) {
-        fail(e.message);
+        // 就地报错：窗口还开着，链接/提示都在眼前，不必再去找那个一闪而过的提示条
+        polishError.value = e.message || '润色失败';
       } finally {
         polishing.value = false;
       }
@@ -353,6 +366,8 @@ export default {
     function adoptPolish() {
       doc.value = (polishText.value || '').trim();
       polishResult.value = null;
+      polishError.value = '';
+      showPolishAsk.value = false;
       if (!doc.value) return warn('内容是空的，没有可采用的');
       ok('已放入「整篇正文」（记得点保存反馈）');
     }
@@ -445,8 +460,8 @@ export default {
              showTplSave, tplName,
              doc, copyDoc, clearDoc,
              images, fileEl, uploading, pickImage, onImageFile, removeImage,
-             polishing, polishResult, polishText, openPolish, runPolish, adoptPolish,
-             showPolishAsk, polishStyle, willSend,
+             polishing, polishResult, polishText, openPolish, runPolish, adoptPolish, backToPolishConfig,
+             showPolishAsk, polishStyle, polishError, willSend,
              docTemplates, docTemplateId, docTemplateContent, applyDocTemplate,
              currentDocTpl, showDocTplSave, docTplName, saveDocTemplate, deleteDocTemplate, docTplPreview,
              showExport, exporting, exportSource, exportMode, doExport };
@@ -598,51 +613,90 @@ export default {
     </template>
   </Modal>
 
-  <!-- AI 润色：模板 + 额外要求 + 「到底会发出去什么」 -->
-  <Modal v-if="showPolishAsk" title="AI 润色（整篇）" wide @close="showPolishAsk = false">
-    <div class="small" style="margin-bottom:12px;color:var(--warning, #d97706)">
-      ⚠️ 接下来会把下面的内容（含学生姓名）发送到你配置的 AI 服务。
-      接口地址与密钥在「设置 → AI 润色」里配置；不配置就不会联网。
-    </div>
-
-    <div class="field">
-      <label>仿照的模板 <span class="muted small">（决定分几个栏目、什么语气；整段会一起发给 AI）</span></label>
-      <div class="row">
-        <select v-model="docTemplateId" @change="applyDocTemplate">
-          <option value="">不套用模板（只把四段整理成一篇）</option>
-          <option v-for="t in docTemplates" :key="t.id" :value="t.id">{{ t.name }}</option>
-        </select>
-        <button class="btn sm" style="flex:none" @click="showDocTplSave = true">存为新模板</button>
-        <button v-if="currentDocTpl() && !currentDocTpl().is_builtin"
-                class="btn sm ghost" style="flex:none;color:var(--danger)"
-                @click="deleteDocTemplate">删除模板</button>
+  <!-- AI 润色（整篇）：配置与结果都在**同一个**弹窗里。
+       以前是「点开始润色 → 本弹窗关掉 → 另弹一个结果窗」，窗口一关一开，
+       人会以为点错了、也看不到上下文；现在原地出结果，左右对照。 -->
+  <Modal v-if="showPolishAsk" title="AI 润色（整篇）" wide
+         @close="polishing || (showPolishAsk = false)">
+    <!-- ① 配置：跑出结果后收起，把位置让给左右对照 -->
+    <template v-if="!polishResult">
+      <div class="small" style="margin-bottom:12px;color:var(--warning, #d97706)">
+        ⚠️ 接下来会把下面的内容（含学生姓名）发送到你配置的 AI 服务。
+        接口地址与密钥在「设置 → AI 润色」里配置；不配置就不会联网。
       </div>
-    </div>
 
-    <div class="field">
-      <label>
-        模板内容
-        <span class="muted small">（可以现场改，改完就按改过的发；满意了可以「存为新模板」）</span>
-      </label>
-      <textarea v-model="docTemplateContent" rows="7"
-                placeholder="写清结构（有几个栏目、每栏写什么），再给一小段示例说明语气。"></textarea>
-    </div>
+      <div class="field">
+        <label>仿照的模板 <span class="muted small">（决定分几个栏目、什么语气；整段会一起发给 AI）</span></label>
+        <div class="row">
+          <select v-model="docTemplateId" @change="applyDocTemplate">
+            <option value="">不套用模板（只把四段整理成一篇）</option>
+            <option v-for="t in docTemplates" :key="t.id" :value="t.id">{{ t.name }}</option>
+          </select>
+          <button class="btn sm" style="flex:none" @click="showDocTplSave = true">存为新模板</button>
+          <button v-if="currentDocTpl() && !currentDocTpl().is_builtin"
+                  class="btn sm ghost" style="flex:none;color:var(--danger)"
+                  @click="deleteDocTemplate">删除模板</button>
+        </div>
+      </div>
 
-    <div class="field">
-      <label>额外要求 <span class="muted small">（可留空）</span></label>
-      <input type="text" v-model="polishStyle" placeholder="如：保持简洁，语气对家长友好" @keyup.enter="runPolish">
-    </div>
+      <div class="field">
+        <label>
+          模板内容
+          <span class="muted small">（可以现场改，改完就按改过的发；满意了可以「存为新模板」）</span>
+        </label>
+        <textarea v-model="docTemplateContent" rows="7"
+                  placeholder="写清结构（有几个栏目、每栏写什么），再给一小段示例说明语气。"></textarea>
+      </div>
 
-    <details>
-      <summary class="small muted" style="cursor:pointer">看看具体会发出去什么</summary>
-      <pre class="small" style="white-space:pre-wrap;margin:6px 0 0;background:var(--panel-2);border:1px solid var(--border);border-radius:var(--radius-sm);padding:8px;max-height:200px;overflow:auto">{{ willSend }}</pre>
-      <div class="small muted" style="margin-top:4px">（另外还会带上上面那份模板正文和额外要求。）</div>
-    </details>
+      <div class="field">
+        <label>额外要求 <span class="muted small">（可留空）</span></label>
+        <input type="text" v-model="polishStyle" placeholder="如：保持简洁，语气对家长友好" @keyup.enter="runPolish">
+      </div>
+
+      <details>
+        <summary class="small muted" style="cursor:pointer">看看具体会发出去什么</summary>
+        <pre class="small" style="white-space:pre-wrap;margin:6px 0 0;background:var(--panel-2);border:1px solid var(--border);border-radius:var(--radius-sm);padding:8px;max-height:200px;overflow:auto">{{ willSend }}</pre>
+        <div class="small muted" style="margin-top:4px">（另外还会带上上面那份模板正文和额外要求。）</div>
+      </details>
+
+      <!-- 等待状态留在原地，窗口不关 —— 关掉会让人以为丢失了内容 -->
+      <div v-if="polishing" class="small muted" style="margin-top:12px">
+        正在润色…整篇比四段长不少，通常要十几秒到一分钟，请稍等（窗口会自动出结果）。
+      </div>
+      <div v-if="polishError" class="small" style="margin-top:12px;color:var(--danger)">{{ polishError }}</div>
+    </template>
+
+    <!-- ② 结果：左边是发出去的原始记录，右边是可编辑的成品 -->
+    <template v-else>
+      <p class="muted small" style="margin-top:0">
+        右边就是整理好的整篇正文，<strong>可以直接改</strong>。点「采用」放进「整篇正文」框，
+        再点「保存反馈」才真正存下来。
+        <span v-if="polishResult.template_name">· 仿照模板：{{ polishResult.template_name }}</span>
+        <span v-if="polishResult.model">· 模型：{{ polishResult.model }}</span>
+        <span v-if="polishResult.usage">
+          · 用量：输入 {{ polishResult.usage.prompt ?? '—' }} / 输出 {{ polishResult.usage.completion ?? '—' }} tokens
+        </span>
+      </p>
+      <div class="grid cols-2">
+        <div>
+          <div class="small muted">发出去的原始记录</div>
+          <pre class="small" style="white-space:pre-wrap;margin:4px 0 0;max-height:320px;overflow:auto;border:1px solid var(--border);border-radius:var(--radius-sm);padding:8px;background:var(--panel-2)">{{ polishResult.draft }}</pre>
+        </div>
+        <div>
+          <div class="small muted">AI 整理后（可编辑）</div>
+          <textarea v-model="polishText" rows="16" style="margin-top:4px"></textarea>
+        </div>
+      </div>
+    </template>
 
     <template #foot>
-      <button class="btn ghost" @click="showPolishAsk = false">取消</button>
-      <button class="btn primary" :disabled="polishing" @click="runPolish">
-        {{ polishing ? '润色中…' : '开始润色' }}
+      <button v-if="!polishResult" class="btn ghost" :disabled="polishing" @click="showPolishAsk = false">取消</button>
+      <button v-else class="btn ghost" @click="backToPolishConfig">返回修改模板</button>
+      <button class="btn" :class="{ primary: !polishResult }" :disabled="polishing" @click="runPolish">
+        {{ polishing ? '润色中…' : (polishResult ? '重新润色' : '开始润色') }}
+      </button>
+      <button v-if="polishResult" class="btn primary" :disabled="!polishText.trim()" @click="adoptPolish">
+        采用为整篇正文
       </button>
     </template>
   </Modal>
@@ -688,33 +742,6 @@ export default {
     </div>
     <template #foot>
       <button class="btn ghost" @click="showExport = false">关闭</button>
-    </template>
-  </Modal>
-
-  <!-- AI 润色结果：左边看发了什么，右边是**可编辑**的成品 -->
-  <Modal v-if="polishResult" title="AI 润色结果（整篇）" wide @close="polishResult = null">
-    <p class="muted small" style="margin-top:0">
-      右边就是整理好的整篇正文，<strong>可以直接改</strong>。点「采用」放进「整篇正文」框，
-      再点「保存反馈」才真正存下来。
-      <span v-if="polishResult.template_name">· 仿照模板：{{ polishResult.template_name }}</span>
-      <span v-if="polishResult.model">· 模型：{{ polishResult.model }}</span>
-      <span v-if="polishResult.usage">
-        · 用量：输入 {{ polishResult.usage.prompt ?? '—' }} / 输出 {{ polishResult.usage.completion ?? '—' }} tokens
-      </span>
-    </p>
-    <div class="grid cols-2">
-      <div>
-        <div class="small muted">发出去的原始记录</div>
-        <pre class="small" style="white-space:pre-wrap;margin:4px 0 0;max-height:300px;overflow:auto;border:1px solid var(--border);border-radius:var(--radius-sm);padding:8px;background:var(--panel-2)">{{ polishResult.draft }}</pre>
-      </div>
-      <div>
-        <div class="small muted">AI 整理后（可编辑）</div>
-        <textarea v-model="polishText" rows="14" style="margin-top:4px"></textarea>
-      </div>
-    </div>
-    <template #foot>
-      <button class="btn ghost" @click="polishResult = null">放弃</button>
-      <button class="btn primary" :disabled="!polishText.trim()" @click="adoptPolish">采用为整篇正文</button>
     </template>
   </Modal>`,
 };
