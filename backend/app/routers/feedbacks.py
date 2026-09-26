@@ -10,6 +10,7 @@ import json
 import mimetypes
 import re
 from pathlib import Path
+from typing import Optional
 from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile
@@ -21,7 +22,7 @@ from .. import config
 from ..adapters import office
 from ..db import get_db
 from ..models import AbilityDim, AbilityScore, AiSetting, Feedback, FeedbackTemplate, Lesson, Student
-from ..schemas import AiSettingIn, DimIn, FeedbackIn, PolishIn, TemplateIn
+from ..schemas import AiSettingIn, AiTestIn, DimIn, FeedbackIn, PolishIn, TemplateIn
 from ..services import ai_polish, feedback_export, images
 
 router = APIRouter(prefix="/api", tags=["feedbacks"])
@@ -372,6 +373,12 @@ def export_feedback(
 
 
 # ---------------------------------------------------------------- AI 润色
+@router.get("/ai/providers")
+def get_ai_providers():
+    """服务商预设（地址 / 模型名 / 申请密钥的入口）。纯静态、无密钥。"""
+    return ai_polish.providers()
+
+
 @router.get("/ai/settings")
 def get_ai_settings(db: Session = Depends(get_db)):
     return ai_polish.masked(ai_polish.get_config(db))
@@ -384,9 +391,10 @@ def put_ai_settings(payload: AiSettingIn, db: Session = Depends(get_db)):
 
 
 @router.post("/ai/test")
-def test_ai(db: Session = Depends(get_db)):
+def test_ai(payload: Optional[AiTestIn] = None, db: Session = Depends(get_db)):
+    """测试连接。可以带上还没保存的表单值 —— 填完就能试，不必先保存。"""
     try:
-        return ai_polish.test_connection(db)
+        return ai_polish.test_connection(db, payload.model_dump() if payload else None)
     except ai_polish.AiError as e:
         raise HTTPException(502, str(e)) from e
 

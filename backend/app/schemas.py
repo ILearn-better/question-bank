@@ -230,6 +230,16 @@ class PolishIn(BaseModel):
     style: Optional[str] = None      # 可选的语气/风格要求，如「简洁」「多鼓励」
 
 
+class AiTestIn(BaseModel):
+    """测试连接。允许带上表单里**还没保存**的值 —— 否则刚填完点「测试连接」会
+    被告知「还没填全」，用户只能先去保存，很别扭。api_key 留空 = 沿用已保存的那把。"""
+
+    base_url: Optional[str] = None
+    model: Optional[str] = None
+    api_key: Optional[str] = None
+    timeout: Optional[int] = Field(default=None, ge=5, le=300)
+
+
 class DimIn(BaseModel):
     name: str
     curriculum_id: Optional[int] = None

@@ -1,7 +1,7 @@
 // 设置：体系 / 能力维度 / 系统与数据安全。
 // 「系统信息」这一块不是装饰 —— 它把 Phase 0 重构的三个验收项直接摆出来：
 // 迁移到哪个版本、WAL 有没有开、外键约束到底生效了没有。
-import { onMounted, reactive, ref } from 'vue';
+import { computed, onMounted, reactive, ref } from 'vue';
 import { abilityApi, aiApi, curriculumApi, systemApi } from '../api.js';
 import { fail, loadCurricula, loadDims, money, ok, todayISO } from '../store.js';
 
@@ -21,15 +21,74 @@ export default {
     const ai = ref(null);                 // 后端返回的是脱敏形态（只有 has_key / key_hint）
     const aiForm = reactive({ base_url: '', model: '', api_key: '', timeout: 60 });
     const aiTest = ref(null);
+    const providers = ref([]);            // 服务商预设（含申请密钥的链接）
+    const aiProvider = ref('');           // 当前选中的预设 id；'custom' = 自己填
+
+    /** 选中：真正生效的预设对象（'custom' 或空选时为 null）。 */
+    const curProvider = computed(
+      () => providers.value.find((p) => p.id === aiProvider.value) || null,
+    );
+
+    /** 按当前地址反推是哪个服务商 —— 刷新页面后下拉应该停在正确的选项上。 */
+    function detectProvider(baseUrl) {
+      const cur = (baseUrl || '').trim().replace(/\/+$/, '').toLowerCase();
+      if (!cur) return '';
+      const hit = providers.value.find((p) => {
+        if (!p.base_url) return false;
+        const b = p.base_url.replace(/\/+$/, '').toLowerCase();
+        return cur === b || cur.startsWith(b + '/') || b.startsWith(cur + '/');
+      });
+      return hit ? hit.id : 'custom';
+    }
+
+    /** 选服务商 = 把地址和模型填好。模型名始终可改（服务商上新会过时）。 */
+    function pickProvider() {
+      const p = curProvider.value;
+      if (!p) return;
+      if (p.base_url) aiForm.base_url = p.base_url;
+      if (p.model) aiForm.model = p.model;
+      aiTest.value = null;
+    }
+
+    /**
+     * 常见填错：把**控制台网页**当成 API 地址。
+     * platform.deepseek.com 是看用量/充值的地方，接口在 api.deepseek.com ——
+     * 这两个很像，填错了只会得到一句看不懂的报错，所以在这里直接点出来。
+     */
+    const URL_TRAPS = [
+      ['platform.deepseek.com', '这是 DeepSeek 的控制台网页（看用量、充值），不是接口地址。改成 https://api.deepseek.com'],
+      ['chat.deepseek.com', '这是 DeepSeek 的聊天网页，不是接口地址。改成 https://api.deepseek.com'],
+      ['bailian.console.aliyun.com', '这是阿里百炼的控制台，接口地址应填 https://dashscope.aliyuncs.com/compatible-mode/v1'],
+      ['platform.openai.com', '这是 OpenAI 的控制台，接口地址应填 https://api.openai.com/v1'],
+      ['platform.moonshot.cn', '这是 Kimi 的控制台，接口地址应填 https://api.moonshot.cn/v1'],
+      ['open.bigmodel.cn/usercenter', '这是智谱的控制台，接口地址应填 https://open.bigmodel.cn/api/paas/v4'],
+    ];
+    const aiUrlWarn = computed(() => {
+      const url = (aiForm.base_url || '').toLowerCase();
+      if (!url) return '';
+      const hit = URL_TRAPS.find(([frag]) => url.includes(frag));
+      return hit ? hit[1] : '';
+    });
+
+    /** 表单与已保存的不一致 —— 标签要如实说「未保存」，而不是笼统的「未配置」。 */
+    const aiDirty = computed(() => {
+      if (!ai.value) return false;
+      return (aiForm.base_url || '') !== (ai.value.base_url || '')
+        || (aiForm.model || '') !== (ai.value.model || '')
+        || Number(aiForm.timeout || 60) !== Number(ai.value.timeout || 60)
+        || !!aiForm.api_key;
+    });
 
     async function loadAi() {
       try {
-        const cfg = await aiApi.settings();
+        const [cfg, ps] = await Promise.all([aiApi.settings(), aiApi.providers()]);
         ai.value = cfg;
+        providers.value = ps;
         aiForm.base_url = cfg.base_url || '';
         aiForm.model = cfg.model || '';
         aiForm.timeout = cfg.timeout || 60;
         aiForm.api_key = '';            // 密钥永远不回填：接口根本不返回明文
+        aiProvider.value = detectProvider(cfg.base_url);
       } catch (e) {
         fail(e.message);
       }
@@ -66,8 +125,12 @@ export default {
       busy.value = 'ai-test';
       aiTest.value = null;
       try {
-        const r = await aiApi.test();
-        aiTest.value = { ok: true, msg: `连接正常，模型回复：「${r.reply}」` };
+        // 带上表单里的值（密钥留空 = 用已保存的）：填完就能先试，不必先保存
+        const r = await aiApi.test({
+          base_url: aiForm.base_url, model: aiForm.model,
+          api_key: aiForm.api_key || '', timeout: aiForm.timeout,
+        });
+        aiTest.value = { ok: true, msg: `连接正常，模型回复：「${r.reply}」（${r.model}）` };
       } catch (e) {
         aiTest.value = { ok: false, msg: e.message };
       } finally {
@@ -170,6 +233,7 @@ export default {
       info, backups, fk, curricula, dims, newCurr, newDim, busy,
       addCurriculum, addDim, disableDim, doBackup, runFkCheck, fmtSize, money, todayISO,
       ai, aiForm, aiTest, saveAi, clearAiKey, testAi,
+      providers, aiProvider, curProvider, pickProvider, aiUrlWarn, aiDirty,
     };
   },
   template: `
@@ -309,29 +373,61 @@ export default {
       <h2>AI 润色</h2>
       <div class="small muted" style="margin-bottom:10px">
         课后反馈里的「AI 润色」按钮用这里的配置。走的是 <strong>OpenAI 兼容</strong>接口，
-        DeepSeek / 通义 / Kimi / 智谱，以及本机跑的 Ollama、vLLM 都是这个格式，
-        所以只需要填地址和模型名。地址填到 <span class="mono">…/v1</span> 或直接填域名均可，会自动补齐。
+        DeepSeek / 通义 / Kimi / 智谱，以及本机跑的 Ollama、vLLM 都是这个格式。
+        下面选一个服务商就会把<strong>接口地址和模型名自动填好</strong>，填完都能改。
       </div>
       <div class="small" style="margin-bottom:10px;color:var(--warning, #d97706)">
         ⚠️ 点「AI 润色」时，反馈正文（通常含学生姓名）会发送到你配置的服务商。
         不配置就完全不会联网，功能照常用。
+        <strong v-if="aiProvider === 'ollama'">选本机 Ollama 的话，内容一步都不出本机。</strong>
+      </div>
+
+      <div class="field">
+        <label>服务商 <span class="muted small">（只是帮你填好地址和模型，选完仍可手改）</span></label>
+        <div class="row">
+          <select v-model="aiProvider" @change="pickProvider">
+            <option value="">—— 请选择，或直接在下面手填 ——</option>
+            <option v-for="p in providers" :key="p.id" :value="p.id">{{ p.name }}</option>
+            <option value="custom">自定义 / 其他（OpenAI 兼容）</option>
+          </select>
+          <a v-if="curProvider && curProvider.keys_url" :href="curProvider.keys_url"
+             target="_blank" rel="noopener" class="btn sm ghost" style="flex:none;text-decoration:none">
+            去申请密钥 ↗
+          </a>
+        </div>
+        <div v-if="curProvider && curProvider.note" class="small muted" style="margin-top:6px">
+          {{ curProvider.note }}
+        </div>
       </div>
 
       <div class="grid cols-2">
         <div class="field">
           <label>接口地址</label>
           <input type="text" v-model="aiForm.base_url" placeholder="如 https://api.deepseek.com">
+          <div v-if="aiUrlWarn" class="small" style="color:var(--danger);margin-top:6px">
+            ⚠️ {{ aiUrlWarn }}
+          </div>
+          <div v-else class="small muted" style="margin-top:6px">
+            填到域名或 <span class="mono">…/v1</span> 均可，会自动补齐。
+          </div>
         </div>
         <div class="field">
           <label>模型名</label>
-          <input type="text" v-model="aiForm.model" placeholder="如 deepseek-chat">
+          <input type="text" v-model="aiForm.model" list="ai-model-options" placeholder="如 deepseek-chat">
+          <datalist id="ai-model-options">
+            <option v-for="m in (curProvider ? curProvider.models : [])" :key="m" :value="m"></option>
+          </datalist>
+          <div class="small muted" style="margin-top:6px">
+            点输入框可看到该服务商的常见型号；服务商上新后若报「模型不存在」，改成最新的即可。
+          </div>
         </div>
         <div class="field">
           <label>
             API 密钥
             <span v-if="ai && ai.has_key" class="muted small">（已保存 {{ ai.key_hint }}；留空表示不改）</span>
           </label>
-          <input type="password" v-model="aiForm.api_key" :placeholder="ai && ai.has_key ? '留空 = 不修改' : 'sk-...'">
+          <input type="password" v-model="aiForm.api_key"
+                 :placeholder="(curProvider && curProvider.key_placeholder) || (ai && ai.has_key ? '留空 = 不修改' : 'sk-...')">
         </div>
         <div class="field">
           <label>超时（秒）</label>
@@ -352,11 +448,16 @@ export default {
           {{ busy === 'ai-test' ? '测试中…' : '测试连接' }}
         </button>
         <button v-if="ai && ai.has_key" class="btn ghost" style="color:var(--danger)" @click="clearAiKey">清除密钥</button>
-        <span v-if="ai && ai.configured" class="tag green" style="align-self:center">已配置</span>
+        <span v-if="aiDirty" class="tag" style="align-self:center;color:var(--warning, #d97706)">有改动未保存</span>
+        <span v-else-if="ai && ai.configured" class="tag green" style="align-self:center">已配置</span>
         <span v-else class="tag" style="align-self:center">未配置</span>
+      </div>
+      <div class="small muted" style="margin-top:8px">
+        「测试连接」用的是上面输入框里当前的値，所以<strong>不必先保存也能测</strong>。
       </div>
       <div v-if="aiTest" class="small" :style="aiTest.ok ? 'color:var(--success);margin-top:10px' : 'color:var(--danger);margin-top:10px'">
         {{ aiTest.msg }}
+        <span v-if="aiTest.ok && aiDirty"> —— 还不错，记得点「保存配置」让它生效。</span>
       </div>
     </div>
 

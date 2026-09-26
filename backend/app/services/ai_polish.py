@@ -48,6 +48,94 @@ SYSTEM_PROMPT = (
 )
 
 
+# ---------------------------------------------------------------- 服务商预设
+# 「地址填哪个、模型叫什么」是接第三方接口最容易错的地方。两个真实踩法：
+#   · 把**控制台网址**当 API 地址填（platform.deepseek.com 是看用量/充值的页面，
+#     不是接口地址）—— 结果是连不上或 404；
+#   · 模型名记成别的产品 —— 结果是 model not found。
+# 所以这里把常见服务商的默认值备好，选一下自动填上。
+#
+# ⚠️ 预设只是「起点」：模型名会随服务商上新而过时，输入框始终可改。
+#    真填错了会收到一条明确的报错，改掉即可，不影响其他功能。
+PROVIDERS = [
+    {
+        "id": "deepseek",
+        "name": "DeepSeek（便宜、中文好）",
+        "base_url": "https://api.deepseek.com",
+        "model": "deepseek-chat",
+        "models": ["deepseek-chat", "deepseek-reasoner"],
+        "note": "润色这种活 deepseek-chat 就够，价格便宜。deepseek-reasoner 更贵、"
+                "擅长推理题，润色用不上。地址填 https://api.deepseek.com 即可，"
+                "别填 platform.deepseek.com（那是控制台网页，不是接口）。",
+        "keys_url": "https://platform.deepseek.com/api_keys",
+    },
+    {
+        "id": "ollama",
+        "name": "本机 Ollama（完全离线，隐私最好）",
+        "base_url": "http://127.0.0.1:11434/v1",
+        "model": "qwen2.5:7b",
+        "models": ["qwen2.5:7b", "qwen2.5:3b", "llama3.1:8b"],
+        "note": "内容一步都不出本机，最符合「数据存本机」的定位，也免费。"
+                "前提是本机已装好 Ollama 并拉取了模型（如 ollama pull qwen2.5:7b）。"
+                "Ollama 不校验密钥，API 密钥随便填几个字符即可（但不能不填）。"
+                "本机 6GB 显存跑 7B 模型偏紧，慢但能用。",
+        "keys_url": "",
+        "key_placeholder": "ollama（随便填，不校验）",
+    },
+    {
+        "id": "dashscope",
+        "name": "阿里百炼 · 通义千问",
+        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        "model": "qwen-plus",
+        "models": ["qwen-plus", "qwen-turbo", "qwen-max"],
+        "note": "必须用兼容模式这个地址（结尾 /compatible-mode/v1），"
+                "不是阿里云控制台的地址。qwen-turbo 最便宜。",
+        "keys_url": "https://bailian.console.aliyun.com/",
+    },
+    {
+        "id": "moonshot",
+        "name": "月之暗面 · Kimi",
+        "base_url": "https://api.moonshot.cn/v1",
+        "model": "moonshot-v1-8k",
+        "models": ["moonshot-v1-8k", "moonshot-v1-32k"],
+        "note": "长文本是它的强项；润色这么短的文本用 8k 版本就够。",
+        "keys_url": "https://platform.moonshot.cn/console/api-keys",
+    },
+    {
+        "id": "zhipu",
+        "name": "智谱 · GLM",
+        "base_url": "https://open.bigmodel.cn/api/paas/v4",
+        "model": "glm-4-flash",
+        "models": ["glm-4-flash", "glm-4-air", "glm-4-plus"],
+        "note": "glm-4-flash 通常是最便宜的档位，适合润色这种轻任务。",
+        "keys_url": "https://open.bigmodel.cn/usercenter/apikeys",
+    },
+    {
+        "id": "siliconflow",
+        "name": "硅基流动（聚合多家模型）",
+        "base_url": "https://api.siliconflow.cn/v1",
+        "model": "Qwen/Qwen2.5-7B-Instruct",
+        "models": ["Qwen/Qwen2.5-7B-Instruct", "deepseek-ai/DeepSeek-V3"],
+        "note": "一个号能切很多开源模型，有免费额度的型号。模型名要带厂商前缀。",
+        "keys_url": "https://cloud.siliconflow.cn/account/ak",
+    },
+    {
+        "id": "openai",
+        "name": "OpenAI（需自行解决网络）",
+        "base_url": "https://api.openai.com/v1",
+        "model": "gpt-4o-mini",
+        "models": ["gpt-4o-mini", "gpt-4o"],
+        "note": "国内直连通常不通，除非本机网络已能访问。",
+        "keys_url": "https://platform.openai.com/api-keys",
+    },
+]
+
+
+def providers() -> list[dict]:
+    """给设置页的服务商预设。纯静态，**不含任何密钥**，可以放心返回。"""
+    return PROVIDERS
+
+
 class AiError(RuntimeError):
     """AI 调用失败（配置缺失、网络、协议、返回格式等）。消息可直接给用户看。"""
 
@@ -267,10 +355,19 @@ def polish(db: Session, fields: dict, context: dict, style: str | None = None) -
     }
 
 
-def test_connection(db: Session) -> dict:
-    """设置页的「测试连接」：发一句最短的请求，确认地址/密钥/模型都对。"""
+def test_connection(db: Session, override: dict | None = None) -> dict:
+    """设置页的「测试连接」：发一句最短的请求，确认地址/密钥/模型都对。
+
+    override 是**表单里还没保存**的值。用户填完就想先试一下是自然的，
+    不该强迫他「先保存才能测」—— 那样他会看到「还没填全」而莫名其妙（真实反馈）。
+    api_key 留空则沿用已保存的那把（界面从不回填明文，所以空≠没填）。
+    """
     cfg = get_config(db)
-    if not cfg["configured"]:
+    for key in ("base_url", "model", "api_key", "timeout"):
+        val = (override or {}).get(key)
+        if val not in (None, ""):
+            cfg[key] = int(val) if key == "timeout" else str(val).strip()
+    if not (cfg["base_url"] and cfg["model"] and cfg["api_key"]):
         raise AiError("地址 / 模型 / 密钥还没填全，先填完再测试")
     data = _post_json(
         _chat_url(cfg["base_url"]),

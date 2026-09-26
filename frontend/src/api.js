@@ -128,9 +128,12 @@ export const feedbackApi = {
 
 /** AI 润色的接口配置（地址 / 模型 / 密钥）。密钥只存本机，接口一律脱敏返回。 */
 export const aiApi = {
+  /** 服务商预设（DeepSeek / 通义 / Kimi / 本机 Ollama …），选中后自动填好地址与模型。 */
+  providers: () => api.get('/api/ai/providers'),
   settings: () => api.get('/api/ai/settings'),
   save: (body) => api.put('/api/ai/settings', body),
-  test: () => api.post('/api/ai/test'),
+  /** 测试连接。带上表单里的值，这样**没保存也能先试**。 */
+  test: (body) => api.post('/api/ai/test', body || {}),
 };
 
 export const curriculumApi = {
