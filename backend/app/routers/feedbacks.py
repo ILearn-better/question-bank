@@ -9,11 +9,9 @@ from __future__ import annotations
 import json
 import mimetypes
 import re
-import urllib.error
-import urllib.request
 from pathlib import Path
 from typing import Optional
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile
 from fastapi.responses import FileResponse
@@ -40,7 +38,6 @@ from ..schemas import (
     DimIn,
     DocTemplateIn,
     FeedbackIn,
-    ImageFromUrlIn,
     PolishIn,
     TemplateIn,
 )
@@ -48,9 +45,6 @@ from ..services import ai_polish, feedback_export, images, storage
 from . import lesson_files
 
 router = APIRouter(prefix="/api", tags=["feedbacks"])
-
-# 服务端去取图时要挡掉的主机名（内网 / 本机没有正当理由）
-_BLOCKED_HOSTS = {"localhost", "localhost.localdomain", "[::1]", "::1"}
 
 # 反馈配图的 URL 形如
 # /api/feedbacks/files/students/u1_李芹旭/2026-09-26/fb_ab12cd34ef56.png
@@ -433,64 +427,12 @@ async def upload_feedback_image(file: UploadFile = File(...), lesson_id: int = Q
     return {"url": f"/api/feedbacks/files/{rel}", "path": rel, **saved}
 
 
-def _fetch_image_bytes(url: str, limit: int) -> bytes:
-    """把链接上的图片取回来。**这是本服务唯一主动访问外网的地方**，所以：
-
-      · 只允许 http / https
-      · 挡掉本机与内网地址（服务端去访问 localhost 没有正当理由）
-      · 限大小、限时间
-    拿回来的字节仍要按魔数校验（调用方做），不是图片一律拒。
-    """
-    parts = urlsplit(url)
-    if parts.scheme not in ("http", "https"):
-        raise HTTPException(422, f"只支持 http / https 链接（收到的是 {parts.scheme or '空'}）")
-    host = (parts.hostname or "").lower()
-    if (host in _BLOCKED_HOSTS or host.startswith("127.") or host.startswith("192.168.")
-            or host.startswith("10.") or host.startswith("169.254.")
-            or host.endswith(".local") or host == "0.0.0.0"):
-        raise HTTPException(422, "不下载本机 / 内网地址上的图片")
-
-    req = urllib.request.Request(url, headers={
-        "User-Agent": "shike/1.0 (+local)",
-        "Accept": "image/*",
-    })
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = resp.read(limit + 1)
-    except urllib.error.HTTPError as e:
-        raise HTTPException(502, f"取这张图失败：服务器返回 {e.code}") from e
-    except urllib.error.URLError as e:
-        raise HTTPException(502, f"取这张图失败：{e.reason}（检查一下网络或链接是否有效）") from e
-    except Exception as e:  # noqa: BLE001
-        raise HTTPException(502, f"取这张图失败：{type(e).__name__}: {e}") from e
-    if len(data) > limit:
-        raise HTTPException(422, f"这张图超过 {limit // 1024 // 1024}MB，先用工具压缩一下再试")
-    return data
-
-
-@router.post("/feedbacks/image-from-url")
-async def upload_feedback_image_from_url(payload: ImageFromUrlIn, db: Session = Depends(get_db)):
-    """把剪贴板里只有**链接**的图片取回来存下。
-
-    为什么需要它：从网页复制一张图时，剪贴板里往往只有一个 <img src="https://…">，
-    没有图片数据 —— 浏览器里拿不到（跨域、file:// 都不行），只能由服务端去取。
-    界面会先明确问一句再调这里（这是本服务唯一主动访问外网的地方）。
-    """
-    ls = _lesson_or_404(db, payload.lesson_id)
-    stu = db.get(Student, ls.student_id)
-    if stu is None:
-        raise HTTPException(404, "这节课的学生不存在")
-
-    url = (payload.url or "").strip()
-    data = _fetch_image_bytes(url, images.MAX_IMAGE_BYTES)
-
-    stem = f"{storage.safe_token(stu.name, 'u%d' % stu.id)}_{storage.lesson_date(ls)}"
-    try:
-        saved = images.save_image(data, storage.dir_for(stu, ls), prefix="fb", stem=stem)
-    except images.ImageRejected as e:
-        raise HTTPException(422, f"这个链接指向的不是图片：{e}") from e
-    rel = storage.rel(storage.dir_for(stu, ls) / saved["name"])
-    return {"url": f"/api/feedbacks/files/{rel}", "path": rel, "source_url": url, **saved}
+# 这里曾经有一个 _fetch_image_bytes() + POST /feedbacks/image-from-url：让服务端顺着
+# 剪贴板里的图片链接去把图下载回来（从网页复制图片时，剪贴板里往往只有一个 <img src="https://…">）。
+# **已删除**，理由：那是本服务唯一会主动访问外网的地方，而本项目的承诺是「数据存在本机、
+# 页面零外网请求」。为一种小概率用法去撬动整体定位不划算 —— 何况「贴缓存图」真正要的
+# （截图、从微信复制的图）本来就不需要联网。要存网页上的图，右键另存到本地再 Ctrl+V 即可，
+# 行为一样而且看得见。
 
 
 @router.get("/feedbacks/files/{rel_path:path}")

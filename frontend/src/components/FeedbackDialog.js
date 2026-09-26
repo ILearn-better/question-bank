@@ -324,20 +324,12 @@ export default {
       }
     }
 
-    /** 让服务端去把链接上的图取回来（本服务唯一会主动访问外网的地方，所以先问一句）。 */
-    async function uploadFromUrl(url) {
-      if (!window.confirm(`剪贴板里只有图片的**链接**，没有图片本身：\n${url}\n\n` +
-                          '要从这个地址把图下载下来存进这份资料吗？')) return;
-      uploading.value = true;
-      try {
-        const r = await feedbackApi.uploadImageFromUrl(props.lesson.id, url);
-        images.value = [...images.value, r.url];
-        ok('已把链接上的图存进来');
-      } catch (e) {
-        fail(e.message);
-      } finally {
-        uploading.value = false;
-      }
+    /** 剪贴板里只有链接的情况：本服务不联网，只能请用户先把图落到本地。
+     *  提示条是按纯文本渲染的，别在这里写 Markdown 的 ** 或反引号（会露出星号）。 */
+    function needLocalCopy(url) {
+      const shown = url && url.length > 48 ? url.slice(0, 48) + '…' : url;
+      warn('剪贴板里只有图片的链接，没有图片本身' + (shown ? `（${shown}）` : '') +
+           '。请先右键「图片另存为」，或者干脆截个图，再按 Ctrl+V 贴进来。');
     }
 
     /**
@@ -400,7 +392,7 @@ export default {
       e.preventDefault();
       if (found.kind === 'file') return uploadImage(found.file);
       if (found.kind === 'data') return uploadDataUrl(found.dataUrl);
-      if (found.kind === 'url') return uploadFromUrl(found.url);
+      if (found.kind === 'url') return needLocalCopy(found.url);
       if (found.kind === 'otherfile') {
         return warn(`剪贴板里是个文件（${found.name}），这里只能贴图片。` +
                     '上课资料请用下面的「上课文件」上传。');
