@@ -16,6 +16,9 @@ from ..models import (
     AbilityScore,
     Curriculum,
     Feedback,
+    Homework,
+    HomeworkDim,
+    HomeworkScore,
     Lesson,
     Student,
     StudentCurriculum,
@@ -237,6 +240,30 @@ def student_timeline(sid: int, limit: int = 100, db: Session = Depends(get_db)):
             {"dim_id": sc.dim_id, "name": dim_names.get(sc.dim_id, f"#{sc.dim_id}"), "score": sc.score}
         )
 
+    # 作业：与反馈并列的一条线，**互不依赖**（可能只有作业没有反馈，反之亦然）。
+    # 维度名走 homework_dims —— 与课堂那套是两份，别拿上面那张表。
+    hw_rows = {
+        h.lesson_id: h
+        for h in db.scalars(select(Homework).where(Homework.lesson_id.in_(lesson_ids))).all()
+    }
+    hw_dim_names = {
+        d.id: d.name
+        for d in db.scalars(
+            select(HomeworkDim).where(HomeworkDim.owner_id == config.OWNER_ID)
+        ).all()
+    }
+    hw_scores: dict[int, list[dict]] = {}
+    if hw_rows:
+        for sc in db.scalars(
+            select(HomeworkScore).where(
+                HomeworkScore.homework_id.in_([h.id for h in hw_rows.values()])
+            )
+        ).all():
+            hw_scores.setdefault(sc.homework_id, []).append(
+                {"dim_id": sc.dim_id, "name": hw_dim_names.get(sc.dim_id, f"#{sc.dim_id}"),
+                 "score": sc.score}
+            )
+
     out = []
     for ls in lessons:
         fb = feedbacks.get(ls.id)
@@ -273,6 +300,17 @@ def student_timeline(sid: int, limit: int = 100, db: Session = Depends(get_db)):
                     "created_at": fb.created_at,
                 },
                 "ability": scores_by_lesson.get(ls.id, []),
+                "homework": None
+                if hw_rows.get(ls.id) is None
+                else {
+                    "id": hw_rows[ls.id].id,
+                    "status": hw_rows[ls.id].status,
+                    "status_label": {
+                        "submitted": "已交", "late": "迟交", "missing": "未交"
+                    }.get(hw_rows[ls.id].status, hw_rows[ls.id].status),
+                    "note": hw_rows[ls.id].note or "",
+                    "scores": hw_scores.get(hw_rows[ls.id].id, []),
+                },
             }
         )
     return out

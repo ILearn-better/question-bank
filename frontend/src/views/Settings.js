@@ -2,7 +2,7 @@
 // 「系统信息」这一块不是装饰 —— 它把 Phase 0 重构的三个验收项直接摆出来：
 // 迁移到哪个版本、WAL 有没有开、外键约束到底生效了没有。
 import { computed, onMounted, reactive, ref } from 'vue';
-import { abilityApi, aiApi, curriculumApi, systemApi } from '../api.js';
+import { abilityApi, aiApi, curriculumApi, homeworkApi, systemApi } from '../api.js';
 import { fail, loadCurricula, loadDims, money, ok, todayISO } from '../store.js';
 
 export default {
@@ -13,6 +13,11 @@ export default {
     const fk = ref(null);
     const curricula = ref([]);
     const dims = ref([]);
+    // 作业维度是**另一套**（用户明确的「分开」）：课堂评「这节课表现如何」，
+    // 作业评「他自己独立做题的质量如何」。共用一套会让两张雷达图重复，
+    // 也说不清变化到底来自哪边。
+    const hwDims = ref([]);
+    const newHwDim = reactive({ name: '', sort_order: 0 });
     const newCurr = reactive({ code: '', name: '', region: 'CN', stage: 'senior' });
     const newDim = reactive({ name: '', sort_order: 0 });
     const busy = ref('');
@@ -140,13 +145,15 @@ export default {
 
     async function load() {
       try {
-        const [i, b, c, d] = await Promise.all([
+        const [i, b, c, d, hd] = await Promise.all([
           systemApi.info(), systemApi.backups(), curriculumApi.list(), abilityApi.dims(),
+          homeworkApi.dims(),
         ]);
         info.value = i;
         backups.value = b;
         curricula.value = c;
         dims.value = d;
+        hwDims.value = hd;
         await loadCurricula(true);
         await loadDims(true);
       } catch (e) {
@@ -195,6 +202,32 @@ export default {
       }
     }
 
+    async function addHwDim() {
+      if (!newHwDim.name.trim()) {
+        fail('维度名称不能为空');
+        return;
+      }
+      try {
+        await homeworkApi.createDim({ name: newHwDim.name, sort_order: hwDims.value.length + 1 });
+        newHwDim.name = '';
+        ok('作业维度已添加');
+        await load();
+      } catch (e) {
+        fail(e.message);
+      }
+    }
+
+    async function disableHwDim(d) {
+      if (!confirm(`停用作业维度「${d.name}」？历史作业评分会保留，只是不再出现在打分界面。`)) return;
+      try {
+        await homeworkApi.disableDim(d.id);
+        ok('已停用');
+        await load();
+      } catch (e) {
+        fail(e.message);
+      }
+    }
+
     async function doBackup() {
       busy.value = 'backup';
       try {
@@ -231,6 +264,7 @@ export default {
 
     return {
       info, backups, fk, curricula, dims, newCurr, newDim, busy,
+      hwDims, newHwDim, addHwDim, disableHwDim,
       addCurriculum, addDim, disableDim, doBackup, runFkCheck, fmtSize, money, todayISO,
       ai, aiForm, aiTest, saveAi, clearAiKey, testAi,
       providers, aiProvider, curProvider, pickProvider, aiUrlWarn, aiDirty,
@@ -366,6 +400,31 @@ export default {
           <input type="text" v-model="newDim.name" placeholder="新维度名称">
           <button class="btn" style="flex:none" @click="addDim">添加</button>
         </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>作业维度</h2>
+      <div class="small muted" style="margin-bottom:10px">
+        「交作业」那块打分用的维度，与上面的能力维度<strong>刻意分开两套</strong>：
+        课堂评的是「这节课他表现如何」，作业评的是「他自己独立做题的质量如何」，
+        评价角度不同。共用一套的话，学生页那两张雷达图会重复，也说不清变化来自哪一边。
+      </div>
+      <table class="tbl">
+        <thead><tr><th>#</th><th>维度</th><th></th></tr></thead>
+        <tbody>
+          <tr v-for="(d, i) in hwDims" :key="d.id">
+            <td class="muted small">{{ i + 1 }}</td>
+            <td>{{ d.name }}</td>
+            <td style="text-align:right">
+              <button class="btn ghost sm" style="color:var(--danger)" @click="disableHwDim(d)">停用</button>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+      <div class="row" style="margin-top:12px">
+        <input type="text" v-model="newHwDim.name" placeholder="新作业维度名称">
+        <button class="btn" style="flex:none" @click="addHwDim">添加</button>
       </div>
     </div>
 

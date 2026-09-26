@@ -286,3 +286,24 @@ class DimIn(BaseModel):
     name: str
     curriculum_id: Optional[int] = None
     sort_order: int = 0
+
+
+# ============================================================ 作业
+class HomeworkScoreIn(BaseModel):
+    dim_id: int
+    score: int = Field(ge=1, le=5)
+
+
+class HomeworkIn(BaseModel):
+    """作业记录（一节课一条）。
+
+    status   submitted（已交）/ late（迟交）/ missing（未交）
+             「没布置 / 不用记」= 直接删掉这条记录，而不是存一个空状态。
+    scores   与 FeedbackIn.ability_scores 同样的语义：**带了这个字段就整组替换**
+             （传空列表 = 清除全部打分），不传才原样保留。
+             未交（missing）时允许只记状态、不打分。
+    """
+
+    status: str = "submitted"
+    note: Optional[str] = None
+    scores: List[HomeworkScoreIn] = Field(default_factory=list)

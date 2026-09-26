@@ -700,7 +700,12 @@ def polish_feedback(lid: int, payload: PolishIn, db: Session = Depends(get_db)):
     # 老师必须知道 AI 到底看到了哪些材料（没抽出来的那些更是要显眼地说）。
     materials, mat_meta = "", {"files": [], "chars": 0, "dropped": []}
     if payload.use_files:
-        stmt = select(LessonFile).where(LessonFile.lesson_id == lid)
+        # 只要**上课材料**（role='material'）。学生作业原件（role='homework'）刻意不进这里：
+        # 提示词第 7 条要求材料只能用来核实「讲了什么」，不得据以推断学生表现；
+        # 而作业照片正是最容易被模型拿去做评价的东西 —— 不打分是老师的事。
+        stmt = select(LessonFile).where(
+            LessonFile.lesson_id == lid, LessonFile.role == "material"
+        )
         if payload.file_ids:
             stmt = stmt.where(LessonFile.id.in_(payload.file_ids))
         rows = list(db.scalars(stmt.order_by(LessonFile.id)).all())

@@ -146,8 +146,11 @@ export const feedbackApi = {
 /** 上课文件（讲义 / 课件 / 试卷）：上传后由后端在本机抽文字，供 AI 润色当参考资料。
  *  ⚠️ 接的是纯文本接口，模型不收文件本身 —— 所以发出去的是**抽出来的文字**。 */
 export const lessonFilesApi = {
-  list: (lessonId) => api.get(`/api/lessons/${lessonId}/files`),
-  upload: (lessonId, formData) => api.upload(`/api/lessons/${lessonId}/files`, formData),
+  /** role: material（上课材料）/ homework（学生作业原件）—— 两份清单互相看不见。 */
+  list: (lessonId, role = 'material') =>
+    api.get(`/api/lessons/${lessonId}/files`, { role }),
+  upload: (lessonId, formData, role = 'material') =>
+    api.upload(`/api/lessons/${lessonId}/files` + qs({ role }), formData),
   remove: (id) => api.del(`/api/lesson-files/${id}`),
   rawUrl: (id) => `/api/lesson-files/${id}/raw`,
   /** 某个学生的全部资料（按上课日期分组）+ 磁盘归档路径。做学生情况分析时用它。 */
@@ -203,6 +206,21 @@ export const abilityApi = {
   createDim: (body) => api.post('/api/ability-dims', body),
   updateDim: (id, body) => api.patch(`/api/ability-dims/${id}`, body),
   disableDim: (id) => api.del(`/api/ability-dims/${id}`),
+};
+
+/** 学生作业：交没交 / 原件 / 老师按几个维度打分。
+ *  维度是**另一套**（homework-dims），与课堂的 ability-dims 分开 —— 两边永远不混。 */
+export const homeworkApi = {
+  get: (lessonId) => api.get(`/api/lessons/${lessonId}/homework`),
+  save: (lessonId, body) => api.put(`/api/lessons/${lessonId}/homework`, body),
+  /** 「这节没布置作业 / 不用记」= 整条撤掉（不是存一个空状态）。 */
+  remove: (lessonId) => api.del(`/api/lessons/${lessonId}/homework`),
+  /** 作业雷达：最新一次 vs 上一次，外加交/迟交/未交的条数。 */
+  radar: (studentId) => api.get(`/api/students/${studentId}/homework-radar`),
+  dims: () => api.get('/api/homework-dims'),
+  createDim: (body) => api.post('/api/homework-dims', body),
+  updateDim: (id, body) => api.patch(`/api/homework-dims/${id}`, body),
+  disableDim: (id) => api.del(`/api/homework-dims/${id}`),
 };
 
 export const systemApi = {

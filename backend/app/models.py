@@ -353,6 +353,90 @@ class Feedback(Base):
     )
 
 
+class HomeworkDim(Base):
+    """作业维度（与课堂的 ability_dims **分开**，用户明确要求的那一条）。
+
+    为什么两套而不是共用一套：课堂评「这节课他表现如何」，作业评「他自己独立做题的
+    质量如何」—— 前者看当场反应，后者看自主完成度，评价角度不同。共用的话两张雷达图
+    会重复，也说不清变化到底来自哪边。
+
+    默认 5 条：完成度 / 正确率 / 过程与规范 / 独立完成 / 订正与复盘（在 0013 迁移里种下）。
+    跟 ability_dims 一样是老师可改可停用的 —— 教不同科目换一套维度即可。
+    """
+
+    __tablename__ = "homework_dims"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    owner_id: Mapped[int] = mapped_column(Integer, nullable=False, default=OWNER_ID, server_default=str(OWNER_ID))
+    name: Mapped[str] = mapped_column(String, nullable=False)
+    curriculum_id: Mapped[int | None] = mapped_column(ForeignKey("curricula.id"))
+    sort_order: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    active: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+
+
+class Homework(Base):
+    """一次作业的记录（一节课一条）。
+
+    为什么独立于 feedbacks：老师完全可能只记「作业没交」而先不写反馈，也可能先收了
+    作业照片、隔天再写反馈、再打分 —— 挂在反馈上会把两件事互相绑死。
+    粒度仍是一节一条（lesson_id 唯一）：跟反馈一致，老师的心智模型就是「这次课的作业」。
+
+    状态只有三种，而**「没布置 / 不用记」= 没有这一行**，不存一个空状态 ——
+    省掉「空状态算不算分母」这种没人想得清的问题。
+    missing（未交）也只记状态、**不打分**：用 0 分记会把平均值和雷达图一起带偏，
+    看起来像退步，而事实可能只是那天没写。
+
+    作业原件不在这里：复用 lesson_files（role='homework'）那套上传/抽文字/归档/清理。
+    """
+
+    __tablename__ = "homeworks"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    owner_id: Mapped[int] = mapped_column(Integer, nullable=False, default=OWNER_ID, server_default=str(OWNER_ID))
+    student_id: Mapped[int] = mapped_column(
+        ForeignKey("students.id", ondelete="CASCADE"), nullable=False
+    )
+    lesson_id: Mapped[int] = mapped_column(
+        ForeignKey("lessons.id", ondelete="CASCADE"), nullable=False
+    )
+    status: Mapped[str] = mapped_column(String, nullable=False, default="submitted", server_default="submitted")
+    note: Mapped[str] = mapped_column(Text, default="", server_default="")   # 老师的批改备注
+    created_at: Mapped[str] = mapped_column(Text, default=_now, server_default=NOW)
+    updated_at: Mapped[str] = mapped_column(Text, default=_now, server_default=NOW)
+
+    __table_args__ = (
+        UniqueConstraint("lesson_id", name="uq_homeworks_lesson"),
+        Index("idx_homeworks_student", "student_id", "id"),
+    )
+
+
+class HomeworkScore(Base):
+    """作业评分（1-5，老师主观打分）。
+
+    构造与 AbilityScore 完全对齐（student × dim × 1-5），所以雷达图、「本次 vs 上次」、
+    趋势的代码可以照拄 —— 但同时它是**另一张表**，两边不可能混在一起。
+    只存真正打过的分：没打分的维度就是没有行，不要存 0。
+    """
+
+    __tablename__ = "homework_scores"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    owner_id: Mapped[int] = mapped_column(Integer, nullable=False, default=OWNER_ID, server_default=str(OWNER_ID))
+    homework_id: Mapped[int] = mapped_column(
+        ForeignKey("homeworks.id", ondelete="CASCADE"), nullable=False
+    )
+    student_id: Mapped[int] = mapped_column(
+        ForeignKey("students.id", ondelete="CASCADE"), nullable=False
+    )
+    dim_id: Mapped[int] = mapped_column(ForeignKey("homework_dims.id"), nullable=False)
+    score: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[str] = mapped_column(Text, default=_now, server_default=NOW)
+
+    dim: Mapped["HomeworkDim"] = relationship()
+
+    __table_args__ = (Index("idx_hwscore_student", "student_id", "dim_id"),)
+
+
 class LessonFile(Base):
     """上课文件（讲义 / 课件 / 试卷），AI 润色时当参考资料用。
 
@@ -375,6 +459,12 @@ class LessonFile(Base):
     )
     name: Mapped[str] = mapped_column(String, nullable=False)      # 原始文件名（给用户看的）
     stored: Mapped[str] = mapped_column(String, default="", server_default="")   # 磁盘上的名字
+    # material（上课材料：讲义/课件/试卷）/ homework（学生作业原件）
+    # 作业原件走同一套上传/抽文字/归档/清理，只是角色不同；默认 material，老数据语义不变。
+    # **两份清单必须互相看不见**：写反馈时看到的「上课文件」只列 material；
+    # 作业那里只列 homework。否则老师会在反馈的文件列表里看到学生的作业照片，
+    # 而 AI 润色也不该把作业当「参考资料」读进去（见 feedbacks 里取 materials 的地方）。
+    role: Mapped[str] = mapped_column(String, nullable=False, default="material", server_default="material")
     kind: Mapped[str] = mapped_column(String, default="", server_default="")
     size_bytes: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     pages: Mapped[int | None] = mapped_column(Integer)

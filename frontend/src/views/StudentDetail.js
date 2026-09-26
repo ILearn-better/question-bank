@@ -2,14 +2,18 @@
 // 设计目标：打开这个人的页面，从上到下就能看完他发生了什么，不用在多个页面之间跳。
 import { computed, onMounted, ref } from 'vue';
 import { useRoute } from 'vue-router';
-import { studentsApi } from '../api.js';
+import { studentsApi, homeworkApi } from '../api.js';
 import AbilityRadar from '../components/AbilityRadar.js';
 import FeedbackDialog from '../components/FeedbackDialog.js';
+import HomeworkDialog from '../components/HomeworkDialog.js';
 import { fail, fmtBytes, hhmm, loadCurricula, money, ok, shortDate, STATUS_LABEL, STATUS_TAG } from '../store.js';
+
+/** 作业状态 -> 标签颜色。未交看红：家长沟通里这是必须提的事。 */
+const HW_TAG = { submitted: 'green', late: 'orange', missing: 'red' };
 
 export default {
   name: 'StudentDetail',
-  components: { AbilityRadar, FeedbackDialog },
+  components: { AbilityRadar, FeedbackDialog, HomeworkDialog },
   setup() {
     const route = useRoute();
     const id = Number(route.params.id);
@@ -20,6 +24,9 @@ export default {
     // 归档文件夹：老师经常要直接翻（找讲义、看孩子这段时间留下了什么）
     const folder = ref(null);
     const openingFolder = ref(false);
+    // 作业：雷达图 + 每节课的作业记录（跟反馈并列，互不依赖）
+    const hwRadar = ref(null);
+    const homeworkLesson = ref(null);
 
     async function load() {
       loading.value = true;
@@ -27,6 +34,7 @@ export default {
         stu.value = await studentsApi.get(id);
         timeline.value = await studentsApi.timeline(id);
         folder.value = await studentsApi.folder(id);
+        hwRadar.value = await homeworkApi.radar(id);
       } catch (e) {
         fail(e.message);
       } finally {
@@ -69,6 +77,22 @@ export default {
       await load();
     }
 
+    /** 「交作业」：跟反馈并列的入口，同一节课、同一个位置。 */
+    function openHomework(item) {
+      homeworkLesson.value = {
+        id: item.lesson.id,
+        student_id: id,
+        student_name: stu.value.name,
+        start_at: item.lesson.start_at,
+        topic: item.lesson.topic,
+      };
+    }
+
+    async function onHomeworkSaved() {
+      homeworkLesson.value = null;
+      await load();
+    }
+
     onMounted(async () => {
       await loadCurricula();
       await load();
@@ -78,6 +102,7 @@ export default {
       stu, timeline, loading, feedbackLesson, pendingCount, abilityDims, hasAbility,
       openFeedback, onSaved, load, hhmm, money, shortDate, STATUS_LABEL, STATUS_TAG,
       folder, openingFolder, openFolder, fmtBytes,
+      hwRadar, homeworkLesson, openHomework, onHomeworkSaved, HW_TAG,
     };
   },
   template: `
@@ -161,6 +186,51 @@ export default {
         </div>
       </div>
 
+      <!-- 作业：与上面那张课堂雷达是**两张图、两套维度**（用户明确要求分开）——
+           硬画进同一张只会让人误读，也说不清变化来自哪一边。 -->
+      <div class="card">
+        <h2>
+          作业情况
+          <span v-if="hwRadar && hwRadar.total" class="small muted" style="font-weight:400">
+            （共 {{ hwRadar.total }} 次：已交 {{ hwRadar.status_counts.submitted }} ·
+             迟交 {{ hwRadar.status_counts.late }} · 未交 {{ hwRadar.status_counts.missing }}）
+          </span>
+        </h2>
+        <div v-if="!hwRadar || !hwRadar.total" class="empty">
+          还没有作业记录
+          <div class="small" style="margin-top:6px">在上课记录里点「交作业」，记一次作业交没交、顺手打几个分</div>
+        </div>
+        <div v-else>
+          <div class="grid cols-2">
+            <div>
+              <AbilityRadar v-if="hwRadar.has_data" :dims="hwRadar.dims" :size="300" />
+              <div v-else class="empty">
+                还没有作业评分
+                <div class="small" style="margin-top:6px">
+                  只记了交没交也算记录；想看到雷达图，在作业上点几个维度即可
+                </div>
+              </div>
+            </div>
+            <table v-if="hwRadar.has_data" class="tbl">
+              <thead><tr><th>维度</th><th>本次</th><th>上次</th><th>变化</th><th>次数</th></tr></thead>
+              <tbody>
+                <tr v-for="d in hwRadar.dims" :key="d.dim_id">
+                  <td>{{ d.name }}</td>
+                  <td>{{ d.latest ?? '—' }}</td>
+                  <td class="muted">{{ d.previous ?? '—' }}</td>
+                  <td>
+                    <span v-if="d.latest && d.previous && d.latest > d.previous" style="color:var(--success)">↑ {{ d.latest - d.previous }}</span>
+                    <span v-else-if="d.latest && d.previous && d.latest < d.previous" style="color:var(--danger)">↓ {{ d.previous - d.latest }}</span>
+                    <span v-else class="muted">—</span>
+                  </td>
+                  <td class="muted">{{ d.count }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
       <div class="card">
         <h2>上课记录 <span class="small muted" style="font-weight:400">（从新到旧，共 {{ timeline.length }} 条）</span></h2>
         <div v-if="!timeline.length" class="empty">
@@ -179,6 +249,9 @@ export default {
               <button class="btn ghost sm" @click="openFeedback(item)">
                 {{ item.feedback ? '改反馈' : '写反馈' }}
               </button>
+              <button class="btn ghost sm" @click="openHomework(item)">
+                {{ item.homework ? '改作业' : '交作业' }}
+              </button>
             </div>
 
             <div v-if="item.lesson.topic" style="margin-top:4px">本次内容：{{ item.lesson.topic }}</div>
@@ -193,6 +266,16 @@ export default {
               </div>
             </div>
             <div v-else class="small" style="margin-top:6px; color:var(--warning)">尚未写反馈</div>
+
+            <!-- 作业：跟反馈并列，**各自独立**（可能只有作业没反馈，反之亦然） -->
+            <div v-if="item.homework" style="margin-top:8px">
+              <span class="tag" :class="HW_TAG[item.homework.status] || ''">作业{{ item.homework.status_label }}</span>
+              <span v-for="a in item.homework.scores" :key="a.dim_id" class="tag blue" style="margin-left:4px">
+                {{ a.name }} {{ a.score }}
+              </span>
+              <div v-if="item.homework.note" class="small" style="margin-top:4px">批改备注：{{ item.homework.note }}</div>
+            </div>
+            <div v-else class="small muted" style="margin-top:6px">这次作业还没记</div>
           </div>
         </div>
       </div>
@@ -200,5 +283,7 @@ export default {
 
     <FeedbackDialog v-if="feedbackLesson" :lesson="feedbackLesson"
                     @close="feedbackLesson = null" @saved="onSaved" />
+    <HomeworkDialog v-if="homeworkLesson" :lesson="homeworkLesson"
+                    @close="homeworkLesson = null" @saved="onHomeworkSaved" />
   </div>`,
 };

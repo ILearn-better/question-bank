@@ -85,10 +85,17 @@ def collect_text(files: list[LessonFile], total_cap: int = 40000) -> tuple[str, 
 
 
 @router.get("/lessons/{lid}/files")
-def list_files(lid: int, db: Session = Depends(get_db)):
+def list_files(lid: int, role: str = Query("material", description="material / homework"),
+               db: Session = Depends(get_db)):
+    """这节课的文件。**按 role 分开列**：写反馈时看的是「上课文件」（讲义/课件），
+    作业那条要看的是学生交上来的作业原件 —— 两份清单互相看不见，
+    否则老师会在反馈的文件列表里看到学生的作业照片。
+    """
     ls = _lesson_or_404(db, lid)
     rows = db.scalars(
-        select(LessonFile).where(LessonFile.lesson_id == lid).order_by(LessonFile.id)
+        select(LessonFile)
+        .where(LessonFile.lesson_id == lid, LessonFile.role == role)
+        .order_by(LessonFile.id)
     ).all()
     stu = db.get(Student, ls.student_id)
     return {
@@ -101,12 +108,19 @@ def list_files(lid: int, db: Session = Depends(get_db)):
 
 
 @router.post("/lessons/{lid}/files")
-async def upload_file(lid: int, file: UploadFile = File(...), db: Session = Depends(get_db)):
+async def upload_file(lid: int, file: UploadFile = File(...),
+                      role: str = Query("material", description="material / homework"),
+                      db: Session = Depends(get_db)):
     """上传并**当场抽文字**。
 
     抽不出来也照样把行存下来（status=failed + reason）：这样界面能一直显示
     「这个文件没读进来、为什么」，而不是上传完就消失得无影无踪。
+
+    role 决定它属于哪一份清单：上课材料（讲义/课件）还是学生作业原件。
+    作业复用同一条管线（归档、抽文字、失败原因、删除清理全一样），只是标签不同。
     """
+    if role not in ("material", "homework"):
+        raise HTTPException(422, f"不认识的 role {role!r}（可选 material / homework）")
     _lesson_or_404(db, lid)
     name = Path(file.filename or "未命名").name        # 只取文件名，防路径穿越
     if file_text.kind_of(name) is None:
@@ -132,7 +146,7 @@ async def upload_file(lid: int, file: UploadFile = File(...), db: Session = Depe
 
     f = LessonFile(
         owner_id=config.OWNER_ID, lesson_id=lid, name=name, stored=stored_rel,
-        kind=file_text.kind_of(name) or "", size_bytes=len(data),
+        kind=file_text.kind_of(name) or "", size_bytes=len(data), role=role,
     )
     try:
         r = file_text.extract(dest, name)

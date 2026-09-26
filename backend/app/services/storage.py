@@ -81,8 +81,9 @@ def feedback_stem(student, lesson) -> str:
     return f"{safe_token(getattr(student, 'name', ''), 'u%d' % student.id)}_{lesson_date(lesson)}"
 
 
-# 保存反馈时同步写进归档目录的那份纯文本快照
+# 保存反馈 / 作业时同步写进归档目录的那份纯文本快照
 FEEDBACK_TXT_SUFFIX = "_反馈.txt"
+HOMEWORK_TXT_SUFFIX = "_作业.txt"
 
 
 def feedback_txt_rel(student, lesson) -> str:
@@ -92,6 +93,11 @@ def feedback_txt_rel(student, lesson) -> str:
     「9 月 26 号那节课」时就该文字和材料都在同一处，而不是只有照片没有字。
     """
     return f"{dated_rel(student, lesson)}/{feedback_stem(student, lesson)}{FEEDBACK_TXT_SUFFIX}"
+
+
+def homework_txt_rel(student, lesson) -> str:
+    """这次作业的 txt 快照路径。与反馈快照同一格、同一命名法，只换后缀。"""
+    return f"{dated_rel(student, lesson)}/{feedback_stem(student, lesson)}{HOMEWORK_TXT_SUFFIX}"
 
 
 def remove_student_dir(student) -> int:
@@ -171,10 +177,10 @@ def collect_lesson_assets(db: Session, lesson_ids: list[int]) -> list[str]:
         select(Lesson, Student).join(Student, Student.id == Lesson.student_id)
         .where(Lesson.id.in_(lesson_ids))
     ).all():
-        rel = feedback_txt_rel(stu, ls)
-        p = safe_join(rel)
-        if p is not None and p.is_file():
-            out.append(rel)
+        for rel in (feedback_txt_rel(stu, ls), homework_txt_rel(stu, ls)):
+            p = safe_join(rel)
+            if p is not None and p.is_file():
+                out.append(rel)
     for (raw,) in db.execute(
         select(Feedback.images).where(Feedback.lesson_id.in_(lesson_ids))
     ).all():
