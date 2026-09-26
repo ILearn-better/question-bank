@@ -333,6 +333,11 @@ class Feedback(Base):
     problems: Mapped[str | None] = mapped_column(Text)      # 存在问题
     homework: Mapped[str | None] = mapped_column(Text)      # 作业布置
     next_plan: Mapped[str | None] = mapped_column(Text)     # 下次安排
+    # 整篇正文：按润色模板整理成文的成品（可直接发给家长）。
+    # 上面四个字段是老师随手写的**原料**，这里是**成品** —— 两者并存，导出时二选一。
+    # 之所以单独存一列而不是让 AI 把长文拆回四个字段：那些栏目标题
+    # （【本次课堂内容】【易错内容】【作业预计时长】…）根本塞不进「四段」这个形状里。
+    doc: Mapped[str] = mapped_column(Text, default="", server_default="")
     rating: Mapped[int | None] = mapped_column(Integer)     # 1-5 综合状态
     share_to_parent: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     # 配图：URL 的 JSON 数组。存 JSON 而不是建关联表 —— 和 notes.ink / questions.tags
@@ -402,6 +407,33 @@ class FeedbackTemplate(Base):
     created_at: Mapped[str] = mapped_column(Text, default=_now, server_default=NOW)
 
     __table_args__ = (Index("idx_fb_templates_owner", "owner_id", "sort_order"),)
+
+
+class FeedbackDocTemplate(Base):
+    """润色时「仿照的模板」—— 一整篇文档的格式与文风参考。
+
+    和 FeedbackTemplate 分开建表，因为两者形状根本不同：
+      · FeedbackTemplate：按四个字段分的快捷短语 + 骨架文本（**录反馈时**用）
+      · FeedbackDocTemplate：一整篇成品文档的结构与语气（**AI 润色时**用，整段塞进提示词）
+
+    为什么不把示例文档直接写死在提示词里：每个老师给家长的格式差得很远
+    （有的要抬头带科目/任课老师，有的只写四段），只有让用户自己给模板才迁就得过来。
+    content 里既放**结构说明**也放**脱敏示例**：光说「写得具体一点」没用，
+    给一段能照着学的文字，模型的语气才对得上。
+    is_builtin：内置模板允许改文案但不允许删（删了下一次种子又会建回来，反而迷惑）。
+    """
+
+    __tablename__ = "feedback_doc_templates"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    owner_id: Mapped[int] = mapped_column(Integer, nullable=False, default=OWNER_ID, server_default=str(OWNER_ID))
+    name: Mapped[str] = mapped_column(String, nullable=False)
+    content: Mapped[str] = mapped_column(Text, default="", server_default="")
+    is_builtin: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    sort_order: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    created_at: Mapped[str] = mapped_column(Text, default=_now, server_default=NOW)
+
+    __table_args__ = (Index("idx_fb_doc_templates_owner", "owner_id", "sort_order"),)
 
 
 class AiSetting(Base):

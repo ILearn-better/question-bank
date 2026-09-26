@@ -6,10 +6,18 @@
 //   · 四段式各自带快捷短语，一点即插，省掉打字
 //   · 能力评分「允许只打部分」，没打的下次仍按历史值算，绝不强制填满
 //   · 所有字段都可留空 —— 只写一句话也能存。卡住一次，这个工具就会被弃用。
-import { onBeforeUnmount, onMounted, reactive, ref } from 'vue';
+import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue';
 import { abilityApi, feedbackApi, studentsApi } from '../api.js';
 import { fail, hhmm, ok, shortDate, warn } from '../store.js';
 import Modal from './Modal.js';
+
+// 四段字段的键与中文名。多处要用（拼原始记录、渲染、存模板），集中一份。
+const FIELDS = [
+  { key: 'performance', label: '课堂表现' },
+  { key: 'problems', label: '存在问题' },
+  { key: 'homework', label: '作业布置' },
+  { key: 'next_plan', label: '下次安排' },
+];
 
 // 快捷短语：一点即插。写得越具体，家长越觉得「老师真的在看我的孩子」。
 const PHRASES = {
@@ -52,18 +60,31 @@ export default {
     const fileEl = ref(null);
     const uploading = ref(false);
 
+    // ---- 整篇正文 ----
+    // 四段是老师随手写的**原料**，doc 是整理成文、可以直接发给家长的**成品**。
+    // 两者并存：润色只写 doc，绝不动四段（老师写的东西不能被 AI 反向覆盖）。
+    const doc = ref('');
+
     // ---- AI 润色 / 导出 ----
     const polishing = ref(false);
-    const polishResult = ref(null);      // { fields: {...}, usage: {...}, model } —— 建议稿，需老师确认
+    const polishResult = ref(null);       // 整篇建议稿的完整响应（含 draft / usage / model）
+    const polishText = ref('');           // 建议稿的**可编辑**副本，采用前老师能直接改
     const showExport = ref(false);
     const exporting = ref('');
-    // 润色前先问风格；模板另存要先起名字。
-    // 两个都用内联小弹窗而不是 window.prompt —— prompt 在部分环境（含内嵌浏览器）
+    const exportSource = ref('auto');     // auto / doc / fields（仅当有整篇时才让选）
+    // 润色前先问模板；模板另存要先起名字。
+    // 用内联小弹窗而不是 window.prompt —— prompt 在部分环境（含内嵌浏览器）
     // 直接抛 “prompt() is not supported”，而且原生弹窗不可控、也不能写多行说明。
     const showPolishAsk = ref(false);
-    const polishStyle = ref('保持简洁，语气对家长友好');
+    const polishStyle = ref('');
     const showTplSave = ref(false);
     const tplName = ref('');
+    // ---- 润色模板（整篇文档的格式与文风） ----
+    const docTemplates = ref([]);
+    const docTemplateId = ref('');
+    const docTemplateContent = ref('');    // 可临场改；改完就按改过的发
+    const showDocTplSave = ref(false);
+    const docTplName = ref('');
 
     onMounted(async () => {
       try {
@@ -77,6 +98,7 @@ export default {
           form.next_plan = fb.next_plan || '';
           form.rating = fb.rating;
           form.share_to_parent = fb.share_to_parent ? 1 : 0;
+          doc.value = fb.doc || '';
           images.value = fb.images || [];
           for (const s of fb.ability_scores || []) form.scores[s.dim_id] = s.score;
         }
@@ -84,6 +106,18 @@ export default {
         try {
           const r = await feedbackApi.templates();
           templates.value = r.items || [];
+        } catch (e) { /* 忽略 */ }
+        // 润色模板单独拉（和上面那套不是一回事），失败同样不影响录反馈
+        try {
+          const r = await feedbackApi.docTemplates();
+          docTemplates.value = r.items || [];
+          // 默认选第一个（内置就是「完整课堂反馈（推荐）」）——
+          // 不预选的话，第一次点润色只能得到干巴巴的四段，没人知道还有个模板能用。
+          const first = docTemplates.value[0];
+          if (first) {
+            docTemplateId.value = first.id;
+            docTemplateContent.value = first.content || '';
+          }
         } catch (e) { /* 忽略 */ }
         // 取该学生各维度的历史分数作为参照 —— 有锚点，打分标准才稳定，
         // 否则这周给 3 星、下周给 4 星可能只是手感不同，雷达图的「变化」就成了噪声。
@@ -129,6 +163,10 @@ export default {
           rating: form.rating || null,
           share_to_parent: form.share_to_parent ? 1 : 0,
           images: images.value,
+          // doc 始终一起提交：弹窗打开时就把服务端那份读进来了，所以这里的值
+          // 就是「用户现在看到的样子」—— 包括他点了「清空」的空串。
+          // （服务端对「没带 doc 字段」的请求仍然按「不改」处理，见 upsert_feedback。）
+          doc: doc.value || '',
           ability_scores: Object.entries(form.scores)
             .filter(([, v]) => v)
             .map(([dimId, score]) => ({ dim_id: Number(dimId), score })),
@@ -246,26 +284,65 @@ export default {
 
     function removeImage(i) { images.value = images.value.filter((_, idx) => idx !== i); }
 
-    /* ================= AI 润色 ================= */
-    /** 点「AI 润色」只是打开询问窗口（风格 + 隐私提醒），真正发请求在 runPolish()。 */
-    function polish() {
-      const fields = { performance: form.performance, problems: form.problems,
-                       homework: form.homework, next_plan: form.next_plan };
-      if (!Object.values(fields).some(v => (v || '').trim())) {
+    /* ================= AI 润色（整篇） ================= */
+    // 逻辑：四段记录拼成一篇「原始记录」→ 连同模板一起发给 AI → 拿回一整篇文档。
+    // 以前是按字段分别润色、逐框回填，那样得到的是四段碎语，成不了给家长看的文档。
+
+    const currentDocTpl = () => docTemplates.value.find(t => String(t.id) === String(docTemplateId.value)) || null;
+
+    /** 选了模板就把它的正文填进可编辑框（老师可以当场改，改完按改过的发）。 */
+    function applyDocTemplate() {
+      const t = currentDocTpl();
+      docTemplateContent.value = t ? (t.content || '') : '';
+    }
+
+    /** 预览「到底会发出去什么」。隐私上这是必需的：老师得看得见有什么要离开本机。 */
+    const willSend = computed(() => {
+      const lines = ['## 课程信息'];
+      lines.push(`学生：${props.lesson.student_name || ''}`);
+      if (props.lesson.start_at) lines.push(`上课时间：${props.lesson.start_at.replace('T', ' ')}`);
+      if (props.lesson.topic) lines.push(`本次内容：${props.lesson.topic}`);
+      lines.push('', '## 老师填写的记录（分段、尚未整理）');
+      for (const f of FIELDS) {
+        const t = (form[f.key] || '').trim();
+        if (t) lines.push(`〔${f.label}〕`, t, '');
+      }
+      return lines.join('\n').trim();
+    });
+
+    const fieldsPayload = () => {
+      const o = {};
+      for (const f of FIELDS) o[f.key] = form[f.key] || '';
+      return o;
+    };
+
+    /** 点「AI 润色」只开询问窗口（模板 + 隐私提醒），真正发请求在 runPolish()。 */
+    function openPolish() {
+      if (!Object.values(fieldsPayload()).some(v => (v || '').trim())) {
         return warn('四个字段都是空的，先写点内容再润色');
       }
       showPolishAsk.value = true;
     }
 
-    /** 真正调 AI。返回的是**建议稿**，必须老师点「采用」才写回去。 */
+    /** 真正调 AI。拿回来的是**建议稿**，必须老师点「采用」才写进整篇正文。 */
     async function runPolish() {
-      const fields = { performance: form.performance, problems: form.problems,
-                       homework: form.homework, next_plan: form.next_plan };
       showPolishAsk.value = false;
       polishing.value = true;
       try {
-        polishResult.value = await feedbackApi.polish(props.lesson.id,
-          { fields, style: polishStyle.value || '' });
+        const res = await feedbackApi.polish(props.lesson.id, {
+          fields: fieldsPayload(),
+          template_id: docTemplateId.value || null,
+          // 只有老师改过模板正文时才把它一起发（服务端以它优先），
+          // 否则发 null 让服务端按 id 取库里的那份 —— 少传一坨文本。
+          template_content: (() => {
+            const t = currentDocTpl();
+            const cur = (docTemplateContent.value || '').trim();
+            return cur && cur !== ((t && t.content) || '').trim() ? cur : null;
+          })(),
+          style: polishStyle.value || '',
+        });
+        polishResult.value = res;
+        polishText.value = res.text || '';
       } catch (e) {
         fail(e.message);
       } finally {
@@ -274,12 +351,57 @@ export default {
     }
 
     function adoptPolish() {
-      const f = (polishResult.value && polishResult.value.fields) || {};
-      for (const k of ['performance', 'problems', 'homework', 'next_plan']) {
-        if ((f[k] || '').trim()) form[k] = f[k];
-      }
+      doc.value = (polishText.value || '').trim();
       polishResult.value = null;
-      ok('已采用润色结果（记得点保存）');
+      if (!doc.value) return warn('内容是空的，没有可采用的');
+      ok('已放入「整篇正文」（记得点保存反馈）');
+    }
+
+    async function saveDocTemplate() {
+      const name = (docTplName.value || '').trim();
+      if (!name) return warn('先给模板起个名字');
+      if (!(docTemplateContent.value || '').trim()) return warn('模板内容是空的');
+      try {
+        const r = await feedbackApi.createDocTemplate({ name, content: docTemplateContent.value });
+        docTemplates.value.push(r);
+        docTemplateId.value = r.id;
+        showDocTplSave.value = false;
+        docTplName.value = '';
+        ok(`已存为润色模板「${r.name}」`);
+      } catch (e) {
+        fail(e.message);
+      }
+    }
+
+    async function deleteDocTemplate() {
+      const t = currentDocTpl();
+      if (!t) return;
+      if (t.is_builtin) return warn('内置模板不能删，可以另存一个新模板');
+      if (!window.confirm(`删除润色模板「${t.name}」？已有的反馈不受影响。`)) return;
+      try {
+        await feedbackApi.removeDocTemplate(t.id);
+        docTemplates.value = docTemplates.value.filter(x => x.id !== t.id);
+        docTemplateId.value = '';
+        docTemplateContent.value = '';
+        ok('模板已删除');
+      } catch (e) {
+        fail(e.message);
+      }
+    }
+
+    /* ================= 整篇正文 ================= */
+    async function copyDoc() {
+      try {
+        await navigator.clipboard.writeText(doc.value);
+        ok('整篇正文已复制');
+      } catch (e) {
+        fail('复制失败，请手动选中复制');
+      }
+    }
+
+    function clearDoc() {
+      if (!window.confirm('清空整篇正文？四段快记不受影响。')) return;
+      doc.value = '';
     }
 
     /* ================= 导出 ================= */
@@ -290,10 +412,15 @@ export default {
       return `${base}.${ext}`;
     }
 
+    /** 有整篇正文就默认导整篇（那是老师确认过的成品），没有就导四段。 */
+    const exportMode = computed(
+      () => (doc.value.trim() ? exportSource.value : 'fields'),
+    );
+
     async function doExport(fmt) {
       exporting.value = fmt;
       try {
-        await feedbackApi.downloadExport(props.lesson.id, fmt, exportName(fmt));
+        await feedbackApi.downloadExport(props.lesson.id, fmt, exportName(fmt), exportMode.value);
         ok(`已导出 ${fmt.toUpperCase()}`);
         showExport.value = false;
       } catch (e) {
@@ -305,12 +432,16 @@ export default {
 
     const dimPreview = (dimId) => lastScores.value[dimId] ?? null;
 
-    return { dims, form, saving, existing, lastScores, PHRASES, insert, setScore, save, hhmm, shortDate, warn, dimPreview,
+    return { dims, form, saving, existing, lastScores, PHRASES, FIELDS, insert, setScore, save, hhmm, shortDate, warn, dimPreview,
              templates, templateId, phrases, applyTemplate, saveAsTemplate, deleteTemplate, currentTpl,
              showTplSave, tplName,
+             doc, copyDoc, clearDoc,
              images, fileEl, uploading, pickImage, onImageFile, removeImage,
-             polishing, polishResult, polish, runPolish, adoptPolish, showPolishAsk, polishStyle,
-             showExport, exporting, doExport };
+             polishing, polishResult, polishText, openPolish, runPolish, adoptPolish,
+             showPolishAsk, polishStyle, willSend,
+             docTemplates, docTemplateId, docTemplateContent, applyDocTemplate,
+             currentDocTpl, showDocTplSave, docTplName, saveDocTemplate, deleteDocTemplate,
+             showExport, exporting, exportSource, exportMode, doExport };
   },
   template: `
   <Modal :title="'课后反馈 · ' + lesson.student_name" @close="$emit('close')">
@@ -364,6 +495,24 @@ export default {
       </div>
     </div>
 
+    <!-- 整篇正文：四段是原料，这一篇是成品。导出时优先用它。 -->
+    <div class="field">
+      <label>
+        整篇正文
+        <span class="muted small">
+          （AI 按模板整理的成品，可以直接发家长；导出 Word/PDF/txt 时优先用这一篇）
+        </span>
+      </label>
+      <textarea v-model="doc" rows="10"
+                placeholder="还没有整篇正文。点左下角「AI 润色」按模板生成一篇，也可以直接在这里手写。"></textarea>
+      <div class="row" style="gap:8px;margin-top:6px">
+        <span class="small muted">{{ (doc || '').length }} 字</span>
+        <span class="spacer"></span>
+        <button v-if="doc" class="btn sm ghost" @click="copyDoc">复制</button>
+        <button v-if="doc" class="btn sm ghost" style="color:var(--danger)" @click="clearDoc">清空</button>
+      </div>
+    </div>
+
     <div class="field">
       <label>能力评分 <span class="muted small">（可只打几项，未打的沿用历史值；再点一次可取消）</span></label>
       <div v-for="d in dims" :key="d.id" class="rate-row">
@@ -393,7 +542,7 @@ export default {
 
     <template #foot>
       <button class="btn" @click="$emit('close')">取消</button>
-      <button class="btn" :disabled="polishing" @click="polish">
+      <button class="btn" :disabled="polishing" @click="openPolish">
         {{ polishing ? '润色中…' : 'AI 润色' }}
       </button>
       <button class="btn" @click="showExport = true">导出</button>
@@ -403,8 +552,8 @@ export default {
     </template>
   </Modal>
 
-  <!-- 存为模板：起个名字 -->
-  <Modal v-if="showTplSave" title="存为模板" @close="showTplSave = false">
+  <!-- 存为反馈模板（快捷短语 + 骨架文本） -->
+  <Modal v-if="showTplSave" title="存为反馈模板" @close="showTplSave = false">
     <p class="muted small" style="margin-top:0">
       会把<strong>当前的快捷短语</strong>和<strong>四段文字</strong>一起存成模板。
       下次选它，短语直接可用；四段文本会在字段为空时自动填入，已经写了内容则会先问你。
@@ -419,19 +568,63 @@ export default {
     </template>
   </Modal>
 
-  <!-- AI 润色前的询问：风格 + 隐私提醒 -->
-  <Modal v-if="showPolishAsk" title="AI 润色" @close="showPolishAsk = false">
+  <!-- 存为润色模板（一整篇文档的格式与文风） -->
+  <Modal v-if="showDocTplSave" title="存为润色模板" @close="showDocTplSave = false">
+    <p class="muted small" style="margin-top:0">
+      存的是上面那个「模板内容」框里的东西 —— 也就是 AI 要仿照的结构与文风。
+      下次润色时选它即可，不用再粘一遍。
+    </p>
+    <div class="field">
+      <label>模板名称</label>
+      <input type="text" v-model="docTplName" placeholder="如：完整课堂反馈" @keyup.enter="saveDocTemplate">
+    </div>
+    <template #foot>
+      <button class="btn ghost" @click="showDocTplSave = false">取消</button>
+      <button class="btn primary" @click="saveDocTemplate">保存模板</button>
+    </template>
+  </Modal>
+
+  <!-- AI 润色：模板 + 额外要求 + 「到底会发出去什么」 -->
+  <Modal v-if="showPolishAsk" title="AI 润色（整篇）" wide @close="showPolishAsk = false">
     <div class="small" style="margin-bottom:12px;color:var(--warning, #d97706)">
-      ⚠️ 接下来会把四段内容（可能包含学生姓名）发送到你配置的 AI 服务。
+      ⚠️ 接下来会把下面的内容（含学生姓名）发送到你配置的 AI 服务。
       接口地址与密钥在「设置 → AI 润色」里配置；不配置就不会联网。
     </div>
+
     <div class="field">
-      <label>风格要求 <span class="muted small">（可留空）</span></label>
+      <label>仿照的模板 <span class="muted small">（决定分几个栏目、什么语气；整段会一起发给 AI）</span></label>
+      <div class="row">
+        <select v-model="docTemplateId" @change="applyDocTemplate">
+          <option value="">不套用模板（只把四段整理成一篇）</option>
+          <option v-for="t in docTemplates" :key="t.id" :value="t.id">{{ t.name }}</option>
+        </select>
+        <button class="btn sm" style="flex:none" @click="showDocTplSave = true">存为新模板</button>
+        <button v-if="currentDocTpl() && !currentDocTpl().is_builtin"
+                class="btn sm ghost" style="flex:none;color:var(--danger)"
+                @click="deleteDocTemplate">删除模板</button>
+      </div>
+    </div>
+
+    <div class="field">
+      <label>
+        模板内容
+        <span class="muted small">（可以现场改，改完就按改过的发；满意了可以「存为新模板」）</span>
+      </label>
+      <textarea v-model="docTemplateContent" rows="7"
+                placeholder="写清结构（有几个栏目、每栏写什么），再给一小段示例说明语气。"></textarea>
+    </div>
+
+    <div class="field">
+      <label>额外要求 <span class="muted small">（可留空）</span></label>
       <input type="text" v-model="polishStyle" placeholder="如：保持简洁，语气对家长友好" @keyup.enter="runPolish">
     </div>
-    <div class="small muted">
-      润色结果会先给你看，确认后才替换；不点「保存反馈」就不会生效。
-    </div>
+
+    <details>
+      <summary class="small muted" style="cursor:pointer">看看具体会发出去什么</summary>
+      <pre class="small" style="white-space:pre-wrap;margin:6px 0 0;background:var(--panel-2);border:1px solid var(--border);border-radius:var(--radius-sm);padding:8px;max-height:200px;overflow:auto">{{ willSend }}</pre>
+      <div class="small muted" style="margin-top:4px">（另外还会带上上面那份模板正文和额外要求。）</div>
+    </details>
+
     <template #foot>
       <button class="btn ghost" @click="showPolishAsk = false">取消</button>
       <button class="btn primary" :disabled="polishing" @click="runPolish">
@@ -440,8 +633,24 @@ export default {
     </template>
   </Modal>
 
-  <!-- 导出：txt / Word / PDF -->
+  <!-- 导出：先选导哪一份内容，再选格式 -->
   <Modal v-if="showExport" title="导出这条反馈" @close="showExport = false">
+    <div class="field">
+      <label>导出内容</label>
+      <div v-if="doc.trim()" style="display:flex;gap:14px;flex-wrap:wrap">
+        <label class="small" style="display:flex;align-items:center;gap:6px">
+          <input type="radio" value="auto" v-model="exportSource">
+          整篇正文（推荐 —— 你确认过的成品）
+        </label>
+        <label class="small" style="display:flex;align-items:center;gap:6px">
+          <input type="radio" value="fields" v-model="exportSource">
+          四段快记
+        </label>
+      </div>
+      <div v-else class="small muted">
+        还没有整篇正文，将按四段快记导出。点「AI 润色」可以生成一篇完整的。
+      </div>
+    </div>
     <p class="muted small" style="margin-top:0">
       三种格式面向不同场合：<strong>txt</strong> 最通用（微信直接发，按需求不带图片）；
       <strong>Word</strong> 带附图、可再编辑；<strong>PDF</strong> 版式最稳，发给家长最好看。
@@ -468,39 +677,30 @@ export default {
     </template>
   </Modal>
 
-  <!-- AI 润色结果：先看建议稿，点「采用」才写回去 -->
-  <Modal v-if="polishResult" title="AI 润色建议" wide @close="polishResult = null">
+  <!-- AI 润色结果：左边看发了什么，右边是**可编辑**的成品 -->
+  <Modal v-if="polishResult" title="AI 润色结果（整篇）" wide @close="polishResult = null">
     <p class="muted small" style="margin-top:0">
-      下面是建议稿，<strong>不会自动替换</strong>你写的内容。确认没问题再点「采用」；
-      采用后仍可自己改，不保存就无效。
-      <span v-if="polishResult.model">（模型：{{ polishResult.model }}）</span>
+      右边就是整理好的整篇正文，<strong>可以直接改</strong>。点「采用」放进「整篇正文」框，
+      再点「保存反馈」才真正存下来。
+      <span v-if="polishResult.template_name">· 仿照模板：{{ polishResult.template_name }}</span>
+      <span v-if="polishResult.model">· 模型：{{ polishResult.model }}</span>
       <span v-if="polishResult.usage">
         · 用量：输入 {{ polishResult.usage.prompt ?? '—' }} / 输出 {{ polishResult.usage.completion ?? '—' }} tokens
       </span>
     </p>
-    <div v-for="f in [
-        { key:'performance', label:'课堂表现' },
-        { key:'problems',    label:'存在问题' },
-        { key:'homework',    label:'作业布置' },
-        { key:'next_plan',   label:'下次安排' }
-      ]" :key="f.key">
-      <div v-if="(polishResult.fields[f.key] || '').trim()" class="field">
-        <label>{{ f.label }}</label>
-        <div class="grid cols-2">
-          <div>
-            <div class="small muted">原文</div>
-            <div class="small" style="white-space:pre-wrap;border:1px solid var(--border);border-radius:var(--radius-sm);padding:8px;background:var(--panel-2)">{{ form[f.key] || '（空）' }}</div>
-          </div>
-          <div>
-            <div class="small muted">润色后</div>
-            <div class="small" style="white-space:pre-wrap;border:1px solid var(--primary);border-radius:var(--radius-sm);padding:8px">{{ polishResult.fields[f.key] }}</div>
-          </div>
-        </div>
+    <div class="grid cols-2">
+      <div>
+        <div class="small muted">发出去的原始记录</div>
+        <pre class="small" style="white-space:pre-wrap;margin:4px 0 0;max-height:300px;overflow:auto;border:1px solid var(--border);border-radius:var(--radius-sm);padding:8px;background:var(--panel-2)">{{ polishResult.draft }}</pre>
+      </div>
+      <div>
+        <div class="small muted">AI 整理后（可编辑）</div>
+        <textarea v-model="polishText" rows="14" style="margin-top:4px"></textarea>
       </div>
     </div>
     <template #foot>
       <button class="btn ghost" @click="polishResult = null">放弃</button>
-      <button class="btn primary" @click="adoptPolish">采用润色结果</button>
+      <button class="btn primary" :disabled="!polishText.trim()" @click="adoptPolish">采用为整篇正文</button>
     </template>
   </Modal>`,
 };

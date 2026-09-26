@@ -12,7 +12,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from . import config
-from .models import Curriculum, FeedbackTemplate, Node
+from .models import Curriculum, FeedbackDocTemplate, FeedbackTemplate, Node
 
 # 用户当前实际教授的体系（2026-09-20 确认）
 DEFAULT_CURRICULA: list[dict] = [
@@ -157,9 +157,79 @@ def ensure_feedback_templates(db: Session) -> int:
     return added
 
 
+# ---------------------------------------------------------------- 润色模板（整篇正文）
+# 这里存的是「AI 把反馈整理成文时该仿照的样子」，整段会进提示词。
+#
+# ⚠️ 内置模板里的示例**必须脱敏**：绝不能拿某位真实学生的反馈当范例 ——
+#    它会进版本库、也会被别的老师看到。所以示例里的姓名、章节、成绩一律用占位写法，
+#    只保留「结构长什么样、语气有多具体」这两件真正需要被模仿的事。
+BUILTIN_DOC_TEMPLATES: list[dict] = [
+    {
+        "name": "完整课堂反馈（推荐）",
+        "content": """【结构】按下面的栏目顺序组织全文，栏目用【】包住，栏目内可以分条。
+整体语气：具体、专业、面向家长，像一个真的旁听了一节课的老师在说话。
+不要写「表现很好」「继续加油」这种放在谁身上都成立的空话，凡是评价都要带着依据。
+
+第一行是抬头，用「学生名-日期 课堂反馈」的写法；下面紧跟几行基本信息：
+科目 / 任课老师 / 上课时间 / 上次作业布置时间（没有的就省略这一行）。
+
+【完成情况】一两句话。用「良好」这类词给个总体结论，后面可以补一句限定。
+【存在问题】一两句话。没有重大问题就如实说明「无全新重大知识漏洞」，并提示详见【易错内容】。
+【本次课堂内容】
+  先写作业讲评情况（讲了哪部分、针对什么共性问题做了订正）。
+  然后按小节逐块写，每块写成「章节号+小节名：要点」的形式，一块一段，涵盖：
+  推导/讲解的核心结论、练了哪些题型、典型例题的作用、易错点的强化训练。
+【本次课堂表现】一段连贯的话（不分条）。把下面几件事串起来写：
+  上课状态与互动、作业完成质量、哪些知识点已掌握、哪里还需要提示、
+  需要改进的具体问题、课下的具体要求、下一阶段的训练计划、最后一句鼓励。
+【易错内容】逐条列出具体到知识点的薄弱处（例如公式记忆、符号运算、比例对应关系）。
+【准时度】用「优秀 / 良好 / 一般」这类词给结论。
+【本次作业】逐条列出，写清题号范围与书写/步骤要求。
+【作业预计时长】用「1.5h」这种写法给个估值。
+
+【示例（仅示意语气与详略，内容与本学生无关）】
+【本次课堂表现】本次课 X 同学表现很好，上课听讲认真，积极互动，遇到问题给予提示后便能回忆起对应解题思路；主要问题集中在少部分题目书写格式不规范、计算粗心。课下需要将本次错题再回顾、重做一遍，下节课会抽查。做此类证明题时，建议先画草图、设清楚坐标、理清证明逻辑再书写。后续会开展综合大题训练。课下希望能吸收巩固今天所讲内容，认真完成所布置作业。
+【易错内容】计算粗心，代入公式时符号运算不熟练；公式中系数与线段的对应关系容易混淆。""",
+    },
+    {
+        "name": "简洁四段式（当前默认）",
+        "content": """【结构】按四个栏目组织，栏目名用【】，每栏 1-3 句，不列点。
+【课堂表现】【存在问题】【作业布置】【下次安排】
+语气：简洁、对家长友好，一句话说清一件事，不要写空话。
+全文控制在 200 字以内 —— 这是发给家长手机上看的东西。
+【示例】
+【课堂表现】状态不错，配合度高，函数单调性的判断能自己说清思路。
+【存在问题】知识点迁移能力偏弱，换一个情境就要提示。
+【作业布置】1. 讲义划线部分；2. 作业校对。
+【下次安排】先讲透本次错题，再进入下一个知识点。""",
+    },
+]
+
+
+def ensure_feedback_doc_templates(db: Session) -> int:
+    """内置润色模板只补不覆盖（用户可能改过它的文案）。"""
+    existing = {t.name for t in db.scalars(select(FeedbackDocTemplate))}
+    added = 0
+    for i, spec in enumerate(BUILTIN_DOC_TEMPLATES):
+        if spec["name"] in existing:
+            continue
+        db.add(FeedbackDocTemplate(
+            owner_id=config.OWNER_ID,
+            name=spec["name"],
+            content=spec["content"],
+            is_builtin=1,
+            sort_order=i,
+        ))
+        added += 1
+    if added:
+        db.commit()
+    return added
+
+
 def seed_all(db: Session) -> dict:
     return {
         "curricula_added": ensure_curricula(db),
         "nodes_imported": import_legacy_tree(db),
         "templates_added": ensure_feedback_templates(db),
+        "doc_templates_added": ensure_feedback_doc_templates(db),
     }

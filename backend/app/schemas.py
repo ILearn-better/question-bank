@@ -198,6 +198,11 @@ class FeedbackIn(BaseModel):
     ability_scores: List[AbilityScoreIn] = Field(default_factory=list)
     # 配图 URL 数组（走现成的 POST /api/uploads/image 上传，服务端按魔数校验格式）
     images: List[str] = Field(default_factory=list)
+    # 整篇正文：AI 按模板整理成文的成品。
+    # 注意语义与四段不同：四段是「老师写的原料」，doc 是「可以直接发给家长的成品」。
+    # 传 None 表示不动它（所以想清空必须显式传空串）—— 少了这个区分，
+    # 任何没带 doc 字段的调用都会把用户辛苦整理出的整篇正文抹掉。
+    doc: Optional[str] = None
 
 
 class TemplateIn(BaseModel):
@@ -206,6 +211,18 @@ class TemplateIn(BaseModel):
     name: str
     phrases: Dict[str, List[str]] = Field(default_factory=dict)
     seeds: Dict[str, str] = Field(default_factory=dict)
+    sort_order: int = 0
+
+
+class DocTemplateIn(BaseModel):
+    """润色模板：一整个文档的格式与文风参考（整段进提示词）。
+
+    和 TemplateIn 分开，因为两者说的不是一件事：
+    那边的 phrases 是「录反馈时一点即插的短语」，这边的 content 是「整篇该长什么样」。
+    """
+
+    name: str
+    content: str = ""
     sort_order: int = 0
 
 
@@ -224,10 +241,23 @@ class AiSettingIn(BaseModel):
 
 
 class PolishIn(BaseModel):
-    """AI 润色请求：只润色传进来的字段，没传的原样不动。"""
+    """整篇润色请求。
+
+    以前是按字段润色（返回 JSON 回填四个输入框）；现在整体润色：
+    把四段拼成一篇原始记录 → AI 照模板整理成一篇文档 → 整篇返回。
+
+    fields   四段原文（常规情况）
+    draft    也可以直接给一篇整篇草稿，给了就优先用它
+    template_id / template_content
+             仿照的模板。content 优先于 id —— 老师在弹窗里改了模板内容就该按改过的来
+    style    额外要求（语气、详略）
+    """
 
     fields: Dict[str, str] = Field(default_factory=dict)
-    style: Optional[str] = None      # 可选的语气/风格要求，如「简洁」「多鼓励」
+    draft: Optional[str] = None
+    template_id: Optional[int] = None
+    template_content: Optional[str] = None
+    style: Optional[str] = None
 
 
 class AiTestIn(BaseModel):

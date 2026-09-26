@@ -8,7 +8,8 @@
   · **pdf** —— 先出 docx，再交给 adapters/office.py 用本机 Word 导出（版式最准）。
     没有 Word 时抛 PdfUnavailable，由路由翻成 503 并给可照做的提示。
 
-内容组织：四段式（课堂表现 / 存在问题 / 作业布置 / 下次安排）+ 综合状态 + 能力评分 + 配图。
+内容组织：整篇正文（AI 按模板整理出的成品）**优先**，没有就退回四段式
+（课堂表现 / 存在问题 / 作业布置 / 下次安排）+ 综合状态 + 能力评分 + 配图。
 空字段**不输出标题**——留一堆「（空）」比不写更难看，这是给家长看的正式文本。
 """
 from __future__ import annotations
@@ -29,6 +30,9 @@ SECTIONS = [
 
 # 图片 URL 形如 /api/feedbacks/files/fb_ab12.png
 _IMG_URL_RE = re.compile(r"^/api/feedbacks/files/([A-Za-z0-9_.\-]+)$")
+
+# 整篇正文里的栏目标题行：「【本次课堂内容】」
+_DOC_HEAD_RE = re.compile(r"^【.+】$")
 
 STAR_FULL, STAR_EMPTY = "★", "☆"
 
@@ -78,8 +82,26 @@ def _image_paths(images: list[str]) -> list:
 
 
 # ---------------------------------------------------------------- TXT
-def build_txt(fb: dict, ctx: dict) -> bytes:
-    """纯文本。刻意不带图片（需求明确：txt 不用图片）。"""
+def build_txt(fb: dict, ctx: dict, doc: str | None = None) -> bytes:
+    """纯文本。刻意不带图片（需求明确：txt 不用图片）。
+
+    doc 是整篇正文（AI 整理的成品）。有它就整篇导出 —— 那是老师确认过的正式文本；
+    没有才退回四段式。不把两者混在一起拼：同一件事写两遍，家长会觉得乱。
+    """
+    if (doc or "").strip():
+        lines: list[str] = [doc.strip(), ""]
+        scores_doc = _score_lines(fb.get("ability_scores") or [])
+        if scores_doc:
+            lines.append("【能力评分】")
+            lines.extend("· " + s for s in scores_doc)
+            lines.append("")
+        images_doc = fb.get("images") or []
+        if images_doc:
+            lines.append(f"（本篇附有 {len(images_doc)} 张图片，请查看 Word 或 PDF 版本）")
+            lines.append("")
+        text_doc = "\n".join(lines).rstrip() + "\n"
+        return text_doc.encode("utf-8-sig")
+
     lines: list[str] = ["课后反馈", "=" * 24]
     meta = _meta_line(ctx)
     if meta:
@@ -113,28 +135,62 @@ def build_txt(fb: dict, ctx: dict) -> bytes:
 
 
 # ---------------------------------------------------------------- DOCX / PDF
-def build_docx(fb: dict, ctx: dict) -> bytes:
+def _add_body(document, text: str, Pt) -> None:
+    """把一段正文写进 docx：整行是【栏目】的当作小标题加粗，其余按段落写。
+
+    整篇正文是 AI 按老师给的模板写的，栏目名不固定（可能是【易错内容】
+    【作业预计时长】这类四段里没有的），所以这里按「长什么样」识别，
+    而不是去比对一张写死的栏目表。
+    """
+    for line in (text or "").splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        p = document.add_paragraph()
+        p.paragraph_format.space_after = Pt(2)
+        if _DOC_HEAD_RE.match(s):
+            p.paragraph_format.space_before = Pt(10)
+            r = p.add_run(s)
+            r.bold = True
+            r.font.size = Pt(12)
+        else:
+            p.add_run(s)
+
+
+def build_docx(fb: dict, ctx: dict, doc: str | None = None) -> bytes:
     from docx import Document
     from docx.enum.text import WD_ALIGN_PARAGRAPH
     from docx.oxml.ns import qn
     from docx.shared import Cm, Pt, RGBColor
 
-    doc = Document()
-    sec = doc.sections[0]
+    doc = (doc or "").strip()
+    whole = bool(doc)
+
+    document = Document()
+    sec = document.sections[0]
     sec.page_width, sec.page_height = Cm(21.0), Cm(29.7)
     sec.left_margin = sec.right_margin = Cm(2.0)
     sec.top_margin = sec.bottom_margin = Cm(2.0)
     content_cm = 21.0 - 2.0 * 2
 
     # python-docx 默认西文字体，中文会走回退。必须显式写 w:eastAsia。
-    normal = doc.styles["Normal"]
+    normal = document.styles["Normal"]
     normal.font.size = Pt(11.5)
     rf = normal.element.get_or_add_rPr().get_or_add_rFonts()
     rf.set(qn("w:eastAsia"), "宋体")
     rf.set(qn("w:ascii"), "Times New Roman")
     rf.set(qn("w:hAnsi"), "Times New Roman")
 
-    tp = doc.add_paragraph()
+    if whole:
+        # 整篇正文通常自带抬头（学生名-日期 课堂反馈 / 科目 / 上课时间…），
+        # 所以不再另加标题，否则会变成「课后反馈」+ 学生自己那行抬头两个标题。
+        _add_body(document, doc, Pt)
+        _append_docx_extras(document, fb, Pt, WD_ALIGN_PARAGRAPH, Cm)
+        buf_whole = io.BytesIO()
+        document.save(buf_whole)
+        return buf_whole.getvalue()
+
+    tp = document.add_paragraph()
     tp.alignment = WD_ALIGN_PARAGRAPH.CENTER
     tr = tp.add_run("课后反馈")
     tr.bold = True
@@ -142,7 +198,7 @@ def build_docx(fb: dict, ctx: dict) -> bytes:
 
     meta = _meta_line(ctx)
     if meta:
-        mp = doc.add_paragraph()
+        mp = document.add_paragraph()
         mp.alignment = WD_ALIGN_PARAGRAPH.CENTER
         mr = mp.add_run(meta)
         mr.font.size = Pt(10)
@@ -152,60 +208,66 @@ def build_docx(fb: dict, ctx: dict) -> bytes:
         text = (fb.get(key) or "").strip()
         if not text:
             continue
-        h = doc.add_paragraph()
+        h = document.add_paragraph()
         h.paragraph_format.space_before = Pt(10)
         h.paragraph_format.space_after = Pt(2)
         hr = h.add_run(f"【{title}】")
         hr.bold = True
         hr.font.size = Pt(12)
         for line in text.splitlines():
-            p = doc.add_paragraph(line)
+            p = document.add_paragraph(line)
             p.paragraph_format.space_after = Pt(2)
 
+    _append_docx_extras(document, fb, Pt, WD_ALIGN_PARAGRAPH, Cm)
+    buf = io.BytesIO()
+    document.save(buf)
+    return buf.getvalue()
+
+
+def _append_docx_extras(document, fb: dict, Pt, WD_ALIGN_PARAGRAPH, Cm) -> None:
+    """两种模式共用的尾巴：能力评分 + 附图。"""
     scores = _score_lines(fb.get("ability_scores") or [])
     if scores:
-        h = doc.add_paragraph()
+        h = document.add_paragraph()
         h.paragraph_format.space_before = Pt(10)
         h.paragraph_format.space_after = Pt(2)
         hr = h.add_run("【能力评分】")
         hr.bold = True
         hr.font.size = Pt(12)
         for s in scores:
-            p = doc.add_paragraph("· " + s)
+            p = document.add_paragraph("· " + s)
             p.paragraph_format.space_after = Pt(0)
 
     pics = _image_paths(fb.get("images") or [])
-    if pics:
-        h = doc.add_paragraph()
-        h.paragraph_format.space_before = Pt(10)
-        h.paragraph_format.space_after = Pt(2)
-        hr = h.add_run("【附图】")
-        hr.bold = True
-        hr.font.size = Pt(12)
-        for path in pics:
-            # 按可用宽度放，同时避免竖长图撑破一页
-            try:
-                import pymupdf
-                with pymupdf.open(str(path)) as im:
-                    pw, ph = im[0].rect.width, im[0].rect.height
-                ratio = (ph / pw) if pw else 1.0
-            except Exception:  # noqa: BLE001  图片坏了不该让整篇导不出来
-                ratio = 1.0
-            width_cm = content_cm * 0.9
-            max_h = 29.7 - 2.0 * 2 - 3.0
-            if width_cm * ratio > max_h:
-                width_cm = max_h / max(ratio, 0.01)
-            doc.add_picture(str(path), width=Cm(width_cm))
-            doc.paragraphs[-1].alignment = WD_ALIGN_PARAGRAPH.CENTER
-
-    buf = io.BytesIO()
-    doc.save(buf)
-    return buf.getvalue()
+    if not pics:
+        return
+    h = document.add_paragraph()
+    h.paragraph_format.space_before = Pt(10)
+    h.paragraph_format.space_after = Pt(2)
+    hr = h.add_run("【附图】")
+    hr.bold = True
+    hr.font.size = Pt(12)
+    content_cm = 21.0 - 2.0 * 2
+    for path in pics:
+        # 按可用宽度放，同时避免竖长图撑破一页
+        try:
+            import pymupdf
+            with pymupdf.open(str(path)) as im:
+                pw, ph = im[0].rect.width, im[0].rect.height
+            ratio = (ph / pw) if pw else 1.0
+        except Exception:  # noqa: BLE001  图片坏了不该让整篇导不出来
+            ratio = 1.0
+        width_cm = content_cm * 0.9
+        max_h = 29.7 - 2.0 * 2 - 3.0
+        if width_cm * ratio > max_h:
+            width_cm = max_h / max(ratio, 0.01)
+        document.add_picture(str(path), width=Cm(width_cm))
+        document.paragraphs[-1].alignment = WD_ALIGN_PARAGRAPH.CENTER
 
 
-def build_pdf(fb: dict, ctx: dict) -> bytes:
+def build_pdf(fb: dict, ctx: dict, doc: str | None = None) -> bytes:
     """docx -> Word -> PDF。没有 Word 时抛 PdfUnavailable。"""
-    docx_bytes = build_docx(fb, ctx)
+    docx_bytes = build_docx(fb, ctx, doc)
     try:
         return office.docx_bytes_to_pdf(docx_bytes)
     except office.OfficeUnavailable as e:

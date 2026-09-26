@@ -21,8 +21,17 @@ from sqlalchemy.orm import Session
 from .. import config
 from ..adapters import office
 from ..db import get_db
-from ..models import AbilityDim, AbilityScore, AiSetting, Feedback, FeedbackTemplate, Lesson, Student
-from ..schemas import AiSettingIn, AiTestIn, DimIn, FeedbackIn, PolishIn, TemplateIn
+from ..models import (
+    AbilityDim,
+    AbilityScore,
+    AiSetting,
+    Feedback,
+    FeedbackDocTemplate,
+    FeedbackTemplate,
+    Lesson,
+    Student,
+)
+from ..schemas import AiSettingIn, AiTestIn, DimIn, DocTemplateIn, FeedbackIn, PolishIn, TemplateIn
 from ..services import ai_polish, feedback_export, images
 
 router = APIRouter(prefix="/api", tags=["feedbacks"])
@@ -63,6 +72,8 @@ def _serialize(fb: Feedback, scores: list[AbilityScore], dims: dict[int, str]) -
         "problems": fb.problems,
         "homework": fb.homework,
         "next_plan": fb.next_plan,
+        # 整篇正文（AI 按模板整理的成品）。四段是原料，这个是可直接发家长的成品。
+        "doc": fb.doc or "",
         "rating": fb.rating,
         "share_to_parent": fb.share_to_parent,
         "images": _parse_images(fb.images),
@@ -149,6 +160,11 @@ def upsert_feedback(lid: int, payload: FeedbackIn, db: Session = Depends(get_db)
     fb.next_plan = payload.next_plan
     fb.rating = payload.rating
     fb.share_to_parent = payload.share_to_parent
+    # doc（整篇正文）只在**本次请求真的带了它**时才动：
+    # 传空串 = 清空，不传 = 原样保留。少了这个区分，任何没带 doc 的调用
+    # （旧前端、脚本）都会把用户辛苦整理出的整篇正文抹掉。
+    if "doc" in payload.model_dump(exclude_unset=True):
+        fb.doc = payload.doc or ""
     # 只留本项目图片目录里的名字，其余 URL 一律丢弃（防把外部地址/路径写进去）
     keep = [m.group(0) for m in (_IMG_RE.search(u) for u in payload.images) if m]
     fb.images = json.dumps(keep, ensure_ascii=False)
@@ -276,6 +292,72 @@ def delete_template(tid: int, db: Session = Depends(get_db)):
     return {"ok": True}
 
 
+# ---------------------------------------------------------------- 润色模板（整篇）
+def _doc_template_out(t: FeedbackDocTemplate) -> dict:
+    return {
+        "id": t.id,
+        "name": t.name,
+        "content": t.content or "",
+        "is_builtin": bool(t.is_builtin),
+        "sort_order": t.sort_order,
+    }
+
+
+@router.get("/feedback-doc-templates")
+def list_doc_templates(db: Session = Depends(get_db)):
+    """润色时「仿照的模板」列表。和按字段分的 feedback-templates 是两回事。"""
+    rows = db.scalars(
+        select(FeedbackDocTemplate)
+        .where(FeedbackDocTemplate.owner_id == config.OWNER_ID)
+        .order_by(FeedbackDocTemplate.sort_order, FeedbackDocTemplate.id)
+    ).all()
+    return {"items": [_doc_template_out(t) for t in rows]}
+
+
+@router.post("/feedback-doc-templates")
+def create_doc_template(payload: DocTemplateIn, db: Session = Depends(get_db)):
+    """把当前调好的模板内容另存为一条新模板。
+
+    「拿一篇满意的成品当模板」是最自然的生产方式，所以允许从弹窗里直接存。
+    """
+    t = FeedbackDocTemplate(
+        owner_id=config.OWNER_ID,
+        name=(payload.name or "").strip() or "未命名模板",
+        content=payload.content or "",
+        is_builtin=0,
+        sort_order=payload.sort_order or 100 + len(db.scalars(select(FeedbackDocTemplate)).all()),
+    )
+    db.add(t)
+    db.commit()
+    return _doc_template_out(t)
+
+
+@router.patch("/feedback-doc-templates/{tid}")
+def patch_doc_template(tid: int, payload: DocTemplateIn, db: Session = Depends(get_db)):
+    t = db.get(FeedbackDocTemplate, tid)
+    if t is None:
+        raise HTTPException(404, "模板不存在")
+    t.name = (payload.name or "").strip() or t.name
+    if payload.content is not None:
+        t.content = payload.content
+    if payload.sort_order:
+        t.sort_order = payload.sort_order
+    db.commit()
+    return _doc_template_out(t)
+
+
+@router.delete("/feedback-doc-templates/{tid}")
+def delete_doc_template(tid: int, db: Session = Depends(get_db)):
+    t = db.get(FeedbackDocTemplate, tid)
+    if t is None:
+        raise HTTPException(404, "模板不存在")
+    if t.is_builtin:
+        raise HTTPException(400, "内置模板不能删除；可以改它的内容，或另存一个新模板")
+    db.delete(t)
+    db.commit()
+    return {"ok": True}
+
+
 # ---------------------------------------------------------------- 反馈配图
 @router.post("/feedbacks/image")
 async def upload_feedback_image(file: UploadFile = File(...)):
@@ -332,8 +414,15 @@ def _export_context(db: Session, ls: Lesson, fb: Feedback) -> dict:
 def export_feedback(
     lid: int,
     format: str = Query("docx", description="txt / docx / pdf"),
+    source: str = Query("auto", description="auto / doc / fields"),
     db: Session = Depends(get_db),
 ):
+    """导出。source 决定导哪一份内容：
+
+      · auto（默认）—— 有整篇正文就导整篇（老师确认过的成品），否则退回四段。
+      · doc         —— 强制整篇；没有就报错，而不是默默导成四段（那会让人以为导错了）。
+      · fields      —— 强制四段。
+    """
     ls = _lesson_or_404(db, lid)
     fb = db.scalar(select(Feedback).where(Feedback.lesson_id == lid))
     if fb is None:
@@ -343,17 +432,26 @@ def export_feedback(
     if fmt not in EXPORT_FORMATS:
         raise HTTPException(422, f"不支持的格式 {format}（可选 txt / docx / pdf）")
 
+    src = (source or "auto").lower()
+    if src not in ("auto", "doc", "fields"):
+        raise HTTPException(422, f"不支持的 source {source}（可选 auto / doc / fields）")
+    whole = (fb.doc or "").strip()
+    if src == "doc" and not whole:
+        raise HTTPException(422, "这条反馈还没有整篇正文，先点「AI 润色」生成一篇")
+    use_doc = bool(whole) and src != "fields"
+
     data = _serialize(fb, [], _dim_map(db))
     ctx = _export_context(db, ls, fb)
     ctx["ability_scores"] = data["ability_scores"]
+    doc_arg = data["doc"] if use_doc else None
 
     try:
         if fmt == "txt":
-            body = feedback_export.build_txt(data, ctx)
+            body = feedback_export.build_txt(data, ctx, doc_arg)
         elif fmt == "docx":
-            body = feedback_export.build_docx(data, ctx)
+            body = feedback_export.build_docx(data, ctx, doc_arg)
         else:
-            body = feedback_export.build_pdf(data, ctx)
+            body = feedback_export.build_pdf(data, ctx, doc_arg)
     except feedback_export.PdfUnavailable as e:
         raise HTTPException(503, str(e)) from e
 
@@ -401,10 +499,13 @@ def test_ai(payload: Optional[AiTestIn] = None, db: Session = Depends(get_db)):
 
 @router.post("/lessons/{lid}/feedback/polish")
 def polish_feedback(lid: int, payload: PolishIn, db: Session = Depends(get_db)):
-    """AI 润色。
+    """AI 整篇润色。
+
+    逻辑：把四段记录 + 课程信息拼成一篇「原始记录」，再让 AI 照着老师选的模板
+    整理成一篇正式的反馈文档，**整篇**返回。
 
     ⚠️ 这里会把反馈正文发到第三方 AI 服务 —— 界面必须事先说清楚，且只能由老师主动触发。
-    返回的是**建议稿**，前端应该让老师确认后再采用，绝不直接覆盖他写的内容。
+    返回的是**建议稿**，前端必须让老师过目、可编辑、确认后才采用，绝不直接覆盖他写的内容。
     """
     ls = _lesson_or_404(db, lid)
     stu = db.get(Student, ls.student_id)
@@ -413,7 +514,21 @@ def polish_feedback(lid: int, payload: PolishIn, db: Session = Depends(get_db)):
         "上课时间": (ls.start_at or "").replace("T", " "),
         "本次内容": ls.topic or "",
     }
+    # 模板内容：弹窗里改过的优先；否则按 id 取库里的
+    template_content = payload.template_content
+    template_name = ""
+    if not (template_content or "").strip() and payload.template_id:
+        t = db.get(FeedbackDocTemplate, payload.template_id)
+        if t is None:
+            raise HTTPException(404, "模板不存在")
+        template_content = t.content or ""
+        template_name = t.name
+
+    draft = ai_polish.assemble_draft(payload.fields, ctx, payload.draft)
     try:
-        return ai_polish.polish(db, payload.fields, ctx, payload.style)
+        result = ai_polish.polish_document(db, draft, template_content, payload.style)
     except ai_polish.AiError as e:
         raise HTTPException(502, str(e)) from e
+    result["draft"] = draft          # 回传一份「到底发了什么」，方便界面如实展示
+    result["template_name"] = template_name
+    return result

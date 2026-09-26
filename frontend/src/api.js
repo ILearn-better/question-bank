@@ -115,15 +115,23 @@ export const feedbackApi = {
   createTemplate: (body) => api.post('/api/feedback-templates', body),
   removeTemplate: (id) => api.del(`/api/feedback-templates/${id}`),
 
+  /** 润色模板：一整篇文档的格式与文风参考，润色时整段进提示词。
+   *  和上面的 templates 是两回事 —— 那边是「录反馈时的快捷短语」，这边是「成文长什么样」。 */
+  docTemplates: () => api.get('/api/feedback-doc-templates'),
+  createDocTemplate: (body) => api.post('/api/feedback-doc-templates', body),
+  removeDocTemplate: (id) => api.del(`/api/feedback-doc-templates/${id}`),
+
   /** 反馈配图上传。返回可直接放进 images 数组的 URL。 */
   uploadImage: (formData) => api.upload('/api/feedbacks/image', formData),
 
-  /** AI 润色。注意：会把内容发到第三方 AI 服务，界面必须先提示。 */
+  /** AI 整篇润色：四段记录进去，一整篇文档出来（建议稿，需老师确认）。
+   *  注意：会把内容发到第三方 AI 服务，界面必须先提示。 */
   polish: (lessonId, body) => api.post(`/api/lessons/${lessonId}/feedback/polish`, body),
 
-  /** 导出 txt / docx / pdf。走 download() 而不是 window.open，失败时才能弹出可读提示。 */
-  downloadExport: (lessonId, format, filename) =>
-    download(`/api/lessons/${lessonId}/feedback/export` + qs({ format }), filename),
+  /** 导出 txt / docx / pdf。
+   *  source：auto（默认，有整篇就导整篇）/ doc（强制整篇）/ fields（强制四段）。 */
+  downloadExport: (lessonId, format, filename, source = 'auto') =>
+    download(`/api/lessons/${lessonId}/feedback/export` + qs({ format, source }), filename),
 };
 
 /** AI 润色的接口配置（地址 / 模型 / 密钥）。密钥只存本机，接口一律脱敏返回。 */

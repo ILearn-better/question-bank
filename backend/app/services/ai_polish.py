@@ -37,14 +37,19 @@ FIELD_CN = {
     "next_plan": "下次安排",
 }
 
-SYSTEM_PROMPT = (
-    "你是一位经验丰富的中学数学老师，正在把课后反馈整理成发给家长看的文字。\n"
-    "要求：\n"
-    "1. 只做语言润色：把口语、零碎、重复的表达整理通顺，不要改变任何事实；\n"
-    "2. 绝不编造学生没做过的事、没考过的分数、没布置的作业；原文没提的信息一律不补；\n"
-    "3. 保持原有的分条/分段结构，原文是列点的仍然列点；\n"
-    "4. 语气专业、具体、对家长友好，不空泛地说「很好」「要加油」；\n"
-    "5. 只输出 JSON，不要任何解释文字。"
+DOC_SYSTEM_PROMPT = (
+    "你是一位经验丰富的中学数学老师，正在把一节课的零散记录整理成一篇可以发给家长的正式文档。\n"
+    "你会拿到【模板】和【原始记录】两部分。请严格按下面的要求做：\n"
+    "1. 仿照模板的结构、栏目顺序、栏目名与详略程度来组织全文，语气也要和模板一致；\n"
+    "2. 只整理与润色：把口语、零碎、重复的表达写通顺，把重复的合并，\n"
+    "   但绝不改变任何事实，绝不添加原始记录里没有的信息；\n"
+    "3. 原始记录里没有对应内容的栏目，直接把整个栏目省略 ——\n"
+    "   不要留一个空标题、不要写「无」「待补充」「暂无」，\n"
+    "   更不要编造一个看起来像真的数字、日期、分数或章节号；\n"
+    "4. 原始记录里有、但模板里没有的内容不要丢掉，另起一个合适的栏目如实写上；\n"
+    "5. 「课程信息」里给的姓名、时间、课程可以直接用在文档抬头；\n"
+    "6. 只输出文档正文本身，不要解释、不要寒暄、不要用 Markdown 的 # 或 ** 或代码围栏，\n"
+    "   栏目名一律用【】包住。"
 )
 
 
@@ -274,59 +279,81 @@ def _extract_content(data: dict) -> str:
     raise AiError(f"AI 接口响应里没有找到正文：{json.dumps(data, ensure_ascii=False)[:200]}")
 
 
-def _parse_json_block(text: str) -> dict:
-    """模型经常把 JSON 包在 ```json 围栏里，或者前后带一句解释 —— 都要能剥出来。"""
-    s = text.strip()
-    if s.startswith("```"):
-        s = s.split("\n", 1)[-1] if "\n" in s else s
-        if s.rstrip().endswith("```"):
-            s = s.rstrip()[:-3]
-    start, end = s.find("{"), s.rfind("}")
-    if start >= 0 and end > start:
-        s = s[start:end + 1]
-    try:
-        obj = json.loads(s)
-    except json.JSONDecodeError as e:
-        raise AiError(f"模型返回的内容不是合法 JSON（{e.msg}）：{text[:200]}") from e
-    if not isinstance(obj, dict):
-        raise AiError(f"模型返回的 JSON 不是对象：{text[:200]}")
-    return obj
+def assemble_draft(fields: dict, context: dict, draft: str | None = None) -> str:
+    """把四段记录 + 课程信息拼成一篇「原始记录」，交给 AI 整理。
+
+    刻意**不**在这里排成模板的样子：怎么排是 AI 的活（它才读得懂模板要什么）。
+    这里只负责把信息如实、完整地传过去，并标明哪一段是什么 ——
+    少标一个标签，模型就可能把「作业布置」当成「课堂表现」混进正文里。
+
+    给了 draft（老师自己写的整篇草稿）就优先用它：那种情况下再拼四段是多余的。
+    """
+    if draft and draft.strip():
+        return draft.strip()
+
+    filled = {k: (fields.get(k) or "").strip() for k in FIELDS}
+    filled = {k: v for k, v in filled.items() if v}
+    if not filled:
+        # 老师一个字都没写：返回空串，让调用方给出「没内容可润色」的提示。
+        # ⚠️ 不能只判断「拼出来的字符串是不是空」—— 课程信息那几行永远非空，
+        #    那样就会把一篇什么都没有的记录发出去，模型除了编没有别的办法。
+        return ""
+
+    lines: list[str] = []
+    ctx_lines = [f"{k}：{v}" for k, v in (context or {}).items() if v]
+    if ctx_lines:
+        lines.append("## 课程信息")
+        lines.extend(ctx_lines)
+        lines.append("")
+    lines.append("## 老师填写的记录（分段、尚未整理）")
+    for key in FIELDS:
+        if key not in filled:
+            continue
+        lines.append(f"〔{FIELD_CN[key]}〕")
+        lines.append(filled[key])
+        lines.append("")
+    return "\n".join(lines).strip()
 
 
-def polish(db: Session, fields: dict, context: dict, style: str | None = None) -> dict:
-    """润色。只处理 FIELDS 里出现且有内容的字段，返回同样键名的结果。"""
+def polish_document(
+    db: Session,
+    draft: str,
+    template_content: str | None = None,
+    style: str | None = None,
+    timeout_cap: int | None = None,
+) -> dict:
+    """整篇润色：一篇原始记录进去，一篇正式文档出来。
+
+    输出是**纯文本**而不是 JSON —— 以前按字段返回 JSON，是因为结果要回填四个输入框；
+    现在结果是整篇文章（栏目数由模板决定，可能七八个），硬塞进固定 JSON 结构只会
+    逼模型裁剪内容。所以让模型直接写文档，前端拿去给老师过目、编辑、采用。
+    """
     cfg = get_config(db)
     if not cfg["configured"]:
         raise AiError("还没有配置 AI 接口（地址 / 模型 / 密钥），请到「设置 → AI 润色」里填写")
-
-    payload_fields = {k: (v or "").strip() for k, v in (fields or {}).items() if k in FIELDS}
-    payload_fields = {k: v for k, v in payload_fields.items() if v}
-    if not payload_fields:
+    if not (draft or "").strip():
         raise AiError("没有需要润色的内容 —— 四个字段都是空的")
 
-    ctx_lines = [f"- {k}：{v}" for k, v in (context or {}).items() if v]
-    body_user = [
-        "## 本节背景",
-        "\n".join(ctx_lines) if ctx_lines else "（无）",
-        "",
-        "## 待润色的反馈（原样保留段落结构）",
-    ]
-    for k, v in payload_fields.items():
-        body_user.append(f"### {FIELD_CN[k]}\n{v}")
-    body_user += [
-        "",
-        "## 输出要求",
-        "返回一个 JSON 对象，键固定为：" + "、".join(FIELD_CN[k] + f"（{k}）" for k in payload_fields),
-        "只包含上面给出的这几段，不要新增段落，不要输出解释。",
-    ]
-    if style:
-        body_user.append(f"## 风格要求\n{style.strip()}")
+    parts: list[str] = []
+    if (template_content or "").strip():
+        parts.append(
+            "## 模板（请仿照它的结构、栏目顺序、语气与详略；模板里的示例只是文风参考，"
+            "其中的姓名、章节、分数都不得出现在结果里）\n" + template_content.strip()
+        )
+    else:
+        parts.append(
+            "## 模板\n（老师没有指定模板。请用【课堂表现】【存在问题】【作业布置】"
+            "【下次安排】四个栏目组织，简洁、面向家长，200 字以内。）"
+        )
+    parts.append("## 原始记录（请整理成上面模板的样子）\n" + draft.strip())
+    if (style or "").strip():
+        parts.append("## 额外要求\n" + style.strip())
 
     body = {
         "model": cfg["model"],
         "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": "\n".join(body_user)},
+            {"role": "system", "content": DOC_SYSTEM_PROMPT},
+            {"role": "user", "content": "\n\n".join(parts)},
         ],
         "temperature": 0.3,          # 润色要稳，不要发挥
         "stream": False,
@@ -335,20 +362,19 @@ def polish(db: Session, fields: dict, context: dict, style: str | None = None) -
         _chat_url(cfg["base_url"]),
         body,
         {"Authorization": f"Bearer {cfg['api_key']}"},
-        int(cfg["timeout"]),
+        int(timeout_cap or cfg["timeout"]),
     )
-    obj = _parse_json_block(_extract_content(data))
-    out = {}
-    for k in payload_fields:
-        val = obj.get(k)
-        if val is None:
-            val = obj.get(FIELD_CN[k])        # 少数模型会回中文键
-        if isinstance(val, list):
-            val = "\n".join(str(x) for x in val)
-        out[k] = str(val).strip() if val else ""
+    text = _extract_content(data).strip()
+    if text.startswith("```"):        # 有些模型习惯包个代码块，剥掉
+        text = text.split("\n", 1)[-1] if "\n" in text else text
+        if text.rstrip().endswith("```"):
+            text = text.rstrip()[:-3]
+        text = text.strip()
+    if not text:
+        raise AiError("模型返回了空内容，可以换个模型或稍后再试")
     usage = data.get("usage") or {}
     return {
-        "fields": out,
+        "text": text,
         # 顺带回报用量：让老师知道这次花了多少 token（自付费用的服务会关心）
         "usage": {"prompt": usage.get("prompt_tokens"), "completion": usage.get("completion_tokens")},
         "model": cfg["model"],
