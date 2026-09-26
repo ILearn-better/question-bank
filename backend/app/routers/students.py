@@ -20,7 +20,7 @@ from ..models import (
     StudentCurriculum,
 )
 from ..schemas import StudentIn, StudentPatch
-from ..services import mastery
+from ..services import mastery, storage
 from . import lesson_files
 
 router = APIRouter(prefix="/api", tags=["students"])
@@ -134,6 +134,9 @@ def delete_student(sid: int, db: Session = Depends(get_db)):
     lesson_files.cleanup_for_lessons(
         db, [r[0] for r in db.execute(select(Lesson.id).where(Lesson.student_id == sid)).all()]
     )
+    # 再把这个学生的归档目录整个收掉。上一步只删得掉「数据库里有登记的」文件，
+    # 上传了却没保存进反馈的配图查不到，会一直躺在硬盘上 —— 整目录删才收得干净。
+    storage.remove_student_dir(s)
     db.delete(s)
     db.commit()
     return {"ok": True}

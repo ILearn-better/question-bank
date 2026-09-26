@@ -306,21 +306,106 @@ export default {
       }
     }
 
+    /** ＋贴图 按钮走的文件选择。 */
     function onImageFile(e) {
       const f = e.target.files && e.target.files[0];
       if (f) uploadImage(f);
       e.target.value = '';
     }
 
-    function onPaste(e) {
-      const items = (e.clipboardData && e.clipboardData.items) || [];
-      for (const it of items) {
-        if (it.type && it.type.startsWith('image/')) {
-          uploadImage(it.getAsFile());
-          e.preventDefault();
-          return;
+    /** 把 data: URL 直接转成文件上传 —— 内容已经在本地了，不联网。 */
+    async function uploadDataUrl(dataUrl) {
+      try {
+        const blob = await (await fetch(dataUrl)).blob();
+        if (!blob.type.startsWith('image/')) throw new Error('剪贴板里的不是图片数据');
+        await uploadImage(new File([blob], 'paste', { type: blob.type }));
+      } catch (e) {
+        fail('这张图读不出来：' + e.message);
+      }
+    }
+
+    /** 让服务端去把链接上的图取回来（本服务唯一会主动访问外网的地方，所以先问一句）。 */
+    async function uploadFromUrl(url) {
+      if (!window.confirm(`剪贴板里只有图片的**链接**，没有图片本身：\n${url}\n\n` +
+                          '要从这个地址把图下载下来存进这份资料吗？')) return;
+      uploading.value = true;
+      try {
+        const r = await feedbackApi.uploadImageFromUrl(props.lesson.id, url);
+        images.value = [...images.value, r.url];
+        ok('已把链接上的图存进来');
+      } catch (e) {
+        fail(e.message);
+      } finally {
+        uploading.value = false;
+      }
+    }
+
+    /**
+     * 从剪贴板里尽量挖出一张图。
+     *
+     * 剪贴板里的形态比想象中杂：
+     *   · 截图 / 从微信复制    → items 里有 image/*（最常见）
+     *   · 从文件夹复制图片文件 → files 里有 File
+     *   · 从网页复制          → 可能**只有** text/html，里面是一个 <img src="…">
+     *   · 网页内嵌图          → text/html 里是 data:image/…（本地就能解，不联网）
+     * 抓不到就返回 null，由调用方给出看得懂的提示 —— 静默失败最糟：
+     * 用户会反复粘，以为是自己操作不对。
+     */
+    function pickPastedImage(e) {
+      const dt = e.clipboardData;
+      if (!dt) return null;
+      // ① 剪贴板里真的有图片二进制（截图、从微信/QQ 复制的图）—— 最该走的一条
+      for (const it of dt.items || []) {
+        if (it.kind === 'file' && it.type && it.type.startsWith('image/')) {
+          const f = it.getAsFile();
+          if (f) return { kind: 'file', file: f };
         }
       }
+      for (const f of dt.files || []) {
+        if (f.type && f.type.startsWith('image/')) return { kind: 'file', file: f };
+      }
+      // 剪贴板里是别的文件（比如从文件夹复制的 PDF）—— 提示一下该去哪儿传
+      const other = [...(dt.files || [])].filter((f) => f.type && !f.type.startsWith('image/'))[0];
+      if (other) return { kind: 'otherfile', name: other.name };
+
+      let html = '', text = '';
+      try { html = dt.getData('text/html') || ''; } catch (err) { /* 某些环境不给读 */ }
+      try { text = (dt.getData('text/plain') || '').trim(); } catch (err) { /* 同上 */ }
+      // 去掉链接之后还剩什么字 —— 用来判断「这是只复制了一个链接/一张图」还是「复制了一段文章」
+      const noUrl = text.replace(/https?:\/\/\S+/gi, '').trim();
+      // 有些复制源只给 text/html、不给 text/plain，所以还要把标签剥掉再看一遍里面有没有正文
+      const htmlText = html.replace(/<[^>]*>/g, ' ').replace(/&nbsp;/gi, ' ')
+        .replace(/https?:\/\/\S+/gi, ' ').trim();
+      const srcOf = (s) => (String(s).match(/src\s*=\s*["']([^"']+)["']/i) || [])[1] || '';
+      const src = srcOf(html);
+
+      // ②③④ 只有「剪贴板里除了图/链接没别的文字」才算一次贴图操作。
+      //     只要还带着别的文字（粘一段带图的网页文章、往正文里粘参考链接），一概不插手：
+      //     把老师已经选好的文字吞掉，比少贴一张图糟糕得多 —— 那是在毁他的内容。
+      if (noUrl || htmlText) return null;
+      if (/^data:image\//i.test(src)) return { kind: 'data', dataUrl: src };      // 内嵌图，本地就能解
+      if (/^https?:\/\//i.test(src)) return { kind: 'url', url: src };            // 得让服务端取
+      // 直接粘了个图片地址。只认「看着就是图片」的地址 —— 粘普通网址是正常的文字操作
+      if (/^https?:\/\/\S+\.(png|jpe?g|gif|webp|bmp|svg)(\?\S*)?$/i.test(text)) {
+        return { kind: 'url', url: text };
+      }
+      // 看得出用户想粘图（剪贴板里确实有个 <img>），但抓不到图 —— 交给上层说句人话
+      if (/<img/i.test(html)) return { kind: 'none' };
+      return null;      // 其余情况：完全不干预，别抢输入框的默认行为
+    }
+
+    function onPaste(e) {
+      const found = pickPastedImage(e);
+      if (!found) return;
+      e.preventDefault();
+      if (found.kind === 'file') return uploadImage(found.file);
+      if (found.kind === 'data') return uploadDataUrl(found.dataUrl);
+      if (found.kind === 'url') return uploadFromUrl(found.url);
+      if (found.kind === 'otherfile') {
+        return warn(`剪贴板里是个文件（${found.name}），这里只能贴图片。` +
+                    '上课资料请用下面的「上课文件」上传。');
+      }
+      warn('剪贴板里没有可以直接用的图片。试试先用截图工具截一下，或点「＋ 贴图」选文件。');
     }
 
     function removeImage(i) { images.value = images.value.filter((_, idx) => idx !== i); }

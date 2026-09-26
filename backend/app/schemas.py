@@ -240,6 +240,17 @@ class AiSettingIn(BaseModel):
     clear_key: bool = False
 
 
+class ImageFromUrlIn(BaseModel):
+    """只带链接的图片：从网页复制图片时剪贴板里往往只有 <img src="https://…">，
+    浏览器拿不到那张图（跨域 / file:// 都不行），只能让服务端去取。
+
+    所以界面会先明确问一句再调这个接口 —— 这是本服务唯一主动访问外网的地方。
+    """
+
+    lesson_id: int
+    url: str
+
+
 class PolishIn(BaseModel):
     """整篇润色请求。
 

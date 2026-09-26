@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import re
+import shutil
 from pathlib import Path
 
 from sqlalchemy import select
@@ -69,6 +70,28 @@ def dir_for(student, lesson) -> Path:
     d = config.UPLOAD_DIR / dated_rel(student, lesson)
     d.mkdir(parents=True, exist_ok=True)
     return d
+
+
+def remove_student_dir(student) -> int:
+    """删掉这个学生的整个归档目录，返回删掉了几个文件。
+
+    为什么整目录删、而不是照着数据库逐个文件删：老师删学生时想的是「这个人连同他的资料
+    一起没」。而且反馈配图是**上传即落盘、保存反馈才登记**的 —— 上传完没保存就关窗的图，
+    数据库里查不到（lesson_files.cleanup_for_lessons 也自然漏掉它们），逐个删必然留下残渣。
+    目录名已经过 safe_token 洗过，这里再确认一次落在归档根之内才动手。
+    """
+    d = config.STUDENTS_DIR / student_folder(student)
+    if d == config.STUDENTS_DIR:            # 兜底：宁可删不掉，也绝不能铲到归档根
+        return 0
+    try:
+        d.relative_to(config.STUDENTS_DIR)
+    except ValueError:
+        return 0
+    if not d.is_dir():
+        return 0
+    n = sum(1 for p in d.rglob("*") if p.is_file())
+    shutil.rmtree(d, ignore_errors=True)
+    return n
 
 
 def unique_name(directory: Path, filename: str) -> str:
