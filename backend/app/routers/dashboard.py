@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 
 from .. import config
 from ..db import get_db
-from ..models import Feedback, Lesson, Student
+from ..models import Feedback, Homework, Lesson, Student
 from ..services import billing
 
 router = APIRouter(prefix="/api/dashboard", tags=["dashboard"])
@@ -42,6 +42,9 @@ def today(db: Session = Depends(get_db)):
         ).all()
     )
     feedback_ids = {f.lesson_id for f in db.scalars(select(Feedback)).all()}
+    # 作业也是一条独立的线：可能只有作业没反馈（先收了作业、隔天再写反馈），
+    # 所以这里单独算一份，不能拿 has_feedback 去推。
+    homework_ids = {h.lesson_id for h in db.scalars(select(Homework)).all()}
     pending = [ls for ls in done_lessons if ls.id not in feedback_ids][:10]
 
     # 未来 7 天的安排
@@ -77,6 +80,7 @@ def today(db: Session = Depends(get_db)):
             "topic": ls.topic,
             "amount": ls.amount,
             "has_feedback": ls.id in feedback_ids,
+            "has_homework": ls.id in homework_ids,
         }
 
     month = billing.monthly_summary(db, datetime.now().strftime("%Y-%m"), config.OWNER_ID)

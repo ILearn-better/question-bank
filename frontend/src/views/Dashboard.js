@@ -3,13 +3,14 @@
 import { onMounted, ref } from 'vue';
 import { dashboardApi, lessonsApi } from '../api.js';
 import FeedbackDialog from '../components/FeedbackDialog.js';
+import HomeworkDialog from '../components/HomeworkDialog.js';
 import {
   currentPeriod, fail, hhmm, money, ok, shortDate, STATUS_LABEL, STATUS_TAG,
 } from '../store.js';
 
 export default {
   name: 'Dashboard',
-  components: { FeedbackDialog },
+  components: { FeedbackDialog, HomeworkDialog },
   setup() {
     const data = ref(null);
     const monthly = ref(null);
@@ -17,6 +18,7 @@ export default {
     const loading = ref(true);
     const busy = ref(0);
     const feedbackLesson = ref(null);
+    const homeworkLesson = ref(null);
 
     async function load() {
       loading.value = true;
@@ -56,10 +58,15 @@ export default {
       load();
     }
 
+    function onHomeworkSaved() {
+      homeworkLesson.value = null;
+      load();
+    }
+
     onMounted(load);
     return {
-      data, monthly, period, loading, busy, feedbackLesson,
-      load, complete, reloadMonthly, onFeedbackSaved,
+      data, monthly, period, loading, busy, feedbackLesson, homeworkLesson,
+      load, complete, reloadMonthly, onFeedbackSaved, onHomeworkSaved,
       hhmm, money, shortDate, STATUS_LABEL, STATUS_TAG,
     };
   },
@@ -123,6 +130,10 @@ export default {
                   @click="feedbackLesson = ls">
             {{ ls.has_feedback ? '改反馈' : '写反馈' }}
           </button>
+          <!-- 作业是跟反馈并列的另一条线：有就改、没有就交（独立于反馈，互不依赖） -->
+          <button class="btn ghost sm" @click="homeworkLesson = ls">
+            {{ ls.has_homework ? '改作业' : '交作业' }}
+          </button>
         </div>
       </div>
 
@@ -141,6 +152,9 @@ export default {
             <div class="meta">{{ hhmm(ls.start_at) }} · {{ ls.duration_min }} 分钟</div>
           </div>
           <button class="btn sm primary" @click="feedbackLesson = ls">写反馈</button>
+          <button class="btn ghost sm" @click="homeworkLesson = ls">
+            {{ ls.has_homework ? '改作业' : '交作业' }}
+          </button>
         </div>
       </div>
 
@@ -188,5 +202,7 @@ export default {
 
     <FeedbackDialog v-if="feedbackLesson" :lesson="feedbackLesson"
                     @close="feedbackLesson = null" @saved="onFeedbackSaved" />
+    <HomeworkDialog v-if="homeworkLesson" :lesson="homeworkLesson"
+                    @close="homeworkLesson = null" @saved="onHomeworkSaved" />
   </div>`,
 };
