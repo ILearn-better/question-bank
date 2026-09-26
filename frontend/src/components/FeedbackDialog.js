@@ -357,6 +357,14 @@ export default {
       ok('已放入「整篇正文」（记得点保存反馈）');
     }
 
+    // 存模板弹窗里亮一眼「到底要存什么」：模板正文有几百字，光看名字没法确认存的是哪一版。
+    // ⚠️ 这个正则不能写在 template 里 —— 整个模板是个 JS 模板字符串，
+    //    里面的 \n 会被 JS 先解释成真换行，Vue 编译器拿到的就是半个正则（实测直接白屏）。
+    const docTplPreview = computed(() => {
+      const t = (docTemplateContent.value || '').trim();
+      return t ? t.slice(0, 40).replace(/\s+/g, ' ') + '…' : '';
+    });
+
     async function saveDocTemplate() {
       const name = (docTplName.value || '').trim();
       if (!name) return warn('先给模板起个名字');
@@ -440,7 +448,7 @@ export default {
              polishing, polishResult, polishText, openPolish, runPolish, adoptPolish,
              showPolishAsk, polishStyle, willSend,
              docTemplates, docTemplateId, docTemplateContent, applyDocTemplate,
-             currentDocTpl, showDocTplSave, docTplName, saveDocTemplate, deleteDocTemplate,
+             currentDocTpl, showDocTplSave, docTplName, saveDocTemplate, deleteDocTemplate, docTplPreview,
              showExport, exporting, exportSource, exportMode, doExport };
   },
   template: `
@@ -571,12 +579,18 @@ export default {
   <!-- 存为润色模板（一整篇文档的格式与文风） -->
   <Modal v-if="showDocTplSave" title="存为润色模板" @close="showDocTplSave = false">
     <p class="muted small" style="margin-top:0">
-      存的是上面那个「模板内容」框里的东西 —— 也就是 AI 要仿照的结构与文风。
-      下次润色时选它即可，不用再粘一遍。
+      存的是「AI 润色」窗口里那个<strong>模板内容</strong>框里的东西 ——
+      也就是 AI 要仿照的结构与文风。下次润色时直接选它即可，不用再粘一遍。
     </p>
     <div class="field">
       <label>模板名称</label>
       <input type="text" v-model="docTplName" placeholder="如：完整课堂反馈" @keyup.enter="saveDocTemplate">
+    </div>
+    <!-- 把要存的内容亮一眼：模板正文很长，光看名字没法确认存的是哪一版 -->
+    <div class="small muted">
+      将要保存的内容：{{ (docTemplateContent || '').length }} 字
+      <span v-if="docTplPreview">· {{ docTplPreview }}</span>
+      <span v-else style="color:var(--danger)">（空的，请先在润色窗口里填写模板内容）</span>
     </div>
     <template #foot>
       <button class="btn ghost" @click="showDocTplSave = false">取消</button>
