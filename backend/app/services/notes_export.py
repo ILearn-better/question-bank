@@ -27,8 +27,6 @@ from __future__ import annotations
 
 import io
 import re
-import tempfile
-from pathlib import Path
 
 from .. import config
 from ..adapters import notes_math, office
@@ -544,23 +542,15 @@ def build_docx(note: dict, include_ink: bool = True) -> tuple[bytes, dict]:
 def build_pdf(note: dict, include_ink: bool = True) -> tuple[bytes, dict]:
     """docx -> Word -> PDF。没有 Word 时抛 PdfUnavailable。"""
     docx_bytes, info = build_docx(note, include_ink=include_ink)
-
-    with tempfile.TemporaryDirectory(prefix="shike_note_pdf_") as td:
-        src = Path(td) / "note.docx"
-        out = Path(td) / "note.pdf"
-        src.write_bytes(docx_bytes)
-        try:
-            office.word_to_pdf(src, out)
-        except office.OfficeUnavailable as e:
-            raise PdfUnavailable(
-                "导出 PDF 需要本机装有 Microsoft Word（服务端用 Word 排版，公式才能正确显示）。"
-                f"当前不可用：{e}。可以先「导出 Word」，再用 Word 另存为 PDF。"
-            ) from e
-        except office.WordConvertError as e:
-            raise PdfUnavailable(str(e)) from e
-        if not out.exists():
-            raise PdfUnavailable("Word 没有产出 PDF（文档可能为空）")
-        return out.read_bytes(), info
+    try:
+        return office.docx_bytes_to_pdf(docx_bytes), info
+    except office.OfficeUnavailable as e:
+        raise PdfUnavailable(
+            "导出 PDF 需要本机装有 Microsoft Word（服务端用 Word 排版，公式才能正确显示）。"
+            f"当前不可用：{e}。可以先「导出 Word」，再用 Word 另存为 PDF。"
+        ) from e
+    except office.WordConvertError as e:
+        raise PdfUnavailable(str(e)) from e
 
 
 def safe_filename(title: str, ext: str) -> str:

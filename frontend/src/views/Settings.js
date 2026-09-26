@@ -2,7 +2,7 @@
 // 「系统信息」这一块不是装饰 —— 它把 Phase 0 重构的三个验收项直接摆出来：
 // 迁移到哪个版本、WAL 有没有开、外键约束到底生效了没有。
 import { onMounted, reactive, ref } from 'vue';
-import { abilityApi, curriculumApi, systemApi } from '../api.js';
+import { abilityApi, aiApi, curriculumApi, systemApi } from '../api.js';
 import { fail, loadCurricula, loadDims, money, ok, todayISO } from '../store.js';
 
 export default {
@@ -16,6 +16,64 @@ export default {
     const newCurr = reactive({ code: '', name: '', region: 'CN', stage: 'senior' });
     const newDim = reactive({ name: '', sort_order: 0 });
     const busy = ref('');
+
+    // ---- AI 润色配置 ----
+    const ai = ref(null);                 // 后端返回的是脱敏形态（只有 has_key / key_hint）
+    const aiForm = reactive({ base_url: '', model: '', api_key: '', timeout: 60 });
+    const aiTest = ref(null);
+
+    async function loadAi() {
+      try {
+        const cfg = await aiApi.settings();
+        ai.value = cfg;
+        aiForm.base_url = cfg.base_url || '';
+        aiForm.model = cfg.model || '';
+        aiForm.timeout = cfg.timeout || 60;
+        aiForm.api_key = '';            // 密钥永远不回填：接口根本不返回明文
+      } catch (e) {
+        fail(e.message);
+      }
+    }
+
+    async function saveAi() {
+      busy.value = 'ai';
+      try {
+        // api_key 留空 = 不改（库里那份保持不变）
+        ai.value = await aiApi.save({
+          base_url: aiForm.base_url, model: aiForm.model, timeout: aiForm.timeout,
+          api_key: aiForm.api_key || '',
+        });
+        aiForm.api_key = '';
+        ok('AI 配置已保存');
+      } catch (e) {
+        fail(e.message);
+      } finally {
+        busy.value = '';
+      }
+    }
+
+    async function clearAiKey() {
+      if (!window.confirm('清除已保存的 API 密钥？清掉之后 AI 润色就用不了了。')) return;
+      try {
+        ai.value = await aiApi.save({ clear_key: true });
+        ok('密钥已清除');
+      } catch (e) {
+        fail(e.message);
+      }
+    }
+
+    async function testAi() {
+      busy.value = 'ai-test';
+      aiTest.value = null;
+      try {
+        const r = await aiApi.test();
+        aiTest.value = { ok: true, msg: `连接正常，模型回复：「${r.reply}」` };
+      } catch (e) {
+        aiTest.value = { ok: false, msg: e.message };
+      } finally {
+        busy.value = '';
+      }
+    }
 
     async function load() {
       try {
@@ -106,11 +164,12 @@ export default {
       return (n / 1024 / 1024).toFixed(2) + ' MB';
     }
 
-    onMounted(load);
+    onMounted(() => { load(); loadAi(); });
 
     return {
       info, backups, fk, curricula, dims, newCurr, newDim, busy,
       addCurriculum, addDim, disableDim, doBackup, runFkCheck, fmtSize, money, todayISO,
+      ai, aiForm, aiTest, saveAi, clearAiKey, testAi,
     };
   },
   template: `
@@ -243,6 +302,61 @@ export default {
           <input type="text" v-model="newDim.name" placeholder="新维度名称">
           <button class="btn" style="flex:none" @click="addDim">添加</button>
         </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>AI 润色</h2>
+      <div class="small muted" style="margin-bottom:10px">
+        课后反馈里的「AI 润色」按钮用这里的配置。走的是 <strong>OpenAI 兼容</strong>接口，
+        DeepSeek / 通义 / Kimi / 智谱，以及本机跑的 Ollama、vLLM 都是这个格式，
+        所以只需要填地址和模型名。地址填到 <span class="mono">…/v1</span> 或直接填域名均可，会自动补齐。
+      </div>
+      <div class="small" style="margin-bottom:10px;color:var(--warning, #d97706)">
+        ⚠️ 点「AI 润色」时，反馈正文（通常含学生姓名）会发送到你配置的服务商。
+        不配置就完全不会联网，功能照常用。
+      </div>
+
+      <div class="grid cols-2">
+        <div class="field">
+          <label>接口地址</label>
+          <input type="text" v-model="aiForm.base_url" placeholder="如 https://api.deepseek.com">
+        </div>
+        <div class="field">
+          <label>模型名</label>
+          <input type="text" v-model="aiForm.model" placeholder="如 deepseek-chat">
+        </div>
+        <div class="field">
+          <label>
+            API 密钥
+            <span v-if="ai && ai.has_key" class="muted small">（已保存 {{ ai.key_hint }}；留空表示不改）</span>
+          </label>
+          <input type="password" v-model="aiForm.api_key" :placeholder="ai && ai.has_key ? '留空 = 不修改' : 'sk-...'">
+        </div>
+        <div class="field">
+          <label>超时（秒）</label>
+          <input type="number" v-model.number="aiForm.timeout" min="5" max="300">
+        </div>
+      </div>
+
+      <div v-if="ai && ai.from_env && ai.from_env.length" class="small muted" style="margin-bottom:8px">
+        环境变量已覆盖：<span class="mono">{{ ai.from_env.join(' , ') }}</span>
+        （不想把密钥落库的话，就只设环境变量）
+      </div>
+
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+        <button class="btn primary" :disabled="busy === 'ai'" @click="saveAi">
+          {{ busy === 'ai' ? '保存中…' : '保存配置' }}
+        </button>
+        <button class="btn" :disabled="busy === 'ai-test'" @click="testAi">
+          {{ busy === 'ai-test' ? '测试中…' : '测试连接' }}
+        </button>
+        <button v-if="ai && ai.has_key" class="btn ghost" style="color:var(--danger)" @click="clearAiKey">清除密钥</button>
+        <span v-if="ai && ai.configured" class="tag green" style="align-self:center">已配置</span>
+        <span v-else class="tag" style="align-self:center">未配置</span>
+      </div>
+      <div v-if="aiTest" class="small" :style="aiTest.ok ? 'color:var(--success);margin-top:10px' : 'color:var(--danger);margin-top:10px'">
+        {{ aiTest.msg }}
       </div>
     </div>
 

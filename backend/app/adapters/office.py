@@ -147,6 +147,27 @@ def _convert_locked(src: str, out_pdf: str) -> int:
                 pass
 
 
+def docx_bytes_to_pdf(docx: bytes) -> bytes:
+    """docx 字节 -> PDF 字节。
+
+    给「导出 PDF」这类场景用：调用方手里只有内存里的 docx，省得每个模块都写一遍
+    临时文件管理。失败时抛 OfficeUnavailable（本机没这个能力）或 WordConvertError
+    （这次没转成），调用方自行翻成用户看得懂的话。
+    """
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="shike_docx2pdf_") as td:
+        src = os.path.join(td, "in.docx")
+        out = os.path.join(td, "out.pdf")
+        with open(src, "wb") as f:
+            f.write(docx)
+        word_to_pdf(src, out)
+        if not os.path.exists(out):
+            raise WordConvertError("Word 没有产出 PDF（文档可能为空或已损坏）")
+        with open(out, "rb") as f:
+            return f.read()
+
+
 def word_to_pdf(src: str | os.PathLike, out_pdf: str | os.PathLike) -> int:
     """把 .docx 导出为 PDF（带版式），返回页数。
 

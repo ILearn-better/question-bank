@@ -2,7 +2,7 @@
 """请求 / 响应模型。输入一律用 Pydantic 校验，输出为便于前端消费的字典结构。"""
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -196,6 +196,38 @@ class FeedbackIn(BaseModel):
     rating: Optional[int] = Field(default=None, ge=1, le=5)
     share_to_parent: int = 0
     ability_scores: List[AbilityScoreIn] = Field(default_factory=list)
+    # 配图 URL 数组（走现成的 POST /api/uploads/image 上传，服务端按魔数校验格式）
+    images: List[str] = Field(default_factory=list)
+
+
+class TemplateIn(BaseModel):
+    """反馈模板。phrases / seeds 都是「字段名 -> 内容」的字典（见 models.FeedbackTemplate）。"""
+
+    name: str
+    phrases: Dict[str, List[str]] = Field(default_factory=dict)
+    seeds: Dict[str, str] = Field(default_factory=dict)
+    sort_order: int = 0
+
+
+class AiSettingIn(BaseModel):
+    """AI 润色配置。api_key 留空表示「不改」—— 否则前端每次保存都会把脱敏后的值写回去。
+
+    要真的删掉密钥得显式传 clear_key=true：光靠传空串区分不了
+    「我不想动它」和「我要清掉它」，结果就是用户没有办法把密钥从库里抹掉。
+    """
+
+    base_url: Optional[str] = None
+    model: Optional[str] = None
+    api_key: Optional[str] = None
+    timeout: Optional[int] = Field(default=None, ge=5, le=300)
+    clear_key: bool = False
+
+
+class PolishIn(BaseModel):
+    """AI 润色请求：只润色传进来的字段，没传的原样不动。"""
+
+    fields: Dict[str, str] = Field(default_factory=dict)
+    style: Optional[str] = None      # 可选的语气/风格要求，如「简洁」「多鼓励」
 
 
 class DimIn(BaseModel):

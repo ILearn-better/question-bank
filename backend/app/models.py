@@ -335,6 +335,9 @@ class Feedback(Base):
     next_plan: Mapped[str | None] = mapped_column(Text)     # 下次安排
     rating: Mapped[int | None] = mapped_column(Integer)     # 1-5 综合状态
     share_to_parent: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    # 配图：URL 的 JSON 数组。存 JSON 而不是建关联表 —— 和 notes.ink / questions.tags
+    # 同一套路数：图片没有额外属性、也不参与查询，只是跟着主体一起取出来渲染。
+    images: Mapped[str] = mapped_column(Text, default="[]", server_default="[]")
     created_at: Mapped[str] = mapped_column(Text, default=_now, server_default=NOW)
 
     lesson: Mapped["Lesson"] = relationship(back_populates="feedback")
@@ -370,3 +373,55 @@ class Note(Base):
     updated_at: Mapped[str] = mapped_column(Text, default=_now, server_default=NOW)
 
     __table_args__ = (Index("idx_notes_updated", "updated_at"),)
+
+
+# ============================================================
+# 反馈模板与 AI 配置
+# ============================================================
+class FeedbackTemplate(Base):
+    """课后反馈模板。
+
+    为什么存数据库而不是写死在代码里：
+      每个老师的行文习惯差很多（有的写「状态不错，配合度高」，有的写「本节掌握情况良好」），
+      模板这种东西只有让用户自己改才用得上。写死等于逼所有人用同一个腔调。
+
+    phrases：每段的快捷短语（一点即插），JSON：{"performance": [...], ...}
+    seeds  ：每段的起始骨架文本，JSON：{"performance": "...", ...}，可为空
+    is_builtin：内置模板，允许改文案但不允许删（删了下次种子又会建回来，反而迷惑）
+    """
+
+    __tablename__ = "feedback_templates"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    owner_id: Mapped[int] = mapped_column(Integer, nullable=False, default=OWNER_ID, server_default=str(OWNER_ID))
+    name: Mapped[str] = mapped_column(String, nullable=False)
+    phrases: Mapped[str] = mapped_column(Text, default="{}", server_default="{}")
+    seeds: Mapped[str] = mapped_column(Text, default="{}", server_default="{}")
+    is_builtin: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    sort_order: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    created_at: Mapped[str] = mapped_column(Text, default=_now, server_default=NOW)
+
+    __table_args__ = (Index("idx_fb_templates_owner", "owner_id", "sort_order"),)
+
+
+class AiSetting(Base):
+    """AI 润色的接口配置（单行，owner_id 唯一）。
+
+    走 OpenAI 兼容的 /chat/completions 协议：DeepSeek、通义、Kimi、本地 Ollama / vLLM
+    都是这个格式，所以只存 base_url + model + api_key 就能对接绝大多数服务，
+    不需要为每家写一个适配器。
+
+    ⚠️ api_key 以明文存本机数据库。这是「单机自用」形态下的取舍：
+       存环境变量更安全，但那样就没法在设置页里改。因此接口面上一律**脱敏返回**
+       （只回 has_key 与后 4 位），绝不把完整 key 发回浏览器。
+    """
+
+    __tablename__ = "ai_settings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    owner_id: Mapped[int] = mapped_column(Integer, nullable=False, unique=True, default=OWNER_ID, server_default=str(OWNER_ID))
+    base_url: Mapped[str] = mapped_column(String, default="", server_default="")
+    model: Mapped[str] = mapped_column(String, default="", server_default="")
+    api_key: Mapped[str] = mapped_column(Text, default="", server_default="")
+    timeout: Mapped[int] = mapped_column(Integer, default=60, server_default="60")
+    updated_at: Mapped[str] = mapped_column(Text, default=_now, server_default=NOW)

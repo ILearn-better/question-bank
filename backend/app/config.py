@@ -29,6 +29,9 @@ PAGES_CACHE = UPLOAD_DIR / "pages"      # PDF 页面渲染图缓存
 CROPS_DIR = UPLOAD_DIR / "crops"        # 框选截图 / 区域存档
 CONVERTED_DIR = UPLOAD_DIR / "converted"  # Word 转出的 PDF（页面视图的数据源）
 NOTES_DIR = UPLOAD_DIR / "notes"        # 笔记里插入的图片
+# 课后反馈的配图。**刻意不复用 CROPS_DIR**：删题目时那段「孤儿截图清理」
+# 只认 questions.image / answer_image，反馈的图在它眼里就是无主文件，会被删掉。
+FEEDBACK_DIR = UPLOAD_DIR / "feedback"
 EXPORT_DIR = DATA_DIR / "exports"
 BACKUP_DIR = DATA_DIR / "backups"
 
@@ -51,7 +54,7 @@ AUTO_MIGRATE = os.getenv("SHIKE_AUTO_MIGRATE", "1") != "0"
 
 def ensure_dirs() -> None:
     for d in (DATA_DIR, UPLOAD_DIR, PAGES_CACHE, CROPS_DIR, CONVERTED_DIR, EXPORT_DIR,
-              BACKUP_DIR, NOTES_DIR):
+              BACKUP_DIR, NOTES_DIR, FEEDBACK_DIR):
         d.mkdir(parents=True, exist_ok=True)
 
 

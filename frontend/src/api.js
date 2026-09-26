@@ -109,6 +109,28 @@ export const feedbackApi = {
   get: (lessonId) => api.get(`/api/lessons/${lessonId}/feedback`),
   save: (lessonId, body) => api.put(`/api/lessons/${lessonId}/feedback`, body),
   remove: (lessonId) => api.del(`/api/lessons/${lessonId}/feedback`),
+
+  /** 反馈模板（四段的可复用文本 + 快捷短语）。存数据库，用户可自己加。 */
+  templates: () => api.get('/api/feedback-templates'),
+  createTemplate: (body) => api.post('/api/feedback-templates', body),
+  removeTemplate: (id) => api.del(`/api/feedback-templates/${id}`),
+
+  /** 反馈配图上传。返回可直接放进 images 数组的 URL。 */
+  uploadImage: (formData) => api.upload('/api/feedbacks/image', formData),
+
+  /** AI 润色。注意：会把内容发到第三方 AI 服务，界面必须先提示。 */
+  polish: (lessonId, body) => api.post(`/api/lessons/${lessonId}/feedback/polish`, body),
+
+  /** 导出 txt / docx / pdf。走 download() 而不是 window.open，失败时才能弹出可读提示。 */
+  downloadExport: (lessonId, format, filename) =>
+    download(`/api/lessons/${lessonId}/feedback/export` + qs({ format }), filename),
+};
+
+/** AI 润色的接口配置（地址 / 模型 / 密钥）。密钥只存本机，接口一律脱敏返回。 */
+export const aiApi = {
+  settings: () => api.get('/api/ai/settings'),
+  save: (body) => api.put('/api/ai/settings', body),
+  test: () => api.post('/api/ai/test'),
 };
 
 export const curriculumApi = {
