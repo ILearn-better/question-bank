@@ -29,11 +29,9 @@ PAGES_CACHE = UPLOAD_DIR / "pages"      # PDF 页面渲染图缓存
 CROPS_DIR = UPLOAD_DIR / "crops"        # 框选截图 / 区域存档
 CONVERTED_DIR = UPLOAD_DIR / "converted"  # Word 转出的 PDF（页面视图的数据源）
 NOTES_DIR = UPLOAD_DIR / "notes"        # 笔记里插入的图片
-# 课后反馈的配图。**刻意不复用 CROPS_DIR**：删题目时那段「孤儿截图清理」
-# 只认 questions.image / answer_image，反馈的图在它眼里就是无主文件，会被删掉。
-FEEDBACK_DIR = UPLOAD_DIR / "feedback"
 # 上课资料归档根目录：按「学生 / 上课日期」分子目录（见 services/storage.py）。
-# 反馈配图与上课文件都归到这里，为后续做学生情况分析留下可读的素材。
+# 反馈配图与上课文件都归到这里 —— 图片名也是「学生_日期」，脱离目录还能自证身份。
+# （原先那个扁平的 uploads/feedback 目录已废弃：所有图片现在都走归档布局。）
 STUDENTS_DIR = UPLOAD_DIR / "students"
 EXPORT_DIR = DATA_DIR / "exports"
 BACKUP_DIR = DATA_DIR / "backups"
@@ -57,7 +55,7 @@ AUTO_MIGRATE = os.getenv("SHIKE_AUTO_MIGRATE", "1") != "0"
 
 def ensure_dirs() -> None:
     for d in (DATA_DIR, UPLOAD_DIR, PAGES_CACHE, CROPS_DIR, CONVERTED_DIR, EXPORT_DIR,
-              BACKUP_DIR, NOTES_DIR, FEEDBACK_DIR, STUDENTS_DIR):
+              BACKUP_DIR, NOTES_DIR, STUDENTS_DIR):
         d.mkdir(parents=True, exist_ok=True)
 
 

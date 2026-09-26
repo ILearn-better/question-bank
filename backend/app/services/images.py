@@ -35,8 +35,14 @@ class ImageRejected(ValueError):
     """图片不合格（空文件 / 太大 / 根本不是图片）。消息可以直接给用户看。"""
 
 
-def save_image(data: bytes, dest_dir: Path, prefix: str) -> dict:
-    """校验并落盘，返回 {name, size_bytes}。文件名由服务端生成，不用原始文件名。"""
+def save_image(data: bytes, dest_dir: Path, prefix: str = "img", stem: str | None = None) -> dict:
+    """校验并落盘，返回 {name, size_bytes}。文件名由服务端生成，不用原始文件名。
+
+    stem 给了就用它当主名（不含扩展名），**扩展名仍然按魔数决定** ——
+    这是安全边界，不能因为调用方说"这是 png"就信。
+    反馈配图会传 `学生_日期` 当 stem：图片脱离归档目录后（被转发、被下载）
+    还得能自证是谁的、哪天的；重名自动加 _2、_3。
+    """
     if not data:
         raise ImageRejected("文件是空的")
     if len(data) > MAX_IMAGE_BYTES:
@@ -46,6 +52,10 @@ def save_image(data: bytes, dest_dir: Path, prefix: str) -> dict:
         raise ImageRejected("这不是可识别的图片（支持 PNG / JPG / GIF / WEBP / BMP）")
 
     dest_dir.mkdir(parents=True, exist_ok=True)
-    name = f"{prefix}_{uuid.uuid4().hex[:12]}{ext}"
+    base = (stem or f"{prefix}_{uuid.uuid4().hex[:12]}").strip() or f"{prefix}_{uuid.uuid4().hex[:12]}"
+    name, n = f"{base}{ext}", 1
+    while (dest_dir / name).exists():          # 同一天传两张截图是完全正常的
+        n += 1
+        name = f"{base}_{n}{ext}"
     (dest_dir / name).write_bytes(data)
     return {"name": name, "size_bytes": len(data)}

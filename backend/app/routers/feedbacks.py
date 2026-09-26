@@ -407,8 +407,12 @@ async def upload_feedback_image(file: UploadFile = File(...), lesson_id: int = Q
     if stu is None:
         raise HTTPException(404, "这节课的学生不存在")
     data = await file.read(images.MAX_IMAGE_BYTES + 1)
+    # 图片名用「学生_日期」（同一天多张自动 _2、_3）。
+    # 图片是要被转发出去的东西：粘在微信里、存到相册里，脱离了这个目录之后
+    # 还得能自证是谁的、哪天的 —— 叫 fb_ab12cd34.png 就完全认不出来了。
+    stem = f"{storage.safe_token(stu.name, 'u%d' % stu.id)}_{storage.lesson_date(ls)}"
     try:
-        saved = images.save_image(data, storage.dir_for(stu, ls), prefix="fb")
+        saved = images.save_image(data, storage.dir_for(stu, ls), prefix="fb", stem=stem)
     except images.ImageRejected as e:
         raise HTTPException(422, str(e)) from e
     rel = storage.rel(storage.dir_for(stu, ls) / saved["name"])
