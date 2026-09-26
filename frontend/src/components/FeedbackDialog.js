@@ -208,11 +208,17 @@ export default {
             .filter(([, v]) => v)
             .map(([dimId, score]) => ({ dim_id: Number(dimId), score })),
         };
-        await feedbackApi.save(props.lesson.id, payload);
+        const r = await feedbackApi.save(props.lesson.id, payload);
         savedSnap.value = snapshot();     // 存成功了才算「已保存」
         savedDoc.value = doc.value;
         // 存进去了就不再是「这次贴进来还没安顿好的图」，取消关窗时不该再去动它们
         addedImages.value = [];
+        // 反馈同时会在「学生/上课日期」那个归档文件夹里留一份 txt 快照。
+        // 写不进去不影响保存（正文已进库），但要让老师知道 —— 不然他会以为文件夹里有。
+        const snap = r && r.archive_txt;
+        if (snap && snap.ok === false) {
+          warn(`反馈已保存，但归档文件夹里的 txt 副本没写成：${snap.reason || '原因不明'}`);
+        }
         return true;
       } catch (e) {
         fail(e.message);

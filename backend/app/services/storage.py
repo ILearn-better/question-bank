@@ -72,6 +72,28 @@ def dir_for(student, lesson) -> Path:
     return d
 
 
+def feedback_stem(student, lesson) -> str:
+    """反馈相关文件的主名：`学生_日期`。
+
+    配图和 txt 快照都用它 —— 这两种东西常被单独拿出去（发给家长、贴到别处），
+    脱离「学生/日期」目录之后还得能自证是谁的哪天的。
+    """
+    return f"{safe_token(getattr(student, 'name', ''), 'u%d' % student.id)}_{lesson_date(lesson)}"
+
+
+# 保存反馈时同步写进归档目录的那份纯文本快照
+FEEDBACK_TXT_SUFFIX = "_反馈.txt"
+
+
+def feedback_txt_rel(student, lesson) -> str:
+    """这条反馈的 txt 快照路径（相对 UPLOAD_DIR，正斜杠）。
+
+    放在「学生 / 上课日期」那一格里，和这节的配图、讲义在一起 —— 翻文件夹回顾
+    「9 月 26 号那节课」时就该文字和材料都在同一处，而不是只有照片没有字。
+    """
+    return f"{dated_rel(student, lesson)}/{feedback_stem(student, lesson)}{FEEDBACK_TXT_SUFFIX}"
+
+
 def remove_student_dir(student) -> int:
     """删掉这个学生的整个归档目录，返回删掉了几个文件。
 
@@ -133,16 +155,26 @@ def safe_join(relative: str | None) -> Path | None:
 
 
 def collect_lesson_assets(db: Session, lesson_ids: list[int]) -> list[str]:
-    """这些课时名下所有素材的相对路径（反馈配图 + 上课文件）。
+    """这些课时名下所有素材的相对路径（反馈配图 + 上课文件 + 反馈的 txt 快照）。
 
     ⚠️ 必须在**删行之前**调用：lesson_files 与 feedbacks 都会随外键 CASCADE 一起消失，
     删完就再也查不到磁盘上该删哪几个文件了。数据库管不了文件系统，这一步只能自己做。
     """
-    from ..models import Feedback, LessonFile
+    from ..models import Feedback, Lesson, LessonFile, Student
 
     out: list[str] = []
     if not lesson_ids:
         return out
+    # 反馈的 txt 快照不在数据库里（它是保存时顺手写的副本），所以只能按命名规则反推。
+    # 只认**磁盘上真存在**的那份，保持「返回的都是真素材」这个语义。
+    for ls, stu in db.execute(
+        select(Lesson, Student).join(Student, Student.id == Lesson.student_id)
+        .where(Lesson.id.in_(lesson_ids))
+    ).all():
+        rel = feedback_txt_rel(stu, ls)
+        p = safe_join(rel)
+        if p is not None and p.is_file():
+            out.append(rel)
     for (raw,) in db.execute(
         select(Feedback.images).where(Feedback.lesson_id.in_(lesson_ids))
     ).all():

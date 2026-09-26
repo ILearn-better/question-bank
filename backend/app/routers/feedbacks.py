@@ -186,6 +186,54 @@ def get_feedback(lid: int, db: Session = Depends(get_db)):
     return _serialize(fb, list(scores), _dim_map(db))
 
 
+def _write_feedback_txt(db: Session, ls: Lesson, fb: Feedback) -> dict:
+    """把这条反馈同步成归档目录里的一份 txt（**对应学生的「上课日期」那个文件夹**）。
+
+    为什么值得写：反馈正文只活在数据库里，而归档目录是「这个孩子这段时间留下了什么」的
+    实物 —— 翻文件夹时就该看得到文字，不该只有讲义和照片。
+
+    几个刻意的决定：
+      · **复用导出那份 build_txt**（含能力评分、图片张数说明），不另写一套格式：
+        同一个内容在「导出的 txt」和「文件夹里的 txt」长得不一样，只会让人怀疑哪个是准的
+      · 每次保存**覆盖同一份**，不学配图那套 _2、_3：它是这条反馈的镜像，不是历史版本
+      · 内容被清空了就把旧文件删掉，不留一个「说这节有反馈」的空壳
+      · 写不进去也不让保存失败（正文已经进库了），但**如实回报**，前端会提醒老师
+
+    返回 {ok, path, bytes} 或 {ok: False, reason}。
+    """
+    stu = db.get(Student, ls.student_id)
+    if stu is None:
+        return {"ok": False, "reason": "学生不存在"}
+    rel = storage.feedback_txt_rel(stu, ls)
+    p = storage.safe_join(rel)
+    if p is None:
+        return {"ok": False, "reason": "归档路径不合法"}
+
+    scores = list(db.scalars(select(AbilityScore).where(AbilityScore.lesson_id == ls.id)).all())
+    has_text = bool((fb.doc or "").strip()) or any(
+        (getattr(fb, k) or "").strip()
+        for k in ("performance", "problems", "homework", "next_plan")
+    )
+    if not has_text and not scores:
+        # 内容被清空了：旧的快照要收掉，不能留个空壳让人以为这节写过反馈
+        existed = p.is_file()
+        storage.unlink_rels([rel])
+        return {"ok": True, "path": rel, "removed": existed}
+
+    data = _serialize(fb, scores, _dim_map(db))
+    ctx = _export_context(db, ls, fb)
+    ctx["ability_scores"] = data["ability_scores"]
+    # 与导出一致：txt 里带「（上次 3）」这种参照，翻文件夹时也看得出变化
+    ctx["ability_prev"] = _prev_scores(db, ls)
+    try:
+        body = feedback_export.build_txt(data, ctx, (fb.doc or "").strip() or None)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(body)
+    except OSError as e:
+        return {"ok": False, "reason": f"{type(e).__name__}: {e}", "path": rel}
+    return {"ok": True, "path": rel, "bytes": len(body)}
+
+
 @router.put("/lessons/{lid}/feedback")
 def upsert_feedback(lid: int, payload: FeedbackIn, db: Session = Depends(get_db)):
     """一节课一条反馈：不存在就建，存在就覆盖。前端不必关心是新增还是修改。"""
@@ -222,7 +270,12 @@ def upsert_feedback(lid: int, payload: FeedbackIn, db: Session = Depends(get_db)
         storage.unlink_rels([rel])
 
     # 能力评分整组替换：不用逐条 diff，语义更清楚，也不会留下上次多打的分数
-    if payload.ability_scores:
+    #
+    # ⚠️ 这里必须看「有没有带这个字段」而不是「它是不是空的」——空列表是 falsy，
+    #    老师把分数全部取消（界面传的就是 []）时会被当成「不动」而留着旧分，
+    #    然后旧分会出现在导出的 txt / 雷达图 / 归档快照里，谁都看不出来。
+    #    与上面 doc 的处理保持一致：带了字段就按它替换，没带（旧前端、脚本）才原样保留。
+    if "ability_scores" in payload.model_dump(exclude_unset=True):
         db.execute(delete(AbilityScore).where(AbilityScore.lesson_id == lid))
         for item in payload.ability_scores:
             db.add(
@@ -236,15 +289,27 @@ def upsert_feedback(lid: int, payload: FeedbackIn, db: Session = Depends(get_db)
                 )
             )
     db.commit()
+    # 归档目录里同步一份 txt 快照（学生 / 上课日期 那一格），让人翻文件夹时就看得见文字。
+    # 放在 commit 之后：DB 是正文，txt 是副本 —— 副本写不进去不能让保存失败。
+    txt = _write_feedback_txt(db, ls, fb)
     scores = db.scalars(select(AbilityScore).where(AbilityScore.lesson_id == lid)).all()
-    return _serialize(fb, list(scores), _dim_map(db))
+    out = _serialize(fb, list(scores), _dim_map(db))
+    out["archive_txt"] = txt
+    return out
 
 
 @router.delete("/lessons/{lid}/feedback")
 def delete_feedback(lid: int, db: Session = Depends(get_db)):
+    # 用 db.get 而不是 or_404：删反馈保持幂等（课不存在也返回 ok），不改变原有语义
+    ls = db.get(Lesson, lid)
+    stu = db.get(Student, ls.student_id) if ls is not None else None
     db.execute(delete(AbilityScore).where(AbilityScore.lesson_id == lid))
     db.execute(delete(Feedback).where(Feedback.lesson_id == lid))
     db.commit()
+    # 归档里那份 txt 是这条反馈的**镜像**，反馈没了就不该留着 ——
+    # 否则文件在说「这节有反馈」，而系统里查不到，反而误导
+    if ls is not None and stu is not None:
+        storage.unlink_rels([storage.feedback_txt_rel(stu, ls)])
     return {"ok": True}
 
 
@@ -419,7 +484,7 @@ async def upload_feedback_image(file: UploadFile = File(...), lesson_id: int = Q
     # 图片名用「学生_日期」（同一天多张自动 _2、_3）。
     # 图片是要被转发出去的东西：粘在微信里、存到相册里，脱离了这个目录之后
     # 还得能自证是谁的、哪天的 —— 叫 fb_ab12cd34.png 就完全认不出来了。
-    stem = f"{storage.safe_token(stu.name, 'u%d' % stu.id)}_{storage.lesson_date(ls)}"
+    stem = storage.feedback_stem(stu, ls)
     try:
         saved = images.save_image(data, storage.dir_for(stu, ls), prefix="fb", stem=stem)
     except images.ImageRejected as e:
