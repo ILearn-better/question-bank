@@ -171,8 +171,10 @@ def get_homework(lid: int, db: Session = Depends(get_db)):
     return {
         "homework": _serialize(db, hw) if hw else None,
         "files": [lesson_files._out(f) for f in files],
-        "accept": lesson_files.file_text.ACCEPT,
-        "supported": lesson_files.file_text.SUPPORTED_NOTE,
+        # 作业**图文都收**：照片、截图、PDF、Word 都行。
+        # 图片与文档的区别只是「有没有文字可抽」，不影响它是不是一份合格的作业。
+        "accept": lesson_files.file_text.ACCEPT_WITH_IMAGES,
+        "supported": lesson_files.file_text.SUPPORTED_NOTE_ANY,
         "rel_dir": storage.dated_rel(stu, ls) if stu else "",
         "status_options": [{"value": k, "label": v} for k, v in STATUS_LABEL.items()],
         # 打分参照：各维度上次的作业分（界面显示「上次 3」，和课堂评分同一用意）

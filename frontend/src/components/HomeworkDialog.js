@@ -12,10 +12,17 @@
 //     用 0 分记会把平均值和雷达图一起带偏，看起来像退步。
 //   · **不用记 = 不存**：什么都没填直接关掉就什么都不会留下；已有记录想撤掉有「撤销记录」。
 //   · 作业维度与课堂维度**是两套**（用户明确要求分开），互不影响。
-import { onMounted, ref } from 'vue';
+import { onBeforeUnmount, onMounted, ref } from 'vue';
 import { homeworkApi, lessonFilesApi } from '../api.js';
 import { fail, fmtBytes, hhmm, ok, shortDate, warn } from '../store.js';
+import { needLocalCopyMessage, pickPastedAsset } from '../pasteAsset.js';
 import Modal from './Modal.js';
+
+// 浏览器能直接当缩略图渲染的图片格式。
+// HEIC/HEIF（iPhone 默认）存得下，但 Chrome 不认，硬渲染只会得到一张碎图 →
+// 那就退化成「图片」标签 + 点开看原件。
+const PREVIEWABLE = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp'];
+const extOf = (name) => String(name || '').split('.').pop().toLowerCase();
 
 export default {
   name: 'HomeworkDialog',
@@ -34,7 +41,8 @@ export default {
     const existing = ref(null);      // 已有记录时才有值（决定要不要显示「撤销记录」）
     const statusOptions = ref([]);
     const files = ref([]);
-    const fileEl = ref(null);
+    const fileEl = ref(null);       // 选文件（文档为主，也接受图片）
+    const imgEl = ref(null);        // 选图片（accept="image/*"）
     const fileAccept = ref('');
     const uploadingFile = ref(false);
     const relDir = ref('');
@@ -66,7 +74,12 @@ export default {
       }
     }
 
-    onMounted(load);
+    onMounted(() => {
+      load();
+      // 贴图挂在 window 上：焦点在哪个输入框都能贴。卸载时必须摘掉。
+      window.addEventListener('paste', onPaste);
+    });
+    onBeforeUnmount(() => window.removeEventListener('paste', onPaste));
 
     /** 再点一次同一个分数 = 取消这一项（允许只打几项，和课堂评分一致）。 */
     function setScore(dimId, v) {
@@ -78,18 +91,21 @@ export default {
     const scoring = () => status.value !== 'missing';
 
     function pickFile() { fileEl.value && fileEl.value.click(); }
+    function pickImage() { imgEl.value && imgEl.value.click(); }
 
-    async function onFilePicked(e) {
-      const f = e.target.files && e.target.files[0];
-      e.target.value = '';
+    /** 收下一份作业原件。**选文件 / 选图片 / 粘截图走的是同一条路**，
+     *  所以三者的归档、抽文字、失败提示、删除行为天然一致。 */
+    async function uploadFile(f) {
       if (!f) return;
       uploadingFile.value = true;
       try {
         const fd = new FormData();
-        fd.append('file', f, f.name);
+        fd.append('file', f, f.name || 'paste.png');
         const r = await lessonFilesApi.upload(props.lesson.id, fd, 'homework');
         files.value = [...files.value, r];
-        if (r.status === 'ok') ok(`已收下「${r.name}」，读出 ${r.chars} 字`);
+        // 图片没有文字可抽**是正常的**，不要报成「读不出」吓人
+        if (r.kind === 'image') ok(`已收下图片「${r.name}」`);
+        else if (r.status === 'ok') ok(`已收下「${r.name}」，读出 ${r.chars} 字`);
         else warn(`「${r.name}」收下了，但没读出文字：${r.reason}`);
       } catch (err) {
         fail(err.message);
@@ -97,6 +113,38 @@ export default {
         uploadingFile.value = false;
       }
     }
+
+    function onFilePicked(e) {
+      const f = e.target.files && e.target.files[0];
+      e.target.value = '';        // 清掉才能反复选同一个文件
+      uploadFile(f);
+    }
+
+    /** 把 data: URL（网页内嵌图）变回文件再上传 —— 内容已经在本地了，不联网。 */
+    async function uploadDataUrl(dataUrl) {
+      try {
+        const blob = await (await fetch(dataUrl)).blob();
+        await uploadFile(new File([blob], 'paste.png', { type: blob.type || 'image/png' }));
+      } catch (err) {
+        fail('这张图读不出来：' + err.message);
+      }
+    }
+
+    /** Ctrl+V 直接贴。截图、从微信/文件夹复制的图、网页内嵌图、
+     *  甚至从文件夹复制的 PDF 都能直接收下 —— 判断用与反馈「附图」同一份
+     * （pasteAsset.js），粘进什么形态太杂，不能两处各写一套。 */
+    function onPaste(e) {
+      const found = pickPastedAsset(e);
+      if (!found) return;         // 普通文字：不插手
+      e.preventDefault();
+      if (found.kind === 'file') return uploadFile(found.file);
+      if (found.kind === 'data') return uploadDataUrl(found.dataUrl);
+      if (found.kind === 'url') return warn(needLocalCopyMessage(found.url));
+      warn('剪贴板里没有可以直接用的图片。试试截图后再贴，或点上面的按钮选文件。');
+    }
+
+    /** 能不能当缩略图渲染（HEIC 等由浏览器不认的退化成标签）。 */
+    const canPreview = (f) => f.kind === 'image' && PREVIEWABLE.includes(extOf(f.name));
 
     async function removeFile(f) {
       if (!window.confirm(`删掉「${f.name}」？（磁盘上的原件也一起删）`)) return;
@@ -150,9 +198,9 @@ export default {
 
     return {
       dims, loading, saving, busy, status, note, scores, existing, statusOptions,
-      files, fileEl, fileAccept, uploadingFile, relDir,
-      setScore, dimPrev, scoring, pickFile, onFilePicked, removeFile, save, clearRecord,
-      fmtBytes, lessonFilesApi, hhmm, shortDate,
+      files, fileEl, imgEl, fileAccept, uploadingFile, relDir,
+      setScore, dimPrev, scoring, pickFile, pickImage, onFilePicked, removeFile, save, clearRecord,
+      canPreview, fmtBytes, lessonFilesApi, hhmm, shortDate,
     };
   },
   template: `
@@ -175,21 +223,32 @@ export default {
         </div>
       </div>
 
-      <!-- 作业原件：可选。有就传，没有照样能打分（用户明确要求）。 -->
+      <!-- 作业原件：可选。有就传，没有照样能打分（用户明确要求）。
+           **图片与文件都能选，也能直接粘截图** —— 三样东西走同一条上传路，
+           所以归档、抽文字、失败提示、删除行为天然一致。 -->
       <div class="field">
         <label>
           作业原件
-          <span class="muted small">（拍照 / PDF / Word 都行，可以不传；传了会在本机转成文字）</span>
+          <span class="muted small">（照片 / 截图 / PDF / Word 都行，可以不传；直接 Ctrl+V 也能贴）</span>
         </label>
         <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-          <button class="btn sm" :disabled="uploadingFile" @click="pickFile">
-            {{ uploadingFile ? '解析中…' : '＋ 上传作业' }}
+          <button class="btn sm" :disabled="uploadingFile" @click="pickImage">
+            {{ uploadingFile ? '处理中…' : '＋ 选图片' }}
           </button>
+          <button class="btn sm" :disabled="uploadingFile" @click="pickFile">＋ 选文件</button>
+          <input ref="imgEl" type="file" accept="image/*" style="display:none" @change="onFilePicked">
           <input ref="fileEl" type="file" style="display:none" :accept="fileAccept" @change="onFilePicked">
           <span v-if="files.length" class="small muted">共 {{ files.length }} 份</span>
+          <span v-else class="small muted">贴截图可以直接 Ctrl+V</span>
         </div>
-        <div v-for="f in files" :key="f.id" style="display:flex;gap:8px;align-items:flex-start;margin-top:8px">
-          <span class="tag" :class="f.status === 'ok' ? 'green' : 'red'" style="flex:none">
+
+        <div v-for="f in files" :key="f.id" class="hw-file">
+          <!-- 图片给缩略图：作业照片得看得见才敢确认收对了 -->
+          <a v-if="canPreview(f)" :href="lessonFilesApi.rawUrl(f.id)" target="_blank"
+             rel="noopener" style="flex:none">
+            <img :src="lessonFilesApi.rawUrl(f.id)" alt="" class="hw-thumb">
+          </a>
+          <span v-else class="tag" :class="f.status === 'ok' ? 'green' : 'red'" style="flex:none">
             {{ f.status === 'ok' ? f.kind_cn : '读不出' }}
           </span>
           <div style="flex:1;min-width:0">
@@ -197,7 +256,8 @@ export default {
             <span v-else style="word-break:break-all">{{ f.name }}</span>
             <span class="small muted">
               · {{ fmtBytes(f.size_bytes) }}
-              <template v-if="f.status === 'ok'"> · 抽出 {{ f.chars }} 字</template>
+              <template v-if="f.kind === 'image'"> · 图片只存档，不抽文字</template>
+              <template v-else-if="f.status === 'ok'"> · 抽出 {{ f.chars }} 字</template>
             </span>
             <div v-if="f.status !== 'ok'" class="small" style="color:var(--danger);margin-top:2px">{{ f.reason }}</div>
           </div>

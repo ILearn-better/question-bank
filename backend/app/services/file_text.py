@@ -38,14 +38,30 @@ KINDS = {
     ".ppt": "ppt-legacy",
     ".txt": "text",
     ".md": "text",
+    # 图片：作业照片、习题截图、拍照交上来的卷子都走这里。
+    # **它们不是「抽不出文字」，而是本来就没有文字层** —— 所以 extract() 对图片不报错，
+    # 只存档、chars=0（见下面 extract 里那一段）。把这种事报成失败会很吓人。
+    ".jpg": "image",
+    ".jpeg": "image",
+    ".png": "image",
+    ".gif": "image",
+    ".webp": "image",
+    ".bmp": "image",
+    ".heic": "image",      # iPhone 默认格式。存得下，但浏览器缩略图可能不认（前端会退化）
+    ".heif": "image",
 }
+IMAGE_KINDS = {"image"}
 # 送给前端的可读说明
 KIND_CN = {
     "pdf": "PDF", "word": "Word", "word-legacy": "Word（旧格式）", "rtf": "RTF",
-    "ppt": "PPT", "ppt-legacy": "PPT（旧格式）", "text": "文本",
+    "ppt": "PPT", "ppt-legacy": "PPT（旧格式）", "text": "文本", "image": "图片",
 }
-ACCEPT = ",".join(sorted(KINDS))
+_DOC_EXTS = sorted(k for k, v in KINDS.items() if v not in IMAGE_KINDS)
+# 上课材料（讲义/课件）用这个：不加图片，免得把「拍照的习题」当讲义收进去
+ACCEPT = ",".join(_DOC_EXTS)
+ACCEPT_WITH_IMAGES = ",".join(sorted(KINDS))       # 作业原件用这个：图文都收
 SUPPORTED_NOTE = "支持 PDF / Word(.docx) / PPT(.pptx) / 文本；老式 .doc / .ppt / .rtf 需要本机装有 Word"
+SUPPORTED_NOTE_ANY = SUPPORTED_NOTE + "；图片（照片/截图）也可以，但只存档、不抽文字"
 
 W_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 A_NS = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
@@ -202,8 +218,15 @@ def extract(path: str | os.PathLike, filename: str | None = None) -> dict:
     kind = kind_of(name)
     if kind is None:
         raise ExtractError(
-            f"暂不支持这种格式（{Path(name).suffix or '无扩展名'}）。{SUPPORTED_NOTE}"
+            f"暂不支持这种格式（{Path(name).suffix or '无扩展名'}）。{SUPPORTED_NOTE_ANY}"
         )
+
+    if kind in IMAGE_KINDS:
+        # 图片本来就没有文字层 —— **这不是失败**，只存档、不抽字。
+        # 不能掉到下面那句「抽出来是空的同样要报错」：对照片/截图来说，
+        # 那会把一件完全正常的事报成错误（以前作业照片就是这么被拒的）。
+        return {"kind": kind, "kind_cn": KIND_CN[kind], "text": "", "chars": 0,
+                "truncated": False, "has_text": False}
 
     try:
         if kind == "pdf":
@@ -237,5 +260,6 @@ def extract(path: str | os.PathLike, filename: str | None = None) -> dict:
         "text": text,
         "chars": len(text),
         "truncated": truncated,
+        "has_text": True,
         **meta,
     }

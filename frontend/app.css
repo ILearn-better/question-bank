@@ -357,3 +357,9 @@ body.notes-zen .notes-preview { min-height: 0; padding: 14px 18px; }
            background: rgba(15, 23, 42, .68); color: #fff; font-size: 14px; line-height: 1; }
 .img-del:hover { background: var(--danger); }
 
+/* 作业原件的一行：左边缩略图（或格式标签）、中间名字与说明、右边删除。
+   作业照片必须看得见缩略图才好确认收对了没有。 */
+.hw-file { display: flex; gap: 8px; align-items: flex-start; margin-top: 8px; }
+.hw-thumb { display: block; height: 56px; max-width: 96px; object-fit: cover;
+            border: 1px solid var(--border); border-radius: var(--radius-sm); }
+

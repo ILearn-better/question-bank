@@ -9,6 +9,7 @@
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue';
 import { abilityApi, feedbackApi, lessonFilesApi, studentsApi } from '../api.js';
 import { fail, fmtBytes as fmtBytesShared, hhmm, ok, shortDate, warn } from '../store.js';
+import { needLocalCopyMessage, pickPastedAsset } from '../pasteAsset.js';
 import Modal from './Modal.js';
 
 // 四段字段的键与中文名。多处要用（拼原始记录、渲染、存模板），集中一份。
@@ -358,78 +359,27 @@ export default {
     }
 
     /** 剪贴板里只有链接的情况：本服务不联网，只能请用户先把图落到本地。
-     *  提示条是按纯文本渲染的，别在这里写 Markdown 的 ** 或反引号（会露出星号）。 */
+     *  说法与作业那边共用一份（见 pasteAsset.js），免得两处各修一半。 */
     function needLocalCopy(url) {
-      const shown = url && url.length > 48 ? url.slice(0, 48) + '…' : url;
-      warn('剪贴板里只有图片的链接，没有图片本身' + (shown ? `（${shown}）` : '') +
-           '。请先右键「图片另存为」，或者干脆截个图，再按 Ctrl+V 贴进来。');
-    }
-
-    /**
-     * 从剪贴板里尽量挖出一张图。
-     *
-     * 剪贴板里的形态比想象中杂：
-     *   · 截图 / 从微信复制    → items 里有 image/*（最常见）
-     *   · 从文件夹复制图片文件 → files 里有 File
-     *   · 从网页复制          → 可能**只有** text/html，里面是一个 <img src="…">
-     *   · 网页内嵌图          → text/html 里是 data:image/…（本地就能解，不联网）
-     * 抓不到就返回 null，由调用方给出看得懂的提示 —— 静默失败最糟：
-     * 用户会反复粘，以为是自己操作不对。
-     */
-    function pickPastedImage(e) {
-      const dt = e.clipboardData;
-      if (!dt) return null;
-      // ① 剪贴板里真的有图片二进制（截图、从微信/QQ 复制的图）—— 最该走的一条
-      for (const it of dt.items || []) {
-        if (it.kind === 'file' && it.type && it.type.startsWith('image/')) {
-          const f = it.getAsFile();
-          if (f) return { kind: 'file', file: f };
-        }
-      }
-      for (const f of dt.files || []) {
-        if (f.type && f.type.startsWith('image/')) return { kind: 'file', file: f };
-      }
-      // 剪贴板里是别的文件（比如从文件夹复制的 PDF）—— 提示一下该去哪儿传
-      const other = [...(dt.files || [])].filter((f) => f.type && !f.type.startsWith('image/'))[0];
-      if (other) return { kind: 'otherfile', name: other.name };
-
-      let html = '', text = '';
-      try { html = dt.getData('text/html') || ''; } catch (err) { /* 某些环境不给读 */ }
-      try { text = (dt.getData('text/plain') || '').trim(); } catch (err) { /* 同上 */ }
-      // 去掉链接之后还剩什么字 —— 用来判断「这是只复制了一个链接/一张图」还是「复制了一段文章」
-      const noUrl = text.replace(/https?:\/\/\S+/gi, '').trim();
-      // 有些复制源只给 text/html、不给 text/plain，所以还要把标签剥掉再看一遍里面有没有正文
-      const htmlText = html.replace(/<[^>]*>/g, ' ').replace(/&nbsp;/gi, ' ')
-        .replace(/https?:\/\/\S+/gi, ' ').trim();
-      const srcOf = (s) => (String(s).match(/src\s*=\s*["']([^"']+)["']/i) || [])[1] || '';
-      const src = srcOf(html);
-
-      // ②③④ 只有「剪贴板里除了图/链接没别的文字」才算一次贴图操作。
-      //     只要还带着别的文字（粘一段带图的网页文章、往正文里粘参考链接），一概不插手：
-      //     把老师已经选好的文字吞掉，比少贴一张图糟糕得多 —— 那是在毁他的内容。
-      if (noUrl || htmlText) return null;
-      if (/^data:image\//i.test(src)) return { kind: 'data', dataUrl: src };      // 内嵌图，本地就能解
-      if (/^https?:\/\//i.test(src)) return { kind: 'url', url: src };            // 得让服务端取
-      // 直接粘了个图片地址。只认「看着就是图片」的地址 —— 粘普通网址是正常的文字操作
-      if (/^https?:\/\/\S+\.(png|jpe?g|gif|webp|bmp|svg)(\?\S*)?$/i.test(text)) {
-        return { kind: 'url', url: text };
-      }
-      // 看得出用户想粘图（剪贴板里确实有个 <img>），但抓不到图 —— 交给上层说句人话
-      if (/<img/i.test(html)) return { kind: 'none' };
-      return null;      // 其余情况：完全不干预，别抢输入框的默认行为
+      warn(needLocalCopyMessage(url));
     }
 
     function onPaste(e) {
-      const found = pickPastedImage(e);
-      if (!found) return;
+      // 判断剪贴板里是什么（截图 / 图文件 / data: / 链接 / 别的文件 / 普通文字），
+      // 细节都收在 pasteAsset.js —— 作业那边用的是同一份，行为不会各修一半。
+      const found = pickPastedAsset(e);
+      if (!found) return;                    // 普通文字：完全不插手，别抢输入框的默认行为
       e.preventDefault();
-      if (found.kind === 'file') return uploadImage(found.file);
+      if (found.kind === 'file') {
+        // 从文件夹复制来的**非图片**文件：这里只能贴图，指个路（作业那边可以直接收）
+        if (!found.isImage) {
+          return warn(`剪贴板里是个文件（${found.file.name}），这里只能贴图片。` +
+                      '上课资料请用下面的「上课文件」上传。');
+        }
+        return uploadImage(found.file);
+      }
       if (found.kind === 'data') return uploadDataUrl(found.dataUrl);
       if (found.kind === 'url') return needLocalCopy(found.url);
-      if (found.kind === 'otherfile') {
-        return warn(`剪贴板里是个文件（${found.name}），这里只能贴图片。` +
-                    '上课资料请用下面的「上课文件」上传。');
-      }
       warn('剪贴板里没有可以直接用的图片。试试先用截图工具截一下，或点「＋ 贴图」选文件。');
     }
 
