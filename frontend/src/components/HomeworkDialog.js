@@ -93,6 +93,11 @@ export default {
     function pickFile() { fileEl.value && fileEl.value.click(); }
     function pickImage() { imgEl.value && imgEl.value.click(); }
 
+    /** 界面上显示哪个名字：**落盘名**（`学生_日期_序号`），不是上传时的原名。
+     *  作业原件落盘会改名，如果界面还显示原名，老师在文件夹里就找不到界面上看到的那个东西。
+     *  原名不丢 —— 界面在旁边小字提示「原 xxx」，而老师当时选的到底是哪份仍然看得见。 */
+    const disp = (f) => f.stored_name || f.name;
+
     /** 收下一份作业原件。**选文件 / 选图片 / 粘截图走的是同一条路**，
      *  所以三者的归档、抽文字、失败提示、删除行为天然一致。 */
     async function uploadFile(f) {
@@ -104,9 +109,9 @@ export default {
         const r = await lessonFilesApi.upload(props.lesson.id, fd, 'homework');
         files.value = [...files.value, r];
         // 图片没有文字可抽**是正常的**，不要报成「读不出」吓人
-        if (r.kind === 'image') ok(`已收下图片「${r.name}」`);
-        else if (r.status === 'ok') ok(`已收下「${r.name}」，读出 ${r.chars} 字`);
-        else warn(`「${r.name}」收下了，但没读出文字：${r.reason}`);
+        if (r.kind === 'image') ok(`已收下图片「${disp(r)}」`);
+        else if (r.status === 'ok') ok(`已收下「${disp(r)}」，读出 ${r.chars} 字`);
+        else warn(`「${disp(r)}」收下了，但没读出文字：${r.reason}`);
       } catch (err) {
         fail(err.message);
       } finally {
@@ -147,7 +152,7 @@ export default {
     const canPreview = (f) => f.kind === 'image' && PREVIEWABLE.includes(extOf(f.name));
 
     async function removeFile(f) {
-      if (!window.confirm(`删掉「${f.name}」？（磁盘上的原件也一起删）`)) return;
+      if (!window.confirm(`删掉「${disp(f)}」？（磁盘上的原件也一起删）`)) return;
       try {
         await lessonFilesApi.remove(f.id);
         files.value = files.value.filter((x) => x.id !== f.id);
@@ -200,7 +205,7 @@ export default {
       dims, loading, saving, busy, status, note, scores, existing, statusOptions,
       files, fileEl, imgEl, fileAccept, uploadingFile, relDir,
       setScore, dimPrev, scoring, pickFile, pickImage, onFilePicked, removeFile, save, clearRecord,
-      canPreview, fmtBytes, lessonFilesApi, hhmm, shortDate,
+      canPreview, fmtBytes, lessonFilesApi, hhmm, shortDate, disp,
     };
   },
   template: `
@@ -252,9 +257,11 @@ export default {
             {{ f.status === 'ok' ? f.kind_cn : '读不出' }}
           </span>
           <div style="flex:1;min-width:0">
-            <a v-if="f.status === 'ok'" :href="lessonFilesApi.rawUrl(f.id)" target="_blank" rel="noopener">{{ f.name }}</a>
-            <span v-else style="word-break:break-all">{{ f.name }}</span>
+            <!-- 显示落盘名（学生_日期_序号），和归档文件夹里看到的一致；原名退到小字 -->
+            <a v-if="f.status === 'ok'" :href="lessonFilesApi.rawUrl(f.id)" target="_blank" rel="noopener">{{ disp(f) }}</a>
+            <span v-else style="word-break:break-all">{{ disp(f) }}</span>
             <span class="small muted">
+              <template v-if="f.name && f.name !== disp(f)"> · 原 {{ f.name }}</template>
               · {{ fmtBytes(f.size_bytes) }}
               <template v-if="f.kind === 'image'"> · 图片只存档，不抽文字</template>
               <template v-else-if="f.status === 'ok'"> · 抽出 {{ f.chars }} 字</template>

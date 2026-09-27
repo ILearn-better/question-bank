@@ -41,6 +41,9 @@ def _out(f: LessonFile) -> dict:
         "id": f.id,
         "lesson_id": f.lesson_id,
         "name": f.name,
+        # 落盘时的文件名。作业是 `学生_日期_序号.ext`，和原名不同 ——
+        # 界面显示它，老师在文件夹里看到的名字才和界面上是同一个。
+        "stored_name": Path(f.stored).name if f.stored else "",
         "stored": f.stored,
         "kind": f.kind,
         "kind_cn": file_text.KIND_CN.get(f.kind, f.kind),
@@ -136,10 +139,17 @@ async def upload_file(lid: int, file: UploadFile = File(...),
     stu = db.get(Student, ls.student_id) if ls else None
     if stu is None:
         raise HTTPException(404, "这节课的学生不存在")
-    # 归到「学生 / 上课日期」目录下（services/storage.py），文件名**保留原名**——
-    # 这个目录是给人看的，叫「讲义.pdf」比叫 lf_9f3a…pdf 有用得多。重名自动加 _2。
+    # 归到「学生 / 上课日期」目录下，落盘文件名按 role 分两套（services/storage.py）：
+    #   · material（讲义/课件）：**保留原名** ——「（笔记）9.1特殊角的三角比.pdf」是老师有意取的名字。
+    #   · homework（作业原件）：`学生_日期_序号` —— 这类文件最常被单独拿出去，
+    #     脱离目录还得能自证是谁的哪天的第几份；而截图/相册存下来的名字往往是一串哈希。
+    # 不管哪套，库里 name 一律存**上传时的原名**，界面用它告诉老师「你选的是哪份」。
     folder = storage.dir_for(stu, ls)
-    stored_name = storage.unique_name(folder, storage.safe_token(Path(name).stem, "file") + Path(name).suffix.lower())
+    suffix = Path(name).suffix.lower()
+    if role == "homework":
+        stored_name = storage.homework_file_name(stu, ls, suffix, folder)
+    else:
+        stored_name = storage.unique_name(folder, storage.safe_token(Path(name).stem, "file") + suffix)
     dest = folder / stored_name
     dest.write_bytes(data)
     stored_rel = storage.rel(dest)

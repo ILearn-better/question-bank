@@ -100,6 +100,39 @@ def homework_txt_rel(student, lesson) -> str:
     return f"{dated_rel(student, lesson)}/{feedback_stem(student, lesson)}{HOMEWORK_TXT_SUFFIX}"
 
 
+def homework_file_name(student, lesson, ext: str, directory: Path) -> str:
+    """作业原件的文件名：`学生_日期_序号`（用户定的命名法）。
+
+    为什么作业不留原名：作业原件是**最常被单独拿出去**的东西（发给家长、贴进错题本、
+    转给别人批）。老师从微信/相册存下来的截图本来就叫 `0c3756ef0f23…jpg`、`IMG_2034.jpg`，
+    脱离「学生/日期」目录就什么也说明不了；`李芹旭_2026-09-26_2.jpg` 能自证是谁的哪天的第几份。
+
+    讲义那类 material 照旧保留原名 —— 那是老师**有意取的名字**，
+    「（笔记）9.1特殊角的三角比.pdf」比任何代号都有用。两种命名法对应两种归宿，不是漏改。
+
+    序号在「同一学生的同一个归档目录」里递增，取已用的最大值 +1 而**不回收空出来的号**：
+    删掉第 2 份之后，下一份是第 4 份而不是顶掉 2 —— 序号是「第几份作业」的身份，
+    回收会让之前说过「第 2 份」的话指向另一张图。
+    """
+    stem = feedback_stem(student, lesson)
+    pat = re.compile(rf"^{re.escape(stem)}_(\d+)$")
+    n = 0
+    try:
+        for p in directory.iterdir():
+            if not p.is_file():
+                continue
+            m = pat.match(p.stem)
+            if m:
+                n = max(n, int(m.group(1)))
+    except OSError:
+        n = 0            # 列目录失败也绝不能让上传丢文件：退回从 1 试，下面还会逐个避让
+    while True:
+        n += 1
+        cand = f"{stem}_{n}{ext}"
+        if not (directory / cand).exists():
+            return cand
+
+
 def remove_student_dir(student) -> int:
     """删掉这个学生的整个归档目录，返回删掉了几个文件。
 
