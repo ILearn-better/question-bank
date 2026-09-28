@@ -496,6 +496,13 @@ class NoteFolder(Base):
 
       · `curriculum_id` **只有根行有值**，非根行一律 NULL。它不是每行的冗余属性；
         冗余就得在移动目录时同步整棵子树，多一个能写歪的地方。
+
+      · `is_unfiled` —— **只有「未归档」那一行是 1**。它是兜底容器：
+        新建笔记没选目录时的落点、以及删掉某个分组后内容的去处。
+        这个标记是显式加上去的（迁移 0015）：以前靠「curriculum_id 为空」认它，
+        那个认法依赖「一级节点必然来自体系」这条前提 —— 前提一旦松动就会认错，
+        而认错的后果很具体（把用户的分组当成兜底容器，或者反过来）。
+        现在就直接读这个字段，不再做推断。
     """
 
     __tablename__ = "note_folders"
@@ -506,6 +513,7 @@ class NoteFolder(Base):
     parent_id: Mapped[int | None] = mapped_column(ForeignKey("note_folders.id", ondelete="CASCADE"))
     name: Mapped[str] = mapped_column(String, nullable=False)
     is_root: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    is_unfiled: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
     sort_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
     created_at: Mapped[str] = mapped_column(Text, default=_now, server_default=NOW)
 

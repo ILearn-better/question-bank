@@ -62,8 +62,12 @@ def _ensure_roots(db: Session) -> list[NoteFolder]:
         if c.id not in have:
             db.add(NoteFolder(curriculum_id=c.id, name=c.name, is_root=1, sort_order=c.sort_order or 0))
             changed = True
-    if None not in have:
-        db.add(NoteFolder(curriculum_id=None, name=UNFILED_NAME, is_root=1, sort_order=9999))
+    if not any(r.is_unfiled for r in rows):
+        # ⚠️ 认「未归档」认 is_unfiled 这个显式标记，不再靠「curriculum_id 为空」：
+        # 笔记的一级分组正在跟体系解绑（见 0015 迁移），解绑之后
+        # 普通一级分组的 curriculum_id 也是空的，靠它认迟早认错。
+        db.add(NoteFolder(curriculum_id=None, name=UNFILED_NAME, is_root=1,
+                          is_unfiled=1, sort_order=9999))
         changed = True
     if changed:
         db.commit()
@@ -81,7 +85,7 @@ def _all_notes(db: Session) -> list[Note]:
 
 def unfiled_root(db: Session) -> NoteFolder:
     """「未归档」那棵的根。新建笔记没指定目录时落这里 —— 永远有地方放，不会丢归属。"""
-    return next(r for r in _ensure_roots(db) if r.curriculum_id is None)
+    return next(r for r in _ensure_roots(db) if r.is_unfiled)
 
 
 def folder_paths(db: Session) -> dict[int, str]:
