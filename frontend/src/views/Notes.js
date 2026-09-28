@@ -360,13 +360,20 @@ export default {
       expanded.value = next;
     }
 
-    /* ---- 新建 / 重命名 / 删除目录 ---- */
+    /* ---- 新建 / 重命名（目录与笔记） / 删除目录 ---- */
     function startNewFolder(parentId) {
       expandIn(parentId, true);
       editing.value = { mode: 'new', parentId, value: '' };
     }
     function startRename(folder) {
-      editing.value = { mode: 'rename', id: folder.id, value: folder.name };
+      editing.value = { mode: 'rename', kind: 'folder', id: folder.id, value: folder.name };
+    }
+    /** 改笔记标题：原地变输入框。
+     *  两件事都要做，否则「点了没反应」：① 目录收着的要先把祖先展开 —— 输入框在屏幕外
+     *  ② 搜索结果里也能改名（那边的输入框单独渲染了一份）。 */
+    function startRenameNote(note) {
+      if (note.folder_id) expandTo(note.folder_id);
+      editing.value = { mode: 'rename', kind: 'note', id: note.id, value: note.title || '' };
     }
     function cancelEdit() { editing.value = null; }
 
@@ -375,12 +382,19 @@ export default {
       if (!ed) return;
       editing.value = null;
       const name = (ed.value || '').trim();
-      if (!name) return;                       // 空名字就当放弃，不建「未命名目录」
+      if (!name) return;                       // 空名字就当放弃：不建「未命名目录」，也不改名
       try {
         if (ed.mode === 'new') {
           await noteFoldersApi.create({ parent_id: ed.parentId, name });
           await loadTree();
           expandIn(ed.parentId, true);
+        } else if (ed.kind === 'note') {
+          // 只提交 title：正文/板书还在自动保存的队列里，这次请求不能顺手动它们
+          const r = await notesApi.update(ed.id, { title: name });
+          // 改的正好是打开着的那篇 → 标题框与右边列表要立刻跟着变，否则屏幕上还是旧名字
+          if (cur.value && cur.value.id === ed.id) cur.value.title = r.title;
+          await loadList();
+          await loadTree();
         } else {
           await noteFoldersApi.update(ed.id, { name });
           await loadTree();
@@ -514,6 +528,7 @@ export default {
         items.push({ label: '删除', danger: true, run: () => removeFolder(row.node) });
       } else if (row.kind === 'note') {
         items.push({ label: '打开', run: () => open(row.node.id) });
+        items.push({ label: '重命名', run: () => startRenameNote(row.node) });
         items.push({ label: row.node.pinned ? '取消置顶' : '置顶', run: () => togglePin(row.node) });
         items.push({ label: '上移', run: () => nudge(row, -1) });
         items.push({ label: '下移', run: () => nudge(row, 1) });
@@ -527,7 +542,10 @@ export default {
       // 位置要**夹在视口里**：行靠近窗口底部时菜单会掉到屏幕外，最后两项就点不到了
       // （窗口小的时候尤其明显 —— 实测 300×500 的窄窗口里必现）。
       // 放不下就翻到行的上方。
-      const W = 152, H = 180;
+      const W = 152;
+      // 高度按项数算出来，以后加项不用回来改这个数字
+      // （一项 ≈ 12.5px 字号的行高 + 上下各 5px 内边距 ≈ 28px，外面还有 4px 内边距）
+      const H = 8 + items.length * 28;
       const vw = window.innerWidth, vh = window.innerHeight;
       const x = Math.max(8, Math.min(box.right - W, vw - W - 8));
       const below = box.bottom + 4;
@@ -1152,7 +1170,7 @@ export default {
       loadList, onSearch, createNote, removeNote, togglePin, open,
       // 目录树
       tree, expanded, rows, searching, selectedFolder, editing, drag, dropAt, menu,
-      noteFoldersApi, toggleExpand, selectFolder, startNewFolder, startRename, cancelEdit,
+      noteFoldersApi, toggleExpand, selectFolder, startNewFolder, startRename, startRenameNote, cancelEdit,
       commitEdit, removeFolder, openMenu, closeMenu, runMenu, nudge, onRowClick, focusEdit,
       // 备份 / 迁移
       showTransfer, transferFile, transferOver, transferReport, transferring, transferEl,
@@ -1205,7 +1223,10 @@ export default {
             <div v-for="n in notes" :key="n.id" class="note-item"
                  :class="{ on: cur && n.id === cur.id }" @click="open(n.id)">
               <div class="note-title">
-                <span v-if="n.pinned" class="pin">📌 </span>{{ n.title }}
+                <input v-if="editing && editing.mode === 'rename' && editing.id === n.id"
+                       :ref="focusEdit" class="nb-inline" v-model="editing.value"
+                       @click.stop @keyup.enter="commitEdit" @keyup.esc="cancelEdit" @blur="commitEdit">
+                <template v-else><span v-if="n.pinned" class="pin">📌 </span>{{ n.title }}</template>
               </div>
               <div class="nb-path">{{ n.path || '（没有目录）' }}</div>
               <div class="note-meta">
