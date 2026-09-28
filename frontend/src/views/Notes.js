@@ -11,7 +11,7 @@
 //   · 保存是防抖 PATCH 且**只提交改动过的字段**，这样切笔记时不会把另一头覆盖掉。
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
-import { notesApi } from '../api.js';
+import { notesApi, noteFoldersApi } from '../api.js';
 import { fail, ok, warn } from '../store.js';
 import Modal from '../components/Modal.js';
 
@@ -249,6 +249,341 @@ export default {
       }
     }
 
+    /* ================= 目录树 =================
+     *
+     * 形状：体系（DSE 数学 / 国内初中…）→ 目录… → 笔记。
+     * 几个刻意的地方：
+     *   · **树一次拿全**（/api/note-folders/tree），再在本地摊成一维行来渲染。
+     *     递归模板不好写也不好拖，摊平之后拖拽只要算行号。笔记量级不大，整棵拉下来没问题。
+     *   · 每个目录里**先列子目录、再列笔记**。两串顺序互不干扰，拖动只在同类之间重排，
+     *     不会出现「目录的 0/1/2 和笔记的 0/1/2 交错」这种没法解释的顺序。
+     *   · 笔记是**叶子**：不能往里放东西。这样拖拽规则永远只有一条。
+     *   · 展开状态记在 localStorage，刷新后不回到「全收起」。
+     */
+    const tree = ref({ roots: [], unfiled_root_id: null, total: 0 });
+    const expanded = ref({});
+    const selectedFolder = ref(null);        // 「新建」落在这里
+    const editing = ref(null);               // {mode:'new', parentId, value} | {mode:'rename', id, value}
+    const drag = ref(null);                  // {kind:'folder'|'note', id}
+    const dropAt = ref(null);                // {id, zone}
+    const menu = ref(null);                  // {items, x, y}
+    const EXPAND_KEY = 'shike.notes.expanded';
+
+    /** 目录 id -> 节点（含 parent_id）。树拿全了，前端自己就能算父子关系。 */
+    const folderMap = computed(() => {
+      const m = {};
+      const walk = (node, parentId) => {
+        m[node.id] = { ...node, parent_id: parentId };
+        for (const c of node.children) walk(c, node.id);
+      };
+      for (const r of tree.value.roots) walk(r, null);
+      return m;
+    });
+
+    /** 笔记 id -> 笔记（含所在目录），拖动时要用。 */
+    const noteMap = computed(() => {
+      const m = {};
+      const walk = (node) => {
+        for (const n of node.notes) m[n.id] = { ...n, folder_id: node.id };
+        for (const c of node.children) walk(c);
+      };
+      for (const r of tree.value.roots) walk(r);
+      return m;
+    });
+
+    /** 树 -> 一维行。「先子目录、再笔记」，展开的才输出。 */
+    const rows = computed(() => {
+      const out = [];
+      const kids = (node, depth) => {
+        for (const c of node.children) {
+          out.push({ kind: 'folder', node: c, depth });
+          if (expanded.value[c.id]) kids(c, depth + 1);
+        }
+        for (const n of node.notes) out.push({ kind: 'note', node: n, depth, folderId: node.id });
+      };
+      for (const root of tree.value.roots) {
+        out.push({ kind: 'root', node: root, depth: 0 });
+        if (expanded.value[root.id]) kids(root, 1);
+      }
+      return out;
+    });
+
+    const searching = computed(() => !!keyword.value.trim());
+
+    async function loadTree() {
+      try {
+        tree.value = await noteFoldersApi.tree();
+      } catch (e) {
+        fail(e.message);
+      }
+    }
+
+    function persistExpanded() {
+      try { localStorage.setItem(EXPAND_KEY, JSON.stringify(expanded.value)); } catch (e) { /* 无痕模式 */ }
+    }
+
+    function toggleExpand(id) {
+      expanded.value = { ...expanded.value, [id]: !expanded.value[id] };
+      persistExpanded();
+    }
+
+    function expandIn(id, on = true) {
+      expanded.value = { ...expanded.value, [id]: on };
+      persistExpanded();
+    }
+
+    /** 把某篇笔记/某个目录的**各级祖先**都展开 —— 搜到一篇笔记点开后，
+     *  树上得能看见它在哪，而不是停在一堆收起的目录外面。 */
+    function expandTo(folderId) {
+      const next = { ...expanded.value };
+      let cur = folderId;
+      const seen = new Set();
+      while (cur && !seen.has(cur)) {
+        seen.add(cur);
+        next[cur] = true;
+        cur = folderMap.value[cur] ? folderMap.value[cur].parent_id : null;
+      }
+      expanded.value = next;
+      persistExpanded();
+    }
+
+    /** 首次进来：有内容的体系根默认展开（空体系收着，免得一屏全是空目录）。 */
+    function initExpanded() {
+      let saved = null;
+      try { saved = JSON.parse(localStorage.getItem(EXPAND_KEY) || 'null'); } catch (e) { saved = null; }
+      if (saved && typeof saved === 'object') {
+        expanded.value = saved;
+        return;
+      }
+      const next = {};
+      for (const r of tree.value.roots) next[r.id] = r.count > 0;
+      expanded.value = next;
+    }
+
+    /* ---- 新建 / 重命名 / 删除目录 ---- */
+    function startNewFolder(parentId) {
+      expandIn(parentId, true);
+      editing.value = { mode: 'new', parentId, value: '' };
+    }
+    function startRename(folder) {
+      editing.value = { mode: 'rename', id: folder.id, value: folder.name };
+    }
+    function cancelEdit() { editing.value = null; }
+
+    async function commitEdit() {
+      const ed = editing.value;
+      if (!ed) return;
+      editing.value = null;
+      const name = (ed.value || '').trim();
+      if (!name) return;                       // 空名字就当放弃，不建「未命名目录」
+      try {
+        if (ed.mode === 'new') {
+          await noteFoldersApi.create({ parent_id: ed.parentId, name });
+          await loadTree();
+          expandIn(ed.parentId, true);
+        } else {
+          await noteFoldersApi.update(ed.id, { name });
+          await loadTree();
+        }
+      } catch (e) {
+        fail(e.message);
+      }
+    }
+
+    async function removeFolder(folder) {
+      // 说清楚「东西去哪儿」再问 —— 删目录绝不删内容，但也不能让用户以为东西没了
+      const inside = folder.count
+        ? `里面的 ${folder.count} 篇笔记会移到上一级（不会删掉）。`
+        : '这个目录是空的。';
+      if (!window.confirm(`删除目录「${folder.name}」？${inside}`)) return;
+      try {
+        const r = await noteFoldersApi.remove(folder.id);
+        const moved = [r.moved_folders ? `${r.moved_folders} 个子目录` : '',
+                       r.moved_notes ? `${r.moved_notes} 篇笔记` : ''].filter(Boolean).join('、');
+        ok(moved ? `目录已删除；${moved}移到了「${r.to}」` : '目录已删除');
+        await loadTree();
+      } catch (e) {
+        fail(e.message);
+      }
+    }
+
+    /* ---- 拖动 ---- */
+    const isSelfOrDescendant = (folderId, candidateId) => {
+      // 把目录拖进自己的后代 → 子树会从根上掉下来，界面上整段消失。服务端也会拒，
+      // 这里判一次只是为了一开始就不给「可以放」的提示。
+      let cur = candidateId;
+      const seen = new Set();
+      while (cur && !seen.has(cur)) {
+        if (cur === folderId) return true;
+        seen.add(cur);
+        const n = folderMap.value[cur];
+        cur = n ? n.parent_id : null;
+      }
+      return false;
+    };
+
+    function zoneOf(row, e) {
+      const r = e.currentTarget.getBoundingClientRect();
+      const y = e.clientY - r.top;
+      // 笔记没有「里面」，所以它只有前后两段
+      if (row.kind === 'note' || r.height < 14) return y < r.height / 2 ? 'before' : 'after';
+      if (y < r.height * 0.28) return 'before';
+      if (y > r.height * 0.72) return 'after';
+      return 'in';
+    }
+
+    function canDrop(d, row, zone) {
+      if (!d || d.id === row.node.id) return false;
+      if (row.kind === 'root') {
+        // 体系根不能被排序，但可以「放进去」和「放到根前/后」——根之间顺序由体系决定，
+        // 所以只接受「放进去」
+        return zone === 'in' && (d.kind === 'note' || !isSelfOrDescendant(d.id, row.node.id));
+      }
+      if (row.kind === 'note') {
+        return d.kind === 'note' && zone !== 'in';       // 笔记是叶子，不能往里放
+      }
+      if (zone === 'in') return d.kind === 'note' || !isSelfOrDescendant(d.id, row.node.id);
+      return d.kind === 'folder';                        // 前后 = 同级排序，两侧必须同类
+    }
+
+    function onDragStart(row, e) {
+      if (row.kind === 'root') { e.preventDefault(); return; }   // 体系根不能拖
+      drag.value = { kind: row.kind, id: row.node.id };
+      e.dataTransfer.effectAllowed = 'move';
+      e.dataTransfer.setData('text/plain', String(row.node.id));  // 某些浏览器没它不触发 drop
+    }
+
+    function onDragOver(row, e) {
+      if (!canDrop(drag.value, row, zoneOf(row, e))) return;
+      e.preventDefault();                                  // 不 preventDefault 就不会有 drop
+      dropAt.value = { id: row.node.id, zone: zoneOf(row, e) };
+    }
+
+    function onDragEnd() { drag.value = null; dropAt.value = null; }
+
+    /** 同级列表里「去掉被拖的那个」之后，目标在第几位 —— 和服务端的算法保持一致，
+     *  否则同层里往下拖会差一位。 */
+    function positionIn(ids, targetId, zone, dragId) {
+      const rest = ids.filter((x) => x !== dragId);
+      const i = rest.indexOf(targetId);
+      return Math.max(0, i + (zone === 'after' ? 1 : 0));
+    }
+
+    async function onDrop(row, e) {
+      e.preventDefault();
+      const d = drag.value;
+      const zone = dropAt.value && dropAt.value.id === row.node.id ? dropAt.value.zone : null;
+      drag.value = null;
+      dropAt.value = null;
+      if (!d || !zone) return;
+      try {
+        if (zone === 'in') {
+          // 9999 = 「放最后」，服务端会夹到合法范围
+          if (d.kind === 'folder') await noteFoldersApi.update(d.id, { parent_id: row.node.id, position: 9999 });
+          else await notesApi.update(d.id, { folder_id: row.node.id, position: 9999 });
+          expandIn(row.node.id, true);
+          if (cur.value && cur.value.id === d.id) { /* 打开着的笔记换了目录，正文不用重载 */ }
+        } else if (d.kind === 'folder') {
+          const parentId = folderMap.value[row.node.id].parent_id;
+          const sibs = parentId ? folderMap.value[parentId].children.map((c) => c.id) : tree.value.roots.map((r) => r.id);
+          await noteFoldersApi.update(d.id, {
+            parent_id: parentId, position: positionIn(sibs, row.node.id, zone, d.id),
+          });
+        } else {
+          const ids = (folderMap.value[row.folderId].notes || []).map((n) => n.id);
+          await notesApi.update(d.id, {
+            folder_id: row.folderId, position: positionIn(ids, row.node.id, zone, d.id),
+          });
+        }
+        await loadTree();
+      } catch (err) {
+        fail(err.message);
+        await loadTree();
+      }
+    }
+
+    /* ---- 行的「⋯」菜单与上下移 ---- */
+    function openMenu(row, e) {
+      e.stopPropagation();
+      const items = [];
+      if (row.kind === 'folder') {
+        items.push({ label: '新建子目录', run: () => startNewFolder(row.node.id) });
+        items.push({ label: '重命名', run: () => startRename(row.node) });
+        items.push({ label: '上移', run: () => nudge(row, -1) });
+        items.push({ label: '下移', run: () => nudge(row, 1) });
+        items.push({ label: '删除', danger: true, run: () => removeFolder(row.node) });
+      } else if (row.kind === 'note') {
+        items.push({ label: '打开', run: () => open(row.node.id) });
+        items.push({ label: row.node.pinned ? '取消置顶' : '置顶', run: () => togglePin(row.node) });
+        items.push({ label: '上移', run: () => nudge(row, -1) });
+        items.push({ label: '下移', run: () => nudge(row, 1) });
+        items.push({ label: '删除', danger: true, run: () => removeNote(row.node) });
+      } else {
+        items.push({ label: '新建笔记', run: () => createNote(row.node.id) });
+        items.push({ label: '新建子目录', run: () => startNewFolder(row.node.id) });
+      }
+      const box = e.currentTarget.getBoundingClientRect();
+      // 用 fixed 定位：树那一列是 overflow 滚动的，绝对定位的菜单会被裁掉。
+      // 位置要**夹在视口里**：行靠近窗口底部时菜单会掉到屏幕外，最后两项就点不到了
+      // （窗口小的时候尤其明显 —— 实测 300×500 的窄窗口里必现）。
+      // 放不下就翻到行的上方。
+      const W = 152, H = 180;
+      const vw = window.innerWidth, vh = window.innerHeight;
+      const x = Math.max(8, Math.min(box.right - W, vw - W - 8));
+      const below = box.bottom + 4;
+      const y = below + H <= vh ? below : Math.max(8, Math.min(box.top - H - 4, vh - H - 8));
+      menu.value = { items, x, y };
+    }
+
+    function closeMenu() { menu.value = null; }
+
+    async function runMenu(it) {
+      closeMenu();
+      try { await it.run(); } catch (e) { fail(e.message); }
+    }
+
+    /** 上移/下移：拖拽的键盘/触控板替代品（拖不准时还有路）。 */
+    async function nudge(row, delta) {
+      try {
+        if (row.kind === 'folder') {
+          const parentId = folderMap.value[row.node.id].parent_id;
+          const sibs = parentId ? folderMap.value[parentId].children.map((c) => c.id) : tree.value.roots.map((r) => r.id);
+          const i = sibs.indexOf(row.node.id);
+          const to = i + delta;
+          if (i < 0 || to < 0 || to >= sibs.length) return;
+          await noteFoldersApi.update(row.node.id, { parent_id: parentId, position: to });
+        } else {
+          const sibs = (folderMap.value[row.folderId].notes || []).map((n) => n.id);
+          const i = sibs.indexOf(row.node.id);
+          const to = i + delta;
+          if (i < 0 || to < 0 || to >= sibs.length) return;
+          await notesApi.update(row.node.id, { folder_id: row.folderId, position: to });
+        }
+        await loadTree();
+      } catch (e) {
+        fail(e.message);
+      }
+    }
+
+    function selectFolder(id) {
+      selectedFolder.value = id;
+      expandIn(id, true);
+    }
+
+    /** 点一行：笔记就打开，目录就「选中 + 展收」。
+     *  选中目录是为了「新建笔记/新建目录落在哪」——没选就落「未归档」。 */
+    function onRowClick(row) {
+      if (row.kind === 'note') { open(row.node.id); return; }
+      selectedFolder.value = row.node.id;
+      toggleExpand(row.node.id);
+    }
+
+    /** 内联输入框出现时自动聚焦（用函数 ref，因为它在 v-for 里，
+     *  写成字符串 ref 会变成数组）。 */
+    function focusEdit(el) {
+      if (el) nextTick(() => el.focus());
+    }
+
     /* ================= 列表 ================= */
     async function loadList() {
       try {
@@ -260,14 +595,20 @@ export default {
     }
     function onSearch() {
       clearTimeout(searchTimer);
-      searchTimer = setTimeout(loadList, 300);
+      searchTimer = setTimeout(async () => {
+        await loadList();
+        if (!searching.value) await loadTree();     // 清空搜索条件时把树拉回最新
+      }, 300);
     }
 
-    async function createNote() {
+    /** 新建笔记：落在「选中的目录」，没选就落「未归档」——永远不会没归属。 */
+    async function createNote(folderId) {
       await flushSave();
+      const target = folderId ?? selectedFolder.value ?? tree.value.unfiled_root_id;
       try {
-        const r = await notesApi.create({ title: '未命名笔记', content: SAMPLE });
-        await loadList();
+        const r = await notesApi.create({ title: '未命名笔记', content: SAMPLE, folder_id: target });
+        await loadTree();
+        if (target) expandTo(target);
         await open(r.id);
       } catch (e) {
         fail(e.message);
@@ -283,6 +624,7 @@ export default {
           router.replace('/notes');
         }
         await loadList();
+        await loadTree();
         ok(r.images_removed ? `已删除（顺带清掉 ${r.images_removed} 张配图）` : '已删除');
       } catch (e) {
         fail(e.message);
@@ -293,6 +635,7 @@ export default {
       try {
         await notesApi.update(n.id, { pinned: !n.pinned });
         await loadList();
+        await loadTree();
       } catch (e) {
         fail(e.message);
       }
@@ -305,6 +648,9 @@ export default {
         cur.value = await notesApi.get(id);
         outline.value = [];
         activeHeading.value = '';
+        // 在树上把这篇所在的分支展开：从搜索或从网址直接打开时，
+        // 不然左侧只会停在一堆收起的目录外面，看不出它在哪
+        if (cur.value.folder_id) { expandTo(cur.value.folder_id); selectedFolder.value = cur.value.folder_id; }
         await nextTick();
         render();
         if (route.params.id !== id) router.replace('/notes/' + id);
@@ -321,6 +667,7 @@ export default {
       fail(`这篇笔记在服务端已不存在（可能已被删除），${action}没有完成。列表已刷新，请重新打开一篇。`);
       cur.value = null;
       await loadList();
+      await loadTree();
       if (route.params.id) router.replace('/notes');
     }
 
@@ -639,12 +986,17 @@ export default {
         .then(() => { libState.value = 'ready'; if (cur.value) render(); })
         .catch(() => { libState.value = 'error'; });
 
+      await loadTree();
+      initExpanded();
       await loadList();
       if (route.params.id) await open(route.params.id);
       // 导出能力探测和主流程无关，不 await，避免拖慢首屏
       loadCaps();
       window.addEventListener('resize', onResize);
       window.addEventListener('keydown', onZenKey);
+      // 点别处把「⋯」菜单收起来。挂在 document 上而不是用 @click，
+      // 因为菜单本身是 fixed、在卡片外面
+      document.addEventListener('click', closeMenu);
     });
 
     watch(zen, (v) => {
@@ -670,6 +1022,7 @@ export default {
       if (ro) ro.disconnect();
       window.removeEventListener('resize', onResize);
       window.removeEventListener('keydown', onZenKey);
+      document.removeEventListener('click', closeMenu);
       // 必须摘掉：否则离开笔记页后整个工作台会一直少一个侧边栏
       document.body.classList.remove('notes-zen');
     });
@@ -683,6 +1036,11 @@ export default {
       outline, activeHeading, editorEl, previewEl, previewWrapEl, canvasEl, fileEl,
       inkOn, inkTool, penColor, penWidth, colors: PEN_COLORS, snippets: SNIPPETS,
       loadList, onSearch, createNote, removeNote, togglePin, open,
+      // 目录树
+      tree, expanded, rows, searching, selectedFolder, editing, drag, dropAt, menu,
+      noteFoldersApi, toggleExpand, selectFolder, startNewFolder, startRename, cancelEdit,
+      commitEdit, removeFolder, openMenu, closeMenu, runMenu, nudge, onRowClick, focusEdit,
+      onDragStart, onDragOver, onDragEnd, onDrop,
       onEdit, onTitleInput, render, scrollToHeading, onPreviewScroll,
       insertSnippet, pickImage, onImageFile, onPaste,
       toggleInk, inkDown, inkMove, inkUp, undoInk, clearInk,
@@ -699,28 +1057,88 @@ export default {
     </div>
 
     <div class="notes-grid" :class="{ zen, 'with-formula': showFormula && hasNote && !zen }">
-      <!-- ============ 左：列表 + 目录 ============ -->
+      <!-- ============ 左：目录树 + 目录 ============ -->
       <div class="notes-side" v-if="!zen">
-        <div class="card">
-          <div style="display:flex;gap:8px;margin-bottom:10px">
-            <button class="btn primary sm" @click="createNote">新建笔记</button>
+        <div class="card nb-card" @click="closeMenu">
+          <!-- 工具栏：新建落在「选中的目录」；搜索一开就切成平铺结果 -->
+          <div class="nb-tools">
+            <button class="btn primary sm" @click="createNote()"
+                    :title="selectedFolder ? '新建在当前选中的目录里' : '新建在「未归档」里'">新建笔记</button>
+            <button class="btn sm" @click="startNewFolder(selectedFolder || tree.unfiled_root_id)"
+                    title="在你选中的目录里建一个子目录">新建目录</button>
             <input type="text" v-model="keyword" placeholder="搜标题 / 正文" @input="onSearch">
           </div>
-          <div class="note-list">
+
+          <!-- 搜索：平铺结果 + 每篇的路径（在树里高亮反而难找） -->
+          <div v-if="searching" class="note-list">
             <div v-for="n in notes" :key="n.id" class="note-item"
                  :class="{ on: cur && n.id === cur.id }" @click="open(n.id)">
               <div class="note-title">
                 <span v-if="n.pinned" class="pin">📌 </span>{{ n.title }}
               </div>
-              <div class="note-excerpt">{{ n.excerpt || '（空笔记）' }}</div>
+              <div class="nb-path">{{ n.path || '（没有目录）' }}</div>
               <div class="note-meta">
                 <span>{{ (n.updated_at || '').replace('T', ' ').slice(5, 16) }}</span>
                 <span style="flex:1"></span>
-                <a @click.stop="togglePin(n)">{{ n.pinned ? '取消置顶' : '置顶' }}</a>
-                <a @click.stop="removeNote(n)">删除</a>
+                <a @click.stop="openMenu({ kind: 'note', node: n }, $event)">更多</a>
               </div>
             </div>
-            <div v-if="!notes.length" class="empty">还没有笔记，点「新建笔记」开始</div>
+            <div v-if="!notes.length" class="empty">没有匹配的笔记</div>
+          </div>
+
+          <!-- 树：体系 → 目录… → 笔记。拖动 = 改层级/改顺序 -->
+          <div v-else class="nb-tree">
+            <div v-for="row in rows" :key="row.kind + row.node.id" class="nb-row"
+                 :class="{
+                   on: (row.kind === 'note' && cur && cur.id === row.node.id)
+                       || (row.kind !== 'note' && selectedFolder === row.node.id),
+                   root: row.kind === 'root',
+                   folder: row.kind === 'folder',
+                   note: row.kind === 'note',
+                   dragging: drag && drag.id === row.node.id,
+                   'drop-before': dropAt && dropAt.id === row.node.id && dropAt.zone === 'before',
+                   'drop-after': dropAt && dropAt.id === row.node.id && dropAt.zone === 'after',
+                   'drop-in': dropAt && dropAt.id === row.node.id && dropAt.zone === 'in',
+                 }"
+                 :style="{ paddingLeft: (6 + row.depth * 14) + 'px' }"
+                 :draggable="row.kind !== 'root'"
+                 @dragstart="onDragStart(row, $event)"
+                 @dragover="onDragOver(row, $event)"
+                 @dragend="onDragEnd"
+                 @drop="onDrop(row, $event)"
+                 @click="onRowClick(row)"
+                 @contextmenu.prevent="openMenu(row, $event)">
+              <!-- 展开三角：只有目录/体系有 -->
+              <span v-if="row.kind !== 'note'" class="nb-caret"
+                    @click.stop="toggleExpand(row.node.id)">{{ expanded[row.node.id] ? '▾' : '▸' }}</span>
+              <span v-else class="nb-caret">·</span>
+
+              <!-- 改名：原地变输入框 -->
+              <input v-if="editing && editing.mode === 'rename' && editing.id === row.node.id"
+                     :ref="focusEdit" class="nb-inline" v-model="editing.value"
+                     @click.stop @keyup.enter="commitEdit" @keyup.esc="cancelEdit" @blur="commitEdit">
+              <template v-else>
+                <span class="nb-name" :title="row.kind === 'note' ? row.node.title : row.node.name">
+                  <span v-if="row.kind === 'note' && row.node.pinned" class="pin">📌</span>{{ row.kind === 'note' ? row.node.title : row.node.name }}
+                </span>
+                <span v-if="row.kind !== 'note' && row.node.count" class="nb-count">{{ row.node.count }}</span>
+              </template>
+
+              <span class="nb-more" @click.stop="openMenu(row, $event)" title="更多">⋯</span>
+            </div>
+
+            <!-- 新建目录的输入行：挂在目标目录下面 -->
+            <div v-if="editing && editing.mode === 'new'" class="nb-row editing">
+              <input :ref="focusEdit" class="nb-inline" v-model="editing.value"
+                     placeholder="目录名，回车确定" @keyup.enter="commitEdit"
+                     @keyup.esc="cancelEdit" @blur="commitEdit">
+            </div>
+          </div>
+          <div v-if="!searching && !rows.length" class="empty">还没有目录</div>
+
+          <!-- 树的操作提示：拖拽是主要方式，但得先让人知道能拖 -->
+          <div v-if="!searching" class="small muted nb-tip">
+            拖动可改层级与顺序；「⋯」里有重命名 / 上下移 / 删除。删目录不会删笔记（内容会移到上一级）。
           </div>
         </div>
 
@@ -873,5 +1291,12 @@ export default {
         <button class="btn ghost" @click="showExport = false">关闭</button>
       </template>
     </Modal>
+
+    <!-- 行的「⋯」菜单。fixed 定位：挂在最外层，不跟着树那一列被裁掉 -->
+    <div v-if="menu" class="nb-menu" :style="{ left: menu.x + 'px', top: menu.y + 'px' }"
+         @click.stop>
+      <div v-for="(it, i) in menu.items" :key="i" :class="{ danger: it.danger }"
+           @click="runMenu(it)">{{ it.label }}</div>
+    </div>
   </div>`,
 };

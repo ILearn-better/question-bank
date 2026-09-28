@@ -28,9 +28,10 @@ from sqlalchemy.orm import Session
 from .. import config
 from ..adapters import notes_math, office
 from ..db import get_db
-from ..models import Note
+from ..models import Note, NoteFolder
 from ..schemas import NoteIn, NotePatch
 from ..services import images, notes_export
+from . import note_folders
 
 router = APIRouter(prefix="/api/notes", tags=["notes"])
 
@@ -65,6 +66,9 @@ def _brief(n: Note) -> dict:
         "id": n.id,
         "title": n.title,
         "pinned": bool(n.pinned),
+        # 目录树靠它挂节点；排序靠它跟 sort_order（拖动出来的手排顺序）
+        "folder_id": n.folder_id,
+        "sort_order": n.sort_order,
         "excerpt": _excerpt(n.content or ""),
         "updated_at": n.updated_at,
         "created_at": n.created_at,
@@ -94,29 +98,47 @@ def _used_images(db: Session) -> set[str]:
 @router.get("")
 def list_notes(
     keyword: str | None = None,
+    folder_id: int | None = Query(None, description="只看某个目录"),
     limit: int = Query(200, ge=1, le=500),
     db: Session = Depends(get_db),
 ):
+    """平铺列表（不带 keyword 时就是「全部笔记」）。
+
+    界面上的主视图已经改成目录树（见 note_folders.note_tree），这个接口留着的两件事：
+    ① 搜索 —— 命中就平铺出来，每条带 path 说明它在哪；② 不带条件的全量导出/统计。
+    """
     conds = []
+    if folder_id is not None:
+        conds.append(Note.folder_id == folder_id)
     kw = (keyword or "").strip()
     if kw:
         like = f"%{kw}%"
         conds.append(or_(Note.title.like(like), Note.content.like(like)))
     rows = db.scalars(
         select(Note).where(*conds)
-        .order_by(Note.pinned.desc(), Note.updated_at.desc())
+        .order_by(Note.pinned.desc(), Note.sort_order, Note.updated_at.desc())
         .limit(limit)
     ).all()
-    return {"items": [_brief(n) for n in rows]}
+    paths = note_folders.folder_paths(db)
+    items = []
+    for n in rows:
+        items.append({**_brief(n), "path": paths.get(n.folder_id, "")})
+    return {"items": items}
 
 
 @router.post("")
 def create_note(payload: NoteIn, db: Session = Depends(get_db)):
     nid = uuid.uuid4().hex[:12]
     now = _now()
+    # 没指定目录就落「未归档」：新建永远不会因为没选目录而没归属
+    folder = (db.get(NoteFolder, payload.folder_id) if payload.folder_id
+              else note_folders.unfiled_root(db))
+    if folder is None:
+        raise HTTPException(404, "目录不存在")
     db.add(Note(
         id=nid,
         owner_id=config.OWNER_ID,
+        folder_id=folder.id,
         title=(payload.title or "").strip() or "未命名笔记",
         content=payload.content or "",
         ink=json.dumps(payload.ink or [], ensure_ascii=False),
@@ -135,18 +157,37 @@ def get_note(nid: str, db: Session = Depends(get_db)):
 
 @router.patch("/{nid}")
 def update_note(nid: str, payload: NotePatch, db: Session = Depends(get_db)):
-    """部分更新。只改显式传进来的字段 —— 自动保存时不会把另一头的内容覆盖掉。"""
+    """部分更新。只改显式传进来的字段 —— 自动保存时不会把另一头的内容覆盖掉。
+
+    拖动（folder_id / position）走的也是这里，但**不动 updated_at**：
+    那是「最后编辑」，把笔记拖个位置不该算改动，否则「最近改过的」这列会全被拖动刷乱。
+    """
     n = _note_or_404(db, nid)
     data = payload.model_dump(exclude_unset=True)
+    edited = False
     if "title" in data:
         n.title = (data["title"] or "").strip() or "未命名笔记"
+        edited = True
     if "content" in data:
         n.content = data["content"] or ""
+        edited = True
     if "ink" in data:
         n.ink = json.dumps(data["ink"] or [], ensure_ascii=False)
+        edited = True
     if "pinned" in data:
         n.pinned = 1 if data["pinned"] else 0
-    n.updated_at = _now()
+        edited = True
+    if "folder_id" in data:
+        if data["folder_id"] is None:
+            # 不做「传 null 就回未归档」：那会让一次写错的请求静默搬走笔记
+            raise HTTPException(422, "笔记必须属于一个目录（要搬走就传目标目录的 id）")
+        if db.get(NoteFolder, data["folder_id"]) is None:
+            raise HTTPException(404, "目标目录不存在")
+        n.folder_id = data["folder_id"]
+    if data.get("position") is not None:
+        note_folders.place_note(db, n, int(data["position"]))
+    if edited:
+        n.updated_at = _now()
     db.commit()
     return _brief(n)
 

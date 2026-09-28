@@ -189,7 +189,7 @@ export const notesApi = {
   list: (params) => api.get('/api/notes', params),
   get: (id) => api.get(`/api/notes/${id}`),
   create: (body) => api.post('/api/notes', body),
-  /** 自动保存走这个：只传改动过的字段。 */
+  /** 自动保存走这个：只传改动过的字段。拖动（folder_id + position）也走它。 */
   update: (id, body) => api.patch(`/api/notes/${id}`, body),
   remove: (id) => api.del(`/api/notes/${id}`),
   uploadImage: (formData) => api.upload('/api/notes/image', formData),
@@ -199,6 +199,18 @@ export const notesApi = {
   /** 导出单篇笔记。Word / PDF 都是服务端生成，这里只管下载。 */
   downloadExport: (id, params, filename) =>
     download(`/api/notes/${id}/export` + qs(params), filename),
+};
+
+/** 笔记目录树（体系 → 目录… → 笔记）。 */
+export const noteFoldersApi = {
+  /** 整棵树一次拿全：目录结构 + 每个目录下的笔记（只含轻量字段）。
+   *  笔记量级不大，一次拿全才能做到「点开目录立刻看到内容」，不必逐个目录去拉。 */
+  tree: () => api.get('/api/note-folders/tree'),
+  create: (body) => api.post('/api/note-folders', body),
+  /** 改名 / 移动 / 排序共用：移动传 {parent_id, position}，position 是**放在第几位**。 */
+  update: (id, body) => api.patch(`/api/note-folders/${id}`, body),
+  /** 删目录**不删内容**：里面的子目录与笔记上移到父目录（返回值里有移了几样）。 */
+  remove: (id) => api.del(`/api/note-folders/${id}`),
 };
 
 export const abilityApi = {

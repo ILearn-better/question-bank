@@ -31,6 +31,7 @@ from app.routers import (                                   # noqa: E402
     homeworks,
     lesson_files,
     lessons,
+    note_folders,
     notes,
     papers,
     questions,
@@ -113,6 +114,8 @@ app.include_router(documents.router)
 app.include_router(system.router)
 app.include_router(uploads.router)
 app.include_router(notes.router)
+# 笔记目录树。**放在 notes 之后无所谓，但两边各自要先声明自己的子路由**（见 note_folders.note_tree 的说明）
+app.include_router(note_folders.router)
 
 # ---- 前端静态资源（必须最后挂，否则会吃掉 /api/*）----
 if config.FRONTEND_DIR.exists():

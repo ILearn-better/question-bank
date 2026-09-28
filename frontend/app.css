@@ -254,6 +254,46 @@ table.tbl tr.clickable:hover { background: var(--panel-2); cursor: pointer; }
 .toc-item:hover { background: var(--panel-2); color: var(--text); }
 .toc-item.on { background: var(--primary-weak); color: var(--primary); font-weight: 600; }
 
+/* ---- 笔记目录树（体系 → 目录… → 笔记）---- */
+.nb-card { padding-bottom: 10px; }
+.nb-tools { display: flex; gap: 6px; margin-bottom: 8px; flex-wrap: wrap; }
+.nb-tools input[type="text"] { flex: 1; min-width: 90px; }
+.nb-tree { max-height: 46vh; overflow: auto; margin: 0 -4px; padding: 0 4px; }
+.nb-row { display: flex; align-items: center; gap: 4px; padding: 4px 6px 4px 0;
+          border-radius: var(--radius-sm); cursor: pointer; position: relative;
+          font-size: 13px; border: 1px solid transparent; }
+.nb-row:hover { background: var(--panel-2); }
+.nb-row.on { background: var(--primary-weak); border-color: #c7d7fe; }
+.nb-row.root { font-weight: 600; color: var(--text); }
+.nb-row.folder { color: var(--text-2); }
+.nb-row.note { color: var(--text-2); }
+.nb-row.dragging { opacity: .45; }
+/* 拖拽落点提示：前/后是一条线，放进去是整行描边 —— 一眼能分清「同级排序」还是「变成子目录」 */
+.nb-row.drop-before { box-shadow: inset 0 2px 0 0 var(--primary); }
+.nb-row.drop-after { box-shadow: inset 0 -2px 0 0 var(--primary); }
+.nb-row.drop-in { border-color: var(--primary); background: var(--primary-weak); }
+.nb-caret { width: 13px; flex: none; color: var(--text-3); font-size: 10px; text-align: center; }
+.nb-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.nb-count { flex: none; font-size: 10.5px; color: var(--text-3); background: var(--panel-2);
+            border-radius: 8px; padding: 1px 6px; }
+.nb-row .pin { margin-right: 2px; }
+.nb-more { flex: none; width: 18px; text-align: center; color: var(--text-3); border-radius: 4px;
+           opacity: 0; }
+.nb-row:hover .nb-more, .nb-row.on .nb-more { opacity: 1; }
+.nb-more:hover { background: var(--border); color: var(--text); }
+.nb-inline { flex: 1; min-width: 0; font-size: 12.5px; padding: 2px 6px; }
+.nb-row.editing { padding-left: 22px; }
+.nb-path { font-size: 11px; color: var(--text-3); margin-top: 2px; overflow: hidden;
+           text-overflow: ellipsis; white-space: nowrap; }
+.nb-tip { margin-top: 8px; line-height: 1.5; }
+/* 行的「⋯」菜单：用 fixed 定位，免得被树那一列的 overflow 裁掉 */
+.nb-menu { position: fixed; z-index: 60; min-width: 140px; background: var(--panel);
+           border: 1px solid var(--border); border-radius: var(--radius-sm);
+           box-shadow: 0 6px 22px rgba(15, 23, 42, .16); padding: 4px; }
+.nb-menu div { padding: 5px 9px; border-radius: 4px; cursor: pointer; font-size: 12.5px; }
+.nb-menu div:hover { background: var(--panel-2); }
+.nb-menu div.danger { color: var(--danger); }
+
 .notes-toolbar { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-bottom: 10px; }
 .notes-toolbar .sep { width: 1px; height: 18px; background: var(--border); margin: 0 3px; }
 .notes-body { display: grid; gap: 12px; grid-template-columns: minmax(0, 1fr); }

@@ -80,6 +80,8 @@ class NoteIn(BaseModel):
     content: str = ""
     ink: List[dict] = Field(default_factory=list)
     pinned: bool = False
+    # 放哪个目录。不传就落到「未归档」——新建时永远不会因为没选目录而丢掉归属。
+    folder_id: Optional[int] = None
 
 
 class NotePatch(BaseModel):
@@ -90,6 +92,23 @@ class NotePatch(BaseModel):
     content: Optional[str] = None
     ink: Optional[List[dict]] = None
     pinned: Optional[bool] = None
+    folder_id: Optional[int] = None
+    # 拖动时用：放到该目录里的第 position 位（0-based，按界面显示顺序）。
+    # **不是数据列**，是「放在哪」的指令 —— 服务端据此重排同层，重排规则见 note_folders.py。
+    position: Optional[int] = None
+
+
+class NoteFolderIn(BaseModel):
+    """新建目录。体系由父节点的根决定，所以只要 parent_id，不要 curriculum_id。"""
+
+    parent_id: int
+    name: str = ""
+
+
+class NoteFolderPatch(BaseModel):
+    name: Optional[str] = None
+    parent_id: Optional[int] = None
+    position: Optional[int] = None
 
 
 # ============================================================ 体系 / 知识点

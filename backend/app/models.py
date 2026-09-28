@@ -481,6 +481,40 @@ class LessonFile(Base):
 # ============================================================
 # M4 笔记（Markdown 正文 + 一层板书笔画）
 # ============================================================
+class NoteFolder(Base):
+    """笔记目录树的节点（迁移 0014）。
+
+    树形：体系根 → 目录… → 笔记。**不复用题库的 `nodes`**：那是官方大纲，
+    学习路径定死；笔记目录是老师自己的整理习惯，要能随手拖。两者混在一棵树上，
+    结果就是两边都不能动。
+
+    两个容易写歪的地方：
+
+      · `is_root` —— 每个体系一棵，根行承载「这棵树属于哪个体系」。
+        有根行，整棵树就只有一种结构（笔记一律有父，归属沿 parent_id 往上走就能定）；
+        不然「笔记属于哪个体系」会有两个来源，一处漏判就把笔记分错体系。
+
+      · `curriculum_id` **只有根行有值**，非根行一律 NULL。它不是每行的冗余属性；
+        冗余就得在移动目录时同步整棵子树，多一个能写歪的地方。
+    """
+
+    __tablename__ = "note_folders"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    owner_id: Mapped[int] = mapped_column(Integer, nullable=False, default=OWNER_ID, server_default=str(OWNER_ID))
+    curriculum_id: Mapped[int | None] = mapped_column(ForeignKey("curricula.id", ondelete="SET NULL"))
+    parent_id: Mapped[int | None] = mapped_column(ForeignKey("note_folders.id", ondelete="CASCADE"))
+    name: Mapped[str] = mapped_column(String, nullable=False)
+    is_root: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    sort_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    created_at: Mapped[str] = mapped_column(Text, default=_now, server_default=NOW)
+
+    __table_args__ = (
+        Index("idx_note_folders_parent", "parent_id", "sort_order"),
+        Index("idx_note_folders_curriculum", "curriculum_id"),
+    )
+
+
 class Note(Base):
     """一页笔记：Markdown 正文 + 一层矢量笔画。
 
@@ -495,6 +529,15 @@ class Note(Base):
 
     id: Mapped[str] = mapped_column(String, primary_key=True)
     owner_id: Mapped[int] = mapped_column(Integer, nullable=False, default=OWNER_ID, server_default=str(OWNER_ID))
+    # 所在目录（笔记目录树的节点）。可空只是**安全网**：应用层一律写值，
+    # 万一目录行被别的路径删掉，笔记会退回「未归档」而不是消失。
+    # 外键带名字：0014 用 batch 模式重建表（SQLite 加带约束的列只能重建），
+    # 而重建时匿名约束对不上号，所以库里的名字和这里保持一致。
+    folder_id: Mapped[int | None] = mapped_column(
+        ForeignKey("note_folders.id", ondelete="SET NULL", name="fk_notes_folder"))
+    # 同一目录里的手排顺序（拖动出来的）。拖动只改它，**不动 updated_at** ——
+    # 那是「最后编辑」，把笔记拖个位置不该算改动。
+    sort_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
     title: Mapped[str] = mapped_column(String, nullable=False, default="未命名笔记", server_default="未命名笔记")
     content: Mapped[str] = mapped_column(Text, default="", server_default="")
     ink: Mapped[str] = mapped_column(Text, default="[]", server_default="[]")     # 笔画数组（JSON）
@@ -502,7 +545,10 @@ class Note(Base):
     created_at: Mapped[str] = mapped_column(Text, default=_now, server_default=NOW)
     updated_at: Mapped[str] = mapped_column(Text, default=_now, server_default=NOW)
 
-    __table_args__ = (Index("idx_notes_updated", "updated_at"),)
+    __table_args__ = (
+        Index("idx_notes_updated", "updated_at"),
+        Index("idx_notes_folder", "folder_id"),
+    )
 
 
 # ============================================================
