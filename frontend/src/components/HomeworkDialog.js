@@ -151,6 +151,23 @@ export default {
     /** 能不能当缩略图渲染（HEIC 等由浏览器不认的退化成标签）。 */
     const canPreview = (f) => f.kind === 'image' && PREVIEWABLE.includes(extOf(f.name));
 
+    /* 图片预览：点缩略图/文件名就在**弹窗里**看大图，而不是先存进下载目录。
+     *  作业照片是拿来核对的（对错、字迹、有没有漏页），下载再看等于多绕一步。
+     *  想存下来或在新标签页打开：预览弹窗里有「下载原件」，链接本身也还是在新标签页开的。 */
+    const preview = ref(null);
+    const previewUrl = (f) => lessonFilesApi.rawUrl(f.id, true);
+
+    function openPreview(f) {
+      if (!canPreview(f)) return;        // 不是图片（PDF/Word/HEIC）就保持原行为：新标签页/下载
+      preview.value = { id: f.id, name: disp(f), url: previewUrl(f) };
+    }
+
+    function onFileNameClick(f, e) {
+      if (!canPreview(f)) return;
+      e.preventDefault();                // 图片：改成就地预览；按住 Ctrl 点仍可走链接本身
+      openPreview(f);
+    }
+
     async function removeFile(f) {
       if (!window.confirm(`删掉「${disp(f)}」？（磁盘上的原件也一起删）`)) return;
       try {
@@ -206,6 +223,7 @@ export default {
       files, fileEl, imgEl, fileAccept, uploadingFile, relDir,
       setScore, dimPrev, scoring, pickFile, pickImage, onFilePicked, removeFile, save, clearRecord,
       canPreview, fmtBytes, lessonFilesApi, hhmm, shortDate, disp,
+      preview, previewUrl, openPreview, onFileNameClick,
     };
   },
   template: `
@@ -248,9 +266,10 @@ export default {
         </div>
 
         <div v-for="f in files" :key="f.id" class="hw-file">
-          <!-- 图片给缩略图：作业照片得看得见才敢确认收对了 -->
-          <a v-if="canPreview(f)" :href="lessonFilesApi.rawUrl(f.id)" target="_blank"
-             rel="noopener" style="flex:none">
+          <!-- 图片给缩略图：作业照片得看得见才敢确认收对了；点一下就放大看 -->
+          <a v-if="canPreview(f)" :href="previewUrl(f)" target="_blank" rel="noopener"
+             style="flex:none" title="点一下放大看（新标签页打开请按住 Ctrl 点）"
+             @click.prevent="openPreview(f)">
             <img :src="lessonFilesApi.rawUrl(f.id)" alt="" class="hw-thumb">
           </a>
           <span v-else class="tag" :class="f.status === 'ok' ? 'green' : 'red'" style="flex:none">
@@ -258,7 +277,8 @@ export default {
           </span>
           <div style="flex:1;min-width:0">
             <!-- 显示落盘名（学生_日期_序号），和归档文件夹里看到的一致；原名退到小字 -->
-            <a v-if="f.status === 'ok'" :href="lessonFilesApi.rawUrl(f.id)" target="_blank" rel="noopener">{{ disp(f) }}</a>
+            <a v-if="f.status === 'ok'" :href="canPreview(f) ? previewUrl(f) : lessonFilesApi.rawUrl(f.id)"
+               target="_blank" rel="noopener" @click="onFileNameClick(f, $event)">{{ disp(f) }}</a>
             <span v-else style="word-break:break-all">{{ disp(f) }}</span>
             <span class="small muted">
               <template v-if="f.name && f.name !== disp(f)"> · 原 {{ f.name }}</template>
@@ -301,6 +321,17 @@ export default {
       <button class="btn primary" :disabled="saving || loading" @click="save">
         {{ saving ? '保存中…' : '保存' }}
       </button>
+    </template>
+  </Modal>
+
+  <!-- 图片预览：在弹窗里看大图，不用下载再找 -->
+  <Modal v-if="preview" :title="preview.name" @close="preview = null">
+    <div class="hw-preview">
+      <img :src="preview.url" :alt="preview.name">
+    </div>
+    <template #foot>
+      <a class="btn ghost" :href="lessonFilesApi.rawUrl(preview.id)" download>下载原件</a>
+      <button class="btn" @click="preview = null">关闭</button>
     </template>
   </Modal>`,
 };

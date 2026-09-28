@@ -401,5 +401,8 @@ body.notes-zen .notes-preview { min-height: 0; padding: 14px 18px; }
    作业照片必须看得见缩略图才好确认收对了没有。 */
 .hw-file { display: flex; gap: 8px; align-items: flex-start; margin-top: 8px; }
 .hw-thumb { display: block; height: 56px; max-width: 96px; object-fit: cover;
-            border: 1px solid var(--border); border-radius: var(--radius-sm); }
+            border: 1px solid var(--border); border-radius: var(--radius-sm); cursor: zoom-in; }
+/* 图片预览（交作业里点缩略图/文件名）：就地在弹窗里看大图，不用先下载 */
+.hw-preview { display: flex; justify-content: center; align-items: center; }
+.hw-preview img { max-width: 100%; max-height: 66vh; border-radius: 6px; display: block; }
 

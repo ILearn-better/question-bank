@@ -27,6 +27,9 @@ router = APIRouter(prefix="/api", tags=["lesson-files"])
 
 MAX_BYTES = 30 * 1024 * 1024      # 30MB。课件/讲义足够，也避免把库撑爆
 
+# 允许「就地显示」的扩展名。只放图片：inline + HTML/SVG 等于开了个 XSS 口子。
+INLINE_OK_EXT = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
+
 
 def _lesson_or_404(db: Session, lid: int) -> Lesson:
     ls = db.get(Lesson, lid)
@@ -185,8 +188,20 @@ def delete_file(fid: int, db: Session = Depends(get_db)):
 
 
 @router.get("/lesson-files/{fid}/raw")
-def download_file(fid: int, db: Session = Depends(get_db)):
-    """取回原件。留一份原件本来就是为了「万一还想自己看看」。"""
+def download_file(
+    fid: int,
+    inline: bool = Query(False, description="图片可以就地显示（预览用）；其它类型一律下载"),
+    db: Session = Depends(get_db),
+):
+    """取回原件。留一份原件本来就是为了「万一还想自己看看」。
+
+    `inline=1` 只对**图片**生效：作业照片点一下就该看见，而不是先存进下载目录
+    （之前一律发 attachment，用户点缩略图的结果是下载 —— 这是被反馈过的）。
+
+    为什么不开放给别的类型：inline + HTML/SVG 等于给自己开一个 XSS 口子
+    （上传者能控制内容），PDF/Word 本来就该下载下来用本机程序打开。
+    再加一条 `X-Content-Type-Options: nosniff`：不靠浏览器猜类型。
+    """
     f = db.get(LessonFile, fid)
     if f is None or not f.stored:
         raise HTTPException(404, "文件不存在")
@@ -195,9 +210,11 @@ def download_file(fid: int, db: Session = Depends(get_db)):
         raise HTTPException(404, "原件已不在磁盘上")
     media = mimetypes.guess_type(f.name)[0] or "application/octet-stream"
     from urllib.parse import quote
+    disp = "inline" if (inline and p.suffix.lower() in INLINE_OK_EXT) else "attachment"
     return FileResponse(str(p), media_type=media, filename=f.name,
                         headers={"Content-Disposition":
-                                 f"attachment; filename=file; filename*=UTF-8''{quote(f.name)}"})
+                                 f"{disp}; filename=file; filename*=UTF-8''{quote(f.name)}",
+                                 "X-Content-Type-Options": "nosniff"})
 
 
 @router.get("/students/{sid}/files")

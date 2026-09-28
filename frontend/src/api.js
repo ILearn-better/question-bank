@@ -152,7 +152,8 @@ export const lessonFilesApi = {
   upload: (lessonId, formData, role = 'material') =>
     api.upload(`/api/lessons/${lessonId}/files` + qs({ role }), formData),
   remove: (id) => api.del(`/api/lesson-files/${id}`),
-  rawUrl: (id) => `/api/lesson-files/${id}/raw`,
+  /** 原件地址。inline=true 时**图片**会就地显示（预览用），其它类型照样下载。 */
+  rawUrl: (id, inline) => `/api/lesson-files/${id}/raw` + (inline ? '?inline=1' : ''),
   /** 某个学生的全部资料（按上课日期分组）+ 磁盘归档路径。做学生情况分析时用它。 */
   byStudent: (studentId) => api.get(`/api/students/${studentId}/files`),
 };
