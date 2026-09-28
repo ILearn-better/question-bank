@@ -216,9 +216,12 @@ export const notesApi = {
   /** 导出能力：PDF 要本机有 Word、公式渲染要 node + Office 的 XSLT。
    *  先问一次，界面上就能把按钮状态和原因写清楚，而不是等用户点了才报错。 */
   exportCaps: () => api.get('/api/notes/export/caps'),
-  /** 导出单篇笔记。Word / PDF 都是服务端生成，这里只管下载。 */
+  /** 导出单篇笔记。Word / PDF 都是服务端生成，这里只管下载。
+   *  with_answer=false 出学生版：正文里插的题**答案整段不会被写进文件**。 */
   downloadExport: (id, params, filename) =>
     download(`/api/notes/${id}/export` + qs(params), filename),
+  /** 把一道题库里的题变成能插进正文的块（题干 + 答案 + 图片副本）。 */
+  questionBlock: (qid, index) => api.post('/api/notes/question-block', { qid, index }),
 };
 
 /** 笔记目录树（体系 → 目录… → 笔记）。 */

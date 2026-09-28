@@ -28,9 +28,9 @@ from sqlalchemy.orm import Session
 from .. import config
 from ..adapters import notes_math, office
 from ..db import get_db
-from ..models import Note, NoteFolder
-from ..schemas import NoteIn, NotePatch
-from ..services import file_text, images, notes_export
+from ..models import Note, NoteFolder, Question
+from ..schemas import NoteIn, NotePatch, QuestionBlockIn
+from ..services import file_text, images, note_questions, notes_export
 from . import note_folders, notes_transfer
 
 router = APIRouter(prefix="/api/notes", tags=["notes"])
@@ -343,6 +343,21 @@ DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.docu
 EXPORT_FORMATS = {"docx": DOCX_MIME, "pdf": "application/pdf"}
 
 
+@router.post("/question-block")
+def question_block(payload: QuestionBlockIn, db: Session = Depends(get_db)):
+    """把一道题库里的题变成可以插进笔记的块（题干 + 答案 + 图片快照）。
+
+    图片会**复制**进笔记资源目录（nb_ 前缀）：只留 /api/crops/ 的 URL 的话，
+    老师删掉那道题时截图会被孤儿清理删走，学生讲义里的图就静默没了。
+    详见 services/note_questions.py。
+    """
+    q = db.get(Question, payload.qid)
+    if q is None:
+        raise HTTPException(404, "题目不存在（可能已被删除）")
+    return {"block": note_questions.build_block(q, payload.index),
+            "qid": q.id, "stem": (q.content or "").strip()[:60]}
+
+
 @router.get("/export/caps")
 def export_caps():
     """导出能力探测。
@@ -367,6 +382,7 @@ def export_note(
     nid: str,
     format: str = Query("docx", description="docx / pdf"),
     ink: bool = Query(True, description="是否附上板书（手写标注）"),
+    with_answer: bool = Query(True, description="教师版（含答案）；false = 学生版，答案根本不写进文件"),
     db: Session = Depends(get_db),
 ):
     fmt = (format or "docx").lower()
@@ -374,9 +390,12 @@ def export_note(
         raise HTTPException(422, f"不支持的格式 {format}（可选 docx / pdf）")
 
     n = _note_or_404(db, nid)
+    # 正文里插了题库的题（<!--q:…--> 块）：导出前按版本处理成普通 Markdown。
+    # 学生版是**把答案整段删掉**（docx 是个 zip，写进去再隐藏藏不住）。
+    content = note_questions.render(n.content or "", with_answer)
     note = {
-        "title": n.title,
-        "content": n.content or "",
+        "title": f"{n.title}（学生版）" if not with_answer else n.title,
+        "content": content,
         "ink": _parse_ink(n.ink),
         "updated_at": n.updated_at,
     }
@@ -390,7 +409,7 @@ def export_note(
         # 503：本机能力不足（不是请求错），前端据此提示"先导 Word 再另存为 PDF"
         raise HTTPException(503, str(e)) from e
 
-    fname = notes_export.safe_filename(n.title, fmt)
+    fname = notes_export.safe_filename(note["title"], fmt)
     return Response(
         content=body,
         media_type=EXPORT_FORMATS[fmt],

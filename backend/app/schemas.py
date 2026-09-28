@@ -98,6 +98,12 @@ class NotePatch(BaseModel):
     position: Optional[int] = None
 
 
+class QuestionBlockIn(BaseModel):
+    """「往笔记里插一道题」的请求。index 只影响题干开头的「练习 N：」。"""
+    qid: str
+    index: Optional[int] = None
+
+
 class NoteFolderIn(BaseModel):
     """新建目录。**不传 parent_id = 建一个一级分组**（笔记自己的顶层，跟体系无关）。"""
 

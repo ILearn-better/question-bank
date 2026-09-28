@@ -14,6 +14,7 @@ import { useRoute, useRouter } from 'vue-router';
 import { notesApi, noteFoldersApi, notesBackupApi } from '../api.js';
 import { fail, ok, warn } from '../store.js';
 import Modal from '../components/Modal.js';
+import QuestionPicker from '../components/QuestionPicker.js';
 
 const SAMPLE = `# 新笔记
 
@@ -158,7 +159,7 @@ const SNIPPETS = [
 
 export default {
   name: 'Notes',
-  components: { Modal },
+  components: { Modal, QuestionPicker },
   setup() {
     const route = useRoute();
     const router = useRouter();
@@ -198,6 +199,9 @@ export default {
     // ---- 导出（Word / PDF）----
     const showExport = ref(false);
     const includeInk = ref(true);
+    // 导给谁看：默认教师版（含答案）。选学生版时，正文里插的题答案
+    // **根本不会被写进文件** —— 不是渲染时藏起来（见后端 note_questions.render）。
+    const exportWithAnswer = ref(true);
     const exporting = ref('');             // '' | 'docx' | 'pdf'：正在导出的格式
     const caps = ref(null);                // 导出能力，见后端 /api/notes/export/caps
 
@@ -232,9 +236,13 @@ export default {
       await flushSave();
       exporting.value = fmt;
       const base = (cur.value.title || '笔记').replace(/[\\/:*?"<>|]+/g, '_').slice(0, 60) || '笔记';
-      const filename = `${base}.${fmt}`;
+      const version = exportWithAnswer.value ? '' : '_学生版';
+      const filename = `${base}${version}.${fmt}`;
       try {
-        await notesApi.downloadExport(cur.value.id, { format: fmt, ink: includeInk.value }, filename);
+        await notesApi.downloadExport(
+          cur.value.id,
+          { format: fmt, ink: includeInk.value, with_answer: exportWithAnswer.value },
+          filename);
         ok(`已导出 ${fmt === 'pdf' ? 'PDF' : 'Word'}：${filename}`);
         showExport.value = false;
       } catch (e) {
@@ -657,8 +665,13 @@ export default {
       transferFile.value = f;
     }
 
-    /** 导出全量笔记。文件名在客户端给：服务端那个 filename* 是给直接点链接的场景用的。 */
-    async function doExport() {
+    /** 导出全量笔记（备份包）。
+     *
+     * 名字必须跟「导出单篇笔记」那个区分开：两个都叫 doExport 时，
+     * 同一个作用域里**后声明的那个会赢** —— 「导出 Word」按钮实际上会去下备份包，
+     * 而且不报错、看不出异常（浏览器里实测踩到过）。
+     */
+    async function exportBackup() {
       const t = new Date();
       const p = (n) => String(n).padStart(2, '0');
       const stamp = `${t.getFullYear()}${p(t.getMonth() + 1)}${p(t.getDate())}_${p(t.getHours())}${p(t.getMinutes())}`;
@@ -985,10 +998,47 @@ export default {
       }
     }
 
+    /* ================= 插入题库里的题 ================= */
+    // 插进正文的是一个**可识别的块**（<!--q:qid--> … <!--qa--> … <!--qe-->），
+    // 不是一段死文本：导出时按版本处理，「学生版」会把答案整段删掉。
+    // 图片由后端连图一起存进这篇笔记的资源目录（nb_ 前缀），
+    // 所以之后删掉题库里那道题，讲义里的图也不会消失。
+    const showPickQ = ref(false);
+    const pickingQ = ref(false);
+
+    /** 「练习 N：」的序号 = 正文里已有的题块数 + 1，老师能看出插到第几道。 */
+    const pickNextIndex = computed(() => {
+      const c = (cur.value && cur.value.content) || '';
+      return (c.match(/<!--q:/g) || []).length + 1;
+    });
+
+    async function insertQuestions(ids) {
+      if (pickingQ.value) return;
+      pickingQ.value = true;
+      try {
+        const blocks = [];
+        let n = pickNextIndex.value;
+        for (const qid of ids) {
+          const r = await notesApi.questionBlock(qid, n);
+          blocks.push(r.block);
+          n += 1;
+        }
+        // 前后各留一个空行，免得贴着上一段或下一段
+        insertAtCursor(`\n\n${blocks.join('\n\n')}\n\n`);
+        showPickQ.value = false;
+        const hi = blocks.some((b) => b.includes('<!--qa-->'));
+        ok(hi ? `已插入 ${ids.length} 道题（含答案；导出学生版时会去掉）`
+              : `已插入 ${ids.length} 道题`);
+      } catch (e) {
+        fail('插题失败：' + e.message);
+      } finally {
+        pickingQ.value = false;
+      }
+    }
+
     function pickImage() {
       if (fileEl.value) fileEl.value.click();
-    }
-    async function onImageFile(e) {
+    }    async function onImageFile(e) {
       const f = e.target.files && e.target.files[0];
       e.target.value = '';                  // 清掉，否则同一个文件选第二次不触发
       if (f) await uploadAndInsert(f);
@@ -1221,14 +1271,15 @@ export default {
       commitEdit, removeFolder, openMenu, closeMenu, runMenu, nudge, onRowClick, focusEdit,
       // 备份 / 迁移
       showTransfer, transferFile, transferOver, transferReport, transferring, transferEl,
-      openTransfer, pickTransferFile, onTransferPicked, doExport, doImport,
+      openTransfer, pickTransferFile, onTransferPicked, exportBackup, doImport,
       // 文档导入
       docEl, importingDoc, pickDoc, onDocPicked,
       onDragStart, onDragOver, onDragEnd, onDrop,
       onEdit, onTitleInput, render, scrollToHeading, onPreviewScroll,
       insertSnippet, pickImage, onImageFile, onPaste,
+      showPickQ, pickingQ, pickNextIndex, insertQuestions,
       toggleInk, inkDown, inkMove, inkUp, undoInk, clearInk,
-      showExport, includeInk, exporting, caps, doExport,
+      showExport, includeInk, exportWithAnswer, exporting, caps, doExport,
       zen, toggleZen,
       saveNow: flushSave,
     };
@@ -1380,6 +1431,9 @@ export default {
             <span class="sep"></span>
             <button class="btn sm" @click="pickImage">插入图片</button>
             <input ref="fileEl" type="file" accept="image/*" style="display:none" @change="onImageFile">
+            <button class="btn sm" :disabled="!hasNote || pickingQ"
+                    title="从题库里找一道题插到光标处（可按关键字、标签、知识点搜）"
+                    @click="showPickQ = true">插入题目</button>
             <button class="btn sm" :class="{ primary: inkOn }" @click="toggleInk">
               {{ inkOn ? '关闭画笔' : '画笔' }}
             </button>
@@ -1473,6 +1527,21 @@ export default {
         </label>
       </div>
 
+      <div class="row" style="align-items:center;gap:10px;margin:10px 0">
+        <span class="muted" style="font-size:12px">
+          给谁看：<template v-if="!cur || !(cur.content || '').includes('<!--q:')">
+          （正文里还没插过题库的题，两版内容一样）</template>
+        </span>
+        <div v-if="cur && (cur.content || '').includes('<!--q:')" class="chips" style="margin:0">
+          <span class="chip" :class="{ on: exportWithAnswer }" @click="exportWithAnswer = true">
+            教师版（含答案）
+          </span>
+          <span class="chip" :class="{ on: !exportWithAnswer }" @click="exportWithAnswer = false">
+            学生版（不含答案）
+          </span>
+        </div>
+      </div>
+
       <div class="row" style="gap:10px;margin-top:4px">
         <button class="btn primary" :disabled="!!exporting" @click="doExport('docx')">
           {{ exporting === 'docx' ? '正在生成…' : '导出 Word（.docx）' }}
@@ -1501,6 +1570,10 @@ export default {
       </template>
     </Modal>
 
+    <!-- ============ 从题库里挑题插进正文 ============ -->
+    <QuestionPicker v-if="showPickQ" :next-index="pickNextIndex"
+                    @close="showPickQ = false" @pick="insertQuestions" />
+
     <!-- 行的「⋯」菜单。fixed 定位：挂在最外层，不跟着树那一列被裁掉 -->
     <div v-if="menu" class="nb-menu" :style="{ left: menu.x + 'px', top: menu.y + 'px' }"
          @click.stop>
@@ -1519,7 +1592,7 @@ export default {
       </p>
 
       <div class="row" style="gap:8px;align-items:center;margin:12px 0">
-        <button class="btn primary" :disabled="!!transferring" @click="doExport">
+        <button class="btn primary" :disabled="!!transferring" @click="exportBackup">
           {{ transferring === 'export' ? '正在打包…' : '导出全部笔记（共 ' + tree.total + ' 篇）' }}
         </button>
         <span class="muted" style="font-size:12px">存哪儿由浏览器的下载设置决定</span>
