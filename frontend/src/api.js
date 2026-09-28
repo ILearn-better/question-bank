@@ -193,10 +193,12 @@ export const curriculumApi = {
 export const papersApi = {
   /** 筛题库。响应是 {total, items}，与录题页在用的 GET /questions（纯数组）不同。 */
   search: (params) => api.get('/api/questions/search', params),
-  /** 库里实际用过的标签及次数 —— 出卷筛选列表用这个，而不是让用户自由输。 */
-  tags: () => api.get('/api/questions/tags'),
+  /** 库里实际用过的标签及次数 —— 出卷筛选列表用这个，而不是让用户自由输。
+   *  传 curriculumId 则只统计该体系里用过的（笔记插题按体系筛时要跟着变）。 */
+  tags: (curriculumId) => api.get('/api/questions/tags', { curriculum_id: curriculumId }),
   /** 库里实际用过的知识点及次数。与 tags 同理：有它才能「录了什么就能按什么筛」。 */
-  knowledgePoints: () => api.get('/api/questions/knowledge-points'),
+  knowledgePoints: (curriculumId) =>
+    api.get('/api/questions/knowledge-points', { curriculum_id: curriculumId }),
   /** 导出/预览合成一个 URL：HTML 是 inline（直接看），Word/PDF 是下载。
    *  这样前端只要 window.open，不用把二进制读进 fetch 再自己造 Blob。 */
   exportUrl: (params) => '/api/papers/export' + qs(params),

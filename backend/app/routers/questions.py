@@ -157,14 +157,21 @@ def create_question(payload: QuestionIn, db: Session = Depends(get_db)):
 
 
 @router.get("/questions/knowledge-points")
-def list_knowledge_points(db: Session = Depends(get_db)):
+def list_knowledge_points(curriculum_id: int | None = None, db: Session = Depends(get_db)):
     """题库里**实际用过**的知识点及次数 —— 出卷页的筛选列表用它。
 
     与 /questions/tags 一个思路：个人题库量级，扫全表在 Python 里统计最快，
     也就不必单独维护一张表。要的效果是「录题时写了什么，出卷时就能按什么筛」。
+
+    `curriculum_id` 可选：只统计该体系里用过的。笔记的「插入题目」弹窗按体系
+    筛题时用它 —— 否则选项上的次数是全库的，选了体系却只搜出 1 条，
+    看起来像搜坏了。**不传 = 全库**（出卷页现在的行为，一行没变）。
     """
+    stmt = select(Question.knowledge_points)
+    if curriculum_id:
+        stmt = stmt.where(Question.curriculum_id == curriculum_id)
     counter: dict[str, int] = {}
-    for (raw,) in db.execute(select(Question.knowledge_points)).all():
+    for (raw,) in db.execute(stmt).all():
         for kp in _parse_tags(raw):
             counter[kp] = counter.get(kp, 0) + 1
     items = [{"kp": k, "count": v}
@@ -173,14 +180,18 @@ def list_knowledge_points(db: Session = Depends(get_db)):
 
 
 @router.get("/questions/tags")
-def list_tags(db: Session = Depends(get_db)):
+def list_tags(curriculum_id: int | None = None, db: Session = Depends(get_db)):
     """库里**实际用过**的标签及次数 —— 给录题页的自动补全和出卷页的筛选列表用。
 
     没有单独的标签表，所以扫全表在 Python 里统计。个人题库量级（几千条）
     一次全表扫是毫秒级，比为此专门维护一张表划算得多。
+    `curriculum_id` 的含义同 /questions/knowledge-points（不传 = 全库）。
     """
+    stmt = select(Question.tags)
+    if curriculum_id:
+        stmt = stmt.where(Question.curriculum_id == curriculum_id)
     counter: dict[str, int] = {}
-    for (raw,) in db.execute(select(Question.tags)).all():
+    for (raw,) in db.execute(stmt).all():
         for t in _parse_tags(raw):
             counter[t] = counter.get(t, 0) + 1
     items = [{"tag": k, "count": v}
