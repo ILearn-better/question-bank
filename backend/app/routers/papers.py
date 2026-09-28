@@ -119,7 +119,10 @@ def export_paper(
     db.commit()
 
     media, ext, inline = FORMATS[fmt]
-    fname = f"{_safe_name(title)}.{ext}"
+    # 文件名带版本：两份同名文件是「把教师版发给学生」的头号原因。
+    # 版本由 show_answer 决定，不需要新参数 —— 有答案就是教师版。
+    version = "教师版" if show_answer else "学生版"
+    fname = f"{_safe_name(title)}_{version}.{ext}"
     disposition = "inline" if inline else "attachment"
     return Response(
         content=body,

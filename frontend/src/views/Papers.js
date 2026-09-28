@@ -155,7 +155,13 @@ export default {
     }
 
     /** 预览/导出：一律新开标签页。
-     *  HTML 后端按 inline 发（直接看，Ctrl+P 存 PDF），Word/PDF 按 attachment 发（浏览器下载）。 */
+     *  HTML 后端按 inline 发（直接看，Ctrl+P 存 PDF），Word/PDF 按 attachment 发（浏览器下载）。
+     *
+     * ⚠️ show_answer / show_analysis **必须显式传 "false"**，不能「不加这个参数」：
+     * 服务端 show_answer 的默认值是 true，不传 = 出教师版。
+     * 之前这里写的是 `opts.show_answer ? true : undefined`，于是「学生版」其实带着答案 ——
+     * 而且学生在文件里看得到（答案是真写在文件里的，不是隐藏）。
+     */
     function open(kind) {
       if (!picked.value.length) {
         fail('还没选题目');
@@ -165,11 +171,17 @@ export default {
         ids: pickedIds.value.join(','),
         format: kind,
         title: title.value,
-        show_answer: opts.show_answer ? true : undefined,
-        show_analysis: opts.show_analysis ? true : undefined,
-        show_tags: opts.show_tags ? true : undefined,
-        show_meta: opts.show_meta ? true : undefined,
+        show_answer: String(opts.show_answer),
+        show_analysis: String(opts.show_answer && opts.show_analysis),
+        show_tags: String(opts.show_tags),
+        show_meta: String(opts.show_meta),
       }), '_blank');
+    }
+
+    /** 切版本时顺手把「答案带解析」也归位：学生版没有答案，也就谈不上解析。 */
+    function setVersion(withAnswer) {
+      opts.show_answer = withAnswer;
+      if (withAnswer) opts.show_analysis = true;      // 教师版默认带上解析（可再关）
     }
 
     function brief(q) {
@@ -202,7 +214,7 @@ export default {
       state, filter, rows, total, loading, kpGroups, picked, pickedIds,
       title, opts, QTYPES, DIFFS, pageNo, pageCount, tagOptions,
       search, resetFilter, add, addPage, remove, clearPicked, move,
-      isPicked, open, brief, prev, next, toggleTag,
+      isPicked, open, brief, prev, next, toggleTag, setVersion,
     };
   },
   template: `
@@ -349,12 +361,24 @@ export default {
           </div>
 
           <div class="field">
-            <label>导出选项</label>
+            <label>版本</label>
             <div class="chips">
+              <span class="chip" :class="{ on: !opts.show_answer }"
+                    @click="setVersion(false)"
+                    title="给学生的那份：答案一个字都不会写进文件">学生版（不含答案）</span>
               <span class="chip" :class="{ on: opts.show_answer }"
-                    @click="opts.show_answer = !opts.show_answer">附参考答案</span>
-              <span class="chip" :class="{ on: opts.show_analysis }"
-                    @click="opts.show_analysis = !opts.show_analysis">答案带解析</span>
+                    @click="setVersion(true)"
+                    title="你自己用的那份：末尾附参考答案">教师版（含答案）</span>
+            </div>
+          </div>
+
+          <div class="field">
+            <label>其它</label>
+            <div class="chips">
+              <span class="chip" :class="{ on: opts.show_analysis, off: !opts.show_answer }"
+                    :style="opts.show_answer ? '' : 'opacity:.4'"
+                    @click="opts.show_answer && (opts.show_analysis = !opts.show_analysis)"
+                    title="教师版才有解析；学生版连答案都不写">答案带解析</span>
               <span class="chip" :class="{ on: opts.show_tags }"
                     @click="opts.show_tags = !opts.show_tags">标注题型·难度·标签</span>
               <span class="chip" :class="{ on: opts.show_meta }"
@@ -363,11 +387,16 @@ export default {
           </div>
 
           <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px">
-            <button class="btn primary" :disabled="!picked.length" @click="open('html')">预览 / 打印</button>
+            <button class="btn primary" :disabled="!picked.length" @click="open('html')"
+                    :title="opts.show_answer ? '含答案' : '不含答案'">
+              预览 / 打印{{ opts.show_answer ? '（教师版）' : '（学生版）' }}
+            </button>
             <button class="btn" :disabled="!picked.length" @click="open('docx')">下载 Word</button>
             <button class="btn" :disabled="!picked.length" @click="open('pdf')">下载 PDF</button>
           </div>
           <p class="muted" style="font-size:12px;line-height:1.6;margin:0 0 12px">
+            文件名会带版本（<code>…_学生版.pdf</code> / <code>…_教师版.pdf</code>）——
+            两份同名文件是「把教师版发给学生」的头号原因。<br>
             「预览 / 打印」出的是 HTML：公式在浏览器里渲染好，Ctrl+P 直接存成 PDF。<br>
             Word / PDF 由服务端排版，<b>公式会显示成 $…$ 原文</b>（服务端没有 LaTeX 引擎）。
           </p>
