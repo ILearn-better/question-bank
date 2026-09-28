@@ -38,6 +38,9 @@ KINDS = {
     ".ppt": "ppt-legacy",
     ".txt": "text",
     ".md": "text",
+    # 网页另存的文件也当材料读（笔记那边还能把标签结构转成 Markdown，见 doc_to_note）
+    ".html": "html",
+    ".htm": "html",
     # 图片：作业照片、习题截图、拍照交上来的卷子都走这里。
     # **它们不是「抽不出文字」，而是本来就没有文字层** —— 所以 extract() 对图片不报错，
     # 只存档、chars=0（见下面 extract 里那一段）。把这种事报成失败会很吓人。
@@ -55,12 +58,13 @@ IMAGE_KINDS = {"image"}
 KIND_CN = {
     "pdf": "PDF", "word": "Word", "word-legacy": "Word（旧格式）", "rtf": "RTF",
     "ppt": "PPT", "ppt-legacy": "PPT（旧格式）", "text": "文本", "image": "图片",
+    "html": "网页",
 }
 _DOC_EXTS = sorted(k for k, v in KINDS.items() if v not in IMAGE_KINDS)
 # 上课材料（讲义/课件）用这个：不加图片，免得把「拍照的习题」当讲义收进去
 ACCEPT = ",".join(_DOC_EXTS)
 ACCEPT_WITH_IMAGES = ",".join(sorted(KINDS))       # 作业原件用这个：图文都收
-SUPPORTED_NOTE = "支持 PDF / Word(.docx) / PPT(.pptx) / 文本；老式 .doc / .ppt / .rtf 需要本机装有 Word"
+SUPPORTED_NOTE = "支持 PDF / Word(.docx) / PPT(.pptx) / 文本 / 网页(.html)；老式 .doc / .ppt / .rtf 需要本机装有 Word"
 SUPPORTED_NOTE_ANY = SUPPORTED_NOTE + "；图片（照片/截图）也可以，但只存档、不抽文字"
 
 W_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
@@ -176,6 +180,34 @@ def _pptx(path: Path) -> tuple[str, dict]:
     return text, {"pages": len(names)}
 
 
+def _html(path: Path) -> tuple[str, dict]:
+    """网页另存的文件。给 AI 看只需要文字，所以粗粗去标签就行（**不必用 doc_to_note 那套
+    带结构的转换器**：那是给笔记用的，反向依赖会成环）。
+
+    这里必须单独开一个分支：否则 kind="html" 会掉到 else 里交给本机 Word 去开，
+    报出一句「用 Word 打开这个文件失败」—— 南辕北辙的错。
+    """
+    from html import unescape
+
+    raw = path.read_bytes()
+    text = None
+    for enc in ("utf-8-sig", "utf-8", "gb18030"):
+        try:
+            text = raw.decode(enc)
+            break
+        except UnicodeDecodeError:
+            continue
+    if text is None:
+        raise ExtractError("这个网页不是常见的编码（试过 UTF-8 / GB18030）")
+    s = re.sub(r"(?is)<(script|style|head)[^>]*>.*?</\1>", " ", text)
+    s = re.sub(r"(?s)<[^>]+>", " ", s)
+    s = _norm(unescape(s))
+    if not s:
+        raise ExtractError("这个网页里没有可读的正文（可能全是脚本或图片）。"
+                           "如果是想把它当笔记，用笔记页的「导入文档」，那里会连结构一起转成 Markdown。")
+    return s, {}
+
+
 def _plain(path: Path) -> tuple[str, dict]:
     raw = path.read_bytes()
     for enc in ("utf-8-sig", "utf-8", "gb18030"):     # 中文 txt 很可能是 GBK
@@ -235,6 +267,8 @@ def extract(path: str | os.PathLike, filename: str | None = None) -> dict:
             text, meta = _docx(p)
         elif kind == "ppt":
             text, meta = _pptx(p)
+        elif kind == "html":
+            text, meta = _html(p)
         elif kind == "text":
             text, meta = _plain(p)
         else:

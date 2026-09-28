@@ -30,7 +30,7 @@ from ..adapters import notes_math, office
 from ..db import get_db
 from ..models import Note, NoteFolder
 from ..schemas import NoteIn, NotePatch
-from ..services import images, notes_export
+from ..services import file_text, images, notes_export
 from . import note_folders, notes_transfer
 
 router = APIRouter(prefix="/api/notes", tags=["notes"])
@@ -234,6 +234,66 @@ def get_file(name: str):
     # 按扩展名给 MIME，不写死 png —— 目录里混进别的格式也不用改这里
     media = mimetypes.guess_type(p.name)[0] or "image/png"
     return FileResponse(str(p), media_type=media)
+
+
+# ---------------------------------------------------------------- 把现成文档导入成笔记
+MAX_DOC_BYTES = 60 * 1024 * 1024
+
+
+@router.post("/import-doc")
+async def import_document(
+    file: UploadFile = File(...),
+    folder_id: int | None = Query(None, description="放进哪个目录；不传落「未归档」"),
+    db: Session = Depends(get_db),
+):
+    """把 Word / PDF / HTML / PPT / 文本变成一篇笔记。
+
+    为什么值得做：老师手里成堆的东西是现成文档（备课讲义、网页资料、试卷），
+    让它们进到笔记里，才能被整理、标注、和在同一个地方检索；
+    之前只能「看一眼」或「上传当上课材料」，都不算归到笔记里。
+
+    转出来的是 Markdown **加一份原件**：Markdown 是能读、能编辑、能喂给 AI 的那部分；
+    原件是一定没丢的那部分。失真与警告都写在笔记开头（见 doc_to_note.header_block）。
+    """
+    name = Path(file.filename or "未命名").name           # 只取文件名，防路径穿越
+    if file_text.kind_of(name) is None or file_text.kind_of(name) in file_text.IMAGE_KINDS:
+        raise HTTPException(422, f"这篇笔记暂时不能从这种文件导入（{Path(name).suffix or '无扩展名'}）。"
+                                 f"{file_text.SUPPORTED_NOTE}"
+                                 "图片请直接贴进笔记（Ctrl+V）。")
+    data = await file.read(MAX_DOC_BYTES + 1)
+    if len(data) > MAX_DOC_BYTES:
+        raise HTTPException(422, f"文件太大了（超过 {MAX_DOC_BYTES // 1024 // 1024}MB）")
+    if not data:
+        raise HTTPException(422, "没有收到文件内容")
+
+    import tempfile
+
+    from ..services import doc_to_note
+
+    try:
+        # ignore_cleanup_errors：Windows 上只要有句柄没关，临时目录就删不掉。
+        # 那不该把一次成功的导入变成 500 —— 临时目录留个残渣远比丢掉一次导入轻。
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            tmp = Path(td) / ("in" + Path(name).suffix.lower())
+            tmp.write_bytes(data)
+            info = doc_to_note.to_markdown(tmp, name)
+    except doc_to_note.DocImportError as e:
+        raise HTTPException(422, str(e)) from e
+
+    folder = (db.get(NoteFolder, folder_id) if folder_id else note_folders.unfiled_root(db))
+    if folder is None:
+        raise HTTPException(404, "目录不存在")
+
+    original = doc_to_note.save_original(data, name)
+    content = doc_to_note.header_block(name, info["kind_cn"], info, original) + info["markdown"]
+    nid = uuid.uuid4().hex[:12]
+    now = _now()
+    db.add(Note(id=nid, owner_id=config.OWNER_ID, folder_id=folder.id,
+                title=doc_to_note._safe_title(name), content=content, ink="[]",
+                created_at=now, updated_at=now))
+    db.commit()
+    return {"id": nid, "title": doc_to_note._safe_title(name), "folder_id": folder.id,
+            "chars": len(content), "original": original, **info}
 
 
 # ---------------------------------------------------------------- 导出 Word / PDF

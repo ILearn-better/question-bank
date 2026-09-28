@@ -193,6 +193,9 @@ export const notesApi = {
   update: (id, body) => api.patch(`/api/notes/${id}`, body),
   remove: (id) => api.del(`/api/notes/${id}`),
   uploadImage: (formData) => api.upload('/api/notes/image', formData),
+  /** 把现成的 Word / PDF / HTML / 文本 变成一篇笔记（原件也一起存下来）。 */
+  importDoc: (formData, folderId) =>
+    api.upload('/api/notes/import-doc' + qs({ folder_id: folderId }), formData),
   /** 导出能力：PDF 要本机有 Word、公式渲染要 node + Office 的 XSLT。
    *  先问一次，界面上就能把按钮状态和原因写清楚，而不是等用户点了才报错。 */
   exportCaps: () => api.get('/api/notes/export/caps'),

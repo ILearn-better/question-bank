@@ -639,6 +639,38 @@ export default {
       showTransfer.value = true;
     }
 
+    /* ================= 把现成文档导入成笔记 ================= */
+    const docEl = ref(null);
+    const importingDoc = ref(false);
+
+    function pickDoc() { docEl.value && docEl.value.click(); }
+
+    /** 导入 Word / PDF / HTML / 文本。**转出来的是 Markdown + 一份原件**：
+     *  Markdown 是能读能改能喂 AI 的那部分，原件是一定没丢的那部分。
+     *  失真与警告会写在笔记开头（后端写的），所以这里只提示一句、然后直接把笔记打开
+     *  —— 用户第一眼就该看到结果长什么样，而不是先看一堆说明。
+     */
+    async function onDocPicked(e) {
+      const f = e.target.files && e.target.files[0];
+      e.target.value = '';
+      if (!f) return;
+      importingDoc.value = true;
+      try {
+        const fd = new FormData();
+        fd.append('file', f, f.name);
+        const r = await notesApi.importDoc(fd, selectedFolder.value || tree.value.unfiled_root_id);
+        await loadTree();
+        if (r.folder_id) expandTo(r.folder_id);
+        await open(r.id);
+        const extra = (r.warnings && r.warnings.length) ? `（有 ${r.warnings.length} 条提示，见正文开头）` : '';
+        ok(`已导入「${r.title}」（${r.kind_cn}，${r.chars} 字）${extra}`);
+      } catch (err) {
+        fail(err.message);
+      } finally {
+        importingDoc.value = false;
+      }
+    }
+
     /** 点一行：笔记就打开，目录就「选中 + 展收」。
      *  选中目录是为了「新建笔记/新建目录落在哪」——没选就落「未归档」。 */
     function onRowClick(row) {
@@ -1112,6 +1144,8 @@ export default {
       // 备份 / 迁移
       showTransfer, transferFile, transferOver, transferReport, transferring, transferEl,
       openTransfer, pickTransferFile, onTransferPicked, doExport, doImport,
+      // 文档导入
+      docEl, importingDoc, pickDoc, onDocPicked,
       onDragStart, onDragOver, onDragEnd, onDrop,
       onEdit, onTitleInput, render, scrollToHeading, onPreviewScroll,
       insertSnippet, pickImage, onImageFile, onPaste,
@@ -1138,10 +1172,19 @@ export default {
                     :title="selectedFolder ? '新建在当前选中的目录里' : '新建在「未归档」里'">新建笔记</button>
             <button class="btn sm" @click="startNewFolder(selectedFolder || tree.unfiled_root_id)"
                     title="在你选中的目录里建一个子目录">新建目录</button>
-            <button class="btn sm" @click="openTransfer" title="导出成一个 zip / 从 zip 导入（换设备用）">
+            <input type="text" v-model="keyword" placeholder="搜标题 / 正文" @input="onSearch">
+          </div>
+          <!-- 少用的两件事另起一行：把现成文档变笔记、整体备份/迁移 -->
+          <div class="nb-tools">
+            <button class="btn sm ghost" :disabled="importingDoc" @click="pickDoc"
+                    title="Word / PDF / HTML / 文本 / PPT 都能导入；会转成 Markdown，并把原件一起存进笔记">
+              {{ importingDoc ? '正在转换…' : '导入文档' }}
+            </button>
+            <input ref="docEl" type="file" style="display:none"
+                   accept=".docx,.doc,.pdf,.html,.htm,.txt,.md,.pptx,.ppt,.rtf" @change="onDocPicked">
+            <button class="btn sm ghost" @click="openTransfer" title="导出成一个 zip / 从 zip 导入（换设备用）">
               备份 / 迁移
             </button>
-            <input type="text" v-model="keyword" placeholder="搜标题 / 正文" @input="onSearch">
           </div>
 
           <!-- 搜索：平铺结果 + 每篇的路径（在树里高亮反而难找） -->
