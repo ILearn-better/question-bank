@@ -374,6 +374,66 @@ class HomeworkDim(Base):
     active: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
 
 
+class LessonSupplement(Base):
+    """课后补充：老师给这个学生挑好的材料（下次上课打印给他）。
+
+    与作业方向相反，所以是**两张表、两块并列**，不塞进 homeworks：
+      · homeworks 是**收**：他交回来的 + 我对它的评价（一课一条）。
+      · 这里是**发**：我准备下次给他的（一节课可以有好几批 —— 今天发 3 题，
+        晚上又想加 2 题，是常态）。
+    两者都挂在同一节课上，所以学生详情页那条时间轴不用另开一栏就「一目了然」。
+
+    为什么记 status：打印发生在**下一次课**，中间隔几天。不记的话，
+    「上节课我准备了点东西」和「到底给没给」就分不出来 —— 那记录就白记了。
+    """
+
+    __tablename__ = "lesson_supplements"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    owner_id: Mapped[int] = mapped_column(Integer, nullable=False, default=OWNER_ID, server_default=str(OWNER_ID))
+    lesson_id: Mapped[int] = mapped_column(
+        ForeignKey("lessons.id", ondelete="CASCADE"), nullable=False
+    )
+    # 针对的知识点：复用题库那套「知识点一律用名字」（不是外键，认名字即可）
+    focus: Mapped[str] = mapped_column(Text, default="", server_default="")
+    note: Mapped[str] = mapped_column(Text, default="", server_default="")   # 备注，可空
+    status: Mapped[str] = mapped_column(String, nullable=False, default="todo", server_default="todo")
+    created_at: Mapped[str] = mapped_column(Text, default=_now, server_default=NOW)
+
+    items: Mapped[list["LessonSupplementItem"]] = relationship(
+        back_populates="supplement", cascade="all, delete-orphan", passive_deletes=True
+    )
+
+    __table_args__ = (Index("idx_supplements_lesson", "lesson_id", "id"),)
+
+
+class LessonSupplementItem(Base):
+    """一批里面的一项：一道题 / 一篇笔记。
+
+    `title` 是**标题快照**：题库里的题或笔记被删了之后，这条记录还得能自解释
+    （显示「《因式分解巩固 8 题》（内容已删）」而不是一片空白）。
+    这里存引用 id 就够 —— 它是「我当时发了什么」的日志，内容变了不影响日志的意义
+    （区别于「笔记正文里插题」：那边必须连图片与文字一起快照，见 doc_to_note/notes 那条线）。
+    """
+
+    __tablename__ = "lesson_supplement_items"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    owner_id: Mapped[int] = mapped_column(Integer, nullable=False, default=OWNER_ID, server_default=str(OWNER_ID))
+    supplement_id: Mapped[int] = mapped_column(
+        ForeignKey("lesson_supplements.id", ondelete="CASCADE"), nullable=False
+    )
+    kind: Mapped[str] = mapped_column(String, nullable=False)     # question | note
+    ref_id: Mapped[str] = mapped_column(String, nullable=False)   # questions.id 或 notes.id
+    title: Mapped[str] = mapped_column(Text, default="", server_default="")
+    sort_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    created_at: Mapped[str] = mapped_column(Text, default=_now, server_default=NOW)
+
+    supplement: Mapped["LessonSupplement"] = relationship(back_populates="items")
+
+    __table_args__ = (Index("idx_supplement_items", "supplement_id", "sort_order"),)
+
+
 class Homework(Base):
     """一次作业的记录（一节课一条）。
 

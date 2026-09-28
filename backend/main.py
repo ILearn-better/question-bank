@@ -37,6 +37,7 @@ from app.routers import (                                   # noqa: E402
     papers,
     questions,
     students,
+    supplements,
     system,
     uploads,
 )
@@ -108,6 +109,7 @@ app.include_router(lessons.router)
 app.include_router(feedbacks.router)
 app.include_router(lesson_files.router)
 app.include_router(homeworks.router)
+app.include_router(supplements.router)
 app.include_router(curriculum.router)
 app.include_router(questions.router)
 app.include_router(papers.router)

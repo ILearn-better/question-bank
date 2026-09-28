@@ -200,6 +200,10 @@ check("正文原样保留（Markdown 不该被再转一遍）", "# 手写的小�
 
 print("\n==== ⑥ 落进指定目录 ====")
 st, t = req("GET", "/api/note-folders/tree")
+if not any(x["name"] == "DSE 数学" for x in t["roots"]):
+    # 一级分组现在是用户自己建的（不再按体系自动生成），测试自己造一个
+    req("POST", "/api/note-folders", {"name": "DSE 数学"})
+    st, t = req("GET", "/api/note-folders/tree")
 dse = next(x for x in t["roots"] if x["name"] == "DSE 数学")
 st, folder = req("POST", "/api/note-folders", {"parent_id": dse["id"], "name": "导入测试"})
 st, r6 = import_doc(tmp_md, folder_id=folder["id"], filename="放进目录.md")

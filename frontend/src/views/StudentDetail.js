@@ -2,18 +2,21 @@
 // 设计目标：打开这个人的页面，从上到下就能看完他发生了什么，不用在多个页面之间跳。
 import { computed, onMounted, ref } from 'vue';
 import { useRoute } from 'vue-router';
-import { studentsApi, homeworkApi } from '../api.js';
+import { studentsApi, homeworkApi, supplementsApi } from '../api.js';
 import AbilityRadar from '../components/AbilityRadar.js';
 import FeedbackDialog from '../components/FeedbackDialog.js';
 import HomeworkDialog from '../components/HomeworkDialog.js';
+import SupplementDialog from '../components/SupplementDialog.js';
 import { fail, fmtBytes, hhmm, loadCurricula, money, ok, shortDate, STATUS_LABEL, STATUS_TAG } from '../store.js';
 
 /** 作业状态 -> 标签颜色。未交看红：家长沟通里这是必须提的事。 */
 const HW_TAG = { submitted: 'green', late: 'orange', missing: 'red' };
+/** 课后补充的状态 -> 标签颜色。还没打印看橙：下次上课前要处理的就是它。 */
+const SUP_TAG = { todo: 'orange', given: 'blue', returned: 'green' };
 
 export default {
   name: 'StudentDetail',
-  components: { AbilityRadar, FeedbackDialog, HomeworkDialog },
+  components: { AbilityRadar, FeedbackDialog, HomeworkDialog, SupplementDialog },
   setup() {
     const route = useRoute();
     const id = Number(route.params.id);
@@ -27,6 +30,28 @@ export default {
     // 作业：雷达图 + 每节课的作业记录（跟反馈并列，互不依赖）
     const hwRadar = ref(null);
     const homeworkLesson = ref(null);
+    // 课后补充：我准备下次给他的材料（挂在课上，与作业方向相反 —— 那边是收，这边是发）
+    const supplementLesson = ref(null);
+    const supPending = ref({ count: 0, items: [] });
+    // lesson_id -> 那个批次数组（时间轴上每条课直接取）
+    const supsByLesson = ref({});
+    const printing = ref(0);
+
+    async function loadSupplements() {
+      const map = {};
+      await Promise.all(timeline.value.map(async (it) => {
+        try {
+          const r = await supplementsApi.list(it.lesson.id);
+          map[it.lesson.id] = r.items || [];
+        } catch (e) { map[it.lesson.id] = []; }
+      }));
+      supsByLesson.value = map;
+      try {
+        supPending.value = await supplementsApi.pending(id);
+      } catch (e) {
+        supPending.value = { count: 0, items: [] };
+      }
+    }
 
     async function load() {
       loading.value = true;
@@ -35,10 +60,61 @@ export default {
         timeline.value = await studentsApi.timeline(id);
         folder.value = await studentsApi.folder(id);
         hwRadar.value = await homeworkApi.radar(id);
+        await loadSupplements();
       } catch (e) {
         fail(e.message);
       } finally {
         loading.value = false;
+      }
+    }
+
+    /** 「课后补充」：挑几样下次给他的材料，存进这节课。 */
+    function openSupplement(item) {
+      supplementLesson.value = {
+        id: item.lesson.id,
+        student_id: id,
+        student_name: stu.value.name,
+        start_at: item.lesson.start_at,
+        topic: item.lesson.topic,
+      };
+    }
+
+    async function onSupplementSaved() {
+      supplementLesson.value = null;
+      // 提示条由弹窗自己给（那句更具体：说明这是给下次上课准备的），这里不再重复弹一条
+      await loadSupplements();
+    }
+
+    async function setSupStatus(batch, status) {
+      try {
+        await supplementsApi.update(batch.id, { status });
+        await loadSupplements();
+      } catch (e) {
+        fail(e.message);
+      }
+    }
+
+    async function printSup(batch) {
+      printing.value = batch.id;
+      try {
+        const when = (batch.created_at || '').slice(0, 10);
+        await supplementsApi.print(batch.id, `${stu.value.name}_${when}_课后补充_学生版.pdf`);
+        ok('已出学生版（不含答案），并记成「已给」');
+        await loadSupplements();
+      } catch (e) {
+        fail(e.message);
+      } finally {
+        printing.value = 0;
+      }
+    }
+
+    async function removeSup(batch) {
+      if (!window.confirm('删掉这批课后补充？（题库里的题、笔记都不会动）')) return;
+      try {
+        await supplementsApi.remove(batch.id);
+        await loadSupplements();
+      } catch (e) {
+        fail(e.message);
       }
     }
 
@@ -103,6 +179,8 @@ export default {
       openFeedback, onSaved, load, hhmm, money, shortDate, STATUS_LABEL, STATUS_TAG,
       folder, openingFolder, openFolder, fmtBytes,
       hwRadar, homeworkLesson, openHomework, onHomeworkSaved, HW_TAG,
+      supplementLesson, supPending, supsByLesson, openSupplement, onSupplementSaved,
+      setSupStatus, printSup, removeSup, printing, SUP_TAG,
     };
   },
   template: `
@@ -231,6 +309,14 @@ export default {
         </div>
       </div>
 
+      <div class="card" v-if="supPending.count"
+           style="border-color:var(--warning); background:var(--panel-2)">
+        <b>有 {{ supPending.count }} 批课后补充还没给</b>
+        <div class="small muted" style="margin-top:4px">
+          挑好了但还没打印 —— 下面上课记录里带「还没打印」标记的就是。
+        </div>
+      </div>
+
       <div class="card">
         <h2>上课记录 <span class="small muted" style="font-weight:400">（从新到旧，共 {{ timeline.length }} 条）</span></h2>
         <div v-if="!timeline.length" class="empty">
@@ -252,6 +338,8 @@ export default {
               <button class="btn ghost sm" @click="openHomework(item)">
                 {{ item.homework ? '改作业' : '交作业' }}
               </button>
+              <button class="btn ghost sm" @click="openSupplement(item)"
+                      title="挑几样下次上课要给他的材料（题库的题 / 笔记）">课后补充</button>
             </div>
 
             <div v-if="item.lesson.topic" style="margin-top:4px">本次内容：{{ item.lesson.topic }}</div>
@@ -276,6 +364,27 @@ export default {
               <div v-if="item.homework.note" class="small" style="margin-top:4px">批改备注：{{ item.homework.note }}</div>
             </div>
             <div v-else class="small muted" style="margin-top:6px">这次作业还没记</div>
+
+            <!-- 课后补充：与作业方向相反（那边是收，这边是发），所以分两块 ---->
+            <div v-for="b in (supsByLesson[item.lesson.id] || [])" :key="b.id" class="sup-row">
+              <span class="tag" :class="SUP_TAG[b.status] || ''">课后补充·{{ b.status_label }}</span>
+              <span class="small muted">{{ (b.created_at || '').slice(5, 16).replace('T', ' ') }}</span>
+              <span v-if="b.focus" class="tag blue">{{ b.focus }}</span>
+              <span class="small">
+                <span v-for="(it, i) in b.items" :key="it.id">
+                  <span v-if="i">、</span>{{ it.kind === 'question' ? '题' : '笔记' }}·{{ it.title }}<span v-if="!it.exists" class="muted">（内容已删）</span>
+                </span>
+              </span>
+              <div class="spacer"></div>
+              <button v-if="b.questions.length" class="btn sm" :disabled="printing === b.id"
+                      @click="printSup(b)" title="出学生版 PDF（不含答案），顺手记成已给">
+                {{ printing === b.id ? '生成中…' : '打印学生版' }}
+              </button>
+              <button v-if="b.status !== 'given'" class="btn sm ghost" @click="setSupStatus(b, 'given')">标为已给</button>
+              <button v-if="b.status === 'given'" class="btn sm ghost" @click="setSupStatus(b, 'returned')">已交回</button>
+              <button class="btn sm ghost" @click="removeSup(b)">删</button>
+              <div v-if="b.note" class="small muted" style="width:100%">备注：{{ b.note }}</div>
+            </div>
           </div>
         </div>
       </div>
@@ -285,5 +394,7 @@ export default {
                     @close="feedbackLesson = null" @saved="onSaved" />
     <HomeworkDialog v-if="homeworkLesson" :lesson="homeworkLesson"
                     @close="homeworkLesson = null" @saved="onHomeworkSaved" />
+    <SupplementDialog v-if="supplementLesson" :lesson="supplementLesson"
+                      @close="supplementLesson = null" @saved="onSupplementSaved" />
   </div>`,
 };

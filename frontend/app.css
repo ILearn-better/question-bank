@@ -406,3 +406,15 @@ body.notes-zen .notes-preview { min-height: 0; padding: 14px 18px; }
 .hw-preview { display: flex; justify-content: center; align-items: center; }
 .hw-preview img { max-width: 100%; max-height: 66vh; border-radius: 6px; display: block; }
 
+/* 课后补充：挑题/挑笔记的列表。结果可能几十条，给它自己的滚动区，
+   弹窗主体不要再长 —— 否则底部的「存进今天这节课」会被顶出屏幕。 */
+.pick-list { max-height: 300px; overflow: auto; border: 1px solid var(--border);
+             border-radius: var(--radius-sm); padding: 6px; }
+.pick-row { display: flex; align-items: center; gap: 8px; padding: 6px 6px;
+            border-bottom: 1px solid var(--border); }
+.pick-row:last-child { border-bottom: none; }
+
+/* 学生详情页里那一行「课后补充」：一批一条，状态用颜色区分 */
+.sup-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 6px; }
+.sup-pending { color: var(--warning); font-weight: 600; }
+

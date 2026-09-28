@@ -111,6 +111,28 @@ class NoteFolderPatch(BaseModel):
     position: Optional[int] = None
 
 
+# ============================================================ 课后补充
+class SupplementItemIn(BaseModel):
+    """一项：一道题 / 一篇笔记。标题快照由服务端去查（前端不必先拉一遍）。"""
+
+    kind: str                       # question | note
+    ref_id: str
+
+
+class SupplementIn(BaseModel):
+    items: List[SupplementItemIn] = Field(default_factory=list)
+    focus: str = ""                 # 针对的知识点（可空）
+    note: str = ""                  # 备注（可空）
+
+
+class SupplementPatch(BaseModel):
+    """部分更新。「没传」= 保持原样（跟笔记/题库那两处同一个语义）。"""
+
+    status: Optional[str] = None
+    focus: Optional[str] = None
+    note: Optional[str] = None
+
+
 # ============================================================ 体系 / 知识点
 class CurriculumIn(BaseModel):
     code: str

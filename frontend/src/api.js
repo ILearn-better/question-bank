@@ -44,10 +44,10 @@ function qs(params) {
  *   window.open 会在新标签页里摊开一段 JSON，用户看不懂也不知道该怎么处理。
  *   走 fetch 就能把它变成一条提示。
  */
-export async function download(path, filename) {
+export async function download(path, filename, method = 'GET') {
   let res;
   try {
-    res = await fetch(BASE + path);
+    res = await fetch(BASE + path, { method });
   } catch (e) {
     throw new Error('连不上后端服务，请确认服务已启动');
   }
@@ -141,6 +141,22 @@ export const feedbackApi = {
    *  source：auto（默认，有整篇就导整篇）/ doc（强制整篇）/ fields（强制四段）。 */
   downloadExport: (lessonId, format, filename, source = 'auto') =>
     download(`/api/lessons/${lessonId}/feedback/export` + qs({ format, source }), filename),
+};
+
+/** 课后补充：老师挑好、下次上课打印给学生的材料（记在今天那节课里）。
+ *  与作业方向相反：作业是收（他交回来的），这里是发（我准备给他的）。 */
+export const supplementsApi = {
+  list: (lessonId) => api.get(`/api/lessons/${lessonId}/supplements`),
+  create: (lessonId, body) => api.post(`/api/lessons/${lessonId}/supplements`, body),
+  update: (id, body) => api.patch(`/api/supplements/${id}`, body),
+  remove: (id) => api.del(`/api/supplements/${id}`),
+  /** 这个学生还没给的（学生详情页那句提醒）。 */
+  pending: (studentId) => api.get(`/api/students/${studentId}/supplements/pending`),
+  /** 出学生版 PDF（不含答案）：后端同时把文件写进学生的归档目录，并把状态置成「已给」。
+   *  走 download() 而不是 window.open —— 这样失败时能把后端的报错变成一句提示。
+   *  ⚠️ 这个接口是 **POST**（它会写库：状态改成已给、记一次题目使用），
+   *  而 download() 默认 GET —— 不传 method 会 404（踩过）。 */
+  print: (id, filename) => download(`/api/supplements/${id}/print`, filename, 'POST'),
 };
 
 /** 上课文件（讲义 / 课件 / 试卷）：上传后由后端在本机抽文字，供 AI 润色当参考资料。
