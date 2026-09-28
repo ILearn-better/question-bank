@@ -213,6 +213,19 @@ export const noteFoldersApi = {
   remove: (id) => api.del(`/api/note-folders/${id}`),
 };
 
+/** 笔记备份 / 迁移：一个 zip 装下目录、正文、板书、配图，能在别的设备上导回来。 */
+export const notesBackupApi = {
+  /** 导出走 download()：失败时后端给的是中文原因（不是摊开一页 JSON）。 */
+  export: (filename) => download('/api/notes-backup/export', filename),
+  /** 导入。dryRun 只试算不写库 —— 拿不准的时候先让它算一遍。
+   *  overwrite 默认 false：同 id 的笔记跳过（保留本机那份），别无声盖掉较新的内容。 */
+  import: (formData, { overwrite = false, dryRun = false } = {}) =>
+    api.upload('/api/notes-backup/import' + qs({
+      overwrite: overwrite ? 'true' : undefined,
+      dry_run: dryRun ? 'true' : undefined,
+    }), formData),
+};
+
 export const abilityApi = {
   dims: () => api.get('/api/ability-dims'),
   createDim: (body) => api.post('/api/ability-dims', body),

@@ -11,7 +11,7 @@
 //   · 保存是防抖 PATCH 且**只提交改动过的字段**，这样切笔记时不会把另一头覆盖掉。
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
-import { notesApi, noteFoldersApi } from '../api.js';
+import { notesApi, noteFoldersApi, notesBackupApi } from '../api.js';
 import { fail, ok, warn } from '../store.js';
 import Modal from '../components/Modal.js';
 
@@ -570,6 +570,75 @@ export default {
       expandIn(id, true);
     }
 
+    /* ================= 备份 / 迁移 ================= */
+    const showTransfer = ref(false);
+    const transferFile = ref(null);
+    const transferOver = ref(false);
+    const transferReport = ref(null);
+    const transferring = ref('');            // '' | 'try' | 'go' | 'export'
+    const transferEl = ref(null);
+
+    function pickTransferFile() { transferEl.value && transferEl.value.click(); }
+
+    function onTransferPicked(e) {
+      const f = e.target.files && e.target.files[0];
+      e.target.value = '';
+      transferReport.value = null;
+      if (!f) return;
+      // 选定就清掉上次的报告：不然旧数字会和这次的混在一起看
+      if (!/\.zip$/i.test(f.name)) {
+        transferFile.value = null;
+        return warn('请选择「拾课笔记备份_….zip」这样的备份包。');
+      }
+      transferFile.value = f;
+    }
+
+    /** 导出全量笔记。文件名在客户端给：服务端那个 filename* 是给直接点链接的场景用的。 */
+    async function doExport() {
+      const t = new Date();
+      const p = (n) => String(n).padStart(2, '0');
+      const stamp = `${t.getFullYear()}${p(t.getMonth() + 1)}${p(t.getDate())}_${p(t.getHours())}${p(t.getMinutes())}`;
+      transferring.value = 'export';
+      try {
+        await notesBackupApi.export(`拾课笔记备份_${stamp}.zip`);
+        ok('备份已导出');
+      } catch (e) {
+        fail(e.message);
+      } finally {
+        transferring.value = '';
+      }
+    }
+
+    /** 导入。dry=true 只试算 —— 「会不会把我的东西盖掉」这种事，最好能先问一遍。 */
+    async function doImport(dry) {
+      const f = transferFile.value;
+      if (!f) return warn('先选一个备份包（.zip）');
+      transferring.value = dry ? 'try' : 'go';
+      transferReport.value = null;
+      try {
+        const fd = new FormData();
+        fd.append('file', f, f.name);
+        const r = await notesBackupApi.import(fd, { overwrite: transferOver.value, dryRun: dry });
+        transferReport.value = r;
+        if (!dry) {
+          await loadTree();
+          await loadList();
+          ok(`导入完成：新建 ${r.notes_created} 篇，跳过 ${r.notes_skipped} 篇`);
+        }
+      } catch (e) {
+        fail(e.message);
+      } finally {
+        transferring.value = '';
+      }
+    }
+
+    function openTransfer() {
+      transferReport.value = null;
+      transferFile.value = null;
+      transferOver.value = false;
+      showTransfer.value = true;
+    }
+
     /** 点一行：笔记就打开，目录就「选中 + 展收」。
      *  选中目录是为了「新建笔记/新建目录落在哪」——没选就落「未归档」。 */
     function onRowClick(row) {
@@ -1040,6 +1109,9 @@ export default {
       tree, expanded, rows, searching, selectedFolder, editing, drag, dropAt, menu,
       noteFoldersApi, toggleExpand, selectFolder, startNewFolder, startRename, cancelEdit,
       commitEdit, removeFolder, openMenu, closeMenu, runMenu, nudge, onRowClick, focusEdit,
+      // 备份 / 迁移
+      showTransfer, transferFile, transferOver, transferReport, transferring, transferEl,
+      openTransfer, pickTransferFile, onTransferPicked, doExport, doImport,
       onDragStart, onDragOver, onDragEnd, onDrop,
       onEdit, onTitleInput, render, scrollToHeading, onPreviewScroll,
       insertSnippet, pickImage, onImageFile, onPaste,
@@ -1066,6 +1138,9 @@ export default {
                     :title="selectedFolder ? '新建在当前选中的目录里' : '新建在「未归档」里'">新建笔记</button>
             <button class="btn sm" @click="startNewFolder(selectedFolder || tree.unfiled_root_id)"
                     title="在你选中的目录里建一个子目录">新建目录</button>
+            <button class="btn sm" @click="openTransfer" title="导出成一个 zip / 从 zip 导入（换设备用）">
+              备份 / 迁移
+            </button>
             <input type="text" v-model="keyword" placeholder="搜标题 / 正文" @input="onSearch">
           </div>
 
@@ -1298,5 +1373,67 @@ export default {
       <div v-for="(it, i) in menu.items" :key="i" :class="{ danger: it.danger }"
            @click="runMenu(it)">{{ it.label }}</div>
     </div>
+    <!-- ============ 备份 / 迁移 ============ -->
+    <Modal v-if="showTransfer" title="备份 / 迁移笔记" @close="showTransfer = false">
+      <p class="muted" style="margin-top:0">
+        导出的 zip 里有：<strong>目录结构、每篇正文、板书笔画、正文引用的配图</strong>，
+        另外还有一份按目录摆好的 <code>.md</code> 副本 —— 哪天不用这个程序了，
+        解压进资源管理器照样能一篇篇读出来。
+      </p>
+      <p class="muted" style="margin-top:0">
+        换设备：在新机器上装好拾课，打开这里，导入同一个包即可。
+      </p>
+
+      <div class="row" style="gap:8px;align-items:center;margin:12px 0">
+        <button class="btn primary" :disabled="!!transferring" @click="doExport">
+          {{ transferring === 'export' ? '正在打包…' : '导出全部笔记（共 ' + tree.total + ' 篇）' }}
+        </button>
+        <span class="muted" style="font-size:12px">存哪儿由浏览器的下载设置决定</span>
+      </div>
+
+      <hr style="border:none;border-top:1px solid var(--border);margin:14px 0">
+
+      <div class="field">
+        <label>从备份导入</label>
+        <div class="row" style="gap:8px;align-items:center;flex-wrap:wrap">
+          <button class="btn sm" :disabled="!!transferring" @click="pickTransferFile">选择备份包（.zip）</button>
+          <input ref="transferEl" type="file" accept=".zip,application/zip" style="display:none"
+                 @change="onTransferPicked">
+          <span v-if="transferFile" class="small">{{ transferFile.name }}</span>
+          <span v-else class="small muted">还没选文件</span>
+        </div>
+        <label class="small" style="display:flex;align-items:center;gap:6px;margin-top:8px;cursor:pointer">
+          <input type="checkbox" v-model="transferOver" style="width:auto">
+          本机已有同一篇笔记时，用备份里的<strong>覆盖</strong>
+          <span class="muted">（默认不勾：跳过，保留本机那份）</span>
+        </label>
+        <div class="row" style="gap:8px;margin-top:10px">
+          <button class="btn" :disabled="!transferFile || !!transferring" @click="doImport(true)">
+            {{ transferring === 'try' ? '试算中…' : '先试算（不写入）' }}
+          </button>
+          <button class="btn primary" :disabled="!transferFile || !!transferring" @click="doImport(false)">
+            {{ transferring === 'go' ? '导入中…' : '开始导入' }}
+          </button>
+        </div>
+      </div>
+
+      <div v-if="transferReport" class="small" style="margin-top:12px">
+        <div v-if="transferReport.dry_run" class="tag" style="margin-bottom:6px">试算结果（什么都没写）</div>
+        <div v-else class="tag green" style="margin-bottom:6px">导入完成</div>
+        <div>笔记：新建 {{ transferReport.notes_created }} ·
+          覆盖 {{ transferReport.notes_overwritten }} ·
+          跳过（本机已有）{{ transferReport.notes_skipped }} ·
+          包内共 {{ transferReport.notes_total }}</div>
+        <div>目录：新建 {{ transferReport.folders_created }} · 复用 {{ transferReport.folders_reused }}</div>
+        <div>配图：新增 {{ transferReport.images_added }} · 已存在 {{ transferReport.images_skipped }}</div>
+        <div v-for="(w, i) in transferReport.warnings" :key="i" style="color:var(--warning,#d97706)">
+          ⚠️ {{ w }}
+        </div>
+      </div>
+
+      <template #foot>
+        <button class="btn ghost" @click="showTransfer = false">关闭</button>
+      </template>
+    </Modal>
   </div>`,
 };

@@ -31,12 +31,14 @@ from ..db import get_db
 from ..models import Note, NoteFolder
 from ..schemas import NoteIn, NotePatch
 from ..services import images, notes_export
-from . import note_folders
+from . import note_folders, notes_transfer
 
 router = APIRouter(prefix="/api/notes", tags=["notes"])
 
-# 正文里引用到的配图，形如 ![](/api/notes/files/nb_ab12cd34ef56.png)
-_IMG_RE = re.compile(r"/api/notes/files/([A-Za-z0-9_.\-]+)")
+# 正文里引用到的配图：定义在 notes_transfer 里（导出/导入也要用同一份），
+# 这里只是取个短名字。两处各写一份的话，改了一处另一处会静默漏掉配图，
+# 删笔记时就留下垃圾文件。
+_IMG_RE = notes_transfer.IMAGE_RE
 
 
 def _now() -> str:
