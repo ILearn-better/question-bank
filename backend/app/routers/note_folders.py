@@ -263,9 +263,29 @@ def update_folder(fid: int, payload: NoteFolderPatch, db: Session = Depends(get_
     """改名 / 移动 / 重排，三件事共用一个接口（拖动只发 parent_id + position）。"""
     f = _folder_or_404(db, fid)
     data = payload.model_dump(exclude_unset=True)
+
     if f.is_root:
-        # 体系根由体系本身决定：名字跟着体系走，位置由体系顺序决定
-        raise HTTPException(422, f"「{f.name}」是体系根，不能改名或移动。要整理请动它下面的目录。")
+        # 体系根：**能改名，不能移动**。位置由体系自己的顺序（curricula.sort_order）决定，
+        # 树上拖它没有意义，只会让「根的顺序」有两个来源。
+        if "parent_id" in data or data.get("position") is not None:
+            raise HTTPException(422, "体系那几行的顺序由体系本身决定，不能在树上拖。要整理请动它下面的目录。")
+        if "name" not in data:
+            return {"id": f.id, "name": f.name, "parent_id": None}
+        name = (data["name"] or "").strip()
+        if not name:
+            raise HTTPException(422, "名字不能为空")
+        # ⚠️ 改的是**体系的名字**，不是笔记这边的一个标签。
+        # 树上的根就是 curricula 那一行（见本文件顶部的设计说明），
+        # 若只写 note_folders.name，同一个体系会在笔记树与题库/学生页有两套叫法。
+        if f.curriculum_id is not None:
+            c = db.get(Curriculum, f.curriculum_id)
+            if c is None:
+                raise HTTPException(404, "这个体系已经不在了")
+            c.name = name
+        # 根行自己也写一份：folder_paths 拿它当兜底（curriculum_id 为空即「未归档」那棵，只能写这里）
+        f.name = name
+        db.commit()
+        return {"id": f.id, "name": f.name, "parent_id": None}
 
     if "name" in data:
         name = (data["name"] or "").strip()

@@ -366,7 +366,19 @@ export default {
       editing.value = { mode: 'new', parentId, value: '' };
     }
     function startRename(folder) {
-      editing.value = { mode: 'rename', kind: 'folder', id: folder.id, value: folder.name };
+      // 体系根改的是**体系名**（题库筛选、学生页、设置页都会跟着变），先说清楚再让动手。
+      // 「未归档」不是体系，只在笔记树里出现，不用问。
+      if (folder.is_root && folder.curriculum_id &&
+          !window.confirm(`改「${folder.name}」的名字？\n\n`
+            + '树上的根就是体系本身，所以题库筛选、学生页、设置页里的体系名会一起改（只有一个名字，不会各叫各的）。')) {
+        return;
+      }
+      editing.value = {
+        mode: 'rename',
+        kind: folder.is_root ? 'root' : 'folder',
+        id: folder.id,
+        value: folder.name,
+      };
     }
     /** 改笔记标题：原地变输入框。
      *  两件事都要做，否则「点了没反应」：① 目录收着的要先把祖先展开 —— 输入框在屏幕外
@@ -396,8 +408,9 @@ export default {
           await loadList();
           await loadTree();
         } else {
-          await noteFoldersApi.update(ed.id, { name });
+          const r = await noteFoldersApi.update(ed.id, { name });
           await loadTree();
+          if (ed.kind === 'root') ok(`已改名为「${r.name}」；题库与学生页里的体系名也一起变了`);
         }
       } catch (e) {
         fail(e.message);
@@ -534,6 +547,8 @@ export default {
         items.push({ label: '下移', run: () => nudge(row, 1) });
         items.push({ label: '删除', danger: true, run: () => removeNote(row.node) });
       } else {
+        // 体系根：「未归档」不是体系，也能改名（它只在笔记树里出现）
+        if (row.node.is_root) items.push({ label: '重命名', run: () => startRename(row.node) });
         items.push({ label: '新建笔记', run: () => createNote(row.node.id) });
         items.push({ label: '新建子目录', run: () => startNewFolder(row.node.id) });
       }
@@ -1291,6 +1306,7 @@ export default {
           <!-- 树的操作提示：拖拽是主要方式，但得先让人知道能拖 -->
           <div v-if="!searching" class="small muted nb-tip">
             拖动可改层级与顺序；「⋯」里有重命名 / 上下移 / 删除。删目录不会删笔记（内容会移到上一级）。
+            <br>体系那几行也能改名 —— 那就是体系名，题库与学生页会一起变。
           </div>
         </div>
 
