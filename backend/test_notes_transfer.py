@@ -109,7 +109,9 @@ def png_bytes():
 print("==== ⓪ 先把临时库清干净（这个测试必须可以反复跑） ====")
 con = sqlite3.connect(str(SCRATCH_DB))
 con.execute("delete from notes")
-con.execute("delete from note_folders where is_root = 0")
+# 连一级分组一起清：一级分组现在是用户自己建的（不再按体系自动生成），
+# 上一轮跑出来的分组会留在这里，不清就会影响后面的计数断言
+con.execute("delete from note_folders where is_unfiled = 0")
 con.commit()
 con.close()
 if SCRATCH_NOTES.is_dir():
@@ -133,7 +135,7 @@ check("包里的笔记数 = 真库里的", manifest["counts"]["notes"], len(real
 check("每篇笔记都有对应的 .md 副本", len([n for n in names if n.startswith("notes/")]), len(real_notes))
 check("包含目录树总览", "目录树.md" in names)
 check("包含 notes.json", "notes.json" in names)
-print("  manifest 里的体系:", [c["code"] for c in manifest["curricula"]])
+print("  manifest 里的分组:", [g["name"] for g in manifest["groups"]])
 
 print("\n==== ② 导进独立临时库（先试算） ====")
 st, dry = upload(SCRATCH, "/api/notes-backup/import", "backup.zip", blob, "?dry_run=true")
@@ -150,7 +152,7 @@ t, scratch_notes = notes_of(SCRATCH)
 check("临时库里笔记数一致", t["total"], len(real_notes))
 check("id 原样保留（换设备后链接不变）", sorted(x[0] for x in scratch_notes), sorted(x[0] for x in real_notes))
 check("标题一致", sorted(x[1] for x in scratch_notes), sorted(x[1] for x in real_notes))
-check("体系归属一致（按 code 认，不按 id）",
+check("分组归属一致（顶层按名字合并）",
       sorted(f"{x[2]}/{x[3]}" for x in scratch_notes), sorted(f"{x[2]}/{x[3]}" for x in real_notes))
 
 print("\n==== ③ 再导一次：不该重复长东西 ====")
@@ -159,7 +161,7 @@ check("全部跳过", rep2["notes_skipped"], len(real_notes))
 check("没有新建笔记", rep2["notes_created"], 0)
 t, again = notes_of(SCRATCH)
 check("笔记数没变（导入两次 == 导入一次）", t["total"], len(real_notes))
-check("体系根也没变多", len(t["roots"]), 5)
+check("分组也没变多（同一个包导两次不会长两套）", len(t["roots"]), 5)
 
 print("\n==== ④ 覆盖模式 ====")
 st, rep3 = upload(SCRATCH, "/api/notes-backup/import", "backup.zip", blob, "?overwrite=true")
@@ -168,6 +170,10 @@ check("没有新建", rep3["notes_created"], 0)
 
 print("\n==== ⑤ 带目录 + 带配图的包（在临时库里造一张，从临时库导出） ====")
 _, dse_root_id, _ = req(SCRATCH, "GET", "/api/note-folders/tree")
+if not any(r["name"] == "DSE 数学" for r in dse_root_id["roots"]):
+    # 一级分组现在是用户自己建的（不再按体系自动生成），测试自己造一个
+    req(SCRATCH, "POST", "/api/note-folders", {"name": "DSE 数学"})
+    _, dse_root_id, _ = req(SCRATCH, "GET", "/api/note-folders/tree")
 dse = next(r for r in dse_root_id["roots"] if r["name"] == "DSE 数学")
 _, f1, _ = req(SCRATCH, "POST", "/api/note-folders", {"parent_id": dse["id"], "name": "一、有理数"})
 _, f2, _ = req(SCRATCH, "POST", "/api/note-folders", {"parent_id": f1["id"], "name": "1.1 认识有理数"})
@@ -195,7 +201,7 @@ check("人读的 .md 顶部写了来源目录", "DSE 数学 / 一、有理数 / 
 print("\n==== ⑥ 清空临时库，再从带目录的包导一次 ====")
 con = sqlite3.connect(str(SCRATCH_DB))
 con.execute("delete from notes")
-con.execute("delete from note_folders where is_root = 0")
+con.execute("delete from note_folders where is_unfiled = 0")   # 含一级分组：它们也是用户建的
 con.commit()
 con.close()
 for p in SCRATCH_NOTES.glob("*"):        # 配图也删掉，验证能从包里恢复
@@ -213,7 +219,20 @@ st, _, _ = req(SCRATCH, "GET", f"/api/notes/files/{img_name}", raw=True)
 check("配图能通过接口取到", st, 200)
 st, full, _ = req(SCRATCH, "GET", f"/api/notes/{n1['id']}")
 check("板书笔画也回来了", len(full["ink"]), 1)
-check("笔记挂回了原来的目录", full["folder_id"] == f2["id"], True)
+# 目录 id 会因重建而变（删了再建，rowid 会复用但不保证），所以断言断的是**路径**
+def paths_by_note(base):
+    _, t, _ = req(base, "GET", "/api/note-folders/tree")
+    out = {}
+    def walk(n, trail):
+        for x in n["notes"]:
+            out[x["id"]] = " / ".join(trail)
+        for c in n["children"]:
+            walk(c, trail + [c["name"]])
+    for r in t["roots"]:
+        walk(r, [r["name"]])
+    return out
+check("笔记挂回了原来的目录（按路径比）",
+      paths_by_note(SCRATCH).get(n1["id"]), "DSE 数学 / 一、有理数 / 1.1 认识有理数")
 
 print("\n==== ⑦ 坏包 / 陌生包 / 新版本包，必须拒绝 ====")
 st, r = upload(SCRATCH, "/api/notes-backup/import", "junk.zip", b"this is not a zip")
@@ -232,19 +251,60 @@ st, r = upload(SCRATCH, "/api/notes-backup/import", "future.zip", buf.getvalue()
 check("更高版本的包 → 422", st, 422)
 check("  并且说清了原因", "更新版本" in (r.get("detail") or ""), True)
 
-print("\n==== ⑧ 包里有个本机没有的体系 → 落到未归档 + 给警告（不能整包拒绝） ====")
+print("\n==== ⑧ v2：包里有个本机没有的分组 → **建一个同名的**（包是自包含的，不落未归档） ====")
 p3 = json.loads(json.dumps(p2))
-p3["notes"] = [dict(x, curriculum_code="nope-sys") for x in p3["notes"]]
+p3["notes"] = [dict(x, group="IB 数学") for x in p3["notes"]]
 p3["folders"] = []
 buf = io.BytesIO()
 with zipfile.ZipFile(buf, "w") as z:
-    z.writestr("manifest.json", json.dumps(manifest | {"version": 1}))
+    z.writestr("manifest.json", json.dumps(
+        {"format": "shike-notes", "version": 2, "exported_at": "",
+         "groups": [{"name": "IB 数学", "curriculum_code": None}]}, ensure_ascii=False))
     z.writestr("notes.json", json.dumps(p3, ensure_ascii=False))
-st, rep5 = upload(SCRATCH, "/api/notes-backup/import", "unknown-sys.zip", buf.getvalue(), "?overwrite=true")
-check("导入没有被整包拒绝", st, 200)
-check("给了警告", len(rep5["warnings"]) > 0, True)
-print("  警告:", rep5["warnings"][0])
+    z.writestr(f"images/{img_name}", z2.read(f"images/{img_name}"))   # 配图一起带上，免得报“配图不在包里”
+st, rep5 = upload(SCRATCH, "/api/notes-backup/import", "new-group.zip", buf.getvalue(), "?overwrite=true")
+check("导入成功", st, 200)
+check("建了 1 个分组", rep5["groups_created"], 1)
+check("没有警告（不是“认不出来”的情况了）", rep5["warnings"], [])
 t, after5 = notes_of(SCRATCH)
-check("那篇笔记落在「未归档」里", any(x[2] == "未归档" for x in after5), True)
+check("那个分组真建出来了", any(r["name"] == "IB 数学" for r in t["roots"]), True)
+check("笔记落在新分组里", any(x[2] == "IB 数学" for x in after5), True)
+
+print("\n==== ⑨ 老包（v1，只有 curriculum_code）仍然能认回去 ====")
+p4 = json.loads(json.dumps(p2))
+for x in p4["notes"]:
+    x.pop("group", None)
+    x["curriculum_code"] = "cn-senior-math"      # 本机有 cn-senior-math 这个体系
+p4["folders"] = []
+buf = io.BytesIO()
+with zipfile.ZipFile(buf, "w") as z:
+    z.writestr("manifest.json", json.dumps({
+        "format": "shike-notes", "version": 1, "exported_at": "",
+        "curricula": [{"code": "cn-senior-math", "name": "国内高中数学"}],
+    }, ensure_ascii=False))
+    z.writestr("notes.json", json.dumps(p4, ensure_ascii=False))
+st, rep6 = upload(SCRATCH, "/api/notes-backup/import", "old-v1.zip", buf.getvalue(), "?overwrite=true")
+check("v1 包也收", st, 200)
+t, after6 = notes_of(SCRATCH)
+check("按体系名落到了「国内高中数学」", any(x[2] == "国内高中数学" for x in after6), True)
+
+print("\n==== ⑩ v2：空分组也要跟着包走（它没有任何笔记，靠行反推就会丢） ====")
+exp = json.loads(json.dumps(p2))
+exp["folders"] = []
+exp["notes"] = []
+buf = io.BytesIO()
+with zipfile.ZipFile(buf, "w") as z:
+    z.writestr("manifest.json", json.dumps(
+        {"format": "shike-notes", "version": 2, "exported_at": "",
+         "groups": [{"name": "IB 数学", "curriculum_code": None},
+                    {"name": "空分组", "curriculum_code": None}]}, ensure_ascii=False))
+    z.writestr("notes.json", json.dumps(exp, ensure_ascii=False))
+st, rep7 = upload(SCRATCH, "/api/notes-backup/import", "empty-groups.zip", buf.getvalue())
+check("导入成功", st, 200)
+t, _ = notes_of(SCRATCH)
+names = [r["name"] for r in t["roots"]]
+check("空分组建出来了", "空分组" in names, True)
+check("已有分组不会被重复建", names.count("IB 数学"), 1)
+check("分组顺序跟着包走", names[:2], ["IB 数学", "空分组"])
 
 print("\n" + ("ALL PASS" if not fails else f"{len(fails)} 项失败: {fails}"))

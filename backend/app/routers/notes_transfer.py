@@ -15,17 +15,18 @@
 
     manifest.json                     格式与版本、导出时间、数量、涉及的体系（按 code）
     notes.json                        机器导入用：目录 + 每篇的完整数据 + 引用到的配图名
-    notes/<体系>/<目录…>/<标题>.md     人看的副本（正文 + 一行来源说明）
+    notes/<分组>/<目录…>/<标题>.md     人看的副本（正文 + 一行来源说明）
     目录树.md                          一页纸的目录总览
     images/                           正文引用到的配图原文件
 
 导入的三条规矩：
 
-  1. **目录按名字合并**：同一个体系下同名目录就当同一个（复用），不重复建。
+  1. **目录与一级分组都按名字合并**：同名就当同一个（复用），不重复建。
      于是同一个包导入两次不会长出两套目录。
-  2. **体系按 code 认，不按 id**：另一台设备上 `curricula.id` 不一定一样，
-     但 `code`（`dse-math` 这类）是稳定的。认不出来就落到「未归档」并给一条警告，
-     绝不因为一个体系对不上就把整包拒了。
+  2. **认不出来的一级分组就建一个新的**（v2）：笔记的一级分组是笔记自己的东西，
+     跟体系已经解绑（v1 里它是按体系 `code` 认的，对方设备没那个体系就只能落「未归档」）。
+     按名字认之后，备份包是**自包含**的 —— 换台设备、甚至一个体系都没有，目录也照样长回来。
+     老包（v1，只有 `curriculum_code`）继续支持：拿 manifest 里的体系名当分组名用。
   3. **笔记 id 相同 = 同一篇**：默认**跳过**（保留本机那份），要覆盖得显式说。
      默认跳过是因为「覆盖」会无声盖掉本机较新的内容 —— 迁移场景下重名 id
      恰恰说明两边同源，留着本机的更安全。
@@ -51,7 +52,7 @@ from .note_folders import _dedupe_name, _ensure_roots, UNFILED_NAME
 router = APIRouter(prefix="/api/notes-backup", tags=["notes"])
 
 FORMAT = "shike-notes"
-VERSION = 1
+VERSION = 2                 # 2 = 顶层按分组名字认（一级分组已跟体系解绑）；1 = 按体系 code
 
 # 包多大算太大：全量笔记 + 配图，正常几 MB。给个上限免得一口气把内存吃满
 MAX_ZIP_BYTES = 300 * 1024 * 1024
@@ -76,10 +77,8 @@ def _safe(name: str, fallback: str = "未命名", maxlen: int = 60) -> str:
 # ================================================================ 导出
 def export_zip(db: Session) -> tuple[bytes, str]:
     """把全部笔记打成一个 zip。返回 (字节, 建议文件名)。"""
-    roots = _ensure_roots(db)          # 顺手把「4 个体系 + 未归档」的根补齐，导出的树才完整
-    curr = list(db.scalars(select(Curriculum)).all())
-    code_of = {c.id: c.code for c in curr}
-    name_of = {c.id: c.name for c in curr}
+    roots = _ensure_roots(db)          # 保底：确保「未归档」那一行在，导出的树才完整
+    code_of = {c.id: c.code for c in db.scalars(select(Curriculum)).all()}
 
     folders = list(db.scalars(select(NoteFolder).where(NoteFolder.is_root == 0)).all())
     kids: dict[int | None, list[NoteFolder]] = {}
@@ -88,21 +87,22 @@ def export_zip(db: Session) -> tuple[bytes, str]:
     for lst in kids.values():
         lst.sort(key=lambda x: (x.sort_order, x.id))
 
-    meta: dict[int | None, dict] = {}          # 目录/根 id -> {code, path(list), 体系名}
+    meta: dict[int | None, dict] = {}          # 目录/根 id -> {group, path(list), 人名}
     folder_rows: list[dict] = []
     note_files: list[tuple[str, str]] = []     # (包内路径, 内容) —— 人读的 .md
 
-    def walk(node_id, code, system_name, parts, node) -> None:
-        meta[node_id] = {"code": code, "path": list(parts), "system": system_name}
+    def walk(node_id, group, system_name, parts, node) -> None:
+        meta[node_id] = {"group": group, "path": list(parts), "system": system_name}
         for c in kids.get(node_id, []):
             p = parts + [c.name]
-            folder_rows.append({"curriculum_code": code, "path": "/".join(p),
+            folder_rows.append({"group": group, "path": "/".join(p),
                                 "name": c.name, "sort_order": c.sort_order})
-            walk(c.id, code, system_name, p, c)
+            walk(c.id, group, system_name, p, c)
 
     for r in roots:
-        code = code_of.get(r.curriculum_id)
-        walk(r.id, code, (name_of.get(r.curriculum_id) or r.name) if r.curriculum_id else UNFILED_NAME, [], r)
+        # 顶层就是这一行自己的名字（一级分组跟体系解绑了，名字不再从体系现取）。
+        # curriculum_code 仍然写进包里，但只是**参考信息**，定位目录不用它。
+        walk(r.id, r.name, r.name, [], r)
 
     # 笔记按目录分组，保证同一目录里的顺序就是界面上的顺序
     notes = list(db.scalars(
@@ -113,13 +113,13 @@ def export_zip(db: Session) -> tuple[bytes, str]:
     used_paths: set[str] = set()
     for n in notes:
         where = meta.get(n.folder_id) or meta.get(
-            next((r.id for r in roots if r.curriculum_id is None), None))
+            next((r.id for r in roots if r.is_unfiled), None))
         if where is None:                   # 树全空（理论上不会）：也照导，只是没有目录信息
-            where = {"code": None, "path": [], "system": UNFILED_NAME}
+            where = {"group": UNFILED_NAME, "path": [], "system": UNFILED_NAME}
         imgs = sorted(referenced_images(n.content or ""))
         images |= set(imgs)
         note_rows.append({
-            "id": n.id, "curriculum_code": where["code"], "folder_path": "/".join(where["path"]),
+            "id": n.id, "group": where["group"], "folder_path": "/".join(where["path"]),
             "title": n.title, "pinned": 1 if n.pinned else 0, "sort_order": n.sort_order,
             "created_at": n.created_at, "updated_at": n.updated_at,
             "content": n.content or "", "ink": _parse_ink(n.ink), "images": imgs,
@@ -148,7 +148,9 @@ def export_zip(db: Session) -> tuple[bytes, str]:
         "format": FORMAT, "version": VERSION,
         "exported_at": now.isoformat(timespec="seconds"),
         "counts": {"notes": len(note_rows), "folders": len(folder_rows), "images": len(images)},
-        "curricula": [{"code": c.code, "name": c.name} for c in curr],
+        # 分组名是 v2 的定位依据；curriculum_code 只当参考（那边是体系表的事）
+        "groups": [{"name": r.name, "curriculum_code": code_of.get(r.curriculum_id)}
+                   for r in roots],
     }
 
     buf = io.BytesIO()
@@ -156,7 +158,7 @@ def export_zip(db: Session) -> tuple[bytes, str]:
         z.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
         z.writestr("notes.json", json.dumps(
             {"folders": folder_rows, "notes": note_rows}, ensure_ascii=False, indent=2))
-        z.writestr("目录树.md", _tree_markdown(roots, kids, notes, meta, name_of))
+        z.writestr("目录树.md", _tree_markdown(roots, kids, notes))
         for path, text in note_files:
             z.writestr(path, text)
         for name in sorted(images):
@@ -174,7 +176,8 @@ def _parse_ink(raw) -> list:
     return v if isinstance(v, list) else []
 
 
-def _tree_markdown(roots, kids, notes, meta, name_of) -> str:
+def _tree_markdown(roots, kids, notes) -> str:
+    """人读的目录总览。顶层就是分组名。"""
     by_folder: dict[int | None, list[Note]] = {}
     for n in notes:
         by_folder.setdefault(n.folder_id, []).append(n)
@@ -188,30 +191,46 @@ def _tree_markdown(roots, kids, notes, meta, name_of) -> str:
 
     out = ["# 笔记目录总览", ""]
     for r in roots:
-        title = (name_of.get(r.curriculum_id) or r.name) if r.curriculum_id else UNFILED_NAME
-        out.append(f"## {title}")
+        out.append(f"## {r.name}")
         node(r.id, 0, out)
         out.append("")
     return "\n".join(out)
 
 
 # ================================================================ 导入
-def _resolve_folder(db, roots_by_curr, code2id, cache, code, path, *, create: bool, report) -> int | None:
-    """把「体系 code + 目录路径」落到本机的一个目录 id 上；create=False 时只查不建。
+def _resolve_group(db, groups: dict, name: str, *, create: bool, report) -> NoteFolder | None:
+    """把「分组名」落到本机一个一级分组上；没有就建一个（create 时才建）。
 
-    按名字合并是**故意的**：同一个包导入两次不该长出两套目录，
-    而且「DSE 数学/一、有理数」在两台设备上就该是同一个地方。
+    按名字合并是**故意的**：同一个包导入两次不该长出两套分组，
+    而且「DSE 数学 / 一、有理数」在两台设备上就该是同一个地方。
     """
-    key = f"{code}|{path}"
+    hit = groups.get(name)
+    if hit is not None:
+        return hit
+    if not create:
+        return None
+    row = NoteFolder(owner_id=config.OWNER_ID, parent_id=None, curriculum_id=None,
+                     is_root=1, is_unfiled=1 if name == UNFILED_NAME else 0,
+                     name=name, sort_order=9999 if name == UNFILED_NAME else 0)
+    db.add(row)
+    db.flush()
+    if not row.is_unfiled:
+        note_folders._renumber([row] + note_folders._root_siblings(db, exclude=row.id))
+        report["groups_created"] += 1
+    groups[name] = row
+    return row
+
+
+def _resolve_folder(db, groups: dict, cache, group_name, path, *, create: bool, report,
+                    unfiled: NoteFolder) -> int | None:
+    """把「一级分组名 + 目录路径」落到本机的一个目录 id 上；create=False 时只查不建。"""
+    key = f"{group_name}|{path}"
     if key in cache:
         return cache[key]
 
-    cid = code2id.get(code) if code else None
-    if code and cid is None:
-        report["warnings"].append(f"备份里的体系「{code}」这台设备上没有，相关笔记放进了「未归档」")
-    root = roots_by_curr.get(cid) or roots_by_curr.get(None)     # 认不出 → 未归档
+    root = _resolve_group(db, groups, group_name, create=create, report=report) or unfiled
     cur = root.id
-    cache[f"{code}|"] = cur
+    cache[f"{group_name}|"] = cur
     walked: list[str] = []
     for part in [p for p in (path or "").split("/") if p]:
         walked.append(part)
@@ -233,7 +252,7 @@ def _resolve_folder(db, roots_by_curr, code2id, cache, code, path, *, create: bo
             report["folders_reused"] += 1
         cur = child.id
         # 中间层也记进缓存：不然「甲/乙」和「甲/丙」会把「甲」数两遍（报告里的数字会虚高）
-        cache[f"{code}|{'/'.join(walked)}"] = cur
+        cache[f"{group_name}|{'/'.join(walked)}"] = cur
     cache[key] = cur
     return cur
 
@@ -242,7 +261,8 @@ def import_zip(db: Session, data: bytes, *, overwrite: bool = False, dry_run: bo
     """把备份包导进本机。默认**不覆盖**同 id 的笔记。"""
     report: dict = {
         "dry_run": dry_run, "notes_created": 0, "notes_overwritten": 0, "notes_skipped": 0,
-        "folders_created": 0, "folders_reused": 0, "images_added": 0, "images_skipped": 0,
+        "folders_created": 0, "folders_reused": 0, "groups_created": 0,
+        "images_added": 0, "images_skipped": 0,
         "warnings": [],
     }
     try:
@@ -264,14 +284,38 @@ def import_zip(db: Session, data: bytes, *, overwrite: bool = False, dry_run: bo
     report["exported_at"] = manifest.get("exported_at", "")
 
     roots = _ensure_roots(db)
-    roots_by_curr = {r.curriculum_id: r for r in roots}
-    code2id = {c.code: c.id for c in db.scalars(select(Curriculum)).all()}
+    unfiled = next(r for r in roots if r.is_unfiled)
+    groups: dict[str, NoteFolder] = {r.name: r for r in roots}
+    # 老包（v1）没有 group 字段，只有 curriculum_code：拿 manifest 里的体系名当分组名用
+    code2name = {c.get("code"): c.get("name") for c in (manifest.get("curricula") or [])}
+
+    def group_of(row: dict) -> str:
+        name = (row.get("group") or "").strip()
+        if name:
+            return name
+        legacy = row.get("curriculum_code")
+        if legacy:
+            # v1 包：顶层就是当时那个体系的名字；本机没见过这个 code 也不挡，
+            # 名字就写在包里，直接用它建一个同名分组 —— 包是自包含的。
+            return code2name.get(legacy) or UNFILED_NAME
+        return UNFILED_NAME
+
     cache: dict[str, int | None] = {}
+
+    # v2 的包会把**分组清单**带在 manifest 里（含一个笔记都没有的空分组）。
+    # 不能只靠 notes.json 里的行去反推：空分组没有行，靠反推就会在迁移时静默消失。
+    # 顺序也照包里的来 —— 用户排好的分组顺序是他整理过的结果。
+    listed = [g.get("name") for g in (manifest.get("groups") or []) if g.get("name")]
+    if listed:
+        made = [_resolve_group(db, groups, n, create=not dry_run, report=report) for n in listed]
+        if not dry_run and len(made) == len(listed):
+            rest = [r for r in note_folders._root_siblings(db) if r not in made]
+            note_folders._renumber([r for r in made if r is not None] + rest)
 
     # 先把目录整棵树建好（笔记要往里面挂）
     for f in payload.get("folders", []):
-        _resolve_folder(db, roots_by_curr, code2id, cache, f.get("curriculum_code"),
-                        f.get("path"), create=not dry_run, report=report)
+        _resolve_folder(db, groups, cache, group_of(f), f.get("path"),
+                        create=not dry_run, report=report, unfiled=unfiled)
 
     need_images: set[str] = set()
     for n in payload.get("notes", []):
@@ -279,8 +323,8 @@ def import_zip(db: Session, data: bytes, *, overwrite: bool = False, dry_run: bo
         if not nid:
             report["warnings"].append("包里有笔记缺 id，已跳过")
             continue
-        fid = _resolve_folder(db, roots_by_curr, code2id, cache, n.get("curriculum_code"),
-                              n.get("folder_path"), create=not dry_run, report=report)
+        fid = _resolve_folder(db, groups, cache, group_of(n), n.get("folder_path"),
+                              create=not dry_run, report=report, unfiled=unfiled)
         existing = db.get(Note, nid)
         if existing is not None and not overwrite:
             report["notes_skipped"] += 1

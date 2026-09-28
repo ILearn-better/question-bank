@@ -347,7 +347,7 @@ export default {
       persistExpanded();
     }
 
-    /** 首次进来：有内容的体系根默认展开（空体系收着，免得一屏全是空目录）。 */
+    /** 首次进来：有内容的分组默认展开（空分组收着，免得一屏全是空目录）。 */
     function initExpanded() {
       let saved = null;
       try { saved = JSON.parse(localStorage.getItem(EXPAND_KEY) || 'null'); } catch (e) { saved = null; }
@@ -360,19 +360,18 @@ export default {
       expanded.value = next;
     }
 
-    /* ---- 新建 / 重命名（目录与笔记） / 删除目录 ---- */
+    /* ---- 新建 / 重命名（分组、目录、笔记） / 删除 ---- */
     function startNewFolder(parentId) {
       expandIn(parentId, true);
       editing.value = { mode: 'new', parentId, value: '' };
     }
+    /** 新建一级分组：输入行渲染在树的最上面（新分组也建在最前面，所见即所得）。 */
+    function startNewGroup() {
+      editing.value = { mode: 'newGroup', value: '' };
+    }
     function startRename(folder) {
-      // 体系根改的是**体系名**（题库筛选、学生页、设置页都会跟着变），先说清楚再让动手。
-      // 「未归档」不是体系，只在笔记树里出现，不用问。
-      if (folder.is_root && folder.curriculum_id &&
-          !window.confirm(`改「${folder.name}」的名字？\n\n`
-            + '树上的根就是体系本身，所以题库筛选、学生页、设置页里的体系名会一起改（只有一个名字，不会各叫各的）。')) {
-        return;
-      }
+      // 一级分组现在就是笔记自己的东西（跟体系解绑了），改名不会影响别的页面，
+      // 所以不再需要那句确认；「未归档」是系统兜底容器，菜单里不给改名。
       editing.value = {
         mode: 'rename',
         kind: folder.is_root ? 'root' : 'folder',
@@ -400,6 +399,9 @@ export default {
           await noteFoldersApi.create({ parent_id: ed.parentId, name });
           await loadTree();
           expandIn(ed.parentId, true);
+        } else if (ed.mode === 'newGroup') {
+          await noteFoldersApi.create({ parent_id: null, name });   // 不传 parent_id = 建一级分组
+          await loadTree();
         } else if (ed.kind === 'note') {
           // 只提交 title：正文/板书还在自动保存的队列里，这次请求不能顺手动它们
           const r = await notesApi.update(ed.id, { title: name });
@@ -410,7 +412,7 @@ export default {
         } else {
           const r = await noteFoldersApi.update(ed.id, { name });
           await loadTree();
-          if (ed.kind === 'root') ok(`已改名为「${r.name}」；题库与学生页里的体系名也一起变了`);
+          if (ed.kind === 'root') ok(`已改名为「${r.name}」`);
         }
       } catch (e) {
         fail(e.message);
@@ -420,14 +422,15 @@ export default {
     async function removeFolder(folder) {
       // 说清楚「东西去哪儿」再问 —— 删目录绝不删内容，但也不能让用户以为东西没了
       const inside = folder.count
-        ? `里面的 ${folder.count} 篇笔记会移到上一级（不会删掉）。`
-        : '这个目录是空的。';
-      if (!window.confirm(`删除目录「${folder.name}」？${inside}`)) return;
+        ? `里面的 ${folder.count} 篇笔记会${folder.is_root ? '移到「未归档」' : '移到上一级'}（不会删掉）。`
+        : '这个是空的。';
+      const what = folder.is_root ? '分组' : '目录';
+      if (!window.confirm(`删除${what}「${folder.name}」？${inside}`)) return;
       try {
         const r = await noteFoldersApi.remove(folder.id);
         const moved = [r.moved_folders ? `${r.moved_folders} 个子目录` : '',
                        r.moved_notes ? `${r.moved_notes} 篇笔记` : ''].filter(Boolean).join('、');
-        ok(moved ? `目录已删除；${moved}移到了「${r.to}」` : '目录已删除');
+        ok(moved ? `${what}已删除；${moved}移到了「${r.to}」` : `${what}已删除`);
         await loadTree();
       } catch (e) {
         fail(e.message);
@@ -459,22 +462,30 @@ export default {
       return 'in';
     }
 
+    /** 一级分组（不含「未归档」）：拖动只在它们之间排序，未归档固定最后。 */
+    const groupIds = () => tree.value.roots.filter((r) => !r.is_unfiled).map((r) => r.id);
+    const isUnfiled = (id) => id === tree.value.unfiled_root_id;
+
     function canDrop(d, row, zone) {
       if (!d || d.id === row.node.id) return false;
       if (row.kind === 'root') {
-        // 体系根不能被排序，但可以「放进去」和「放到根前/后」——根之间顺序由体系决定，
-        // 所以只接受「放进去」
+        if (isUnfiled(row.node.id)) {
+          // 「未归档」不接受前后插入，只能放进去
+          return zone === 'in' && (d.kind === 'note' || !isSelfOrDescendant(d.id, row.node.id));
+        }
+        if (d.kind === 'root') return zone !== 'in';        // 分组之间只能排前后，不能嵌套
         return zone === 'in' && (d.kind === 'note' || !isSelfOrDescendant(d.id, row.node.id));
       }
       if (row.kind === 'note') {
         return d.kind === 'note' && zone !== 'in';       // 笔记是叶子，不能往里放
       }
       if (zone === 'in') return d.kind === 'note' || !isSelfOrDescendant(d.id, row.node.id);
+      if (d.kind === 'root') return false;               // 分组不能插到目录之间
       return d.kind === 'folder';                        // 前后 = 同级排序，两侧必须同类
     }
 
     function onDragStart(row, e) {
-      if (row.kind === 'root') { e.preventDefault(); return; }   // 体系根不能拖
+      if (row.kind === 'root' && isUnfiled(row.node.id)) { e.preventDefault(); return; }  // 未归档固定最后
       drag.value = { kind: row.kind, id: row.node.id };
       e.dataTransfer.effectAllowed = 'move';
       e.dataTransfer.setData('text/plain', String(row.node.id));  // 某些浏览器没它不触发 drop
@@ -510,6 +521,11 @@ export default {
           else await notesApi.update(d.id, { folder_id: row.node.id, position: 9999 });
           expandIn(row.node.id, true);
           if (cur.value && cur.value.id === d.id) { /* 打开着的笔记换了目录，正文不用重载 */ }
+        } else if (d.kind === 'root') {
+          // 拖动一级分组 = 自己在分组之间换位置
+          await noteFoldersApi.update(d.id, {
+            position: positionIn(groupIds(), row.node.id, zone, d.id),
+          });
         } else if (d.kind === 'folder') {
           const parentId = folderMap.value[row.node.id].parent_id;
           const sibs = parentId ? folderMap.value[parentId].children.map((c) => c.id) : tree.value.roots.map((r) => r.id);
@@ -547,10 +563,18 @@ export default {
         items.push({ label: '下移', run: () => nudge(row, 1) });
         items.push({ label: '删除', danger: true, run: () => removeNote(row.node) });
       } else {
-        // 体系根：「未归档」不是体系，也能改名（它只在笔记树里出现）
-        if (row.node.is_root) items.push({ label: '重命名', run: () => startRename(row.node) });
+        // 一级分组：能改名 / 排序 / 删（内容会移到「未归档」）。
+        // 「未归档」是系统兜底容器，只能往里放东西。
+        if (!row.node.is_unfiled) {
+          items.push({ label: '重命名', run: () => startRename(row.node) });
+        }
         items.push({ label: '新建笔记', run: () => createNote(row.node.id) });
         items.push({ label: '新建子目录', run: () => startNewFolder(row.node.id) });
+        if (!row.node.is_unfiled) {
+          items.push({ label: '上移', run: () => nudge(row, -1) });
+          items.push({ label: '下移', run: () => nudge(row, 1) });
+          items.push({ label: '删除分组', danger: true, run: () => removeFolder(row.node) });
+        }
       }
       const box = e.currentTarget.getBoundingClientRect();
       // 用 fixed 定位：树那一列是 overflow 滚动的，绝对定位的菜单会被裁掉。
@@ -578,9 +602,16 @@ export default {
     /** 上移/下移：拖拽的键盘/触控板替代品（拖不准时还有路）。 */
     async function nudge(row, delta) {
       try {
-        if (row.kind === 'folder') {
+        if (row.kind === 'root') {
+          // 一级分组之间换位置（「未归档」不参与，它固定最后，菜单里也不给这两项）
+          const sibs = groupIds();
+          const i = sibs.indexOf(row.node.id);
+          const to = i + delta;
+          if (i < 0 || to < 0 || to >= sibs.length) return;
+          await noteFoldersApi.update(row.node.id, { position: to });
+        } else if (row.kind === 'folder') {
           const parentId = folderMap.value[row.node.id].parent_id;
-          const sibs = parentId ? folderMap.value[parentId].children.map((c) => c.id) : tree.value.roots.map((r) => r.id);
+          const sibs = parentId ? folderMap.value[parentId].children.map((c) => c.id) : groupIds();
           const i = sibs.indexOf(row.node.id);
           const to = i + delta;
           if (i < 0 || to < 0 || to >= sibs.length) return;
@@ -1185,7 +1216,8 @@ export default {
       loadList, onSearch, createNote, removeNote, togglePin, open,
       // 目录树
       tree, expanded, rows, searching, selectedFolder, editing, drag, dropAt, menu,
-      noteFoldersApi, toggleExpand, selectFolder, startNewFolder, startRename, startRenameNote, cancelEdit,
+      noteFoldersApi, toggleExpand, selectFolder, startNewFolder, startNewGroup, startRename,
+      startRenameNote, cancelEdit,
       commitEdit, removeFolder, openMenu, closeMenu, runMenu, nudge, onRowClick, focusEdit,
       // 备份 / 迁移
       showTransfer, transferFile, transferOver, transferReport, transferring, transferEl,
@@ -1218,6 +1250,8 @@ export default {
                     :title="selectedFolder ? '新建在当前选中的目录里' : '新建在「未归档」里'">新建笔记</button>
             <button class="btn sm" @click="startNewFolder(selectedFolder || tree.unfiled_root_id)"
                     title="在你选中的目录里建一个子目录">新建目录</button>
+            <button class="btn sm" @click="startNewGroup"
+                    title="建一个最顶层分组（DSE 数学、IB 数学…笔记自己的分类，跟体系无关）">新建分组</button>
             <input type="text" v-model="keyword" placeholder="搜标题 / 正文" @input="onSearch">
           </div>
           <!-- 少用的两件事另起一行：把现成文档变笔记、整体备份/迁移 -->
@@ -1253,8 +1287,15 @@ export default {
             <div v-if="!notes.length" class="empty">没有匹配的笔记</div>
           </div>
 
-          <!-- 树：体系 → 目录… → 笔记。拖动 = 改层级/改顺序 -->
+          <!-- 树：分组 → 目录… → 笔记。拖动 = 改层级/改顺序 -->
           <div v-else class="nb-tree">
+            <!-- 新建分组的输入行：放在最上面，新分组也建在最前面 -->
+            <div v-if="editing && editing.mode === 'newGroup'" class="nb-row editing">
+              <span class="nb-caret">▸</span>
+              <input :ref="focusEdit" class="nb-inline" v-model="editing.value"
+                     placeholder="分组名（如 DSE 数学），回车确定" @keyup.enter="commitEdit"
+                     @keyup.esc="cancelEdit" @blur="commitEdit">
+            </div>
             <div v-for="row in rows" :key="row.kind + row.node.id" class="nb-row"
                  :class="{
                    on: (row.kind === 'note' && cur && cur.id === row.node.id)
@@ -1306,7 +1347,7 @@ export default {
           <!-- 树的操作提示：拖拽是主要方式，但得先让人知道能拖 -->
           <div v-if="!searching" class="small muted nb-tip">
             拖动可改层级与顺序；「⋯」里有重命名 / 上下移 / 删除。删目录不会删笔记（内容会移到上一级）。
-            <br>体系那几行也能改名 —— 那就是体系名，题库与学生页会一起变。
+            <br>最上层是分组（DSE 数学、IB 数学这类）—— 那是笔记自己的分类，跟体系无关联，随便建与改。
           </div>
         </div>
 

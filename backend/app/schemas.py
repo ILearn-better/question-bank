@@ -99,9 +99,9 @@ class NotePatch(BaseModel):
 
 
 class NoteFolderIn(BaseModel):
-    """新建目录。体系由父节点的根决定，所以只要 parent_id，不要 curriculum_id。"""
+    """新建目录。**不传 parent_id = 建一个一级分组**（笔记自己的顶层，跟体系无关）。"""
 
-    parent_id: int
+    parent_id: Optional[int] = None
     name: str = ""
 
 
