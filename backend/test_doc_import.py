@@ -92,6 +92,23 @@ def raw_status(path):
         return e.code, "", 0
 
 
+def upload_image(filename: str):
+    """往笔记资源目录塞一张真 PNG（走配图上传接口，和服务端命名规则一致）。"""
+    import pymupdf
+    doc = pymupdf.open()
+    pg = doc.new_page(width=100, height=60)
+    pg.insert_text((8, 30), "img", fontsize=10)
+    blob = pg.get_pixmap().tobytes("png")
+    doc.close()
+    b = uuid.uuid4().hex
+    body = (f"--{b}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\n"
+            f"Content-Type: image/png\r\n\r\n").encode() + blob + f"\r\n--{b}--\r\n".encode()
+    r = urllib.request.Request(SCRATCH + "/api/notes/image", data=body, method="POST",
+                               headers={"Content-Type": f"multipart/form-data; boundary={b}"})
+    with urllib.request.urlopen(r, timeout=60) as resp:
+        return resp.status, json.loads(resp.read())["name"]
+
+
 def note_body(nid):
     st, n = req("GET", f"/api/notes/{nid}")
     return n
@@ -211,5 +228,54 @@ st, r = req("DELETE", f"/api/notes/{r3['id']}")           # 扫描版那篇：�
 after = len(list(SCRATCH_NOTES.glob("*")))
 check("删笔记顺带清了它的图片", after < before, True)
 print(f"  文件数 {before} → {after}，接口回: {r}")
+
+print("\n==== ⑨ 把正文里的图片引用删掉 → 磁盘文件跟着清（引用计数归零才清） ====")
+# 造一张图 + 一篇引用它的笔记
+st, img = upload_image("清扫测试图.png")
+check("图片上传成功", st, 200)
+ref = f"![](/api/notes/files/{img})"
+st, n_a = req("POST", "/api/notes", {"title": "引用这张图的笔记", "content": f"看图：\n\n{ref}\n"})
+check("笔记建好了", st, 200)
+check("文件在磁盘上", (SCRATCH_NOTES / img).is_file())
+
+# ① 去掉引用 → 文件应该被清掉
+st, r_save = req("PATCH", f"/api/notes/{n_a['id']}", {"content": "看图：\n\n（图删了）\n"})
+check("保存后报告清掉了 1 个文件", r_save.get("images_removed"), 1)
+check("磁盘上真没了", (SCRATCH_NOTES / img).is_file(), False)
+
+# ② 两个笔记引用同一张图 → 只删一处不能把文件删掉
+st, img2 = upload_image("共享图.png")
+ref2 = f"![](/api/notes/files/{img2})"
+st, na = req("POST", "/api/notes", {"title": "共享图笔记甲", "content": f"{ref2}\n"})
+st, nb = req("POST", "/api/notes", {"title": "共享图笔记乙", "content": f"{ref2}\n"})
+st, r1 = req("PATCH", f"/api/notes/{na['id']}", {"content": "甲不要图了\n"})
+check("拿掉一处：不动文件", (r1.get("images_removed"), (SCRATCH_NOTES / img2).is_file()), (0, True))
+st, r2 = req("PATCH", f"/api/notes/{nb['id']}", {"content": "乙也不要了\n"})
+check("拿掉最后一处：才删", (r2.get("images_removed"), (SCRATCH_NOTES / img2).is_file()), (1, False))
+
+# ③ 导入文档的原件：删掉那行链接**不**销毁原件（原件是「一定没丢的那部分」）
+st, r_doc = import_doc(SAMPLES / "高二数学专项测试卷.pdf", filename="原件保留测试.pdf")
+doc_file = SCRATCH_NOTES / r_doc["original"]
+check("原件在磁盘上", doc_file.is_file())
+full = note_body(r_doc["id"])
+kept = re.sub(r"> 原始文件：\[[^\]]+\]\(/api/notes/files/[^)]+\)\n", "", full["content"])
+st, r_del = req("PATCH", f"/api/notes/{r_doc['id']}", {"content": kept})
+check("删掉正文里的原件链接：原件**保留**（保存路径只收配图）",
+      ((r_del.get("images_removed"), doc_file.is_file())), (0, True))
+
+# 引用还在的时候删整篇笔记 → 原件一起收（这是「删掉这篇，它的东西一并没」的本意）
+st, _ = req("PATCH", f"/api/notes/{r_doc['id']}", {"content": full["content"]})
+st, r_gone = req("DELETE", f"/api/notes/{r_doc['id']}")
+check("引用还在时删整篇笔记：原件一起收",
+      ((r_gone.get("images_removed"), doc_file.is_file())), (1, False))
+
+# ④ 安全边界：不认识的文件名一律不动
+stranger = SCRATCH_NOTES / "keep_me_please.txt"
+stranger.write_text("这不是笔记的配图", encoding="utf-8")
+st, n_c = req("POST", "/api/notes", {"title": "乱引用一封", "content": "![](/api/notes/files/keep_me_please.txt)\n"})
+st, r_sweep = req("PATCH", f"/api/notes/{n_c['id']}", {"content": "不要了\n"})
+check("不在回收名单里的文件名：不删", (r_sweep.get("images_removed"), stranger.is_file()), (0, True))
+st, _ = req("DELETE", f"/api/notes/{n_c['id']}")
+stranger.unlink(missing_ok=True)
 
 print("\n" + ("ALL PASS" if not fails else f"{len(fails)} 项失败: {fails}"))

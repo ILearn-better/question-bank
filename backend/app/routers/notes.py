@@ -96,6 +96,40 @@ def _used_images(db: Session) -> set[str]:
     return used
 
 
+# 笔记资源目录里的文件名形态：`nb_<12 位 hex>.扩展名`。
+# 上传配图（images.save_image）与导入文档的原件（doc_to_note._save_asset）都是这个名字 ——
+# **只认这个形态**才能既扫得干净、又不可能误删目录里别的东西。
+_ASSET_RE = re.compile(r"^nb_[0-9a-f]{12}\.([a-z0-9]{1,8})$", re.I)
+_IMAGE_EXTS = {"png", "jpg", "jpeg", "gif", "bmp", "webp"}
+
+
+def _sweep_assets(db: Session, candidates: set[str], *, images_only: bool) -> int:
+    """把「刚没被任何笔记引用」的资源文件从磁盘删掉，返回删了几个。
+
+    只删**引用计数真的归零**的：同一张图被两篇笔记用到，拿掉一处不能把文件删了。
+    候选集只包含「这篇笔记刚刚不再引用」的名字，所以不会扫到别人身上。
+
+    `images_only` 是两种语义的分界，不是图省事：
+      · **保存笔记时**（正文里那段 `![](...)` 被删掉）→ 只收配图。顺手把导入文档的原件
+        也删了，等于「删掉一行链接就销毁了原件」，太重 —— 原件是「一定没丢的那部分」。
+      · **删整篇笔记时** → 连原件一起收。这才是「删掉这篇，它的东西一并没」的本意。
+    """
+    todo = candidates - _used_images(db)
+    removed = 0
+    for name in todo:
+        m = _ASSET_RE.match(name or "")
+        if m is None:
+            continue                      # 不认识的文件名一律不动（安全边界）
+        if images_only and m.group(1).lower() not in _IMAGE_EXTS:
+            continue                      # 原件保留
+        try:
+            (config.NOTES_DIR / name).unlink()
+            removed += 1
+        except OSError:
+            pass
+    return removed
+
+
 # ---------------------------------------------------------------- CRUD
 @router.get("")
 def list_notes(
@@ -167,10 +201,14 @@ def update_note(nid: str, payload: NotePatch, db: Session = Depends(get_db)):
     n = _note_or_404(db, nid)
     data = payload.model_dump(exclude_unset=True)
     edited = False
+    gone: set[str] = set()
     if "title" in data:
         n.title = (data["title"] or "").strip() or "未命名笔记"
         edited = True
     if "content" in data:
+        # 记下「改之前引用、改之后不再引用」的配图 —— 提交后再清，顺序不能反：
+        # 先删文件后提交的话，一旦提交失败就变成「文件没了但正文还引着」。
+        gone = set(_IMG_RE.findall(n.content or "")) - set(_IMG_RE.findall(data["content"] or ""))
         n.content = data["content"] or ""
         edited = True
     if "ink" in data:
@@ -191,23 +229,25 @@ def update_note(nid: str, payload: NotePatch, db: Session = Depends(get_db)):
     if edited:
         n.updated_at = _now()
     db.commit()
-    return _brief(n)
+    # 正文里删掉的配图：如果全库再没人引用它，就把磁盘文件也清掉。
+    # 不做这件事的后果很具体：贴图 → 删掉正文里那段 `![](...)` → 文件永远留在硬盘上
+    # （用户自己的笔记目录里真出现过这种孤儿，见 docs/已知问题与取舍记录.md）。
+    removed = _sweep_assets(db, gone, images_only=True) if gone else 0
+    return {**_brief(n), "images_removed": removed}
 
 
 @router.delete("/{nid}")
 def delete_note(nid: str, db: Session = Depends(get_db)):
-    """删笔记，并清掉只有它引用的配图（引用计数，和删题目清截图同一套思路）。"""
+    """删笔记，并清掉只有它引用的资源（引用计数，和删题目清截图同一套思路）。
+
+    这里连**导入文档的原件**一起收（images_only=False）—— 「删掉这篇，它的东西一并没」
+    就是这个意思；而只是把正文里一段引用删掉时，原件不动（见 _sweep_assets 的说明）。
+    """
     n = _note_or_404(db, nid)
     mine = set(_IMG_RE.findall(n.content or ""))
 
     db.execute(delete(Note).where(Note.id == nid))
-    removed = 0
-    for name in (mine - _used_images(db)) if mine else ():
-        try:
-            (config.NOTES_DIR / name).unlink()
-            removed += 1
-        except OSError:
-            pass
+    removed = _sweep_assets(db, mine, images_only=False)
 
     db.commit()
     return {"ok": True, "images_removed": removed}

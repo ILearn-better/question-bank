@@ -756,8 +756,16 @@ export default {
         render();
         if (route.params.id !== id) router.replace('/notes/' + id);
       } catch (e) {
-        fail(e.message);
         cur.value = null;
+        if (isNoteGone(e)) {
+          // 网址上那篇已经不在了：把地址也换回列表。
+          // 不换的话地址栏一直停在那个死 id 上，刷新还是它，会以为功能坏了（踩过）。
+          fail('这篇笔记已不存在（可能被删除了），已回到列表。');
+          await loadTree();
+          if (route.params.id) router.replace('/notes');
+        } else {
+          fail(e.message);
+        }
       }
     }
 
@@ -794,6 +802,11 @@ export default {
       try {
         const brief = await notesApi.update(cur.value.id, patch);
         saveState.value = 'saved';
+        // 正文里删掉的配图，服务端会把磁盘文件也清掉（引用计数归零才清）。
+        // 删了东西必须说一声 —— 不能说「你自己把那段字删了，所以文件没了活该」。
+        if (brief.images_removed) {
+          ok(`已清掉 ${brief.images_removed} 张不再引用的配图`);
+        }
         // 就地更新列表那一条，不用整表重拉
         const i = notes.value.findIndex(n => n.id === brief.id);
         if (i >= 0) notes.value[i] = brief;
