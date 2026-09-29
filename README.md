@@ -43,6 +43,7 @@
 
 ```
 question-bank/
+├── 启动拾课.bat               # 双击就启动（探测端口 → 起服务 → 自动开页面）
 ├── backend/
 │   ├── main.py                 # 只做装配：建 app、挂路由、挂静态资源
 │   ├── app/                    # 业务代码全在这里
@@ -97,10 +98,20 @@ question-bank/
 
 ## 启动方式
 
+**日常使用：双击仓库根目录的 `启动拾课.bat`**（黑窗口就是服务本体，用完关掉它就行）。
+它会：探测端口避免重复启动 → 启动服务 → 过几秒自动打开 http://127.0.0.1:8000。
+
+- 已经在跑时再双击：只开页面，**不会**起第二个服务
+- 想放桌面：右键 `启动拾课.bat` → 发送到 → 桌面快捷方式
+- 换端口：设环境变量 `SHIKE_PORT=8020`；不想自动开浏览器：`SHIKE_NO_BROWSER=1`
+- 改代码要热重载：`启动拾课.bat dev`（日常使用不必开，重载会在每次保存文件时真重启）
+
+手动启动（等价于脚本里那句）：
+
 ```bash
 cd question-bank/backend
 pip install -r requirements.txt
-python -m uvicorn main:app --host 127.0.0.1 --port 8000 --reload
+python -m uvicorn main:app --host 127.0.0.1 --port 8000
 ```
 
 浏览器打开 http://127.0.0.1:8000
