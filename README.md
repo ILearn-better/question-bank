@@ -117,11 +117,45 @@ question-bank/
 
 ```bash
 cd question-bank/backend
-pip install -r requirements.txt
-python -m uvicorn main:app --host 127.0.0.1 --port 8000
+./.venv/Scripts/python.exe -m uvicorn main:app --host 127.0.0.1 --port 8000
 ```
 
 浏览器打开 http://127.0.0.1:8000
+
+### 新机器首次准备：创建虚拟环境
+
+两个启动脚本都写死用 `backend/.venv/Scripts/python.exe`，**没有这个 venv 时双击 bat 会停在提示上**。
+换一台机器（或新克隆仓库）后先做一次：
+
+```bash
+cd question-bank/backend
+
+# 1. 建虚拟环境（实测用 Python 3.13 可正常跑通；3.9+ 均可）
+python -m venv .venv
+
+# 2. 装依赖 —— 必须带国内镜像，否则会卡死（原因见下方说明）
+./.venv/Scripts/python.exe -m pip install -r requirements.txt \
+    -i https://pypi.tuna.tsinghua.edu.cn/simple --progress-bar off
+```
+
+> **为什么必须带镜像**：本机（开发机）所有网络走本地代理，pip 直连 PyPI 会**静默卡死**——
+> 实测 12 分钟 0 个包落地、日志一片空白，看起来像在下载其实什么都没干；换清华源后同一份
+> `requirements.txt` **1 分钟出头装完**。另外**别把 pip 输出管到 `tail`**（会缓冲到命令结束才吐，
+> 中途看不到任何进度），要观察进度请重定向到日志文件。详见 `docs/开发环境搭建记录.md`。
+
+装完先自检一遍（`import alembic` 要**在 `backend/` 目录之外**执行，否则会命中本地迁移目录
+`backend/alembic/` 造成"已装好"的假阳性）：
+
+```bash
+cd ..   # 回到 question-bank/，务必离开 backend/
+./backend/.venv/Scripts/python.exe -c "import fastapi, uvicorn, multipart, fitz, docx, sqlalchemy, alembic; print('deps ok')"
+```
+
+> `pywin32`（`import win32com`）只在录入 Word 试卷时才用得到；没装 Word 或不需要这条链路时，
+> 缺它也不影响服务启动 —— `app/adapters/office.py` 里是按需导入的。
+
+> `.venv/` 已在 `.gitignore` 里，不会被提交。前端是零构建的（依赖全在 `frontend/vendor/`），
+> **不需要 npm install**。
 
 ## 数据说明
 
