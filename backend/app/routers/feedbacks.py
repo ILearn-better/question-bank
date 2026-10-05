@@ -10,7 +10,6 @@ import json
 import mimetypes
 import re
 from pathlib import Path
-from typing import Optional
 from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile
@@ -24,7 +23,6 @@ from ..db import get_db
 from ..models import (
     AbilityDim,
     AbilityScore,
-    AiSetting,
     Feedback,
     FeedbackDocTemplate,
     FeedbackTemplate,
@@ -33,8 +31,6 @@ from ..models import (
     Student,
 )
 from ..schemas import (
-    AiSettingIn,
-    AiTestIn,
     DimIn,
     DocTemplateIn,
     FeedbackIn,
@@ -641,32 +637,8 @@ def export_feedback(
 
 
 # ---------------------------------------------------------------- AI 润色
-@router.get("/ai/providers")
-def get_ai_providers():
-    """服务商预设（地址 / 模型名 / 申请密钥的入口）。纯静态、无密钥。"""
-    return ai_polish.providers()
-
-
-@router.get("/ai/settings")
-def get_ai_settings(db: Session = Depends(get_db)):
-    return ai_polish.masked(ai_polish.get_config(db))
-
-
-@router.put("/ai/settings")
-def put_ai_settings(payload: AiSettingIn, db: Session = Depends(get_db)):
-    """保存配置。api_key 传空串表示「不改」—— 前端拿到的是脱敏值，回填会把真 key 冲掉。"""
-    return ai_polish.save_config(db, payload)
-
-
-@router.post("/ai/test")
-def test_ai(payload: Optional[AiTestIn] = None, db: Session = Depends(get_db)):
-    """测试连接。可以带上还没保存的表单值 —— 填完就能试，不必先保存。"""
-    try:
-        return ai_polish.test_connection(db, payload.model_dump() if payload else None)
-    except ai_polish.AiError as e:
-        raise HTTPException(502, str(e)) from e
-
-
+# ⚠️ AI 的「配置 / 测试连接 / 公式识别」接口已迁到 routers/ai.py（路径不变，
+#    仍是 /api/ai/*）。这里只留「用 AI 润色这篇反馈」—— 那才是反馈业务本身。
 @router.post("/lessons/{lid}/feedback/polish")
 def polish_feedback(lid: int, payload: PolishIn, db: Session = Depends(get_db)):
     """AI 整篇润色。

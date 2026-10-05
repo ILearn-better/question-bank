@@ -24,6 +24,7 @@ if str(BACKEND_DIR) not in sys.path:
 from app import __version__, config, migrate, seed          # noqa: E402
 from app.db import SessionLocal                             # noqa: E402
 from app.routers import (                                   # noqa: E402
+    ai,
     curriculum,
     dashboard,
     documents,
@@ -104,6 +105,7 @@ async def add_revalidate_header(request, call_next):
 
 # ---- API 路由（按模块拆分）----
 app.include_router(dashboard.router)
+app.include_router(ai.router)
 app.include_router(students.router)
 app.include_router(lessons.router)
 app.include_router(feedbacks.router)

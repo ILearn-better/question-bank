@@ -38,11 +38,38 @@
   .block-text { font-size: 13px; color: #303133; line-height: 1.7; white-space: pre-wrap; word-break: break-all; flex: 1; }
   .block-tag { flex: none; margin-top: 2px; }
   .qform { background: #fff; border: 1px solid #e4e7ed; border-radius: 8px; padding: 16px; }
+  /* ===== 预览区：文本（上渲染 / 下源码）与图片各占一块，各带标签 ===== */
+  .prev-block {
+    border: 1px solid #e4e7ed; border-radius: 6px; padding: 8px 10px;
+    margin-bottom: 10px; background: #fff;
+  }
+  .prev-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; flex-wrap: wrap; }
   .preview-box {
     background: #fafafa; border: 1px dashed #dcdfe6; border-radius: 6px;
-    padding: 12px 14px; min-height: 72px; max-height: 320px; overflow: auto;
-    font-size: 14px; line-height: 1.9; color: #303133; white-space: pre-wrap;
+    padding: 10px 12px; min-height: 56px; max-height: 260px; overflow: auto;
+    font-size: 14px; line-height: 1.9; color: #303133;
   }
+  .preview-box.sm { min-height: 40px; max-height: 180px; font-size: 13px; padding: 8px 10px; }
+  /* Markdown 渲染出来的元素自带外边距，不收一收会把预览撑得很空 */
+  .preview-box > :first-child { margin-top: 0; }
+  .preview-box > :last-child { margin-bottom: 0; }
+  .preview-box p { margin: 0 0 6px; }
+  .preview-box ul, .preview-box ol { margin: 0 0 6px; padding-left: 22px; }
+  .preview-box code { background: #f0f2f5; padding: 1px 4px; border-radius: 3px; font-size: 12.5px; }
+  .preview-box pre { background: #f0f2f5; padding: 8px; border-radius: 4px; overflow: auto; }
+  .preview-box .katex-display { margin: 6px 0; }
+  /* 源码框：等宽字体，和上面的渲染对得上 */
+  .src-box { margin-top: 6px; }
+  .src-box textarea {
+    font-family: Consolas, "Courier New", monospace;
+    font-size: 12.5px; line-height: 1.65;
+  }
+  .prev-img {
+    max-width: 100%; border: 1px solid #ebeef5; border-radius: 4px;
+    display: block; margin-top: 2px;
+  }
+  .prev-img.sm { max-height: 170px; }
+  .preview-box.empty-hint { color: #c0c4cc; display: flex; align-items: center; }
   .saved-item {
     background: #fff; border: 1px solid #e4e7ed; border-radius: 6px;
     padding: 10px 12px; margin-bottom: 8px; font-size: 13px;
@@ -165,6 +192,15 @@
     display: flex; align-items: center; justify-content: space-between;
     font-size: 11px; color: #909399; margin-top: 4px;
   }
+  /* 删除确认框里的「会删掉什么」清单：左边是什么、中间叫什么、右边多大 */
+  .del-box {
+    background: #fafafa; border: 1px solid #ebeef5; border-radius: 6px;
+    padding: 8px 12px; font-size: 13px;
+  }
+  .del-line { display: flex; gap: 10px; align-items: baseline; line-height: 2; }
+  .del-line .k { flex: 0 0 84px; color: #909399; white-space: nowrap; }
+  .del-line .v { flex: 1; color: #303133; word-break: break-all; }
+  .del-line .s { color: #909399; white-space: nowrap; }
 </style>
 </head>
 <body>
@@ -209,6 +245,8 @@
               <el-button v-if="isWord && viewMode==='page' && hasPreview" size="small" plain
                          :loading="building" @click="buildPreview(true)">重新生成页面图</el-button>
               <el-button v-if="doc && viewMode==='blocks'" size="small" @click="resetSel">重置选择</el-button>
+              <!-- 删文档：一眼能看见，但一定先过确认框（里面会把会删掉什么摊开） -->
+              <el-button v-if="doc" size="small" type="danger" plain @click="askDeleteDoc">删除此文档</el-button>
             </div>
           </template>
 
@@ -404,23 +442,58 @@
             </template>
             <!-- 题目预览只在录新题模式下有意义；补答案模式下题干在题目列表里已经显示了 -->
             <template v-if="!answerMode">
-            <div class="hint" style="margin-bottom:6px">题目预览（文字与原貌图可同时存，公式自动渲染 $…$）</div>
-            <div class="preview-box">
-              <!-- 预览文字刻意交给 renderMath() 直接写 DOM，不走 Vue 插值。
+            <div class="hint" style="margin-bottom:6px">
+              题目预览 ·
+              <el-tag size="small" effect="plain">文本</el-tag> 与
+              <el-tag size="small" type="success" effect="plain">图片</el-tag>
+              都会存下来，出卷时按下面「出卷时用」决定印哪个
+            </div>
+
+            <!-- 文本：上渲染、下源码。改下面的源码，上面立刻跟着变 -->
+            <div class="prev-block">
+              <div class="prev-head">
+                <el-tag size="small" effect="plain">文本</el-tag>
+                <span class="muted-hint">支持 Markdown 与 $公式$；入库存的是下面这段源码</span>
+                <div style="flex:1"></div>
+                <el-button v-if="form.content" size="small" text @click="clearText">清空</el-button>
+              </div>
+              <!-- 渲染结果刻意交给 renderMath() 直接写 DOM，不走 Vue 插值。
                    KaTeX 的 auto-render 会把 Vue 管理的文本节点整个换掉，
                    Vue 之后仍往那个已摘除的节点里写新内容 —— 结果就是预览
-                   永远停在第一次渲染出公式的那一版（真实踩过的坑）。 -->
-              <div ref="previewText"></div>
-              <img v-if="form.image" :src="form.image"
-                   style="max-width:100%;margin-top:8px;border:1px solid #ebeef5;border-radius:4px" alt="题目原貌图">
-              <template v-if="!form.content && !form.image">在左侧框选区域后，这里生成题目预览…</template>
+                   永远停在第一次渲染出公式的那一版（真实踩过的坑）。
+                   v-show（而不是 v-if）就是为了让这个节点始终存在。 -->
+              <div class="preview-box" ref="previewText" v-show="form.content"></div>
+              <div v-if="!form.content" class="preview-box empty-hint">在左侧框选区域后，这里生成题目预览…</div>
+              <el-input v-model="form.content" type="textarea" :rows="4" class="src-box"
+                        placeholder="题目文本源码（Markdown + $LaTeX$）。可以直接改，上面实时渲染"
+                        @input="renderMath"></el-input>
             </div>
-            <div v-if="form.image" style="margin-top:6px;display:flex;gap:8px">
-              <el-button size="small" type="danger" text @click="clearFigure">清除原貌图</el-button>
+
+            <!-- 图片：原貌截图。和文本各自独立，清除一个不影响另一个 -->
+            <div class="prev-block" v-if="form.image">
+              <div class="prev-head">
+                <el-tag size="small" type="success" effect="plain">图片</el-tag>
+                <span class="muted-hint">原貌截图</span>
+                <div style="flex:1"></div>
+                <el-button size="small" text type="danger" @click="clearFigure">清除原貌图</el-button>
+              </div>
+              <img :src="form.image" class="prev-img" alt="题目原貌图">
             </div>
             </template>
 
             <el-form label-position="top" style="margin-top:14px">
+              <!-- 出卷时印文本还是印图。放最前面，因为它说的就是上面那块预览 -->
+              <el-form-item label="出卷时用">
+                <el-radio-group v-model="form.render_prefer" size="small">
+                  <el-radio-button value="auto">自动</el-radio-button>
+                  <el-radio-button value="text">文本</el-radio-button>
+                  <el-radio-button value="image">图片</el-radio-button>
+                </el-radio-group>
+                <div class="hint" style="margin-top:2px">
+                  自动 = 有文本用文本、没文本用图。缺哪种形态会自动退回另一种，不会印出空白题；
+                  出卷时还能整卷再改一次
+                </div>
+              </el-form-item>
               <el-row :gutter="10">
                 <el-col :span="12">
                   <el-form-item label="题型">
@@ -463,18 +536,36 @@
                   <el-option v-for="t in tagOptions" :key="t" :label="t" :value="t"></el-option>
                 </el-select>
               </el-form-item>
-              <el-form-item label="答案（支持 $ 公式 $）">
-                <el-input v-model="form.answer" type="textarea" :rows="2"
-                          placeholder="标准答案（也可以走到第 ② 步，在页面上圈出答案图）"></el-input>
-                <img v-if="form.answer_image" :src="form.answer_image" alt="答案图"
-                     style="max-width:100%;margin-top:6px;border:1px solid #ebeef5;border-radius:4px">
+              <!-- 答案：和题干同一套 —— 文本（上渲染 / 下源码）+ 图片，各带标签 -->
+              <el-form-item>
+                <template #label>
+                  答案 ·
+                  <el-tag size="small" effect="plain">文本</el-tag>
+                  <el-tag v-if="form.answer_image" size="small" type="success" effect="plain">图片</el-tag>
+                </template>
+                <div class="prev-block" style="margin-bottom:0">
+                  <div class="preview-box sm" ref="answerPreview" v-show="form.answer"></div>
+                  <div v-if="!form.answer" class="preview-box sm empty-hint">
+                    还没填答案（可以直接打字，也可以在页面上圈出答案图）
+                  </div>
+                  <el-input v-model="form.answer" type="textarea" :rows="3" class="src-box"
+                            placeholder="标准答案源码（Markdown + $LaTeX$）"
+                            @input="renderAnswerMath"></el-input>
+                  <div v-if="form.answer_image" style="margin-top:6px">
+                    <div class="prev-head" style="margin-bottom:4px">
+                      <el-tag size="small" type="success" effect="plain">图片</el-tag>
+                      <span class="muted-hint">答案图</span>
+                      <div style="flex:1"></div>
+                      <el-button size="small" text type="danger" @click="clearAnswerImage">清除</el-button>
+                    </div>
+                    <img :src="form.answer_image" class="prev-img sm" alt="答案图">
+                  </div>
+                </div>
                 <div style="margin-top:6px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
                   <el-button size="small" plain @click="pickLocalImage">📁 从电脑选图片</el-button>
                   <el-button size="small" plain @click="openCropPicker">🖼 从已有截图选</el-button>
                   <el-button v-if="form.image && !form.answer_image" size="small" text
                              @click="copyToAnswer(form.image)">用题目图</el-button>
-                  <el-button v-if="form.answer_image" size="small" text type="danger"
-                             @click="clearAnswerImage">清除答案图</el-button>
                 </div>
                 <!-- 选本地图片：用隐藏 input 触发，不走 el-upload（这里不需要上传列表） -->
                 <input ref="localImg" type="file" accept="image/*" style="display:none" @change="onLocalImage">
@@ -482,6 +573,49 @@
               <el-form-item label="解析">
                 <el-input v-model="form.analysis" type="textarea" :rows="2" placeholder="解题步骤（可选）"></el-input>
               </el-form-item>
+
+              <!-- AI 识别：把上面那张**原貌图**转成可编辑的 Markdown 文本（公式转 LaTeX）。
+                   结果不直接写入表单，先让人过目 —— 识别偶尔看错一个手写字母或
+                   正负号，悄悄决定了，错的那一半会一路印到卷子上。 -->
+              <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:4px">
+                <el-button size="small" type="primary" plain :loading="aiBusy"
+                           :disabled="!aiTargetImage" @click="aiRecognize">
+                  🤖 AI 识别{{ stage === 'answer' ? '答案' : '题目' }}（图片 → Markdown）
+                </el-button>
+                <el-input v-model="aiHint" size="small" style="max-width:300px"
+                          placeholder="可选：补一句说明，如「这是 a 不是 alpha」"></el-input>
+              </div>
+              <div class="hint" style="margin:0 0 8px">
+                <template v-if="aiTargetImage">
+                  对着上面的<b>原貌图</b>识别：把图里的文字与公式转成可编辑的 Markdown /
+                  <code>$LaTeX$</code> 文本 —— 比 PDF 文字层直接抽出来的整齐得多。
+                </template>
+                <template v-else>
+                  先在左侧框出{{ stage === 'answer' ? '答案' : '这道题' }}（或点「📷 附加到…」），
+                  有原貌图之后这里就能识别
+                </template>
+              </div>
+              <div v-if="aiErr" class="hint" style="color:#f56c6c;margin:0 0 8px">{{ aiErr }}</div>
+              <div v-if="aiResult !== null"
+                   style="border:1px solid #e4e7ed;border-radius:6px;padding:10px;margin-bottom:10px;background:#fafafa">
+                <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+                  <b style="font-size:13px">AI 识别结果（先核对，再采用）</b>
+                  <span class="hint" style="margin:0">{{ aiMeta }}</span>
+                  <div style="flex:1"></div>
+                  <el-button size="small" text @click="discardAi">丢弃</el-button>
+                </div>
+                <el-input v-model="aiResult" type="textarea" :rows="5"></el-input>
+                <div style="display:flex;gap:8px;margin-top:8px">
+                  <el-button size="small" type="primary" @click="applyAi(false)">
+                    替换{{ stage === 'answer' ? '答案' : '题干' }}
+                  </el-button>
+                  <el-button size="small" @click="applyAi(true)">追加到末尾</el-button>
+                </div>
+                <div class="hint" style="margin:6px 0 0">
+                  公式用 <code>$…$</code> 包住，右侧预览会渲染成排版公式。可以直接在框里改，改好再采用。
+                </div>
+              </div>
+
               <div style="display:flex;gap:8px">
                 <el-button v-if="viewMode==='page' && canGrabFromPage" size="default" plain
                            style="flex:1" @click="attachCrop">
@@ -521,7 +655,12 @@
             <div style="display:flex;gap:6px;align-items:center">
               <el-tag size="small">{{ q.qtype }}</el-tag>
               <el-tag size="small" :type="diffTag(q.difficulty)">{{ q.difficulty }}</el-tag>
-              <el-tag v-if="q.image" size="small" type="success" effect="plain">📷 图片题</el-tag>
+              <el-tag v-if="q.content" size="small" effect="plain">文本</el-tag>
+              <el-tag v-if="q.image" size="small" type="success" effect="plain">图片</el-tag>
+              <el-tag v-if="q.render_prefer && q.render_prefer !== 'auto'" size="small"
+                      type="warning" effect="plain">
+                出卷用{{ q.render_prefer === 'image' ? '图' : '文本' }}
+              </el-tag>
               <span style="flex:1"></span>
               <el-button size="small" text type="primary" @click="startAnswerFor(q)">补答案</el-button>
               <el-button size="small" text type="danger" @click="del(q.id)">删除</el-button>
@@ -556,6 +695,68 @@
       </div>
     </div>
   </el-dialog>
+
+  <!-- 删除文档：破坏性动作，先把「会删掉什么」摊开，再让人决定要不要连题一起删。
+       数字全部来自服务端的 delete-impact（真实统计），不在前端估算 —— 这里算错
+       就等于骗用户点确认。 -->
+  <el-dialog v-model="delDlg.show" title="删除这份文档" width="560px" :close-on-click-modal="false">
+    <div v-if="delDlg.busy && !delDlg.impact" class="empty-block">正在统计会删掉什么…</div>
+    <template v-else-if="delDlg.impact">
+      <p style="margin:0 0 10px">确定删除 <b>{{ delDlg.impact.filename }}</b>？</p>
+
+      <div class="del-box">
+        <div class="del-line" v-for="f in delDlg.impact.files" :key="f.kind">
+          <span class="k">{{ fileKindText(f.kind) }}</span>
+          <span class="v">{{ f.name }}</span>
+          <span class="s">{{ fmtSize(f.bytes) }}</span>
+        </div>
+        <div class="del-line" v-if="delDlg.impact.crops">
+          <span class="k">截图</span>
+          <span class="v">只被这份卷子的题引用、别处用不到的，会一并删掉</span>
+          <span class="s">{{ delDlg.impact.crops }} 张</span>
+        </div>
+        <div class="del-line" v-if="!delDlg.impact.files.length && !delDlg.impact.crops">
+          <span class="v">磁盘上没有找到这个文档的文件（可能之前已经被手工删过）</span>
+        </div>
+      </div>
+
+      <el-alert v-if="delDlg.impact.questions" type="warning" :closable="false" show-icon
+                style="margin-top:12px">
+        <template #title>
+          这份文档下已经录了 {{ delDlg.impact.questions }} 道题
+        </template>
+        <div style="line-height:1.7">
+          <el-checkbox v-model="delDlg.withQuestions">
+            连这 {{ delDlg.impact.questions }} 道题一起删除
+          </el-checkbox>
+          <div class="hint" style="margin-top:2px">
+            <template v-if="delDlg.withQuestions">
+              题目、答案、解析与它们独占的截图都会被删掉，<b>不可恢复</b>。
+            </template>
+            <template v-else>
+              不勾选 = 题目留在题库里（还能查看、出卷、补答案），只是不再关联这份文档。
+            </template>
+          </div>
+        </div>
+      </el-alert>
+      <el-alert v-else type="info" :closable="false" show-icon style="margin-top:12px"
+                title="这份文档下还没有录入任何题目" />
+
+      <div class="hint" style="margin-top:10px">
+        删除前会自动备份一次数据库（设置 → 数据备份里能看到），但<b>试卷原件与页面图删了就回不来</b> ——
+        原件还在你电脑里的话，需要时重新上传即可。
+      </div>
+      <div v-if="delDlg.err" class="hint" style="color:#f56c6c;margin-top:8px">{{ delDlg.err }}</div>
+    </template>
+
+    <template #footer>
+      <el-button @click="delDlg.show = false">取消</el-button>
+      <el-button type="danger" :loading="delDlg.busy" :disabled="!delDlg.impact"
+                 @click="doDeleteDoc">
+        {{ delDlg.withQuestions ? '删除文档与题目' : '仅删除文档' }}
+      </el-button>
+    </template>
+  </el-dialog>
 </div>
 
 <!-- Vue 3.5.43 的 global 构建（**含模板编译器**，本页用运行时模板，不能换成 runtime-only）；
@@ -563,11 +764,64 @@
      脚本按顺序执行，auto-render 排在 katex 之后是对的，不要并行化。 -->
 <script src="/vendor/vue.global.prod.js"></script>
 <script src="/vendor/element-plus/index.full.min.js"></script>
+<!-- Markdown（marked）+ 消毒（DOMPurify）：题干/答案的文本要按 Markdown 渲染，
+     预览走 innerHTML 所以必须过 DOMPurify —— marked 自己不做消毒。
+     和工作台那份（Notes.js）是同一对库，同一个用法。 -->
+<script src="/vendor/marked.min.js"></script>
+<script src="/vendor/purify.min.js"></script>
 <script src="/vendor/katex/katex.min.js"></script>
 <script src="/vendor/katex/auto-render.min.js"></script>
 <script>
 const { createApp } = Vue;
 const QNUM_RE = /^\s*\d{1,3}\s*[.、．]|[（(]\s*\d{1,3}\s*[)）]/;
+
+/** 把 LaTeX 惯用的 \(…\) / \[…\] 归一成 $…$ / $$…$$。
+ *
+ *  必须放在 marked **之前**：Markdown 里 `\(` 是「转义的左括号」，marked 会把
+ *  反斜杠吃掉，等轮到 KaTeX 时它已经变成 `(x)` 了 —— 光在 auto-render 那边
+ *  多配几个定界符是没用的（Notes.js 里踩过同一个坑，实测就是这个原因）。
+ *  代码块与行内代码里的内容不动：那是要展示的代码本身，改写它才是错的。
+ *
+ *  后端导出（services/paper_export.py）有一份等价的「LaTeX 就地渲染」实现，
+ *  改一处要记得想着另一处 —— 不然会出现「预览能渲染、导出的 Word 里还是原文」。
+ */
+function normalizeMath(md) {
+  const conv = (s) => s
+    .replace(/\\\[([\s\S]+?)\\\]/g, (m, tex) => `$$${tex}$$`)
+    .replace(/\\\(([\s\S]+?)\\\)/g, (m, tex) => `$${tex}$`);
+  const inText = (seg) => seg.split(/(`[^`\n]*`)/)
+    .map((p, i) => (i % 2 ? p : conv(p))).join('');
+  return String(md || '').split(/(```[\s\S]*?```)/)
+    .map((s, i) => (i % 2 ? s : inText(s))).join('');
+}
+
+/** 文本 → 渲染进 el：先按 Markdown 排版，再让 KaTeX 就地渲染 $…$。
+ *
+ *  必须写 innerHTML，**不能**交给 Vue 插值：KaTeX 的 auto-render 会把 Vue
+ *  管理的文本节点整个换掉，Vue 之后还往那个已摘除的节点里写新内容，
+ *  预览会永远停在第一次渲染出公式的那一版。
+ *  marked 挂了也要能活 —— 退回纯文本，公式继续渲染，别让整块白掉。
+ */
+function renderRich(el, text) {
+  if (!el) return;
+  const t = text || '';
+  if (!t) { el.textContent = ''; return; }
+  if (window.marked) {
+    const raw = window.marked.parse(normalizeMath(t), { breaks: true, gfm: true });
+    el.innerHTML = window.DOMPurify ? window.DOMPurify.sanitize(raw) : raw;
+  } else {
+    el.textContent = t;
+  }
+  if (window.renderMathInElement) {
+    renderMathInElement(el, {
+      delimiters: [
+        { left: '$$', right: '$$', display: true },
+        { left: '$', right: '$', display: false }
+      ],
+      throwOnError: false
+    });
+  }
+}
 
 const app = createApp({
   data() {
@@ -600,13 +854,26 @@ const app = createApp({
       difficulties: ['基础', '中档', '拔高'],
       treeOptions: [],
       form: { content: '', qtype: '解答题', difficulty: '中档', knowledge_points: [], answer: '', answer_image: '', analysis: '', image: '',
-              tags: [], curriculum_id: null },
+              tags: [], curriculum_id: null, render_prefer: 'auto' },
+      // 选区指纹：判断「选区真的变了没有」。变了才重建文本，没变就**不动用户手改过的内容**
+      // —— 预览区可编辑之后，不设这道闸，用户辛苦改完的题干会被下一次 updatePreview 冲掉。
+      lastSelKey: null,
       curricula: [],
+      // AI 识别（图 → 带 $LaTeX$ 的文本）。结果先落在 aiResult 里等老师确认，
+      // **绝不直接写进 form** —— 理由见 aiRecognize 的注释。
+      aiBusy: false,
+      aiResult: null,               // null = 没有待确认的结果；'' = 识别回来是空的
+      aiUsage: null,                // 用量，面板右上角显示
+      aiErr: '',                    // 失败原因（给用户看）
+      aiHint: '',                   // 手写体读错时补一句，如「这是 a 不是 alpha」
       // 知识点选项：**所有**体系的节点（按体系分组）+ 题库里已用过的名字。
       // 刻意不跟着「体系」走 —— 目前只有国内高中数学有知识树，跟着走的话
       // 选了初中就是个空下拉，老师只能把知识点写进标签框（真发生过）
       kpGroups: [],
       tagOptions: [],               // 库里实际用过的标签，供输入时自动补全
+      // 删除文档（破坏性动作）：先拉影响面给人看清楚，再让人决定要不要连题一起删。
+      // withQuestions 默认 false —— 删文档 ≠ 删题，题是独立资产，不能顺手带走。
+      delDlg: { show: false, impact: null, withQuestions: false, busy: false, err: '' },
       // 补答案模式：给已录的题补答案（而不是录新题）
       answerMode: false,
       editingId: null,
@@ -646,6 +913,25 @@ const app = createApp({
     /** 当前阶段截出来的图写到哪个字段：① 选题目 → 题干图；② 选答案 → 答案图。 */
     figureTarget() {
       return this.stage === 'answer' ? 'answer_image' : 'image';
+    },
+    /** AI 要识别的是当前阶段那张图。复用 figureTarget，不再写一遍阶段判断 ——
+     *  两处判断早晚会有一天只改了一处。 */
+    aiTargetImage() {
+      return this.form[this.figureTarget] || '';
+    },
+    /** 识别结果该写进哪个文本字段：① 题目 → 题干；② 答案 → 答案。 */
+    aiTargetText() {
+      return this.stage === 'answer' ? 'answer' : 'content';
+    },
+    /** 结果面板右上角的用量提示。自付费的服务老师会关心一次花了多少 token。 */
+    aiMeta() {
+      if (this.aiBusy) return '识别中…（一页约 2–5 秒）';
+      const u = this.aiUsage;
+      if (!u) return '';
+      const bits = [];
+      if (u.prompt) bits.push(`输入 ${u.prompt}`);
+      if (u.completion) bits.push(`输出 ${u.completion}`);
+      return bits.length ? bits.join(' / ') + ' tokens' : '';
     }
   },
   mounted() {
@@ -1041,6 +1327,74 @@ const app = createApp({
     },
     clearAnswerImage() { this.form.answer_image = ''; },
 
+    /* ===== AI 识别：图 → 带 $LaTeX$ 的文本 ===== */
+    /** 把当前阶段的图发给 AI 识别，结果先放进待确认面板，**不直接写表单**。
+     *
+     *  为什么不直接写：识别偶尔会看错一个手写字母或正负号 —— 实测 DSE 真卷里
+     *  `(y+2)` 与 `(y-2)` 这类最容易错。悄悄替老师决定了，错的那一半会一路带到
+     * 印出来的卷子上，而他直到发给学生才发现。所以结果一律先过目、可改、再采用。 */
+    async aiRecognize() {
+      const src = this.aiTargetImage;
+      if (!src) {
+        ElementPlus.ElMessage.warning('先在左侧框选出一道题，或附加一张图');
+        return;
+      }
+      this.aiBusy = true;
+      this.aiErr = '';
+      this.aiUsage = null;
+      try {
+        // 图先读成 base64 再发。接口只收 base64，后端就完全不用关心
+        // 「这个 URL 对应磁盘上哪个文件」—— 截图可能还没落盘。
+        // 前端多走一步，换来少一处会错的地方。
+        const blob = await (await fetch(src)).blob();
+        const image = await new Promise((resolve, reject) => {
+          const fr = new FileReader();
+          fr.onload = () => resolve(fr.result);
+          fr.onerror = () => reject(new Error('图片读取失败，请重新框选'));
+          fr.readAsDataURL(blob);
+        });
+        const r = await this.api('/api/ai/recognize', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          // 答案有自己的提示词：答案往往是整段解题过程，要求保留换行与步骤顺序，
+          // 和「把题干转录成一段」是两回事。
+          body: JSON.stringify({
+            image,
+            mode: this.stage === 'answer' ? 'answer' : 'question',
+            hint: this.aiHint || '',
+          }),
+        });
+        this.aiResult = r.text || '';
+        this.aiUsage = r.usage || null;
+        if (!this.aiResult) this.aiErr = '识别回来是空的，试着补一句说明再识别一次';
+      } catch (e) {
+        this.aiErr = e.message;
+      } finally {
+        this.aiBusy = false;
+      }
+    },
+    /** 采用识别结果。append=true 时接到现有内容后面，而不是覆盖。 */
+    applyAi(append) {
+      const txt = (this.aiResult || '').trim();
+      if (!txt) { ElementPlus.ElMessage.warning('识别结果为空'); return; }
+      const key = this.aiTargetText;
+      const cur = this.form[key] || '';
+      this.form[key] = (append && cur.trim())
+        ? cur.replace(/\s+$/, '') + '\n' + txt
+        : txt;
+      this.discardAi();
+      // 直接渲染，不走 updatePreview —— 后者会按当前选区再截一次原貌图，
+      // 而"采用识别结果"这一步根本没动选区，白跑一次请求。
+      this.renderMath();
+      this.renderAnswerMath();
+      ElementPlus.ElMessage.success(append ? '已追加到末尾' : '已替换');
+    },
+    discardAi() {
+      this.aiResult = null;
+      this.aiErr = '';
+      this.aiUsage = null;
+    },
+
     /* ===== 两阶段：① 选题目 → ② 选答案 ===== */
     /** 切阶段。切的时候清掉左侧选区（否则下一阶段一动线就改坏了上一阶段的图），
      *  但**不动已经截好的图** —— 所以来回切不会把题目图弄丢。 */
@@ -1105,7 +1459,9 @@ const app = createApp({
       this.form.difficulty = q.difficulty || this.form.difficulty;
       this.form.curriculum_id = q.curriculum_id || null;
       this.form.knowledge_points = (q.knowledge_points || []).slice();
+      this.form.render_prefer = q.render_prefer || 'auto';
       this.stage = 'answer';
+      this.renderAnswerMath();
     },
     /** 保存答案：走 PATCH，**只提交答案相关字段** —— 不碰题干，也不会误删题干图。 */
     async saveAnswer() {
@@ -1123,7 +1479,8 @@ const app = createApp({
             qtype: this.form.qtype,
             difficulty: this.form.difficulty,
             curriculum_id: this.form.curriculum_id,
-            knowledge_points: this.form.knowledge_points
+            knowledge_points: this.form.knowledge_points,
+            render_prefer: this.form.render_prefer
           })
         });
         ElementPlus.ElMessage.success('答案已保存');
@@ -1280,14 +1637,21 @@ const app = createApp({
     },
 
     /** 原貌图跟随选区自动刷新（350ms 防抖，避免拖选过程中狂发请求）。
-     *  单页走 /crop，跨页走 /crop-strip 竖拼 —— 跨页题的原貌图也是一张。 */
+     *  两种选段方式共用：Word 两条线（pickedRegions）和 PDF 分界线选段（selectionRegions）。
+     *  以前只有 Word 会出图，PDF 选段只填文字层文本 —— 于是 AI 按钮一直点不动。
+     *  单页走 /crop，跨页走 /crop-strip 竖拼 —— 跨页题的原貌图也是一张。
+     *
+     *  ⚠️ 选区空了**不清图**：丢一张图是不可逆的（重新框选很麻烦），留一张是可逆的
+     *     （有「清除原貌图」按钮）。宁可让老师显式清，也不要在切阶段、清分界线时
+     *     把图悄悄抹掉。
+     */
     refreshFigure() {
-      if (this.wordTool !== 'text' || !this.hasPreview) return;
+      if (!this.hasPreview) return;
       clearTimeout(this._figTimer);
       this._figTimer = setTimeout(async () => {
         const target = this.figureTarget;      // 只写当前阶段那一个字段，另一个不动
-        const regions = this.pickedRegions();
-        if (!regions.length) { this.form[target] = ''; return; }
+        const regions = this.selectionRegions();
+        if (!regions.length) return;
         try {
           this.form[target] = await this.cropRegionsToUrl(regions);
         } catch (e) { /* 原貌图生成失败不阻断录题，图片还在 */ }
@@ -1328,54 +1692,76 @@ const app = createApp({
       // 体系（curriculum_id）刻意保留 —— 同一份卷子基本同体系，省得反复选。
       this.form.tags = [];
       this.form.knowledge_points = [];
+      // 出卷形态回默认：这是**每题**的判断（这道公式题印文本、那道图形题印图），
+      // 没有「同一份卷子都一样」的规律，所以不像体系那样保留。
+      this.form.render_prefer = 'auto';
       // 补答案模式下没有「第①步」，别把阶段打回去
       this.stage = this.answerMode ? 'answer' : 'question';
       this.renderMath();
+      this.renderAnswerMath();
+    },
+    /** 当前选区的指纹。只用来判断「选区变了没有」，不参与任何渲染。
+     *  三种选段方式各给一个前缀，免得跨模式的指纹撞车。 */
+    selKey() {
+      if (this.isWord && this.viewMode === 'page') {
+        const sp = this.markSpan;
+        if (!sp) return 'w:';
+        return 'w:' + sp.a.page + ':' + sp.a.y + '-' + (sp.b ? sp.b.page + ':' + sp.b.y : '');
+      }
+      if (this.viewMode === 'page') return 'p:' + this.selectedSegs.join(',');
+      return 'b:' + this.selStart + '-' + this.selEnd;
     },
     updatePreview() {
+      // 选区没变就不重建文本。理由见 lastSelKey 的注释：预览可编辑了，
+      // 不设这道闸，用户刚改好的字会被下一次 updatePreview 冲掉。
+      const key = this.selKey();
+      const changed = key !== this.lastSelKey;
+      this.lastSelKey = key;
+
       if (this.isWord && this.viewMode === 'page') {
-        // Word 行标记：只要两条线之间的原貌图，不做任何文字识别
+        // Word 行标记：只要两条线之间的原貌图，不做文字识别
+        // （Word 的文字层对公式同样是废的，一个字都不要读）
         if (this.wordTool === 'text') {
-          if (this.stage === 'question') this.form.content = '';
+          if (this.stage === 'question' && changed) this.form.content = '';
           this.refreshFigure();        // 内部按当前阶段写对应字段
         }
       } else if (this.viewMode === 'page') {
         // 阶段②是在圈答案，不能再去改题干的文字
-        if (this.stage === 'question') {
+        if (this.stage === 'question' && changed) {
           this.form.content = this.selectedSegs.map(k => {
             const [pno, idx] = k.split(':');
             return this.segText(parseInt(pno, 10), parseInt(idx, 10));
           }).filter(Boolean).join('\n');
         }
+        // ⚠️ 选段就自动出原貌图，是**刻意的**：AI 识别按钮靠「当前阶段那张图」干活，
+        //    不出图按钮就永远是灰的 —— 这正是「AI 识别按钮点不了」那条反馈的根因。
+        this.refreshFigure();
       } else if (this.selStart !== null) {
         const end = this.selEnd === null ? this.selStart : this.selEnd;
         const lo = Math.min(this.selStart, end), hi = Math.max(this.selStart, end);
-        this.form.content = this.doc.blocks.slice(lo, hi + 1).map(b => b.text).join('\n');
-      } else {
+        if (changed) this.form.content = this.doc.blocks.slice(lo, hi + 1).map(b => b.text).join('\n');
+      } else if (changed) {
         this.form.content = '';
       }
       this.renderMath();
+      this.renderAnswerMath();
     },
+    /** 题目文本 → 渲染区。Markdown 排版 + KaTeX 公式，renderRich 一次做完。 */
     renderMath() {
-      this.$nextTick(() => {
-        const box = this.$refs.previewText;
-        if (!box) return;
-        // 先原样写入纯文本（KaTeX 渲染过后这里会残留它的 DOM，所以每次都要重置），
-        // 再让 KaTeX 就地渲染 $…$ / $$…$$。这个节点 Vue 从不插手，改多少遍都不会失灵。
-        box.textContent = this.form.content || '';
-        if (window.renderMathInElement && this.form.content) {
-          renderMathInElement(box, {
-            delimiters: [
-              { left: '$$', right: '$$', display: true },
-              { left: '$', right: '$', display: false }
-            ],
-            throwOnError: false
-          });
-        }
-      });
+      this.$nextTick(() => renderRich(this.$refs.previewText, this.form.content));
     },
+    /** 答案文本 → 渲染区。和题干完全同一套（用户要求答案也有同样的能力）。 */
+    renderAnswerMath() {
+      this.$nextTick(() => renderRich(this.$refs.answerPreview, this.form.answer));
+    },
+    clearText() { this.form.content = ''; this.renderMath(); },
     async saveQuestion() {
-      if (!(this.form.content || this.form.image) || !this.doc) return;
+      // 删光文档后右栏还在，这时保存本来会静默什么都不做 —— 说清楚为什么没反应
+      if (!this.doc) {
+        ElementPlus.ElMessage.warning('还没有打开任何文档，先上传一份试卷');
+        return;
+      }
+      if (!this.form.content && !this.form.image) return;
       // start/end_block 仅内容块模式有语义；页面选区一律 -1（区域信息已随原貌图存档）
       const inPageMode = this.viewMode === 'page';
       const end = this.selEnd === null ? this.selStart : this.selEnd;
@@ -1399,6 +1785,7 @@ const app = createApp({
             image: this.form.image,
             tags: this.form.tags,
             curriculum_id: this.form.curriculum_id,
+            render_prefer: this.form.render_prefer,
             node_id: null
           })
         });
@@ -1414,6 +1801,62 @@ const app = createApp({
     async del(id) {
       await this.api('/api/questions/' + id, { method: 'DELETE' });
       this.loadQuestions();
+    },
+
+    /* ===== 删除整份文档 =====
+       三件事要分清：库里的记录、磁盘上的文件、挂在这份卷子下的题目。
+       后两者以前都得进 data/ 目录手工删，而且一定会漏（页面图缓存、Word 转换件
+       分别躺在两个子目录里）。所以删之前先向服务端要一份「会删掉什么」的清单 ——
+       数字由服务端统计，不在前端估算：这里算错就等于骗用户点确认。 */
+    async askDeleteDoc() {
+      if (!this.doc) return;
+      const d = this.delDlg;
+      d.show = true; d.busy = true; d.err = ''; d.impact = null; d.withQuestions = false;
+      try {
+        d.impact = await this.api('/api/documents/' + this.doc.id + '/delete-impact');
+      } catch (e) {
+        d.err = '统计失败：' + e.message;
+      } finally { d.busy = false; }
+    },
+    fileKindText(kind) {
+      return { source: '试卷原件', converted: 'Word 转换件', pages: '页面图缓存' }[kind] || kind;
+    },
+    fmtSize(n) {
+      if (!n) return '0 KB';
+      return n >= 1024 * 1024 ? (n / 1024 / 1024).toFixed(1) + ' MB'
+                              : Math.max(1, Math.round(n / 1024)) + ' KB';
+    },
+    async doDeleteDoc() {
+      const d = this.delDlg;
+      if (!this.doc || d.busy || !d.impact) return;
+      d.busy = true; d.err = '';
+      try {
+        const r = await this.api('/api/documents/' + this.doc.id
+                                 + '?with_questions=' + (d.withQuestions ? 'true' : 'false'),
+                                 { method: 'DELETE' });
+        d.show = false;
+        const bits = [];
+        if (r.questions_removed) bits.push('连题目删了 ' + r.questions_removed + ' 道');
+        if (r.questions_kept) bits.push('保留了 ' + r.questions_kept + ' 道题');
+        if (r.crops_removed) bits.push('回收截图 ' + r.crops_removed + ' 张');
+        ElementPlus.ElMessage.success('已删除「' + r.filename + '」'
+          + (bits.length ? '（' + bits.join('，') + '）' : ''));
+        this.afterDocDelete();
+      } catch (e) {
+        d.err = '删除失败：' + e.message;
+      } finally { d.busy = false; }
+    },
+    async afterDocDelete() {
+      // 左侧跟这份文档绑定的状态必须一起清掉：留着会让「新录的题挂到已删的文档上」
+      this.doc = null;
+      this.currentDocId = null;
+      this.viewMode = 'blocks';
+      this.pv = { count: 0, pages: {} };
+      this.dividers = {};
+      this.previewErr = null;
+      this.resetSel();
+      this.loadQuestions();
+      await this.loadDocs();     // 还有别的文档就自动打开第一份；一份都没了就留空
     },
     diffTag(d) { return d === '基础' ? 'success' : d === '拔高' ? 'danger' : 'warning'; },
     exportJson() {

@@ -172,6 +172,16 @@ class Question(Base):
     last_used_at: Mapped[str | None] = mapped_column(Text)
     stem_format: Mapped[str] = mapped_column(String, default="text", server_default="text")
     tags: Mapped[str] = mapped_column(Text, default="[]", server_default="[]")
+    # 每题分值。可空是刻意的：老数据没有分值，出卷时按「不标分值」处理，
+    # 绝不拿 0 或某个默认值去填 —— 印错分数的试卷比不印分数严重得多。
+    score: Mapped[float | None] = mapped_column(REAL)
+    # 出卷时这一题优先印哪种形态。录题时「原貌图」和「识别文本」常常同时在，
+    # 到底印哪个是老师对**这一题**的判断（公式题印文本更清楚、图形题只能印图），
+    # 替他定就是印错。所以每题存一个偏好，出卷时还能整卷统一覆盖。
+    #   auto  —— 有文本用文本，没文本用图（默认；也兼容老数据）
+    #   text  —— 强制用文本（没有文本时自动退回图，不印空白题）
+    #   image —— 强制用图（没有图时自动退回文本）
+    render_prefer: Mapped[str] = mapped_column(String, default="auto", server_default="auto")
 
     __table_args__ = (Index("idx_questions_curr", "curriculum_id", "node_id"),)
 
@@ -675,9 +685,43 @@ class FeedbackDocTemplate(Base):
     __table_args__ = (Index("idx_fb_doc_templates_owner", "owner_id", "sort_order"),)
 
 
+class PaperTemplate(Base):
+    """出卷的「卷种样式」：一套卷面长什么样，决定导出 HTML / Word / PDF 的版式。
+
+    为什么存数据库而不是把四套写死在渲染代码里：
+      高考 / 中考 / DSE / A-Level 只是**起点**。同一场考试不同年份、不同学校
+      的抬头和说明都不一样，写死等于每次改一行说明都要改代码。
+      存成数据后，「复制内置模板 → 改两个字段」就是一次普通的界面操作。
+
+    形状（四个 JSON 字段，都在 services/paper_style.py 里解析）：
+      paper    抬头区 —— 副标题、考试说明、注意事项逐条、姓名栏字段
+      style    排版   —— 字号、行距、页边距、题间距、答题留白、题号样式
+      sections 分区   —— 按题型把题目分组（"一、选择题" / "Section A"）
+      sample   示例   —— 一句「这套长什么样」的说明，仅供界面上给人看
+
+    sections 为空数组 = **不分区**，题目按用户排的顺序平铺（自定义模板的默认形态）。
+    is_builtin：内置模板允许改但不允许删 —— 删了下次启动种子又会建回来，反而迷惑。
+    """
+
+    __tablename__ = "paper_templates"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    owner_id: Mapped[int] = mapped_column(Integer, nullable=False, default=OWNER_ID, server_default=str(OWNER_ID))
+    name: Mapped[str] = mapped_column(String, nullable=False)
+    code: Mapped[str] = mapped_column(String, default="", server_default="")   # 内置标识，如 gaokao
+    paper: Mapped[str] = mapped_column(Text, default="{}", server_default="{}")
+    style: Mapped[str] = mapped_column(Text, default="{}", server_default="{}")
+    sections: Mapped[str] = mapped_column(Text, default="[]", server_default="[]")
+    sample: Mapped[str] = mapped_column(Text, default="", server_default="")
+    is_builtin: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    sort_order: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    created_at: Mapped[str] = mapped_column(Text, default=_now, server_default=NOW)
+
+    __table_args__ = (Index("idx_paper_templates_owner", "owner_id", "sort_order"),)
+
+
 class AiSetting(Base):
     """AI 润色的接口配置（单行，owner_id 唯一）。
-
     走 OpenAI 兼容的 /chat/completions 协议：DeepSeek、通义、Kimi、本地 Ollama / vLLM
     都是这个格式，所以只存 base_url + model + api_key 就能对接绝大多数服务，
     不需要为每家写一个适配器。

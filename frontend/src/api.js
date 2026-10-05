@@ -204,6 +204,21 @@ export const papersApi = {
   exportUrl: (params) => '/api/papers/export' + qs(params),
 };
 
+/** 卷种样式模板（高考 / 中考 / DSE / A-Level，四套内置 + 自己复制改的）。
+ *  返回的每一项都带**解析后**的 paper / style / sections —— 界面显示的字段
+ *  和导出时用的字段是同一套，不会出现「界面上改了却没生效」。 */
+export const paperTemplatesApi = {
+  list: () => api.get('/api/paper-templates'),
+  get: (id) => api.get(`/api/paper-templates/${id}`),
+  create: (body) => api.post('/api/paper-templates', body),
+  /** 复制一份再改 —— 「可扩展」真正好用的路径：挑一套最像的复制，比从零填省事。 */
+  copy: (sourceId, name) => api.post('/api/paper-templates/copy', { source_id: sourceId, name }),
+  /** 改模板：**没传的块保持原样**（只改名字不该把排版重置回默认）。 */
+  update: (id, body) => api.patch(`/api/paper-templates/${id}`, body),
+  /** 内置的改得了、删不了（删了下次启动种子又建回来）。 */
+  remove: (id) => api.del(`/api/paper-templates/${id}`),
+};
+
 export const notesApi = {
   list: (params) => api.get('/api/notes', params),
   get: (id) => api.get(`/api/notes/${id}`),

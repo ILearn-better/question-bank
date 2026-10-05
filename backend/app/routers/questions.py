@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 import uuid
 from datetime import datetime
 
@@ -15,6 +14,7 @@ from .. import config
 from ..db import get_db
 from ..models import Node, Question, QuestionNode
 from ..schemas import QuestionIn, QuestionPatch
+from ..services import crops
 
 router = APIRouter(prefix="/api", tags=["questions"])
 
@@ -107,6 +107,8 @@ def _serialize(q: Question) -> dict:
         "usage_count": q.usage_count,
         "stem_format": q.stem_format,
         "tags": _parse_tags(q.tags),
+        "score": q.score,
+        "render_prefer": q.render_prefer or "auto",
     }
 
 
@@ -147,6 +149,8 @@ def create_question(payload: QuestionIn, db: Session = Depends(get_db)):
             source=payload.source,
             year=payload.year,
             stem_format=payload.stem_format,
+            score=payload.score,
+            render_prefer=payload.render_prefer,
         )
     )
     # 主知识点同时写入关系表 —— 将来算掌握度靠它，靠 JSON 数组是算不动的
@@ -219,6 +223,14 @@ def update_question(qid: str, payload: QuestionPatch, db: Session = Depends(get_
             setattr(q, field, data[field] or "")
     if "year" in data:
         q.year = data["year"]
+    # 分值可空，所以不能走上面那个「显式传 null 落成空串」的循环 ——
+    # 清空分值要落成 NULL（= 不标分值），落成 0 会印出「（0 分）」。
+    if "score" in data:
+        q.score = data["score"]
+    # 出卷形态偏好。可空字段里唯一一个「有默认值但不是 NULL」的，所以单独处理：
+    # 显式传 null 落回 auto，而不是落成空串（空串会让出卷判定认不出来）。
+    if "render_prefer" in data:
+        q.render_prefer = data["render_prefer"] or "auto"
     if "tags" in data:
         q.tags = json.dumps(_clean_tags(data["tags"]), ensure_ascii=False)
 
@@ -379,25 +391,6 @@ def search_questions(
     return {"total": total, "items": [_serialize(q) for q in rows]}
 
 
-def _crop_files(*urls: str | None) -> set[str]:
-    """从 image / answer_image 的 URL 里取出截图文件名（只认文件名，不认目录）。"""
-    names: set[str] = set()
-    for u in urls:
-        if u:
-            name = os.path.basename(u.split("?")[0].strip())
-            if name:
-                names.add(name)
-    return names
-
-
-def _all_crop_refs(db: Session) -> set[str]:
-    """当前库里**所有**题目引用到的截图文件名。"""
-    refs: set[str] = set()
-    for img, ans in db.execute(select(Question.image, Question.answer_image)).all():
-        refs |= _crop_files(img, ans)
-    return refs
-
-
 @router.delete("/questions/{qid}")
 def delete_question(qid: str, db: Session = Depends(get_db)):
     """删题，并顺手清掉只有它引用的截图。
@@ -406,26 +399,20 @@ def delete_question(qid: str, db: Session = Depends(get_db)):
     磁盘上却有 92 张图、3.4 MB。录了又删的题会一直占盘，而且那是学生试卷的
     截图 —— 用户以为删掉了，文件其实还在。
 
-    这里按「引用计数」删而不是直接删：image 与 answer_image 可能指向同一张图
-    （同一份原貌图既当题干又当答案），先收齐全库引用，再删没人用的那些。
+    截图按「引用计数」删而不是直接删（同一张图可能既当题干又当答案），
+    这套判断与删文档时共用一份，见 services/crops.py。
     """
     q = db.get(Question, qid)
     if q is None:
         raise HTTPException(404, "题目不存在")
-    mine = _crop_files(q.image, q.answer_image)
+    mine = crops.crop_names(q.image, q.answer_image)
 
     # 先删关系表（外键现在是真生效的，顺序错了会撞约束）
     db.execute(delete(QuestionNode).where(QuestionNode.question_id == qid))
     db.execute(delete(Question).where(Question.id == qid))
 
     # 上面的 DELETE 已经在本事务里生效，所以这次查询不会再算进这一条
-    removed = 0
-    for name in (mine - _all_crop_refs(db)) if mine else ():
-        try:
-            (config.CROPS_DIR / name).unlink()
-            removed += 1
-        except OSError:
-            pass          # 文件本来就不在就算了，不该因为清理失败让删题也跟着失败
+    removed = crops.purge(mine - crops.referenced_crops(db))
 
     db.commit()
     return {"ok": True, "crops_removed": removed}

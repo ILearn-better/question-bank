@@ -23,15 +23,17 @@ from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from .. import config
 from ..adapters import office as office_adapter
 from ..adapters import pdf as pdf_adapter
 from ..db import get_db
-from ..models import Document
+from ..migrate import backup_db
+from ..models import Document, Question, QuestionNode
 from ..schemas import CropIn, CropStripIn
+from ..services import crops
 
 router = APIRouter(prefix="/api", tags=["documents"])
 
@@ -310,3 +312,134 @@ def get_crop(name: str):
     # 按扩展名给 MIME，不写死 png —— 目录里将来混进别的格式也不用改这里
     media = mimetypes.guess_type(p.name)[0] or "image/png"
     return FileResponse(str(p), media_type=media)
+
+
+# ---------------------------------------------------------------- 删除文档
+def _unlink(path: Path) -> list[str]:
+    """删一个文件，返回「真删掉了」的文件名。不存在或删不动都当没事发生。"""
+    try:
+        if path.is_file():
+            path.unlink()
+            return [path.name]
+    except OSError:
+        pass
+    return []
+
+
+def _delete_impact(db: Session, doc: Document) -> dict:
+    """删这份文档会动到什么 —— 前端在确认框里先把账摊开给人看。
+
+    两个数字都算的是「**真的**会少掉多少」：
+      · 题目数 —— 挂在它下面的题（按 document_id 认，就是它）
+      · 截图数 —— 这些题引用的截图，再扣掉别处也在用的（引用计数）
+    宁可这里多查一次，也好过用户点完「删除」才发现带走了不该带的东西。
+    """
+    qs = db.scalars(select(Question).where(Question.document_id == doc.id)).all()
+    mine: set[str] = set()
+    for q in qs:
+        mine |= crops.crop_names(q.image, q.answer_image)
+    # 预演：把这几道题当作已经删掉，看还剩谁在引用这些图
+    freed = mine - crops.referenced_crops(db, exclude_qids=[q.id for q in qs])
+
+    files: list[dict] = []
+    src = config.abs_from_data(doc.file_path)
+    if src and Path(src).is_file():
+        files.append({"kind": "source", "name": Path(src).name,
+                      "bytes": Path(src).stat().st_size})
+    conv = _preview_pdf_path(doc)
+    if conv.is_file():
+        files.append({"kind": "converted", "name": conv.name, "bytes": conv.stat().st_size})
+    cache = config.PAGES_CACHE / doc.id
+    if cache.is_dir():
+        files.append({"kind": "pages", "name": f"{doc.id}/",
+                      "bytes": sum(p.stat().st_size for p in cache.rglob("*") if p.is_file())})
+
+    return {
+        "id": doc.id,
+        "filename": doc.filename,
+        "filetype": doc.filetype,
+        "created_at": doc.created_at,
+        "questions": len(qs),
+        "crops": len(freed),
+        "files": files,
+        "bytes": sum(f["bytes"] for f in files),
+    }
+
+
+@router.get("/documents/{doc_id}/delete-impact")
+def delete_impact(doc_id: str, db: Session = Depends(get_db)):
+    """纯读取：删之前先看会删掉什么。不写任何东西，可以随便点。"""
+    return _delete_impact(db, _doc_or_404(db, doc_id))
+
+
+@router.delete("/documents/{doc_id}")
+def delete_document(
+    doc_id: str,
+    with_questions: bool = Query(False, description="true = 连同该文档下已录入的题目一起删"),
+    db: Session = Depends(get_db),
+):
+    """删除一份卷子**及它落盘的每一处**。
+
+    一份文档在磁盘上不止一个文件：原件、Word 转出的 PDF（页面视图的数据源）、
+    页面渲染图缓存。以前只能去 data/ 目录里自己翻着删，漏掉哪一处都不会报错 ——
+    表现是「下次打开还看到旧页面图」，或者几十 MB 悄悄占着。这里一次清干净。
+
+    ⚠️ with_questions 默认 false：**删文档 ≠ 删题**。题目是独立资产 ——
+    有自己的文本、截图，可能已经出过卷、有学生做过。把它们跟着文档一起带走，
+    是用户没说过的事。真要一起删，得调用方明确表态（前端默认不勾）。
+    不删题时会把题的 document_id 清空（来源名 doc_filename 保留），
+    免得题库里留一堆指向已删文档的 id。
+
+    删行之前先备份一次数据库：文件删了回不来，至少让「当时哪几道题挂在它下面」
+    有据可查（备份在 设置 → 数据备份，超出保留份数自动清最旧的）。
+    """
+    doc = _doc_or_404(db, doc_id)
+    filename = doc.filename
+    src_path = config.abs_from_data(doc.file_path)
+    conv_path = _preview_pdf_path(doc)
+
+    questions = db.scalars(select(Question).where(Question.document_id == doc_id)).all()
+    q_ids = [q.id for q in questions]
+
+    # 会释放哪些截图必须在删行**之前**算 —— 删完就问不出来了
+    freed: set[str] = set()
+    if questions:
+        mine: set[str] = set()
+        for q in questions:
+            mine |= crops.crop_names(q.image, q.answer_image)
+        freed = mine - crops.referenced_crops(db, exclude_qids=q_ids)
+
+    backup = ""
+    try:
+        made = backup_db("del-doc")
+        backup = made.name if made else ""
+    except Exception:            # noqa: BLE001
+        pass                     # 备份失败不该挡住「用户想删东西」这件事
+
+    if with_questions and q_ids:
+        # 顺序不能反：question_nodes 有指向 questions 的外键，且是真生效的
+        db.execute(delete(QuestionNode).where(QuestionNode.question_id.in_(q_ids)))
+        db.execute(delete(Question).where(Question.id.in_(q_ids)))
+    else:
+        for q in questions:
+            q.document_id = None
+    db.execute(delete(Document).where(Document.id == doc_id))
+    db.commit()
+
+    # 库改完才动文件：中途失败也不会留下「文件没了、记录还在」的空壳
+    files_removed: list[str] = []
+    if src_path:
+        files_removed += _unlink(Path(src_path))
+    files_removed += _unlink(conv_path)
+    # 页面缓存是一整个目录，且里面可能有 rmtree 删不掉的句柄 —— 忽略失败
+    shutil.rmtree(config.PAGES_CACHE / doc_id, ignore_errors=True)
+
+    return {
+        "ok": True,
+        "filename": filename,
+        "questions_removed": len(q_ids) if with_questions else 0,
+        "questions_kept": 0 if with_questions else len(q_ids),
+        "crops_removed": crops.purge(freed),
+        "files_removed": files_removed,
+        "backup": backup,
+    }

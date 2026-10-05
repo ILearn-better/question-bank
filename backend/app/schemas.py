@@ -2,7 +2,7 @@
 """请求 / 响应模型。输入一律用 Pydantic 校验，输出为便于前端消费的字典结构。"""
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -43,6 +43,13 @@ class QuestionIn(BaseModel):
     year: Optional[int] = None
     stem_format: str = "text"
     tags: List[str] = Field(default_factory=list)
+    # 每题分值。可空 —— 不填就不标，绝不会凭空显示一个假分数。
+    # ge=0 挡掉负数：负分只可能来自手滑，落到出卷里就是印错的试卷。
+    score: Optional[float] = Field(default=None, ge=0, le=200)
+    # 出卷时优先印哪种形态（见 models.Question.render_prefer）。
+    # 用 Literal 挡掉拼错的值 —— 拼错的字符串不会报错，只会让这一题静默用回默认，
+    # 排查时完全看不出问题在哪。
+    render_prefer: Literal["auto", "text", "image"] = "auto"
 
     @field_validator("content", "answer", "answer_image", "analysis", "image", "doc_filename", mode="before")
     @classmethod
@@ -72,6 +79,8 @@ class QuestionPatch(BaseModel):
     node_id: Optional[int] = None
     source: Optional[str] = None
     year: Optional[int] = None
+    score: Optional[float] = Field(default=None, ge=0, le=200)
+    render_prefer: Optional[Literal["auto", "text", "image"]] = None
 
 
 # ============================================================ 笔记
@@ -329,6 +338,20 @@ class AiTestIn(BaseModel):
     timeout: Optional[int] = Field(default=None, ge=5, le=300)
 
 
+class RecognizeIn(BaseModel):
+    """公式 / 题干识别请求。
+
+    image 收 base64（`data:image/png;base64,...` 或裸 base64 都行），**不收 URL**。
+    理由：要识别的图可能还没落盘 —— 老师刚框选完、题还没保存；即便已落盘，
+    让后端去反查「这个 URL 对应磁盘上哪个文件」也只是多一处会错的地方。
+    前端多走一步 fetch → FileReader，换来后端完全不关心图片从哪来。
+    """
+
+    image: str
+    mode: str = "question"          # question（题干）/ formula（纯公式）
+    hint: Optional[str] = None      # 老师额外给的一句话提示，可空
+
+
 class DimIn(BaseModel):
     name: str
     curriculum_id: Optional[int] = None
@@ -354,3 +377,30 @@ class HomeworkIn(BaseModel):
     status: str = "submitted"
     note: Optional[str] = None
     scores: List[HomeworkScoreIn] = Field(default_factory=list)
+
+
+# ============================================================ 出卷样式
+class PaperTemplateIn(BaseModel):
+    """卷种样式模板。三个字段的形状见 services/paper_style.py。
+
+    都不给默认值而是 Optional：**没传 = 不改这一块**。
+    这是有意的 —— 只改名字时不该把排版一起重置回默认值。
+    （新建时三个都不传，等于建一套全默认的模板，也是有效的用法。）
+
+    sections 是列表、paper/style 是字典，类型分开写：混成一个 dict 的话，
+    前端传错形状只会在渲染时才炸，而那时候已经过了一层 HTTP。
+    """
+
+    name: str = ""
+    paper: Optional[Dict[str, Any]] = None
+    style: Optional[Dict[str, Any]] = None
+    sections: Optional[List[Dict[str, Any]]] = None
+    sample: str = ""
+    sort_order: int = 0
+
+
+class PaperTemplateCopyIn(BaseModel):
+    """由现有模板复制一份（含一份全默认的空模板：source_id 不传即可）。"""
+
+    source_id: Optional[int] = None
+    name: str = ""

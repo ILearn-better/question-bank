@@ -4,7 +4,7 @@
 // 后者是录题页正在用的、返回纯数组的旧接口；出卷要多条件 + 分页 + 「共 N 题」，
 // 诉求不同，硬改那个接口会把录题页一起弄坏。
 import { computed, onMounted, reactive, ref, watch } from 'vue';
-import { curriculumApi, papersApi } from '../api.js';
+import { curriculumApi, papersApi, paperTemplatesApi } from '../api.js';
 import { fail, loadCurricula, ok, state } from '../store.js';
 
 const QTYPES = ['选择题', '填空题', '解答题', '判断题', '证明题', '应用题', '图片题'];
@@ -36,9 +36,38 @@ export default {
     const tagOptions = ref([]);       // 库里实际用过的标签
     const picked = ref([]);           // 已选题目，顺序即卷面顺序
     const title = ref(todayTitle());
+    const templates = ref([]);        // 卷种样式（四套内置 + 自己复制的）
+    const templateId = ref('');       // '' = 用默认样式（跟加样式功能之前一致）
     const opts = reactive({
       show_answer: true, show_analysis: false, show_tags: true, show_meta: true,
+      // 题目呈现：整卷覆盖「每道题自己存的偏好」（录题页「出卷时用」那个）。
+      // auto = 各按各的走，与加这个选项之前的行为一致。
+      render_mode: 'auto',
     });
+
+    /** 拉卷种样式。失败不阻塞出卷 —— 拿不到模板就只能用默认样式，
+     *  这比「整页打不开」好得多，所以这里只提示、不抛。 */
+    async function loadTemplates() {
+      try {
+        const r = await paperTemplatesApi.list();
+        templates.value = r.items || [];
+      } catch (e) {
+        fail(`卷种样式加载失败（仍可用默认样式出卷）：${e.message}`);
+      }
+    }
+
+    /** 当前选中的模板对象，用来在下拉下面显示抬头预览。 */
+    const currentTemplate = computed(
+      () => templates.value.find(t => t.id === templateId.value) || null,
+    );
+
+    /** 「题目呈现」那一行的解释。三种选择各说各的话 ——
+     *  老师最怕的是「我选了图片，怎么这道题是空的」，所以每条都在讲退回规则。 */
+    const renderModeHint = computed(() => ({
+      auto: '按每道题自己存的偏好走（录题时「出卷时用」选的那个）：有文本用文本、没文本用图。',
+      text: '整卷都印识别出来的文本；哪道题没有文本，会自动退回印它的原貌图，不会印出空白题。',
+      image: '整卷都印原貌图；哪道题没截过图，会自动退回印文本。',
+    }[opts.render_mode]));
 
     /** 知识点选项：**所有**体系的节点（按体系分组）+ 题库里已用过的名字。
      *
@@ -171,10 +200,13 @@ export default {
         ids: pickedIds.value.join(','),
         format: kind,
         title: title.value,
+        // 不选模板 = 不传这个参数 = 服务端用默认样式，与加模板功能之前完全一致
+        template_id: templateId.value || undefined,
         show_answer: String(opts.show_answer),
         show_analysis: String(opts.show_answer && opts.show_analysis),
         show_tags: String(opts.show_tags),
         show_meta: String(opts.show_meta),
+        render_mode: opts.render_mode,
       }), '_blank');
     }
 
@@ -207,12 +239,14 @@ export default {
       await loadCurricula();
       loadKpOptions();
       loadTags();
+      loadTemplates();
       search();
     });
 
     return {
       state, filter, rows, total, loading, kpGroups, picked, pickedIds,
       title, opts, QTYPES, DIFFS, pageNo, pageCount, tagOptions,
+      templates, templateId, currentTemplate, renderModeHint,
       search, resetFilter, add, addPage, remove, clearPicked, move,
       isPicked, open, brief, prev, next, toggleTag, setVersion,
     };
@@ -361,6 +395,42 @@ export default {
           </div>
 
           <div class="field">
+            <label>卷种样式</label>
+            <select v-model="templateId">
+              <option value="">默认样式（不套模板）</option>
+              <option v-for="t in templates" :key="t.id" :value="t.id">
+                {{ t.name }}{{ t.is_builtin ? '' : '（自定义）' }}
+              </option>
+            </select>
+            <p v-if="currentTemplate" class="muted"
+               style="font-size:12px;margin:6px 0 0;line-height:1.6">
+              <template v-if="currentTemplate.paper.subtitle">{{ currentTemplate.paper.subtitle }}<br></template>
+              <template v-if="currentTemplate.paper.exam_note">{{ currentTemplate.paper.exam_note }}<br></template>
+              <template v-if="currentTemplate.sections.length">分 {{ currentTemplate.sections.length }} 个区：{{
+                currentTemplate.sections.map(s => s.title).join(' / ') }}</template>
+              <template v-if="currentTemplate.sample">示例：{{ currentTemplate.sample }}</template>
+            </p>
+          </div>
+
+          <div class="field">
+            <label>题目呈现</label>
+            <div class="chips">
+              <span class="chip" :class="{ on: opts.render_mode === 'auto' }"
+                    @click="opts.render_mode = 'auto'"
+                    title="按每道题自己存的偏好走">自动（按每题）</span>
+              <span class="chip" :class="{ on: opts.render_mode === 'text' }"
+                    @click="opts.render_mode = 'text'"
+                    title="整卷都印识别出来的文本">全部用文本</span>
+              <span class="chip" :class="{ on: opts.render_mode === 'image' }"
+                    @click="opts.render_mode = 'image'"
+                    title="整卷都印原貌截图">全部用图片</span>
+            </div>
+            <p class="muted" style="font-size:12px;line-height:1.6;margin:6px 0 0">
+              {{ renderModeHint }}
+            </p>
+          </div>
+
+          <div class="field">
             <label>版本</label>
             <div class="chips">
               <span class="chip" :class="{ on: !opts.show_answer }"
@@ -397,6 +467,8 @@ export default {
           <p class="muted" style="font-size:12px;line-height:1.6;margin:0 0 12px">
             文件名会带版本（<code>…_学生版.pdf</code> / <code>…_教师版.pdf</code>）——
             两份同名文件是「把教师版发给学生」的头号原因。<br>
+            <b>卷种样式</b>决定抬头、字号、页边距、题号形态，以及按题型/难度分区
+            （高考的「一、选择题」、DSE 的「Section A(1)」）——同一批题换个样式就是另一份卷子。<br>
             「预览 / 打印」出的是 HTML：公式在浏览器里渲染好，Ctrl+P 直接存成 PDF。<br>
             Word / PDF 由服务端排版，<b>公式会显示成 $…$ 原文</b>（服务端没有 LaTeX 引擎）。
           </p>
