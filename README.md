@@ -130,7 +130,7 @@ cd question-bank/backend
 ```bash
 cd question-bank/backend
 
-# 1. 建虚拟环境（实测用 Python 3.13 可正常跑通；3.9+ 均可）
+# 1. 建虚拟环境（实测 Python 3.13 与 3.12.10 都能跑通；3.9+ 均可）
 python -m venv .venv
 
 # 2. 装依赖 —— 必须带国内镜像，否则会卡死（原因见下方说明）
