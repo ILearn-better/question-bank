@@ -57,6 +57,26 @@ const LIBS = {
 
 let libsPromise = null;
 
+/** 把 LaTeX 惯用的 \(…\) / \[…\] 归一成 $…$ / $$…$$。
+ *
+ *  为什么必须放在 marked **之前**：Markdown 里 `\(` 是「转义的左括号」，
+ *  marked 会把反斜杠吃掉 —— 等轮到 KaTeX 时它已经变成 `(x)` 了，
+ *  光在 auto-render 那边多配几个定界符是没用的（实测就是这个原因渲染不出来）。
+ *  后端导出（services/notes_export.py 的 normalize_math）有一份等价实现，
+ *  改一处要记得改另一处 —— 不然会出现「预览能渲染、导出的 Word 里还是原文」。
+ *
+ *  代码块与行内代码里的内容**不动**：那是要展示的代码本身，改写它才是错的。
+ */
+function normalizeMath(md) {
+  const conv = (s) => s
+    .replace(/\\\[([\s\S]+?)\\\]/g, (m, tex) => `$$${tex}$$`)
+    .replace(/\\\(([\s\S]+?)\\\)/g, (m, tex) => `$${tex}$`);
+  const inText = (seg) => seg.split(/(`[^`\n]*`)/)
+    .map((p, i) => (i % 2 ? p : conv(p))).join('');
+  return String(md || '').split(/(```[\s\S]*?```)/)
+    .map((s, i) => (i % 2 ? s : inText(s))).join('');
+}
+
 function loadScript(src) {
   return new Promise((resolve, reject) => {
     const s = document.createElement('script');
@@ -168,8 +188,14 @@ export default {
     const keyword = ref('');
     const cur = ref(null);                 // 当前打开的笔记（含 content / ink）
     const mode = ref('split');             // split | edit | preview
-    const showFormula = ref(true);
-    const saveState = ref('idle');         // idle | dirty | saving | saved | error
+    // 左侧笔记树列可收起（跟「公式速查」一样）；状态存在本机，刷新后保持。
+    const SIDE_KEY = 'shike.notes.side';
+    const showSide = ref(localStorage.getItem(SIDE_KEY) !== '0');
+    function toggleSide() {
+      showSide.value = !showSide.value;
+      try { localStorage.setItem(SIDE_KEY, showSide.value ? '1' : '0'); } catch (e) { /* 忽略 */ }
+    }
+    const showFormula = ref(true);    const saveState = ref('idle');         // idle | dirty | saving | saved | error
 
     const outline = ref([]);               // [{id, level, text}] 从渲染后的 DOM 扫出来
     const activeHeading = ref('');
@@ -194,6 +220,7 @@ export default {
     const content = computed(() => (cur.value ? cur.value.content : ''));
     const hasNote = computed(() => !!cur.value);
     const libState = ref('idle');           // idle | loading | ready | error
+    const libError = ref('');               // 失败时记下是哪个文件没加载上
     const markdownReady = computed(() => libState.value === 'ready');
 
     // ---- 导出（Word / PDF）----
@@ -906,13 +933,14 @@ export default {
     function render() {
       const el = previewEl.value;
       if (!el || !cur.value) return;
-      const md = cur.value.content || '';
+      const src = cur.value.content || '';
 
       if (!window.marked) {                 // CDN 没加载上：退成纯文本，别白屏
-        el.textContent = md;
+        el.textContent = src;               // 注意这里给**原文**：没渲染时不该连内容都被改写
         outline.value = [];
         return;
       }
+      const md = normalizeMath(src);
       const raw = window.marked.parse(md, { breaks: true, gfm: true });
       el.innerHTML = window.DOMPurify ? window.DOMPurify.sanitize(raw) : raw;
 
@@ -920,9 +948,14 @@ export default {
       if (window.renderMathInElement) {
         try {
           window.renderMathInElement(el, {
+            // 除 $…$ / $$…$$ 外，也认 LaTeX 惯用的 \(…\) 与 \[…\] ——
+            // 从别处（讲义/网页/PDF 复制）粘过来常常是那种写法，
+            // 只认 $ 的话用户看到的就是一段带反斜杠的原文，很难自己猜出原因。
             delimiters: [
               { left: '$$', right: '$$', display: true },
+              { left: '\\[', right: '\\]', display: true },
               { left: '$', right: '$', display: false },
+              { left: '\\(', right: '\\)', display: false },
             ],
             throwOnError: false,
           });
@@ -1201,6 +1234,23 @@ export default {
 
     /* ================= 生命周期 ================= */
     let ro = null;
+    let zenMemo = null;          // 进全屏前的两侧栏状态（退出时恢复）
+
+    /** 加载 Markdown / 公式库。失败必须能重试：libsPromise 是个模块级缓存，
+     *  一旦 reject 就一直 reject —— 不重置的话，页面内切来切去永远好不了，
+     *  只能整页刷新（用户看到的就是「公式怎么都不渲染」）。 */
+    function initLibs() {
+      libState.value = 'loading';
+      libError.value = '';
+      ensureLibs()
+        .then(() => { libState.value = 'ready'; if (cur.value) render(); })
+        .catch((e) => {
+          libState.value = 'error';
+          libError.value = e && e.message ? e.message : '加载失败';
+          libsPromise = null;            // 允许重试（下次点「重试」真的会再去拉）
+        });
+    }
+
     function onResize() {
       sizeCanvas();
       redraw();
@@ -1209,10 +1259,7 @@ export default {
     onMounted(async () => {
       // 渲染依赖这几个库，所以先加载、加载完再渲染一次：在这之前会退成纯文本，
       // 不会先闪一屏“没渲染的样子”然后才变。
-      libState.value = 'loading';
-      ensureLibs()
-        .then(() => { libState.value = 'ready'; if (cur.value) render(); })
-        .catch(() => { libState.value = 'error'; });
+      initLibs();
 
       await loadTree();
       initExpanded();
@@ -1230,6 +1277,17 @@ export default {
     watch(zen, (v) => {
       // body 上的类是给全局 CSS 用的（要藏掉 App 里的左侧导航）
       document.body.classList.toggle('notes-zen', v);
+      // 进全屏时**先收起**两侧栏（专注），但工具栏的开关仍然有效 ——
+      // 想在全屏下继续用目录或公式速查，点一下就放回来；退出时恢复进全屏前的样子。
+      if (v) {
+        zenMemo = { side: showSide.value, formula: showFormula.value };
+        showSide.value = false;
+        showFormula.value = false;
+      } else if (zenMemo) {
+        showSide.value = zenMemo.side;
+        showFormula.value = zenMemo.formula;
+        zenMemo = null;
+      }
       refreshCanvasLater();
     });
 
@@ -1280,7 +1338,7 @@ export default {
       showPickQ, pickingQ, pickNextIndex, insertQuestions,
       toggleInk, inkDown, inkMove, inkUp, undoInk, clearInk,
       showExport, includeInk, exportWithAnswer, exporting, caps, doExport,
-      zen, toggleZen,
+      zen, toggleZen, showSide, toggleSide, libError, initLibs,
       saveNow: flushSave,
     };
   },
@@ -1291,9 +1349,9 @@ export default {
       <span class="sub">Markdown 正文 · 公式实时渲染 · 插图 · 板书笔画</span>
     </div>
 
-    <div class="notes-grid" :class="{ zen, 'with-formula': showFormula && hasNote && !zen }">
+    <div class="notes-grid" :class="{ zen, 'with-side': showSide, 'with-formula': showFormula && hasNote }">
       <!-- ============ 左：目录树 + 目录 ============ -->
-      <div class="notes-side" v-if="!zen">
+      <div class="notes-side" v-if="showSide">
         <div class="card nb-card" @click="closeMenu">
           <!-- 工具栏：新建落在「选中的目录」；搜索一开就切成平铺结果 -->
           <div class="nb-tools">
@@ -1437,6 +1495,10 @@ export default {
             <button class="btn sm" :class="{ primary: inkOn }" @click="toggleInk">
               {{ inkOn ? '关闭画笔' : '画笔' }}
             </button>
+            <button class="btn sm" :class="{ primary: showSide }" @click="toggleSide"
+                    :title="showSide ? '收起左侧笔记列表' : '展开左侧笔记列表'">
+              {{ showSide ? '收起侧栏' : '展开侧栏' }}
+            </button>
             <button class="btn sm" :class="{ primary: showFormula }" @click="showFormula = !showFormula">
               公式速查
             </button>
@@ -1476,9 +1538,11 @@ export default {
           <div v-if="libState === 'loading'" class="muted" style="font-size:12px;margin-bottom:6px">
             正在加载 Markdown / 公式库…
           </div>
-          <div v-else-if="libState === 'error'" class="muted" style="font-size:12px;margin-bottom:6px">
-            ⚠️ Markdown / 公式库没加载上（多半是网络问题）—— 正文照样能编辑保存，
-            但只按纯文本显示，公式也不会渲染。刷新重试。
+          <div v-if="libState === 'error'" class="muted"
+               style="font-size:12px;margin-bottom:6px;display:flex;align-items:center;gap:8px">
+            <span>⚠️ Markdown / 公式库没加载上（{{ libError }}）—— 正文照样能编辑保存，
+            但只按纯文本显示，公式也不会渲染。</span>
+            <button class="btn sm" @click="initLibs">重试</button>
           </div>
 
           <div class="notes-body" :class="{ split: mode === 'split' }">
@@ -1497,7 +1561,7 @@ export default {
       </div>
 
       <!-- ============ 右：公式速查 ============ -->
-      <div v-if="showFormula && hasNote && !zen" class="card notes-formula">
+      <div v-if="showFormula && hasNote" class="card notes-formula">
         <h2>公式速查</h2>
         <div class="muted" style="font-size:11.5px;margin-bottom:10px">
           点一下就插到光标处，光标停在空位上。行内用 <code>$…$</code>，独立一行用 <code>$$…$$</code>。

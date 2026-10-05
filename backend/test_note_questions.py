@@ -205,6 +205,22 @@ check("manifest 记了图片数量", man.get("counts", {}).get("images"), 2)
 check("manifest 版本 >= 2", man.get("version", 0) >= 2)
 check("没有任何 /api/crops/ 泄漏进备份", "/api/crops/" in " ".join(names), False)
 
+print("==== ⑥ LaTeX 惯用写法 \\(…\\) / \\[…\\] 也要能出公式 ====")
+# 这条同时守着两件事：归一化在解析前生效（否则反斜杠先被吃掉）、
+# 并且真的走到了公式管线（导出的正文里不该留 \\( 原文）。
+st, mnote = req("POST", "/api/notes", {"title": "公式写法测试",
+                                       "content": "行内 \\(x^2+1\\) 与独立 \\[\\frac{a}{b}\\] 结束"})
+check("建笔记 200", st, 200)
+mid = mnote["id"]
+st, mdoc = raw(f"/api/notes/{mid}/export?format=docx&with_answer=true")
+check("导出 200", st, 200)
+mt = docx_text(mdoc)
+check("导出里没有 \\( 原文（归一化生效了）", "\\(" in mt, False)
+check("导出里没有 \\[ 原文", "\\[" in mt, False)
+check("公式没有整段丢掉（文字还在）", "行内" in mt and "结束" in mt)
+st, back = req("GET", f"/api/notes/{mid}")
+check("正文里仍然是用户写的 \\( \\) 原文（不改用户的内容）", "\\(" in back["content"])
+
 print()
 if fails:
     print(f"❌ {len(fails)} 项没过：" + "；".join(fails))

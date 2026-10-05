@@ -62,6 +62,18 @@ a { color: var(--primary); text-decoration: none; }
 
 .sidebar .foot { margin-top: auto; padding: 10px 8px 0; font-size: 11px; color: var(--text-3); }
 
+/* 侧栏折叠按钮：平时很淡，鼠标进侧栏才明显 —— 它是个「偶尔用一次」的东西，
+   不该跟导航条目争注意力。 */
+.nav-toggle {
+  position: absolute; top: 10px; right: 8px; width: 22px; height: 22px; padding: 0;
+  border: 1px solid var(--border); border-radius: 4px; background: var(--panel-2);
+  color: var(--text-3); font-size: 12px; line-height: 1; cursor: pointer; opacity: .45;
+}
+.sidebar:hover .nav-toggle { opacity: 1; }
+.nav-toggle:hover { color: var(--text); background: var(--border); }
+.layout.nav-collapsed .sidebar { width: 46px; padding: 12px 8px; }
+.layout.nav-collapsed .sidebar .nav-toggle { position: static; opacity: 1; }
+
 .content { flex: 1; min-width: 0; padding: 20px 24px 48px; }
 .page-head { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; flex-wrap: wrap; }
 .page-head h1 { font-size: 19px; margin: 0; font-weight: 600; }
@@ -227,13 +239,30 @@ table.tbl tr.clickable:hover { background: var(--panel-2); cursor: pointer; }
 .toast.ok { background: var(--success); }
 
 /* ---------------- 笔记 ---------------- */
+/* 左边笔记树列现在是**可收放的**（工具栏「侧栏」），所以列数由类名决定：
+   有没有左列看 .with-side、有没有右列看 .with-formula，两者的四种组合都写清楚。 */
 .notes-grid {
   display: grid; gap: 14px; align-items: start;
-  grid-template-columns: minmax(0, 250px) minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr);
 }
-.notes-grid.with-formula { grid-template-columns: minmax(0, 230px) minmax(0, 1fr) minmax(0, 218px); }
-@media (max-width: 1200px) { .notes-grid.with-formula { grid-template-columns: minmax(0, 230px) minmax(0, 1fr); } }
-@media (max-width: 900px) { .notes-grid, .notes-grid.with-formula { grid-template-columns: 1fr; } }
+.notes-grid.with-side { grid-template-columns: minmax(0, 250px) minmax(0, 1fr); }
+.notes-grid.with-formula { grid-template-columns: minmax(0, 1fr) minmax(0, 218px); }
+.notes-grid.with-side.with-formula {
+  grid-template-columns: minmax(0, 230px) minmax(0, 1fr) minmax(0, 218px);
+}
+/* 窄窗口自动让出空间 —— **但只限非全屏**：全屏是用户主动选的专注模式，
+   它自己知道还剩多少地方（见下面 body.notes-zen 那段）。 */
+@media (max-width: 1200px) {
+  body:not(.notes-zen) .notes-grid.with-side.with-formula {
+    grid-template-columns: minmax(0, 230px) minmax(0, 1fr);
+  }
+}
+@media (max-width: 900px) {
+  body:not(.notes-zen) .notes-grid.with-side,
+  body:not(.notes-zen) .notes-grid.with-side.with-formula {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
 .notes-side { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
 .notes-main { min-width: 0; }
 
@@ -324,11 +353,26 @@ table.tbl tr.clickable:hover { background: var(--panel-2); cursor: pointer; }
    工具栏保留 —— 退出全屏、切编辑/分栏/预览、看保存状态都要用它。 */
 body.notes-zen .sidebar { display: none; }
 body.notes-zen .content { padding: 0; }
+/* 全屏时列数由上面的组合类决定（用户可以自己把侧栏放回来），这里只收紧间距。
+   注意**不能加纵向 padding**：下面 .notes-main 是 100vh，多出几像素页面就能滚。 */
 body.notes-zen .notes-grid,
-body.notes-zen .notes-grid.with-formula { grid-template-columns: minmax(0, 1fr); gap: 0; }
+body.notes-zen .notes-grid.with-side,
+body.notes-zen .notes-grid.with-formula,
+body.notes-zen .notes-grid.with-side.with-formula { gap: 10px; }
+/* 🔴 分栏在全屏下**必须**是并排两栏：
+   原来跟着窗口宽度退化（≤1100px 变上下堆叠），结果 1024px 窗口全屏时
+   编辑区被挤成 74px 高的一条、预览在下面，两块同一个页面流 —— 一滚就一起动。
+   全屏本来就没有侧栏，横向空间够，所以这条用更高优先级把它钉死。 */
+body.notes-zen .notes-body.split {
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
+}
 body.notes-zen .notes-main {
   border: none; border-radius: 0; box-shadow: none; background: var(--panel);
-  min-height: 100vh; display: flex; flex-direction: column;
+  /* 必须是**确定高度**：原来写 min-height: 100vh，而下面 .notes-body 是 flex:1，
+     父高度不确定时 1fr 会退回按内容撑开 —— 页面比视口高两百多像素，
+     在全屏里滚轮先把整页推走，看起来就像「编辑区把预览一起带跑了」。 */
+  height: 100vh; min-height: 0; display: flex; flex-direction: column;
 }
 body.notes-zen .notes-toolbar {
   margin: 0; padding: 8px 14px; border-bottom: 1px solid var(--border); flex: none;

@@ -109,8 +109,37 @@ def _parse_inline(text: str, formulas: list[str]) -> list[dict]:
     return out
 
 
+_BACKSLASH_MATH_RE = re.compile(r"\\\[([\s\S]+?)\\\]|\\\(([\s\S]+?)\\\)")
+
+
+def normalize_math(md: str) -> str:
+    """把 LaTeX 惯用的 \\(…\\) / \\[…\\] 归一成 $…$ / $$…$$。
+
+    为什么必须在解析**之前**做：Markdown 里 `\\(` 是「转义的左括号」，渲染器会把反斜杠
+    吃掉 —— 从讲义/网页粘过来的公式到这里已经变成 `(x)`，光在公式那边多配定界符是没用的。
+    前端预览（views/Notes.js 的 normalizeMath）有一份等价实现，改一处要记得改另一处。
+
+    代码块与行内代码里的内容**不动**：那是要展示的代码本身，改写它才是错的。
+    """
+    def conv(s: str) -> str:
+        def repl(m: re.Match) -> str:
+            tex = m.group(1) if m.group(1) is not None else m.group(2)
+            return f"$${tex}$$" if m.group(1) is not None else f"${tex}$"
+        return _BACKSLASH_MATH_RE.sub(repl, s)
+
+    def map_outside_code(seg: str) -> str:
+        # 行内代码 `…` 按奇偶段分：奇数段是代码，原样保留
+        parts = re.split(r"(`[^`\n]*`)", seg)
+        return "".join(p if i % 2 else conv(p) for i, p in enumerate(parts))
+
+    # 围栏代码块 ```…``` 切段，偶数段是正文
+    fenced = re.split(r"(```[\s\S]*?```)", md or "")
+    return "".join(s if i % 2 else map_outside_code(s) for i, s in enumerate(fenced))
+
+
 def _parse_blocks(md: str, formulas: list[str]) -> list[dict]:
     """Markdown -> 块列表。公式（行内与独立）登记进 formulas。"""
+    md = normalize_math(md)
     lines = (md or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
     blocks: list[dict] = []
     i = 0

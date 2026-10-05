@@ -192,7 +192,14 @@ check("包里带上了配图", f"images/{img_name}" in n2)
 check("包里带上了人读的 .md（按目录分级）",
       any(x.startswith("notes/DSE 数学/一、有理数/1.1 认识有理数/") for x in n2), True)
 p2 = json.loads(z2.read("notes.json"))
-check("目录记录在包里", [f["path"] for f in p2["folders"]], ["一、有理数", "一、有理数/1.1 认识有理数"])
+# ⚠️ 不能断言「目录列表完全等于我建的那两个」：临时库里还有从真库导进来的目录，
+#    而真库是活的（用户随时会加目录）—— 断死它迟早会假报错。
+#    改成断言「我建的那两级在里面，且先后顺序对」。
+folder_paths = [f["path"] for f in p2["folders"]]
+check("我建的两级目录都在包里",
+      ("一、有理数" in folder_paths) and ("一、有理数/1.1 认识有理数" in folder_paths), True)
+check("父目录排在子目录前面",
+      folder_paths.index("一、有理数") < folder_paths.index("一、有理数/1.1 认识有理数"), True)
 check("板书笔画也带上了", any(x["ink"] for x in p2["notes"]), True)
 md = z2.read([x for x in n2 if "带图的临时笔记" in x][0]).decode("utf-8")
 check("人读的 .md 里有正文", "这里有张图" in md)
@@ -211,7 +218,7 @@ check("临时库已清空", t["total"], 0)
 st, rep4 = upload(SCRATCH, "/api/notes-backup/import", "backup2.zip", blob2)
 check("导入成功", st, 200)
 print("  报告:", {k: v for k, v in rep4.items() if k != "warnings"})
-check("目录建回来了（2 层）", rep4["folders_created"], 2)
+check("我建的两级目录建回来了（包里还有别人的目录，不复总数）", rep4["folders_created"] >= 2)
 t, back = notes_of(SCRATCH)
 check("笔记回来了（原 5 篇 + 临时 1 篇）", t["total"], len(real_notes) + 1)
 check("配图从包里恢复了", (SCRATCH_NOTES / img_name).is_file(), True)
@@ -261,7 +268,13 @@ with zipfile.ZipFile(buf, "w") as z:
         {"format": "shike-notes", "version": 2, "exported_at": "",
          "groups": [{"name": "IB 数学", "curriculum_code": None}]}, ensure_ascii=False))
     z.writestr("notes.json", json.dumps(p3, ensure_ascii=False))
-    z.writestr(f"images/{img_name}", z2.read(f"images/{img_name}"))   # 配图一起带上，免得报“配图不在包里”
+    # 包里的**所有**配图都要带过来，不只自己那张：
+    # 这份 notes.json 是从临时库导出来的（里面还有从真库导进来的笔记），
+    # 只带一张的话，那些笔记的图就成了「引用了但不在包里」→ 导入时会报一片警告。
+    # （真库以前没图，所以这个疤一直没露出来。）
+    for name in n2:
+        if name.startswith("images/"):
+            z.writestr(name, z2.read(name))
 st, rep5 = upload(SCRATCH, "/api/notes-backup/import", "new-group.zip", buf.getvalue(), "?overwrite=true")
 check("导入成功", st, 200)
 check("建了 1 个分组", rep5["groups_created"], 1)

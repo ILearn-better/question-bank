@@ -66,6 +66,11 @@ def notes(base=S):
 
 
 print("⓪ 先把临时库清干净（这个测试必须能反复跑）")
+# 真库基线：这个套件对真库只发 GET，所以开始与结束时的数字必须一样。
+# ⚠️ 别把真库的数字写死（“应该是 3 篇”）—— 用户随时会加笔记、改体系名，
+#    那种断言迟早会假报错，而假报错会让人养成「红了也先不管」的毛病。
+real_notes_at_start = len(call(REAL, "GET", "/api/notes")[1]["items"])
+real_roots_at_start = sorted(r["name"] for r in roots(REAL))
 if SCRATCH_DB.exists():
     con = sqlite3.connect(str(SCRATCH_DB))
     con.execute("delete from notes")
@@ -165,13 +170,16 @@ rep2 = call(S, "DELETE", f"/api/note-folders/{a['id']}")[1]
 check("删目录报移走 1 篇", rep2["moved_notes"], 1)
 check("移到父目录", notes()[n3]["folder_id"], dse["id"])
 
-print("\n⑩ 真库（只读核对）：那 5 行分组还在，名字没变")
+print("\n⑩ 真库（只读核对）：分组行还在，而且全程没被我改过")
 real_roots = [r["name"] for r in roots(REAL)]
 print("     ", real_roots)
 # 「未归档」固定排最后（新规则；以前它在数据里是 sort_order=0，所以显示在最前）
-check("真库分组", real_roots,
-      ["DSE 数学", "A-Level 数学", "国内高中数学", "国内初中数学", "未归档"])
-check("真库笔记数没变", len(call(REAL, "GET", "/api/notes")[1]["items"]), 3)
+check("真库最后一行是「未归档」", real_roots[-1], "未归档")
+check("真库的体系分组还在（名字归用户改，只数个数）",
+      len([r for r in real_roots if r != "未归档"]) >= 4, True)
+check("真库分组名与开始时一字不差", sorted(real_roots), real_roots_at_start)
+check("真库笔记数没变（全程只读过它）",
+      len(call(REAL, "GET", "/api/notes")[1]["items"]), real_notes_at_start)
 
 print()
 print("ALL PASS" if not fails else f"{len(fails)} 项失败: {fails}")

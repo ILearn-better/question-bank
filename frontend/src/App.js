@@ -1,10 +1,19 @@
 // 应用外壳：左侧导航 + 内容区 + 消息提示。
-import { onMounted } from 'vue';
+import { onMounted, ref } from 'vue';
 import { loadCurricula, loadDims, loadStudents, state, toasts } from './store.js';
+
+const NAV_KEY = 'shike.navCollapsed';
 
 export default {
   name: 'App',
   setup() {
+    // 侧栏可收起：小屏幕上腾地方。状态存在本机，刷新后保持原样。
+    const navCollapsed = ref(localStorage.getItem(NAV_KEY) === '1');
+    function toggleNav() {
+      navCollapsed.value = !navCollapsed.value;
+      try { localStorage.setItem(NAV_KEY, navCollapsed.value ? '1' : '0'); } catch (e) { /* 无痕模式等，忽略 */ }
+    }
+
     onMounted(() => {
       // 体系与能力维度是全站共用的基础数据，启动时各取一次。
       // 学生列表也要取 —— 侧栏的「共 N 位学生」读的是它，
@@ -13,11 +22,14 @@ export default {
       loadDims().catch(() => {});
       loadStudents().catch(() => {});
     });
-    return { toasts, state };
+    return { toasts, state, navCollapsed, toggleNav };
   },
   template: `
-  <div class="layout">
+  <div class="layout" :class="{ 'nav-collapsed': navCollapsed }">
     <aside class="sidebar">
+      <button class="nav-toggle" @click="toggleNav"
+              :title="navCollapsed ? '展开侧栏' : '收起侧栏'">{{ navCollapsed ? '»' : '«' }}</button>
+      <template v-if="!navCollapsed">
       <div class="brand">
         <div class="name">拾课</div>
         <div class="en">SHIKE</div>
@@ -34,6 +46,7 @@ export default {
       <div class="foot">
         数据存在本机<br>共 {{ state.students.length }} 位学生
       </div>
+      </template>
     </aside>
 
     <main class="content">
