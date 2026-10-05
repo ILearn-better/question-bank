@@ -1,8 +1,11 @@
 // 笔记：Markdown 正文 + 板书笔画 + 配图。
 //
-// 三栏：左边（笔记列表 + 本笔记目录）／中间（编辑·预览·分栏）／右边（公式速查，可收起）。
+// 三栏：左边（笔记列表）／中间（编辑·预览·分栏）／右边（本文目录 + 公式速查，各自可收起）。
 //
 // 几个刻意的决定，写下来免得以后自己都忘了为什么：
+//   · 「本文目录」在**右**边（用户 2026-10-05 提的）：它是给预览导航用的，
+//     挨着正文比压在左侧笔记列表那栏里顺手；两个侧栏区块各自有开关，
+//     列数由类名决定（with-side / with-right），不跟「哪个模式」硬绑。
 //   · 目录是从**渲染后的 DOM** 里扫 <h1..h6> 得到的，不是用正则去解析 Markdown。
 //     正则会被代码块里的 "#" 骗到，而且一旦和渲染器对不上就永远不同步。
 //   · 笔画存矢量（坐标归一化到 0~1），不存位图：橡皮、换色、调粗细、撤销
@@ -195,7 +198,14 @@ export default {
       showSide.value = !showSide.value;
       try { localStorage.setItem(SIDE_KEY, showSide.value ? '1' : '0'); } catch (e) { /* 忽略 */ }
     }
-    const showFormula = ref(true);    const saveState = ref('idle');         // idle | dirty | saving | saved | error
+    const showFormula = ref(true);
+    // 「本文目录」（从渲染后的 DOM 扫出来的 h1..h6）放在**右**边，默认开。
+    const OUTLINE_KEY = 'shike.notes.outline';
+    const showOutline = ref(localStorage.getItem(OUTLINE_KEY) !== '0');
+    function toggleOutline() {
+      showOutline.value = !showOutline.value;
+      try { localStorage.setItem(OUTLINE_KEY, showOutline.value ? '1' : '0'); } catch (e) { /* 忽略 */ }
+    }    const saveState = ref('idle');         // idle | dirty | saving | saved | error
 
     const outline = ref([]);               // [{id, level, text}] 从渲染后的 DOM 扫出来
     const activeHeading = ref('');
@@ -1280,12 +1290,14 @@ export default {
       // 进全屏时**先收起**两侧栏（专注），但工具栏的开关仍然有效 ——
       // 想在全屏下继续用目录或公式速查，点一下就放回来；退出时恢复进全屏前的样子。
       if (v) {
-        zenMemo = { side: showSide.value, formula: showFormula.value };
+        zenMemo = { side: showSide.value, formula: showFormula.value, outline: showOutline.value };
         showSide.value = false;
         showFormula.value = false;
+        showOutline.value = false;
       } else if (zenMemo) {
         showSide.value = zenMemo.side;
         showFormula.value = zenMemo.formula;
+        showOutline.value = zenMemo.outline;
         zenMemo = null;
       }
       refreshCanvasLater();
@@ -1339,6 +1351,7 @@ export default {
       toggleInk, inkDown, inkMove, inkUp, undoInk, clearInk,
       showExport, includeInk, exportWithAnswer, exporting, caps, doExport,
       zen, toggleZen, showSide, toggleSide, libError, initLibs,
+      showOutline, toggleOutline,
       saveNow: flushSave,
     };
   },
@@ -1349,8 +1362,9 @@ export default {
       <span class="sub">Markdown 正文 · 公式实时渲染 · 插图 · 板书笔画</span>
     </div>
 
-    <div class="notes-grid" :class="{ zen, 'with-side': showSide, 'with-formula': showFormula && hasNote }">
-      <!-- ============ 左：目录树 + 目录 ============ -->
+    <div class="notes-grid" :class="{ zen, 'with-side': showSide,
+                                    'with-right': hasNote && (showOutline || showFormula) }">
+      <!-- ============ 左：笔记列表（目录树） ============ -->
       <div class="notes-side" v-if="showSide">
         <div class="card nb-card" @click="closeMenu">
           <!-- 工具栏：新建落在「选中的目录」；搜索一开就切成平铺结果 -->
@@ -1459,18 +1473,6 @@ export default {
             <br>最上层是分组（DSE 数学、IB 数学这类）—— 那是笔记自己的分类，跟体系无关联，随便建与改。
           </div>
         </div>
-
-        <div class="card">
-          <h2>目录</h2>
-          <div v-if="!hasNote" class="muted" style="font-size:12px">打开一篇笔记后显示</div>
-          <div v-else-if="!outline.length" class="muted" style="font-size:12px">
-            正文里写 <code># 标题</code>，这里会自动列出来
-          </div>
-          <div v-for="h in outline" :key="h.id" class="toc-item"
-               :class="{ on: h.id === activeHeading }"
-               :style="{ paddingLeft: (8 + (h.level - 1) * 11) + 'px' }"
-               @click="scrollToHeading(h.id)">{{ h.text }}</div>
-        </div>
       </div>
 
       <!-- ============ 中：编辑 / 预览 ============ -->
@@ -1498,6 +1500,10 @@ export default {
             <button class="btn sm" :class="{ primary: showSide }" @click="toggleSide"
                     :title="showSide ? '收起左侧笔记列表' : '展开左侧笔记列表'">
               {{ showSide ? '收起侧栏' : '展开侧栏' }}
+            </button>
+            <button class="btn sm" :class="{ primary: showOutline }" @click="toggleOutline"
+                    :title="showOutline ? '收起右侧目录' : '展开右侧目录'">
+              目录
             </button>
             <button class="btn sm" :class="{ primary: showFormula }" @click="showFormula = !showFormula">
               公式速查
@@ -1560,16 +1566,35 @@ export default {
         </template>
       </div>
 
-      <!-- ============ 右：公式速查 ============ -->
-      <div v-if="showFormula && hasNote" class="card notes-formula">
-        <h2>公式速查</h2>
-        <div class="muted" style="font-size:11.5px;margin-bottom:10px">
-          点一下就插到光标处，光标停在空位上。行内用 <code>$…$</code>，独立一行用 <code>$$…$$</code>。
+      <!-- ============ 右：本文目录 + 公式速查（各自可收起） ============
+           目录从左侧挪到这里（用户 2026-10-05 提的）：它是给预览导航用的，
+           挨着正文比压在左侧笔记列表那栏里顺手。两块各自有开关，
+           都关掉时这一列整个消失（列数由 with-right 类决定，不留空列）。 -->
+      <div v-if="hasNote && (showOutline || showFormula)" class="notes-right">
+        <div v-if="showOutline" class="card">
+          <h2>目录</h2>
+          <div v-if="!outline.length" class="muted" style="font-size:12px">
+            正文里写 <code># 标题</code>，这里会自动列出来
+          </div>
+          <div class="notes-toc">
+            <div v-for="h in outline" :key="h.id" class="toc-item"
+                 :class="{ on: h.id === activeHeading }"
+                 :style="{ paddingLeft: (8 + (h.level - 1) * 11) + 'px' }"
+                 @click="scrollToHeading(h.id)">{{ h.text }}</div>
+          </div>
         </div>
-        <div v-for="g in snippets" :key="g.title" class="fx-group">
-          <div class="fx-title">{{ g.title }}</div>
-          <div class="fx-items">
-            <span v-for="(s, i) in g.items" :key="i" class="fx-item" @click="insertSnippet(s)">{{ s.label }}</span>
+
+        <div v-if="showFormula" class="card notes-formula">
+          <h2>公式速查</h2>
+          <div class="muted" style="font-size:11.5px;margin-bottom:10px">
+            点一下就插到光标处，光标停在空位上。行内用 <code>$…$</code>，独立一行用 <code>$$…$$</code>；
+            从别处粘来的 <code>\\(…\\)</code> 写法也认。
+          </div>
+          <div v-for="g in snippets" :key="g.title" class="fx-group">
+            <div class="fx-title">{{ g.title }}</div>
+            <div class="fx-items">
+              <span v-for="(s, i) in g.items" :key="i" class="fx-item" @click="insertSnippet(s)">{{ s.label }}</span>
+            </div>
           </div>
         </div>
       </div>

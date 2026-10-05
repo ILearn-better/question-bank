@@ -239,31 +239,45 @@ table.tbl tr.clickable:hover { background: var(--panel-2); cursor: pointer; }
 .toast.ok { background: var(--success); }
 
 /* ---------------- 笔记 ---------------- */
-/* 左边笔记树列现在是**可收放的**（工具栏「侧栏」），所以列数由类名决定：
-   有没有左列看 .with-side、有没有右列看 .with-formula，两者的四种组合都写清楚。 */
+/* 左侧笔记列表列与右侧栏（本文目录 + 公式速查）都是**可收放的**，所以列数由类名决定：
+   有没有左列看 .with-side、有没有右列看 .with-right，四种组合都写清楚。
+   （以前右列类名是 with-formula —— 现在右列里还装本文目录，名字改了以免误导。） */
 .notes-grid {
   display: grid; gap: 14px; align-items: start;
   grid-template-columns: minmax(0, 1fr);
 }
 .notes-grid.with-side { grid-template-columns: minmax(0, 250px) minmax(0, 1fr); }
-.notes-grid.with-formula { grid-template-columns: minmax(0, 1fr) minmax(0, 218px); }
-.notes-grid.with-side.with-formula {
+.notes-grid.with-right { grid-template-columns: minmax(0, 1fr) minmax(0, 218px); }
+.notes-grid.with-side.with-right {
   grid-template-columns: minmax(0, 230px) minmax(0, 1fr) minmax(0, 218px);
 }
-/* 窄窗口自动让出空间 —— **但只限非全屏**：全屏是用户主动选的专注模式，
-   它自己知道还剩多少地方（见下面 body.notes-zen 那段）。 */
+/* 窄窗口：把两侧栏**变窄**，但绝不把它们藏起来。
+   ⚠️ 原来这里写的是「≤1200px 直接删掉右列」—— 那会跟用户的开关打架：
+   他点了「展开目录/公式速查」，面板却因为窗口不够宽被 CSS 悄悄藏掉，
+   界面上开关是亮的、东西却不在。侧栏既然交给人管，就一路听他的。 */
 @media (max-width: 1200px) {
-  body:not(.notes-zen) .notes-grid.with-side.with-formula {
-    grid-template-columns: minmax(0, 230px) minmax(0, 1fr);
+  body:not(.notes-zen) .notes-grid.with-side {
+    grid-template-columns: minmax(0, 200px) minmax(0, 1fr);
+  }
+  body:not(.notes-zen) .notes-grid.with-right {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 190px);
+  }
+  body:not(.notes-zen) .notes-grid.with-side.with-right {
+    grid-template-columns: minmax(0, 185px) minmax(0, 1fr) minmax(0, 190px);
   }
 }
+/* 再窄就上下堆叠 —— 堆叠只是换了位置，面板仍然看得见（跟开关不冲突） */
 @media (max-width: 900px) {
   body:not(.notes-zen) .notes-grid.with-side,
-  body:not(.notes-zen) .notes-grid.with-side.with-formula {
+  body:not(.notes-zen) .notes-grid.with-side.with-right {
     grid-template-columns: minmax(0, 1fr);
   }
+  body:not(.notes-zen) .notes-toc { max-height: 22vh; }
 }
 .notes-side { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+/* 右列：目录在上、公式速查在下；两块各自有开关 */
+.notes-right { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+.notes-toc { max-height: 38vh; overflow: auto; margin: 0 -4px; padding: 0 4px; }
 .notes-main { min-width: 0; }
 
 .note-list { max-height: 42vh; overflow: auto; margin: -4px; padding: 4px; }
@@ -357,8 +371,8 @@ body.notes-zen .content { padding: 0; }
    注意**不能加纵向 padding**：下面 .notes-main 是 100vh，多出几像素页面就能滚。 */
 body.notes-zen .notes-grid,
 body.notes-zen .notes-grid.with-side,
-body.notes-zen .notes-grid.with-formula,
-body.notes-zen .notes-grid.with-side.with-formula { gap: 10px; }
+body.notes-zen .notes-grid.with-right,
+body.notes-zen .notes-grid.with-side.with-right { gap: 10px; }
 /* 🔴 分栏在全屏下**必须**是并排两栏：
    原来跟着窗口宽度退化（≤1100px 变上下堆叠），结果 1024px 窗口全屏时
    编辑区被挤成 74px 高的一条、预览在下面，两块同一个页面流 —— 一滚就一起动。
@@ -386,6 +400,11 @@ body.notes-zen .notes-preview-wrap {
   height: 100%; max-height: none; border: none; border-radius: 0;
 }
 body.notes-zen .notes-preview { min-height: 0; padding: 14px 18px; }
+/* 全屏下左右列也限高、各自内部滚 —— 否则它们会把页面撑高，
+   而全屏下页面是不该滚动的（滚轮应该只作用于当前面板）。 */
+body.notes-zen .notes-side,
+body.notes-zen .notes-right { height: 100vh; overflow: auto; }
+body.notes-zen .notes-toc { max-height: none; }
 
 /* Markdown 正文样式 —— 只覆盖必要的，不引第三方主题 */
 .notes-preview h1, .notes-preview h2, .notes-preview h3, .notes-preview h4 {
