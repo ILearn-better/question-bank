@@ -251,28 +251,45 @@ table.tbl tr.clickable:hover { background: var(--panel-2); cursor: pointer; }
 .notes-grid.with-side.with-right {
   grid-template-columns: minmax(0, 230px) minmax(0, 1fr) minmax(0, 218px);
 }
-/* 窄窗口：把两侧栏**变窄**，但绝不把它们藏起来。
-   ⚠️ 原来这里写的是「≤1200px 直接删掉右列」—— 那会跟用户的开关打架：
-   他点了「展开目录/公式速查」，面板却因为窗口不够宽被 CSS 悄悄藏掉，
-   界面上开关是亮的、东西却不在。侧栏既然交给人管，就一路听他的。 */
+/* 窄窗口：**宁可换行，不把三列挤扁**。
+   ⚠️ 这里踩过两次，两个方向都错：
+   ① 起初「≤1200px 直接删掉右列」—— 跟用户的开关打架：他点了展开，面板却被 CSS 悄悄藏掉；
+   ② 后来改成「把两侧栏变窄」—— 开关是听了，但 1024px 窗口下三列并排只剩
+      185 + 371 + 190，分栏时编辑区与预览**各 163px 宽**，看着就像「笔记显示不正常」。
+   现在：左列 + 中列并排，**右列（目录/公式速查）换到中列下方**，右列内部横着摊开。
+   三块都在、都不挤；真想回到并排，收起左列（开关）就行。全屏（zen）不受这些规则影响。 */
 @media (max-width: 1200px) {
   body:not(.notes-zen) .notes-grid.with-side {
     grid-template-columns: minmax(0, 200px) minmax(0, 1fr);
   }
   body:not(.notes-zen) .notes-grid.with-right {
-    grid-template-columns: minmax(0, 1fr) minmax(0, 190px);
+    grid-template-columns: minmax(0, 1fr); grid-template-rows: auto auto;
   }
+  body:not(.notes-zen) .notes-grid.with-right > .notes-right { grid-column: 1; grid-row: 2; }
   body:not(.notes-zen) .notes-grid.with-side.with-right {
-    grid-template-columns: minmax(0, 185px) minmax(0, 1fr) minmax(0, 190px);
+    grid-template-columns: minmax(0, 200px) minmax(0, 1fr); grid-template-rows: auto auto;
   }
+  body:not(.notes-zen) .notes-grid.with-side.with-right > .notes-right {
+    grid-column: 2; grid-row: 2;
+  }
+  /* 换到下方之后把两块横着排，不然目录+公式速查竖着堆会很长 */
+  body:not(.notes-zen) .notes-right { flex-direction: row; align-items: flex-start; }
+  body:not(.notes-zen) .notes-right > .card { flex: 1 1 0; min-width: 0; }
+  body:not(.notes-zen) .notes-toc { max-height: 20vh; }
 }
-/* 再窄就上下堆叠 —— 堆叠只是换了位置，面板仍然看得见（跟开关不冲突） */
+/* 再窄就全部上下堆叠 —— 堆叠只是换位置，面板仍然看得见（跟开关不冲突）；
+   注意把上面那两行的 grid-column/grid-row 复位，否则单列下会被撑出多余列 */
 @media (max-width: 900px) {
   body:not(.notes-zen) .notes-grid.with-side,
-  body:not(.notes-zen) .notes-grid.with-side.with-right {
-    grid-template-columns: minmax(0, 1fr);
+  body:not(.notes-zen) .notes-grid.with-side.with-right,
+  body:not(.notes-zen) .notes-grid.with-right {
+    grid-template-columns: minmax(0, 1fr); grid-template-rows: none;
   }
-  body:not(.notes-zen) .notes-toc { max-height: 22vh; }
+  body:not(.notes-zen) .notes-grid.with-side.with-right > .notes-right,
+  body:not(.notes-zen) .notes-grid.with-right > .notes-right {
+    grid-column: auto; grid-row: auto;
+  }
+  body:not(.notes-zen) .notes-toc { max-height: 20vh; }
 }
 .notes-side { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
 /* 右列：目录在上、公式速查在下；两块各自有开关 */
