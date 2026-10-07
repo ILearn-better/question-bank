@@ -20,7 +20,7 @@ class CropStripIn(BaseModel):
     """把多个区域竖着拼成一张图（跨页题目的原貌图）。"""
 
     regions: List[CropIn]
-    gap: int = 14
+    gap: int = 0
 
 
 class QuestionIn(BaseModel):
@@ -148,6 +148,30 @@ class SupplementPatch(BaseModel):
     status: Optional[str] = None
     focus: Optional[str] = None
     note: Optional[str] = None
+
+
+# ============================================================ 课前备课
+class PrepItemIn(BaseModel):
+    """一项材料：一道题 / 一篇笔记。标题快照由服务端去查（前端不必先拉一遍）。"""
+
+    kind: str                       # question | note
+    ref_id: str
+
+
+class PrepIn(BaseModel):
+    """保存课前备课（PUT，一节一条）。
+
+    四个字段 + note_id 都「没传 = 保持原样」；note_id 传空串 = 清除与笔记的关联。
+    `items` 特殊：None（没传）= 不动，传了（含空数组）= 整组替换 —— 与作业评分同一语义，
+    否则「把挑的材料全撤掉」会变成「不动」，旧材料静默留在库里。
+    """
+
+    goal: Optional[str] = None
+    key_points: Optional[str] = None
+    flow: Optional[str] = None
+    materials: Optional[str] = None
+    note_id: Optional[str] = None
+    items: Optional[List[PrepItemIn]] = None
 
 
 # ============================================================ 体系 / 知识点
@@ -433,7 +457,7 @@ class BatchBlockIn(BaseModel):
 
 class BatchCropIn(BaseModel):
     blocks: List[BatchBlockIn]
-    gap: int = 14
+    gap: int = 0
 
 
 class BatchItemIn(BaseModel):
@@ -480,4 +504,4 @@ class FigureCropIn(BaseModel):
     """
 
     regions: List[BatchRegionIn]
-    gap: int = 14
+    gap: int = 0

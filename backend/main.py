@@ -40,6 +40,7 @@ from app.routers import (                                   # noqa: E402
     notes,
     notes_transfer,
     papers,
+    preps,
     questions,
     students,
     supplements,
@@ -165,6 +166,7 @@ app.include_router(feedbacks.router)
 app.include_router(lesson_files.router)
 app.include_router(homeworks.router)
 app.include_router(supplements.router)
+app.include_router(preps.router)
 app.include_router(curriculum.router)
 app.include_router(questions.router)
 app.include_router(papers.router)
