@@ -1,15 +1,20 @@
 # -*- coding: utf-8 -*-
-"""在**干净的**临时库上把 0014 / 0015 / 0016 双向跑通（不碰真库）。
+"""在**干净的**临时库上把笔记树那几条迁移（0014 / 0015 / 0016）双向跑通（不碰真库）。
 
 为什么要单独一个脚本：SQLite 的 DDL 不是事务性的，迁移跑一半抛异常会留下
 「表建了、版本没动」的半成品，下一次就撞 already exists。之前在本机真库上
 反复试就是被这个半成品挡住，越试越乱。干净库 + 一次跑完才算数。
 
 验的事：
-  ① 0013 → 0016：新列都在、外键在、**新索引也在**（batch 里建索引那个坑）、
+  ① 0013 → head：新列都在、外键在、**新索引也在**（batch 里建索引那个坑）、
      老笔记被放进「未归档」根、未归档那行打了 is_unfiled 标记、课后补充两张表建好。
-  ② 0016 → 0015 → 0014 → 0013：能干净退回去（带外键的列必须走 batch，否则 SQLite 拒绝 DROP COLUMN）。
-  ③ 再来一次 0013 → 0016：可重复，不是一次性的。
+     顺带算是一次「从很老的库一路升到最新」的冒烟 —— 后面的迁移在这条路上也得是干净的。
+  ② head → 0015 → 0014 → 0013：能干净退回去（带外键的列必须走 batch，否则 SQLite 拒绝 DROP COLUMN）。
+  ③ 再来一次 0013 → head：可重复，不是一次性的。
+
+⚠️ head 的版本号**不能写死**。以前这里三处都写死 "0016"，于是每加一条迁移
+（0017 / 0018 / 0019 / 0020…）就假失败一次，报「版本: '0020' 期望 '0016'」，
+看着像迁移坏了，其实是被测试绊住 —— 详见 head_rev()。
 """
 import os
 import sqlite3
@@ -24,6 +29,19 @@ for suffix in ("", "-wal", "-shm"):
 
 env = dict(os.environ, SHIKE_DB_PATH=str(SCRATCH))
 fails = []
+
+
+def head_rev() -> str:
+    """当前最新迁移的版本号 —— 直接问 alembic 的脚本目录，不写死。"""
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+    cfg = Config(str(BACKEND / "alembic.ini"))
+    cfg.set_main_option("script_location", str(BACKEND / "alembic"))
+    return ScriptDirectory.from_config(cfg).get_current_head()
+
+
+HEAD = head_rev()
+print(f"（当前 head = {HEAD}）")
 
 
 def alembic(*args):
@@ -87,10 +105,10 @@ c.commit()
 c.close()
 print("  造了 2 篇老笔记（一篇标了置顶）")
 
-print("② 0013 → head（0016）")
+print(f"② 0013 → head（{HEAD}）")
 assert alembic("upgrade", "head")
 ver, cols, fks, idx, tabs = info()
-check("版本", ver, "0016")
+check("版本", ver, HEAD)
 check("两个新列都在", [c for c in cols if c in ("folder_id", "sort_order")], ["folder_id", "sort_order"])
 check("folder_id 是真外键（指向 note_folders）", (fks[0][2], fks[0][6]) if fks else None,
       ("note_folders", "SET NULL"))
@@ -113,7 +131,7 @@ check("课后补充两张表没了", tabs, ["note_folders", "notes"])
 check("笔记还在", [r[0] for r in notes_rows()[0]], ["aaa", "bbb"])
 assert alembic("upgrade", "head")
 ver, *_ = info()
-check("再升到 0016", ver, "0016")
+check("再升到 head", ver, HEAD)
 check("·未归档· 又标记上了", [r[4] for r in notes_rows()[1]], [1])
 
 print("④ 一路回退到 0013")
@@ -128,9 +146,14 @@ check("笔记还在（回退不删数据）", [r[0] for r in notes_rows()[0]], [
 print("⑤ 再升一次（可重复）")
 assert alembic("upgrade", "head")
 ver, cols, fks, idx, tabs = info()
-check("版本", ver, "0016")
+check("版本", ver, HEAD)
 check("新索引这次也在", "idx_notes_folder" in idx, True)
 check("两篇笔记又回到未归档", [(r[0], r[2]) for r in notes_rows()[0]], [("aaa", 1), ("bbb", 1)])
 
 print("\n" + ("ALL PASS" if not fails else f"{len(fails)} 项失败: {fails}"))
 print(f"（临时库：{SCRATCH}）")
+
+
+# 退出码即结果（0 = 全过）。以前这里只打印不设码 —— 单跑时人看得出来，
+# 但脚本化批量回归会把失败当成通过，静默漏掉一整轮。
+raise SystemExit(1 if fails else 0)

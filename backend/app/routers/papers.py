@@ -106,6 +106,10 @@ def export_paper(
             "difficulty": rows[qid].difficulty,
             "content": rows[qid].content,
             "image": rows[qid].image,
+            # 题干里那幅「如图」的图（老师审核时框出来的）。
+            # 文本形态出卷时 image 整张不印，靠它把图补上 —— 少了这行，
+            # 卷子上会出现「如图」却找不到图，而且没有任何报错。
+            "figure_image": rows[qid].figure_image or "",
             "answer": rows[qid].answer,
             "answer_image": rows[qid].answer_image or "",
             "analysis": rows[qid].analysis,

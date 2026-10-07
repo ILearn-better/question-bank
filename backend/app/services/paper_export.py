@@ -52,6 +52,16 @@ def image_path(url: str | None) -> Path | None:
     return p if p.exists() else None
 
 
+def figure_path(it: dict) -> Path | None:
+    """题干里那幅「如图」的图（老师审核时从原卷上框出来的）。没有就 None。
+
+    ⚠️ **只有文本形态才该用它。** 图片形态印的是整块原貌图，
+        那幅图本来就在里面 —— 再印一次，同一道题会出现两遍同样的图。
+        调用点都按这个前提写了分支，改动渲染逻辑时别把这条丢了。
+    """
+    return image_path(it.get("figure_image"))
+
+
 def _data_uri(path: Path) -> str:
     """图片转 base64：导出的 HTML 必须是自包含的单个文件，否则发给别人图片全丢。"""
     mime = mimetypes.guess_type(path.name)[0] or "image/png"
@@ -349,7 +359,8 @@ def _html_body(out: list[str], items: list[dict], t: dict, style: dict, opts: di
             stem = _esc(_stem_text(it))
             no = f'<b>{_esc(paper_style.num_text(it["n"], style))}</b>'
             score = f'<span class="tag">{_esc(score_text(it, style))}</span>'
-            if body_form(it, opts.get("render_mode")) == "image":
+            form = body_form(it, opts.get("render_mode"))
+            if form == "image":
                 # 用图片形态：题号照印（不然学生不知道这是第几题），题干文字不印
                 out.append(f'<div class="stem">{no}{score}{tag}</div>')
                 p = image_path(it.get("image"))
@@ -357,6 +368,11 @@ def _html_body(out: list[str], items: list[dict], t: dict, style: dict, opts: di
                     out.append(f'<img src="{_data_uri(p)}" alt="">')
             else:
                 out.append(f'<div class="stem">{no} {stem}{score}{tag}</div>')
+                # 题干配图。**只在文本形态补**：图片形态的原貌图里已经有它了。
+                fp = figure_path(it)
+                if fp:
+                    out.append(f'<img class="fig" src="{_data_uri(fp)}" alt="" '
+                               'style="max-width:64%;display:block;margin:8px auto">')
             for _ in range(blank_lines(it, style)):
                 out.append('<div class="rule"></div>')
             out.append('</div>')
@@ -438,13 +454,18 @@ def build_docx(title: str, items: list[dict], opts: dict, tpl=None) -> bytes:
                 if line:
                     tag = f'（{line}）'
             no = paper_style.num_text(it["n"], style)
-            if body_form(it, opts.get("render_mode")) == "image":
+            form = body_form(it, opts.get("render_mode"))
+            if form == "image":
                 para(f'{no}{score_text(it, style)}{tag}')
                 p = image_path(it.get("image"))
                 if p:
                     doc.add_picture(str(p), width=Cm(content_cm))
             else:
                 para(f'{no} {_stem_text(it)}{score_text(it, style)}{tag}')
+                # 题干配图只在文本形态补（图片形态的原貌图里已经有它）
+                fp = figure_path(it)
+                if fp:
+                    doc.add_picture(str(fp), width=Cm(content_cm * 0.64))
             for _ in range(blank_lines(it, style)):
                 para("")
 
@@ -520,7 +541,11 @@ def build_pdf(title: str, items: list[dict], opts: dict, tpl=None) -> bytes:
                     continue
             state["y"] += (rect.height - left) + gap
 
-    def draw_image(path: Path, max_ratio: float = 1.0) -> None:
+    def draw_image(path: Path | None, max_ratio: float = 1.0) -> None:
+        # path 为 None = 这题没有那幅图（配图未框、或文件已被删）。
+        # 在这里挡掉而不是让每个调用点各判一次 —— 漏判一处就是 AttributeError。
+        if not path:
+            return
         try:
             pm = pymupdf.Pixmap(str(path))
         except Exception:  # noqa: BLE001  图片坏了不该让整份卷子导不出来
@@ -607,13 +632,16 @@ def build_pdf(title: str, items: list[dict], opts: dict, tpl=None) -> bytes:
                 if line:
                     tag = f'（{line}）'
             no = paper_style.num_text(it["n"], style)
-            if body_form(it, opts.get("render_mode")) == "image":
+            form = body_form(it, opts.get("render_mode"))
+            if form == "image":
                 write(f'{no}{score_text(it, style)}{tag}')
                 p = image_path(it.get("image"))
                 if p:
                     draw_image(p)
             else:
                 write(f'{no} {_stem_text(it)}{score_text(it, style)}{tag}')
+                # 题干配图只在文本形态补（图片形态的原貌图里已经有它）
+                draw_image(figure_path(it), max_ratio=0.7)
             rule(blank_lines(it, style))
 
     if opts.get("show_answer"):

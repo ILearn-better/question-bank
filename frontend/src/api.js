@@ -113,7 +113,7 @@ export const feedbackApi = {
   save: (lessonId, body) => api.put(`/api/lessons/${lessonId}/feedback`, body),
   remove: (lessonId) => api.del(`/api/lessons/${lessonId}/feedback`),
 
-  /** 反馈模板（四段的可复用文本 + 快捷短语）。存数据库，用户可自己加。 */
+  /** 反馈模板（五段的可复用文本 + 快捷短语）。存数据库，用户可自己加。 */
   templates: () => api.get('/api/feedback-templates'),
   createTemplate: (body) => api.post('/api/feedback-templates', body),
   removeTemplate: (id) => api.del(`/api/feedback-templates/${id}`),
@@ -133,12 +133,12 @@ export const feedbackApi = {
   deleteImage: (lessonId, url) =>
     api.post('/api/feedbacks/image/remove', { lesson_id: lessonId, url }),
 
-  /** AI 整篇润色：四段记录进去，一整篇文档出来（建议稿，需老师确认）。
+  /** AI 整篇润色：五段记录进去，一整篇文档出来（建议稿，需老师确认）。
    *  注意：会把内容发到第三方 AI 服务，界面必须先提示。 */
   polish: (lessonId, body) => api.post(`/api/lessons/${lessonId}/feedback/polish`, body),
 
   /** 导出 txt / docx / pdf。
-   *  source：auto（默认，有整篇就导整篇）/ doc（强制整篇）/ fields（强制四段）。 */
+   *  source：auto（默认，有整篇就导整篇）/ doc（强制整篇）/ fields（强制五段）。 */
   downloadExport: (lessonId, format, filename, source = 'auto') =>
     download(`/api/lessons/${lessonId}/feedback/export` + qs({ format, source }), filename),
 };

@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import base64
 import io
+from pathlib import Path
 
 from PIL import Image
 from sqlalchemy.orm import Session
@@ -156,6 +157,19 @@ def prepare_image(raw: bytes) -> tuple[str, tuple[int, int]]:
     im.save(buf, "JPEG", quality=JPEG_QUALITY, optimize=True)
     uri = "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
     return uri, original
+
+
+def prepare_image_file(path) -> str:
+    """从磁盘上的图直接出 data URI。
+
+    批量识别用的就是它 —— 那边的题块在提交时就已经裁好落盘了（`crops/` 里），
+    再让前端把图读成 base64 传一遍纯属浪费：一张 3 倍分辨率的原貌图
+    经过浏览器 → JSON → 服务端，往返几百 KB。
+    """
+    p = Path(path)
+    if not p.exists():
+        raise VisionError("原貌图不见了，可能已被清理，请重新分割")
+    return prepare_image(p.read_bytes())[0]
 
 
 def _strip_fence(text: str) -> str:

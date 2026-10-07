@@ -283,3 +283,8 @@ st, _ = req("DELETE", f"/api/notes/{n_c['id']}")
 stranger.unlink(missing_ok=True)
 
 print("\n" + ("ALL PASS" if not fails else f"{len(fails)} 项失败: {fails}"))
+
+
+# 退出码即结果（0 = 全过）。以前这里只打印不设码 —— 单跑时人看得出来，
+# 但脚本化批量回归会把失败当成通过，静默漏掉一整轮。
+raise SystemExit(1 if fails else 0)

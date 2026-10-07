@@ -22,7 +22,7 @@ from datetime import datetime
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
@@ -32,7 +32,7 @@ from ..adapters import pdf as pdf_adapter
 from ..db import get_db
 from ..migrate import backup_db
 from ..models import Document, Question, QuestionNode
-from ..schemas import CropIn, CropStripIn
+from ..schemas import BatchCropIn, CropIn, CropStripIn
 from ..services import crops
 
 router = APIRouter(prefix="/api", tags=["documents"])
@@ -259,7 +259,14 @@ def build_preview(
 # ---------------------------------------------------------------- 页面视图
 @router.get("/documents/{doc_id}/pages")
 def doc_page_count(doc_id: str, db: Session = Depends(get_db)):
-    return {"page_count": pdf_adapter.page_count(str(_page_source(db, doc_id)))}
+    try:
+        return {"page_count": pdf_adapter.page_count(str(_page_source(db, doc_id)))}
+    except HTTPException:
+        raise
+    except Exception as e:
+        # 损坏的 PDF / 渲染库报错 —— 转成 4xx 并把原因说出来。
+        # 直接抛出去会变成 500「Internal Server Error」，前端只能显示一行没有信息量的字。
+        raise HTTPException(422, f"读不出这份文档的页面：{e}") from e
 
 
 @router.get("/documents/{doc_id}/pages/{pno}/image")
@@ -280,6 +287,12 @@ def doc_page_lines(doc_id: str, pno: int, db: Session = Depends(get_db)):
         return pdf_adapter.page_lines(str(_page_source(db, doc_id)), pno)
     except ValueError as e:            # 同上：页码越界
         raise HTTPException(422, str(e)) from e
+    except HTTPException:
+        raise
+    except Exception as e:
+        # 单页取不出来**不该拖垮整份文档** —— 前端逐页容错，会把它当「这页没有文字层」。
+        # 这里给 4xx + 原因，方便在控制台看出是哪一页、为什么。
+        raise HTTPException(422, f"第 {pno} 页读不出文字层：{e}") from e
 
 
 @router.post("/documents/{doc_id}/crop")
@@ -302,6 +315,102 @@ def doc_crop_strip(doc_id: str, payload: CropStripIn, db: Session = Depends(get_
     except ValueError as e:
         raise HTTPException(422, str(e)) from e
     return {"url": f"/api/crops/{name}"}
+
+
+@router.get("/documents/{doc_id}/region-image")
+def doc_region_image(
+    doc_id: str,
+    spec: str,
+    zoom: float = Query(1.5, ge=0.5, le=3.0),
+    db: Session = Depends(get_db),
+):
+    """把一个（或几个，跨页竖拼）区域渲染成 PNG **直接返回、不写盘**。
+
+    给「分割线之间到底切成了什么」做即时预览：老师画完线，右栏每一块后面
+    立刻能看到那块的样子，不用等提交。
+
+    为什么必须是不落盘的：
+        `data/uploads/crops/` 是**资产**目录 —— 里面每张图都有数据库行引用它，
+        删的时候靠引用计数回收。预览图没有任何行引用，攒多了就是纯垃圾
+        （实测踩过：题库 0 行、盘上 92 张图）。所以预览走内存直出。
+
+    为什么用 GET + 查询串而不是 POST body：
+        它要能直接当 `<img src="...">` 用 —— 浏览器才会替我们做缓存、
+        懒加载与并发控制。POST 做不到这些。
+
+    spec 形如 `1:40,90,550,300`（页: x0,y0,x1,y1），跨页用 `;` 连接：
+        `1:40,540,550,800;2:40,90,550,320`
+    """
+    path = _page_source(db, doc_id)
+    regions = _parse_region_spec(spec)
+    try:
+        png = pdf_adapter.render_region_png(str(path), regions, zoom=zoom)
+    except ValueError as e:
+        raise HTTPException(422, str(e)) from e
+    return Response(
+        content=png,
+        media_type="image/png",
+        # 同一份原件的同一块切出来是确定的 —— 让浏览器别重复问。
+        # private：这是学生卷子，不进中间缓存。
+        headers={"Cache-Control": "private, max-age=600"},
+    )
+
+
+def _parse_region_spec(spec: str) -> list[tuple[int, float, float, float, float]]:
+    """把 `页:x0,y0,x1,y1` 用 `;` 连起来的串解析成区域列表。
+
+    写错就 422 说清楚哪个片段不对 —— 前端拼 URL 的地方不止一处
+    （块缩略图、配图框选），静默当成「空区域」会让图整片不显示却查不出原因。
+    """
+    out: list[tuple[int, float, float, float, float]] = []
+    for part in (spec or "").split(";"):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            pno_s, coords = part.split(":", 1)
+            nums = [float(x) for x in coords.split(",")]
+            if len(nums) != 4:
+                raise ValueError
+            out.append((int(pno_s), nums[0], nums[1], nums[2], nums[3]))
+        except ValueError as e:
+            raise HTTPException(
+                422, f"区域写法不对：{part}（应为 页:x0,y0,x1,y1）"
+            ) from e
+    if not out:
+        raise HTTPException(422, "没有给出要预览的区域")
+    return out
+
+
+@router.post("/documents/{doc_id}/batch-crop")
+def doc_batch_crop(doc_id: str, payload: BatchCropIn, db: Session = Depends(get_db)):
+    """一次裁出**很多**题块的原貌图（批量入库用）。
+
+    为什么不复用 /crop 逐个调：一次提交 30 个块，逐个走 HTTP 就是 30 次往返 +
+    30 次「打开 PDF 文档」的开销（pymupdf 每次都要重新 open 同一个文件）。
+    这里在同一个 _page_source 上循环裁，只有一轮往返。
+
+    逐块容错：某一块裁不出来（越界、空区域）不该让整次提交失败 ——
+    返回里那个位置的 error 非空，前端据此把它标红让老师重新画，其余照常入库。
+    """
+    path = _page_source(db, doc_id)
+    out = []
+    for i, block in enumerate(payload.blocks):
+        regions = [(r.page, r.x0, r.y0, r.x1, r.y1) for r in block.regions]
+        if not regions:
+            out.append({"index": i, "url": None, "error": "空区域"})
+            continue
+        try:
+            pno, x0, y0, x1, y1 = regions[0]
+            if len(regions) == 1:
+                name = pdf_adapter.crop_region(str(path), pno, [x0, y0, x1, y1], CROPS_DIR)
+            else:
+                name = pdf_adapter.crop_regions(str(path), regions, CROPS_DIR, gap=payload.gap)
+            out.append({"index": i, "url": f"/api/crops/{name}", "error": None})
+        except ValueError as e:
+            out.append({"index": i, "url": None, "error": str(e)})
+    ok = sum(1 for x in out if x["url"])
+    return {"total": len(out), "ok": ok, "items": out}
 
 
 @router.get("/crops/{name}")

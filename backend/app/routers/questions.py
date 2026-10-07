@@ -15,6 +15,12 @@ from ..db import get_db
 from ..models import Node, Question, QuestionNode
 from ..schemas import QuestionIn, QuestionPatch
 from ..services import crops
+# 知识点解析已抽到 services/knowledge.py —— 批量入库也要用同一套判断，
+# 与其让两个路由互相 import 私有函数（删文档那次的先例），不如共用一份。
+# 保留 `_` 前缀的局部名，是为了让本文件里原有的调用点一行都不用改。
+from ..services.knowledge import clean_tags as _clean_tags
+from ..services.knowledge import node_path as _node_path
+from ..services.knowledge import resolve_kp as _resolve_kp
 
 router = APIRouter(prefix="/api", tags=["questions"])
 
@@ -28,55 +34,9 @@ def _parse_tags(raw: str | None) -> list[str]:
     return [str(t) for t in v] if isinstance(v, list) else []
 
 
-def _clean_tags(tags) -> list[str]:
-    """去空白、去空串、去重，保持输入顺序。"""
-    out: list[str] = []
-    for t in tags or []:
-        s = str(t).strip()
-        if s and s not in out:
-            out.append(s)
-    return out
-
-
 def _escape_like(s: str) -> str:
     """转义 LIKE 的通配符 —— 标签里出现 % 或 _ 时，不转义会误命中一大片。"""
     return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-
-
-def _node_path(db: Session, node_id: int | None) -> str | None:
-    """知识点全路径（"章/节/知识点"），用于冗余进 knowledge_points 供列表直接显示。"""
-    if not node_id:
-        return None
-    names: list[str] = []
-    cur = db.get(Node, node_id)
-    # 限深，防库里出现环时死循环
-    while cur is not None and len(names) < 12:
-        names.append(cur.name)
-        cur = db.get(Node, cur.parent_id) if cur.parent_id else None
-    return "/".join(reversed(names)) if names else None
-
-
-def _resolve_kp(db: Session, names, curriculum_id: int | None):
-    """把「知识点名字」解析成知识树节点。
-
-    为什么由服务端解析：前端只送名字 —— 用户既能从树里挑节点，也能自己敲一个树里
-    没有的。后者不是容错，是**刚需**：现在只有国内高中数学有知识树（119 个节点），
-    初中/其他体系都是空的，不给手填就等于不让人记知识点。
-
-    能对上同名节点就顺手把关系也建了（将来算掌握度靠它），对不上就纯文本存着。
-    返回 (存进 knowledge_points 的名字列表, node_id, curriculum_id)。
-    """
-    cleaned = _clean_tags(names)
-    if not cleaned:
-        return [], None, curriculum_id
-    q = select(Node).where(Node.name == cleaned[0])
-    node = db.scalar(q.where(Node.curriculum_id == curriculum_id).limit(1)) if curriculum_id else None
-    if node is None:
-        node = db.scalar(q.limit(1))
-    if node is None:
-        return cleaned, None, curriculum_id
-    # 用户显式选了体系就以他的为准，不因为同名节点在别的体系就给他改掉
-    return cleaned, node.id, curriculum_id or node.curriculum_id
 
 
 def _serialize(q: Question) -> dict:
@@ -98,6 +58,9 @@ def _serialize(q: Question) -> dict:
         "analysis": q.analysis,
         "image": q.image,
         "answer_image": q.answer_image or "",
+        # 题干里那幅「如图」的图（批量审核时框出来的）。
+        # 文本形态出卷靠它把图补上 —— 见 services/paper_export.py 的 figure_path()。
+        "figure_image": q.figure_image or "",
         "created_at": q.created_at,
         # 新增字段（纯增量，不影响旧前端）
         "curriculum_id": q.curriculum_id,
@@ -231,6 +194,16 @@ def update_question(qid: str, payload: QuestionPatch, db: Session = Depends(get_
     # 显式传 null 落回 auto，而不是落成空串（空串会让出卷判定认不出来）。
     if "render_prefer" in data:
         q.render_prefer = data["render_prefer"] or "auto"
+    # 题干配图：换一张或清空，都要按引用计数回收旧图 ——
+    # 跟删题共用 services/crops.py 那一套判断。不回收的话，
+    # 每换一次配图就在盘上留一张没人引用的垃圾（题库 0 行、盘上 92 张图就是这么来的）。
+    if "figure_image" in data:
+        new_fig = data["figure_image"] or ""
+        old_fig = q.figure_image or ""
+        q.figure_image = new_fig
+        if old_fig and old_fig != new_fig:
+            db.flush()               # 新值先落进事务，引用计数才数得对
+            crops.purge(crops.crop_names(old_fig) - crops.referenced_crops(db))
     if "tags" in data:
         q.tags = json.dumps(_clean_tags(data["tags"]), ensure_ascii=False)
 
@@ -405,7 +378,9 @@ def delete_question(qid: str, db: Session = Depends(get_db)):
     q = db.get(Question, qid)
     if q is None:
         raise HTTPException(404, "题目不存在")
-    mine = crops.crop_names(q.image, q.answer_image)
+    # 三张图都要算进来：原貌图、答案图、**题干配图**。
+    # 漏掉最后那个，老师框了很久的配图会在删题时被静默抹掉。
+    mine = crops.crop_names(q.image, q.answer_image, q.figure_image)
 
     # 先删关系表（外键现在是真生效的，顺序错了会撞约束）
     db.execute(delete(QuestionNode).where(QuestionNode.question_id == qid))

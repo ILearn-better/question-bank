@@ -28,9 +28,11 @@ from sqlalchemy.orm import Session
 from .. import config
 from ..models import AiSetting
 
-# 反馈的四段字段（润色只处理这几个键，别的键原样返回）
-FIELDS = ("performance", "problems", "homework", "next_plan")
+# 反馈的五段字段（润色只处理这几个键，别的键原样返回）。
+# 课程内容排最前：先告诉 AI「讲了什么」，它才能把模板的【本次课堂内容】栏写对。
+FIELDS = ("course_content", "performance", "problems", "homework", "next_plan")
 FIELD_CN = {
+    "course_content": "课程内容",
     "performance": "课堂表现",
     "problems": "存在问题",
     "homework": "作业布置",
@@ -291,13 +293,13 @@ def extract_content(data: dict) -> str:
 
 
 def assemble_draft(fields: dict, context: dict, draft: str | None = None) -> str:
-    """把四段记录 + 课程信息拼成一篇「原始记录」，交给 AI 整理。
+    """把五段记录 + 课程信息拼成一篇「原始记录」，交给 AI 整理。
 
     刻意**不**在这里排成模板的样子：怎么排是 AI 的活（它才读得懂模板要什么）。
     这里只负责把信息如实、完整地传过去，并标明哪一段是什么 ——
     少标一个标签，模型就可能把「作业布置」当成「课堂表现」混进正文里。
 
-    给了 draft（老师自己写的整篇草稿）就优先用它：那种情况下再拼四段是多余的。
+    给了 draft（老师自己写的整篇草稿）就优先用它：那种情况下再拼五段是多余的。
     """
     if draft and draft.strip():
         return draft.strip()
