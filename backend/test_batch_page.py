@@ -461,6 +461,273 @@ def check_figure_and_thumb(src: str) -> None:
           "FIGURE_KEYWORDS" in tax)
 
 
+# ---------------------------------------------------------------- ⑧ 起始线语义 + 自由排序合并
+def check_startline_merge(src: str) -> None:
+    """2026-10-07 两轮反馈的回归防线：
+
+    · 「清空分界线再删块后画线没反应」—— 根因是删「整页一块」时把 cutHead 抬到页底，
+      之后画的线全被「起点=页底」过滤掉。现在改成 skips 标记整页跳过，画线即恢复。
+    · 「跨页合并有大间隔、截到页码」—— 跨页题改用「框选」自由截取每段，服务端 gap=0 无缝拼接。
+    · 第二轮（同日深夜）：「框选好的两段中间总隔着别的块，合不了」＋「要能自由调块顺序」＋
+      「每页最后一个分割线不用向下选取」。→ 引入 groups **编排表**（顺序由拖拽决定、
+      rebuild 绝不按位置重排）、mergePrev 只认列表上一块、末线以下不再自动成块。
+    """
+    band = method_body(src, "bandsOf")
+    rm = method_body(src, "removeBlock")
+    mg = method_body(src, "mergePrev")
+    rb = method_body(src, "rebuild")
+    tail = method_body(src, "tailBand")
+
+    check("抠到 bandsOf / removeBlock / mergePrev / rebuild / tailBand",
+          all([band, rm, mg, rb, tail]))
+
+    # —— 起始线语义：第一条线以上自动跳过，不再有 cutHead 起点概念 ——
+    check("起始线：bandsOf 里不再出现 cutHead（卷头不再靠手动删）", "cutHead" not in band)
+    check("起始线：无分界线时整页一块、标 unsplit", "unsplit" in band and "y0: 0" in band)
+    check("起始线：两线之间成块（遍历 ds）", "ds.length - 1" in band)
+    # —— 末线以下**不再**自动成块（免得把页脚、页码带进图里）——
+    check("末线：bandsOf 不再生成「末线→页底」那一块",
+          "pg.height - ds[ds.length - 1]" not in band)
+    check("末线：tailBand 只出虚线提示、不产题块",
+          "return { y0: last, y1: pg.height }" in tail and "skips[pno]" in tail)
+
+    # —— 删整页块不再把起点抬到页底（bug 修复）——
+    check("删块：整页一块改为 skips 标记（不再 cutHead=页底）",
+          "skips" in rm and "cutHead" not in rm)
+    check("删块：整页跳过时不再把起点抬到页底", "cutHead" not in rm and "skips[" in rm)
+    check("恢复本页：restorePage 清掉 skips", "restorePage" in src and "delete this.skips[pno]" in src)
+
+    # —— 编排表：块顺序由用户决定，rebuild 不按位置重排 ——
+    check("编排：rebuild 写回 this.groups（源头是编排表，blocks 是产物）",
+          "this.groups = groups" in rb)
+    check("编排：新段插到锚点块的后面（不覆盖已拖过的顺序）",
+          "groups.splice(gi + 1, 0" in rb)
+    check("编排：块带 keys（认块、删块都靠它，不再用 rGids）", "keys: g.slice()" in rb)
+    check("排序：shiftBlock 支持上移/下移", "shiftBlock(i, d)" in src)
+    check("排序：拖拽 dropOn 改的是 groups 顺序",
+          "dropOn" in src and "this.groups.splice(from, 1)[0]" in src)
+    check("排序：拖拽事件挂在卡片上（draggable + dragstart/over/drop）",
+          'draggable="true"' in src
+          and '@dragstart="dragStart(i, $event)"' in src
+          and '@drop.prevent="dropOn(i)"' in src)
+
+    # —— 合并：只认列表上一块（把两块拖到相邻再合），不再受相邻/来源限制 ——
+    check("合并：mergePrev 拼 groups 的相邻两块",
+          "this.groups[i - 1].concat(this.groups[i])" in mg)
+    check("合并：不再限制来源（线块也能合，跨页框选不再被挡）",
+          "cur.source !== 'rect'" not in mg)
+    # 旧机制的三处**实际用法**都不该再出现（注释里提一句历史不算）
+    check("合并：joinPrev 一件套已彻底移除",
+          not any(t in src for t in ("joinPrev: new Set()", "joinPrev.add", "joinPrev.has")))
+
+    # —— 「不提交」：卷面结构说明（「四、解答题；本题共 5 小题，共 77 分」）不送 AI ——
+    pb = method_body(src, "blockPayload")
+    sub = method_body(src, "submitAll")
+    tg = method_body(src, "toggleSkip")
+    check("抠到 toggleSkip / blockPayload / submitAll", all([tg, pb, sub]))
+    # 标记必须挂**段 key** —— 挂 blocks 下标会被下一次 rebuild 冲掉（blocks 是产物）
+    check("不提交：状态是 skipKeys（段 key 为键），不是 blocks 下标",
+          "skipKeys: {}" in src and "this.skipKeys[k]" in rb)
+    check("不提交：rebuild 里 blocks 带 skipped（合并的段任一被标 → 整块不提交）",
+          "skipped: g.some(k => !!this.skipKeys[k])" in rb)
+    check("不提交：rebuild 顺手清掉已消失段的标记（不会越攒越多）", "this.skipKeys = sk" in rb)
+    check("不提交：切换时整组段一起标/一起撤", "g.forEach((k) => { if (on) sk[k] = true; else delete sk[k]; })" in tg)
+    # 删块要**显式**清标记：线被删后段会以新身份重建（如退回 unsplit），
+    # 段 key 若恰好相同，旧标记会让新块一出现就是灰的。
+    check("不提交：删块时显式清掉该组的标记", "g.forEach((k) => { delete sk[k]; })" in rm)
+    # 不提交的块**连裁图都不发** —— 发了会在 crops/ 里攒下没人引用的图
+    check("不提交：blockPayload 直接不发票了的块（连带不裁图）", "if (b.skipped) return;" in pb)
+    check("不提交：提交前先滤出 todo，全被排除时给提示而不是发空任务",
+          "const todo = this.blocks.filter(b => !b.skipped)" in sub
+          and "没有要提交的题块" in sub)
+    # 发出去的数组下标 ≠ blocks 下标（滤过一层）→ 回填必须按 todo 映射
+    check("不提交：裁图回填按 todo[r.index] 映射（不能当 blocks 下标用）",
+          "todo[r.index]" in sub and "this.blocks[r.index]" not in sub)
+    check("不提交：按钮数字与可点状态都看 submitCount",
+          '识别这 {{ submitCount }} 块' in src and ':disabled="!submitCount || !curriculumId"' in src)
+    check("不提交：卡片上有开关（toggleSkip）", '@click="toggleSkip(i)"' in src)
+
+    # —— 后端 gap 默认 0（无缝拼接）——
+    schemas = (ROOT / "backend" / "app" / "schemas.py").read_text(encoding="utf-8")
+    pdf = (ROOT / "backend" / "app" / "adapters" / "pdf.py").read_text(encoding="utf-8")
+    check("无缝拼接：schema 里 gap 默认 0（不再是 14）",
+          "gap: int = 14" not in schemas and "gap: int = 0" in schemas)
+    check("无缝拼接：pdf.py 的 crop/render 默认 gap=0",
+          "gap: int = 0" in pdf and "gap: int = 14" not in pdf)
+
+
+# ------------------------------------------------- ⑨ 题块编排：真实方法体在 node 里跑行为断言
+#
+# 为什么不是纯静态断言：本轮改的是**算法**（段 → 编排表 → 题块），
+# 「顺序在 rebuild 后还保不保得住」「新段插到哪」「合并后是不是真的两段」
+# 这些都不是 grep 能看出来的。而它又极易被下一次「顺手改成按位置重排」弄坏。
+# 所以把 batch.html 里的**真实方法体**抠出来，挂到一个最小 state 上，在 node 里跑。
+JS_SIGS = [
+    ("segKey(pno, gy)", "segKey"),
+    ("bandsOf(pno)", "bandsOf"),
+    ("tailBand(pno)", "tailBand"),
+    ("rebuild()", "rebuild"),
+    ("mergePrev(i)", "mergePrev"),
+    ("shiftBlock(i, d)", "shiftBlock"),
+    ("dropOn(i)", "dropOn"),
+    ("removeBlock(i)", "removeBlock"),
+    ("toggleSkip(i)", "toggleSkip"),
+    ("blockPayload()", "blockPayload"),
+]
+
+JS_HEAD = """'use strict';
+const fails = [];
+function check(name, ok) {
+  console.log('  [' + (ok ? 'OK ' : 'FAIL') + '] ' + name);
+  if (!ok) fails.push(name);
+}
+function fresh() {
+  return {
+    pv: { count: 2, pages: { 1: { width: 600, height: 800 }, 2: { width: 600, height: 800 } } },
+    pageList: [1, 2],
+    dividers: {}, rects: [], skips: {}, skipKeys: {}, groups: [], _rectSeq: 0, blocks: [],
+    dragFrom: null, dragOver: null,
+    previewUrl() { return ''; },
+"""
+
+JS_TAIL = r"""  };
+}
+
+const ids = s => s.blocks.map(b => b.id);
+const idx = (s, id) => s.blocks.findIndex(b => b.id === id);
+let s;
+
+// 1) 空文档：每页一个整页块
+s = fresh(); s.rebuild();
+check('空文档：两页各一个整页块（unsplit）',
+      s.blocks.length === 2 && s.blocks[0].unsplit && s.blocks[1].unsplit);
+
+// 2) 末线不再生成到页底的块
+s = fresh(); s.dividers[1] = [100, 300]; s.rebuild();
+check('末线不成块：两条线只出 1 块', s.blocks.filter(b => b.startPage === 1).length === 1);
+check('末线不成块：块顶就是第一条线', s.blocks[0].regions[0].y0 === 100);
+const tb = s.tailBand(1);
+check('末线提示：tailBand 覆盖 300→页底', !!tb && tb.y0 === 300 && tb.y1 === 800);
+check('末线提示：无分界线的页不提示（整页块已覆盖）', s.tailBand(2) === null);
+
+// 3) 删「整页一块」= 整页跳过；再画线即恢复
+s = fresh(); s.rebuild();
+s.removeBlock(idx(s, 'L2_0'));
+check('删整页块：标记整页跳过', s.skips[2] === true);
+check('删整页块：该页不再产块', s.blocks.filter(b => b.startPage === 2).length === 0);
+delete s.skips[2]; s.dividers[2] = [120, 400]; s.rebuild();
+check('画线即恢复：页 2 重新出块', s.blocks.filter(b => b.startPage === 2).length === 1);
+
+// 4) 自由排序：拖/移之后 rebuild 不重排；新段插到锚点块后面
+s = fresh(); s.dividers[1] = [100, 300, 600]; s.dividers[2] = [100, 300, 600]; s.rebuild();
+check('四块就绪', s.blocks.length === 4);
+const k0 = ids(s);
+s.shiftBlock(3, -1); s.rebuild();
+check('上移一块：顺序变了且 rebuild 后保持',
+      ids(s).join() === [k0[0], k0[1], k0[3], k0[2]].join());
+s.dragFrom = 3; s.dropOn(0);
+check('拖拽：dropOn 把它挪到最前', ids(s)[0] === k0[2] && s.blocks.length === 4);
+s.dividers[2] = [100, 300, 600, 700]; s.rebuild();
+check('新段插入：数量 +1', s.blocks.length === 5);
+check('新段插入：已拖过的顺序不变（新段插在锚点块后面）',
+      ids(s).slice(0, 4).join() === [k0[2], k0[0], k0[1], k0[3]].join()
+      && ids(s)[4] === 'L2_6000');
+
+// 5) 跨页自由合并 —— 复现「框好的两段中间总隔着别的块」
+s = fresh();
+s.rects = [{ gid: 'r1', page: 1, x0: 40, y0: 600, x1: 300, y1: 780 },
+           { gid: 'r2', page: 2, x0: 40, y0: 30, x1: 300, y1: 200 }];
+s.rebuild();
+check('跨页：两页都没画线 → 整页块 + 框选块共 4 块', s.blocks.length === 4);
+check('跨页：中间果然隔着整页块（复现用户反馈）', idx(s, 'Rr1') + 1 < idx(s, 'Rr2'));
+for (let k = idx(s, 'Rr2'); k > idx(s, 'Rr1') + 1; k--) s.shiftBlock(k, -1);
+check('跨页：拖到相邻后两段挨着', idx(s, 'Rr2') === idx(s, 'Rr1') + 1);
+s.mergePrev(idx(s, 'Rr2'));
+const merged = s.blocks.find(b => b.regions.length === 2);
+check('跨页：并入上一块后合出一块两段',
+      !!merged && merged.regions[0].page === 1 && merged.regions[1].page === 2);
+check('跨页：合并后总数 -1', s.blocks.length === 3);
+
+// 6) 删块：框选块删 rect，线块删它顶部那条起始线
+s = fresh(); s.dividers[1] = [100, 300, 600];
+s.rects = [{ gid: 'r9', page: 2, x0: 10, y0: 10, x1: 100, y1: 100 }];
+s.rebuild();
+const before = s.blocks.length;
+s.removeBlock(idx(s, 'Rr9'));
+check('删框选块：rects 少一个', s.rects.length === 0);
+check('删框选块：块数 -1', s.blocks.length === before - 1);
+s = fresh(); s.dividers[1] = [100, 300, 600]; s.rebuild();
+s.removeBlock(idx(s, 'L1_3000'));
+check('删线块：撤掉它顶部那条起始线', s.dividers[1].indexOf(300) < 0);
+check('删线块：块数 -1', s.blocks.length === 2);
+
+// 7) 「不提交」：标记挂段 key，跨 rebuild 存活；换位跟着块走；合并/删除都不出错
+s = fresh(); s.dividers[1] = [100, 300, 600]; s.rebuild();
+check('不提交：默认都没标', s.blocks.length === 3 && s.blocks.every(b => !b.skipped));
+s.toggleSkip(1);
+check('不提交：标上后该块 skipped、其它块不受影响',
+      s.blocks[1].skipped === true && s.blocks.filter(b => b.skipped).length === 1);
+s.rebuild();
+check('不提交：rebuild 之后标记还在（挂的是段 key，不是会被重建的下标）', s.blocks[1].skipped === true);
+check('不提交：提交载荷剔掉它（也不裁图）', s.blockPayload().length === 2);
+s.shiftBlock(1, 1);
+check('不提交：换位后标记跟着这块走', s.blocks[2].skipped === true);
+s.toggleSkip(2);
+check('不提交：再点一次恢复提交', s.blocks[2].skipped === false && s.blockPayload().length === 3);
+s.toggleSkip(1); s.mergePrev(1);
+check('不提交：被标的段并进上一块后，整块仍不提交', s.blocks[0].skipped === true);
+check('不提交：合并后提交载荷仍剔掉它', s.blockPayload().length === s.blocks.length - 1);
+s.toggleSkip(0);
+check('不提交：取消时整组段一起恢复', s.blocks[0].skipped === false);
+s.toggleSkip(0); s.removeBlock(0);
+check('不提交：删块后标记被清掉（不会越攒越多）', Object.keys(s.skipKeys).length === 0);
+
+console.log('');
+if (fails.length) { console.log('❌ 行为验证未通过：' + JSON.stringify(fails)); process.exit(1); }
+console.log('✅ 行为验证全部通过');
+"""
+
+
+def check_ordering_behavior(src: str) -> None:
+    node = shutil.which("node")
+    if not node:
+        print("  [SKIP] node 不在 PATH —— 跳过题块编排的行为验证")
+        return
+    parts = [JS_HEAD]
+    for sig, name in JS_SIGS:
+        body = method_body(src, name)
+        if not body:
+            check(f"行为验证：抠出 {name} 的真实方法体", False)
+            return
+        parts.append("    %s {%s\n    },\n" % (sig, body))
+    parts.append(JS_TAIL)
+    js = "".join(parts)
+
+    with tempfile.TemporaryDirectory() as td:
+        f = Path(td) / "blk_behaviour.js"
+        f.write_text(js, encoding="utf-8")
+        r = subprocess.run([node, str(f)], capture_output=True, text=True,
+                           encoding="utf-8", errors="replace")
+    # ⚠️ 别对整段 stdout 做 .strip()：那会把**首行**前面的两个缩进空格也吃掉，
+    #    首行就匹配不上、被静默丢掉（第一次写就踩了，第一项断言凭空消失）。
+    out = r.stdout or ""
+    saw_fail = False
+    for line in out.splitlines():
+        # 行格式与 python 的 check() 一致：`  [OK ] 名称` / `  [FAIL] 名称`
+        s = line.strip()
+        if s.startswith("[") and "] " in s:
+            cut = s.index("] ")
+            ok = s[1:cut].strip() == "OK"
+            saw_fail = saw_fail or not ok
+            check(s[cut + 2:], ok)
+    if r.returncode != 0 and not saw_fail:
+        # 有输出但一条 FAIL 都没记下来 → 多半是 JS 抛异常/语法错，别当成通过
+        check("题块编排行为验证（node 异常退出）", False,
+              ((r.stderr or "") + out).strip()[-300:])
+    if not out.strip():
+        check("题块编排行为验证（node 无输出）", False, (r.stderr or "").strip()[:300])
+
+
 def main() -> int:
     src = BATCH.read_text(encoding="utf-8")
     clean = strip_noise(src)          # 标签配对要在去注释/去 script 的标记文本上数
@@ -495,9 +762,13 @@ def main() -> int:
         "框选工具": "'rect'",
         "自动铺线": "autoSegment",
         "线间自动成块": "bandsOf",
-        "页眉块可删（页顶可切）": "cutHead",
-        "恢复页顶": "restoreHead",
-        "跨页合并": "mergeFirstOf",
+        "起始线语义（第一条线以上跳过）": "起始线",
+        "整页可跳过": "skips",
+        "恢复本页": "restorePage",
+        "题块自由排序（拖拽/上下移）": "shiftBlock",
+        "跨页合并（拖到相邻再并入上一块）": "mergePrev",
+        "末线以下不出块、给虚线提示": "tail-hint",
+        "不提交（跳过识别的结构说明块）": "toggleSkip",
         "一次裁多块接口": "batch-crop",
         "建任务接口": "/api/batches",
         "把裁剪结果映射回块": "crop.items",
@@ -568,6 +839,12 @@ def main() -> int:
     print("\n==== ⑦ 题块缩略图 + 题干配图 ====")
     preview_not_persisted(src)
     check_figure_and_thumb(src)
+
+    print("\n==== ⑧ 起始线语义 + 自由排序合并 ====")
+    check_startline_merge(src)
+
+    print("\n==== ⑨ 题块编排（真实方法体在 node 里跑） ====")
+    check_ordering_behavior(src)
 
     print("\n" + "=" * 60)
     if fails:

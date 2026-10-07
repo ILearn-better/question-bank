@@ -135,7 +135,7 @@ def crop_region(
 
 
 def crop_regions(
-    path: str | os.PathLike, regions, out_dir: str | os.PathLike, zoom: float = 3.0, gap: int = 14
+    path: str | os.PathLike, regions, out_dir: str | os.PathLike, zoom: float = 3.0, gap: int = 0
 ) -> str:
     """把多个区域（可跨页）竖着拼成一张图，**落盘**并返回文件名。
 
@@ -156,7 +156,7 @@ def crop_regions(
 
 
 def render_region_png(
-    path: str | os.PathLike, regions, zoom: float = 1.5, gap: int = 14
+    path: str | os.PathLike, regions, zoom: float = 1.5, gap: int = 0
 ) -> bytes:
     """渲染若干区域并竖拼成 PNG，**不落盘**，直接返回字节。
 
