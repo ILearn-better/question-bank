@@ -143,13 +143,25 @@
   .fig-warn { color: #e6a23c; font-size: 12.5px; line-height: 1.7; margin-top: 6px; }
 
   /* 框选配图的弹窗 */
+  /* ⚠️ 滚动必须挂在**外层**、定位容器只包住图片本身（与左栏 .page-box 同一套）。
+     曾经把 max-height/overflow 加在 .fig-pick-page 上：那会让它的 padding-box 高度
+     = 62vh（可见高度），而图片实际高度是 880px 宽下的整页高度（A4 约 1188px）。
+     于是两处一起歪：① 鼠标换算用容器 rect 且没算 scrollTop；② 矩形的百分比 top
+     按容器高度解析。表现为「框和鼠标选的对不齐，且框出来的内容根本不是那一块」。 */
+  .fig-pick-scroll {
+    max-height: 62vh; overflow: auto; background: #fff;
+    border: 1px solid #e4e7ed; border-radius: 4px;
+  }
+  /* 定位容器：高度由 aspect-ratio 定死 = 图片高度，且**无** border/padding/滚动，
+     这样 getBoundingClientRect() 与百分比定位才与图片严格同一基准。 */
   .fig-pick-page {
     position: relative; user-select: none; -webkit-user-select: none;
-    border: 1px solid #e4e7ed; border-radius: 4px; overflow: hidden;
-    background: #fff; line-height: 0; cursor: crosshair;
-    max-height: 62vh; overflow-y: auto;
+    line-height: 0; cursor: crosshair;
   }
-  .fig-pick-page img { width: 100%; display: block; pointer-events: none; }
+  .fig-pick-page img {
+    position: absolute; inset: 0; width: 100%; height: 100%;
+    display: block; pointer-events: none;
+  }
   .fig-rect {
     position: absolute; border: 2px solid #67c23a; background: rgba(103, 194, 58, .14);
     pointer-events: none; box-sizing: border-box;
@@ -433,6 +445,10 @@
                     重跑失败的 {{ currentJob.failed }} 条
                   </el-button>
                   <div style="flex:1"></div>
+                  <!-- 手动同步：轮询在任务跑完/出错时就停了，之后服务端再变就看不到 -->
+                  <el-button size="small" plain :loading="syncing" @click="syncModel">
+                    同步识别结果
+                  </el-button>
                   <el-button size="small" type="primary" plain :disabled="!pendingCount"
                              @click="approveAllPending">全部通过（{{ pendingCount }}）</el-button>
                 </div>
@@ -470,19 +486,22 @@
                         <rich-text :text="it.content"></rich-text>
                         <div class="src-box" style="margin-top:6px">
                           <el-input v-model="it.content" type="textarea" :rows="4"
+                                    @input="markEdited(it, 'content')"
                                     placeholder="识别失败或为空时可以直接在这里补写"></el-input>
                         </div>
 
                         <el-row :gutter="8" style="margin-top:8px">
                           <el-col :span="12">
                             <div class="hint">题型</div>
-                            <el-select v-model="it.qtype" size="small" style="width:100%">
+                            <el-select v-model="it.qtype" size="small" style="width:100%"
+                                       @change="markEdited(it, 'qtype')">
                               <el-option v-for="t in options.qtypes" :key="t" :value="t" :label="t"></el-option>
                             </el-select>
                           </el-col>
                           <el-col :span="12">
                             <div class="hint">难度</div>
-                            <el-select v-model="it.difficulty" size="small" style="width:100%">
+                            <el-select v-model="it.difficulty" size="small" style="width:100%"
+                                       @change="markEdited(it, 'difficulty')">
                               <el-option v-for="d in options.difficulties" :key="d" :value="d" :label="d"></el-option>
                             </el-select>
                           </el-col>
@@ -499,6 +518,7 @@
                             </template>
                           </div>
                           <el-input v-model="it.knowledge_point" size="small"
+                                    @input="markEdited(it, 'knowledge_point')"
                                     placeholder="如：三角函数的图像与性质（留空表示不确定）"></el-input>
                         </div>
 
@@ -506,6 +526,7 @@
                           <div class="hint">标签（回车添加，最多 {{ options.max_tags }} 个）</div>
                           <el-select v-model="it.tags" size="small" multiple filterable allow-create
                                      default-first-option :reserve-keyword="false" style="width:100%"
+                                     @change="markEdited(it, 'tags')"
                                      placeholder="如：含参讨论 / 恒成立">
                           </el-select>
                         </div>
@@ -522,7 +543,7 @@
                              这里的勾选框就是那个人工判断，默认值是模型给的，但以人勾的为准。 -->
                         <div class="fig-box" :class="{ on: it.needs_figure }">
                           <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
-                            <el-checkbox v-model="it.needs_figure" @change="saveFigure(it)">
+                            <el-checkbox v-model="it.needs_figure" @change="figToggle(it)">
                               这题有配图
                             </el-checkbox>
                             <el-tag v-if="it.figure_note" size="small" type="info" effect="plain">
@@ -615,13 +636,18 @@
                      @click="figPick.rects = []">清空重框</el-button>
         </div>
 
-        <div class="fig-pick-page" @pointerdown="figDown($event)">
-          <img :src="pageImg(figPick.page)" alt="" draggable="false">
-          <div v-for="(r, ri) in figPick.rects" :key="'fr' + ri" v-show="r.page === figPick.page"
-               class="fig-rect" :style="figRectStyle(r)">
-            <span class="fig-seq">{{ ri + 1 }}</span>
+        <!-- 滚动在外层，定位容器只包图片（高度由 aspect-ratio 定死）——
+             这样框选坐标与图片严格同一基准，翻页/滚动后也不会歪。 -->
+        <div class="fig-pick-scroll">
+          <div class="fig-pick-page" :style="figPageStyle()"
+               @pointerdown="figDown($event)">
+            <img :src="pageImg(figPick.page)" alt="" draggable="false">
+            <div v-for="(r, ri) in figPick.rects" :key="'fr' + ri" v-show="r.page === figPick.page"
+                 class="fig-rect" :style="figRectStyle(r)">
+              <span class="fig-seq">{{ ri + 1 }}</span>
+            </div>
+            <div v-if="figPick.draft" class="fig-rect draft" :style="figRectStyle(figPick.draft)"></div>
           </div>
-          <div v-if="figPick.draft" class="fig-rect draft" :style="figRectStyle(figPick.draft)"></div>
         </div>
 
         <div class="hint" style="margin-top:6px">
@@ -656,6 +682,34 @@ const AUTO_MAX_TOTAL = 40;   // 整份超过这个数，多半是页码/编号�
 
 /** 一次提交超过这个块数就二次确认 —— 提交多少块就是多少次 AI 调用（花钱、也怕被限流）。 */
 const SUBMIT_MAX = 30;
+
+/** 待审页里**老师可以改**的字段。轮询/手动同步时只对这几项做「谁说了算」的取舍，
+ *  其余字段（status / flags / error / node_path / question_id…）一律以服务端为准。
+ *  ⚠️ `figure_image` 刻意**不在列** —— 它只由服务端写（框选 / 撤掉），
+ *     保留本地旧值会把刚框好的图覆盖回去（实测踩过）。 */
+const REVIEW_FIELDS = ['content', 'qtype', 'difficulty', 'knowledge_point', 'tags', 'needs_figure'];
+
+/** 值算不算「空」：空串 / 纯空白 / 空数组 / null。
+ *  注意布尔（有没有配图）与下拉（题型、难度）**永远有值** ——
+ *  它们本来就不靠「补空」，靠轮询跟随服务端。 */
+function isBlank(v) {
+  if (v === null || v === undefined) return true;
+  if (Array.isArray(v)) return v.length === 0;
+  if (typeof v === 'boolean') return false;
+  return String(v).trim() === '';
+}
+
+/** 两个字段值是否等价。tags 是**数组**，用 `!==` 会恒为真（每轮都当成「有更新」）。 */
+function sameVal(a, b) {
+  if (Array.isArray(a) || Array.isArray(b)) {
+    const x = Array.isArray(a) ? a : [];
+    const y = Array.isArray(b) ? b : [];
+    return x.length === y.length && x.every((v, i) => v === y[i]);
+  }
+  if (typeof a === 'boolean' || typeof b === 'boolean') return !!a === !!b;
+  return String(a === null || a === undefined ? '' : a)
+      === String(b === null || b === undefined ? '' : b);
+}
 
 /** 这一行看起来像不像「一道题的开头」。
  *
@@ -767,6 +821,11 @@ const app = createApp({
       items: [],
       jobs: [],
       _poll: null,
+      // edited = { 条目id: { 字段: true } } 老师**真的动过**的字段。
+      // 轮询每 1.5 秒把列表换一次：动过的保留本地（不吞正在敲的字），
+      // 没动过的必须以服务端为准 —— 否则识别结果永远进不来（见 applyItems）。
+      edited: {},
+      syncing: false,           // 「同步识别结果」按钮的 loading
       // 框选配图弹窗。rects 是**已确认的段**（跨页时会有多段，服务端竖拼成一张），
       // draft 是正在拖的那个矩形。
       figPick: { show: false, item: null, page: 1, rects: [], draft: null, saving: false },
@@ -1513,22 +1572,65 @@ const app = createApp({
         if (!this.currentJob.finished) this.startPoll(id);
       } catch (e) { ElementPlus.ElMessage.error(e.message); }
     },
-    async loadItems(jobId) {
-      const list = await this.api('/api/batches/' + jobId + '/items');
-      // 保留正在编辑的字段：轮询每 1.5 秒覆盖一次，直接换掉会把用户刚敲的字吞了
+    /** 记一笔「这个字段老师动过」。模板上每个可编辑控件都挂它。 */
+    markEdited(it, f) {
+      if (!this.edited[it.id]) this.edited[it.id] = {};
+      this.edited[it.id][f] = true;
+    },
+    /** 把服务端的待审列表合进界面，返回改动处数。
+     *
+     *  ⚠️⚠️ **不能**写成「可编辑字段一律保留本地旧值」—— 那是老 bug 的根源：
+     *    提交后第一次轮询（1.5 秒）识别还没回来，本地存下的是**空串**，
+     *    之后每一轮都把这个空串保住 → **模型输出永远进不了文本框**，
+     *    只有从「历史任务」重新点开该任务时才看得到（那时没有旧值可保留）。
+     *  现在按「动过没动过」分开算：
+     *    · 没动过 → 以服务端为准（识别结果一出来就自动进文本框）
+     *    · 动过   → 保留本地；fillEmptyOnly（手动同步）时，本地为空才用服务端补上
+     *    · 其余字段（status / flags / error / figure_image…）永远服务端说了算
+     */
+    applyItems(list, fillEmptyOnly) {
       const byId = {};
       this.items.forEach(i => { byId[i.id] = i; });
-      this.items = list.map(n => {
+      let changed = 0;
+      const out = list.map((n) => {
         const old = byId[n.id];
-        if (!old) return n;
-        // 只保留「用户可能正在编辑」的字段，其余以服务端为准。
-        // needs_figure 必须在列：老师刚勾上、请求还在路上时，轮询不能把它打回原样。
-        // figure_image 反之**不能**保留 —— 它只由服务端写（框选/撤掉），
-        // 保留旧值会把刚框好的图覆盖回去。
-        return { ...n, content: old.content, qtype: old.qtype,
-                 difficulty: old.difficulty, knowledge_point: old.knowledge_point,
-                 tags: old.tags, needs_figure: old.needs_figure };
+        if (!old) { changed++; return n; }      // 新条目就是「有更新」
+        const merged = { ...n };
+        const ed = this.edited[n.id] || {};
+        REVIEW_FIELDS.forEach((f) => {
+          if (!ed[f]) merged[f] = n[f];
+          else if (fillEmptyOnly && isBlank(old[f])) merged[f] = n[f];
+          else merged[f] = old[f];
+          if (!sameVal(merged[f], old[f])) changed++;
+        });
+        return merged;
       });
+      this.items = out;
+      return changed;
+    },
+    async loadItems(jobId) {
+      const list = await this.api('/api/batches/' + jobId + '/items');
+      this.applyItems(list, false);
+    },
+    /** 「同步识别结果」：手动立刻拉一次（任务 + 条目）。
+     *
+     *  为什么有按钮还需要它：**轮询在任务跑完或出错时就停了**，那之后服务端再变就看不到；
+     *  从「历史任务」点开旧任务时也一样。语义刻意保守 —— 老师写过的内容**绝不覆盖**，
+     *  只在那一格是空的时候把模型输出补上。
+     */
+    async syncModel() {
+      if (!this.currentJob) return;
+      const id = this.currentJob.id;
+      this.syncing = true;
+      try {
+        const job = await this.api('/api/batches/' + id);
+        const list = await this.api('/api/batches/' + id + '/items');
+        const n = this.applyItems(list, true);
+        this.currentJob = job;
+        ElementPlus.ElMessage.success(n ? `已同步 ${n} 处更新` : '已是最新，没有新的模型输出');
+      } catch (e) {
+        ElementPlus.ElMessage.error(e.message);
+      } finally { this.syncing = false; }
     },
 
     /* ---------- 审核 ---------- */
@@ -1545,6 +1647,8 @@ const app = createApp({
           }),
         });
         Object.assign(it, r);
+        // 已落库 → 不再有「本地未保存的修改」，这几项重新跟随服务端
+        delete this.edited[it.id];
         ElementPlus.ElMessage.success('已保存');
         return true;
       } catch (e) {
@@ -1661,6 +1765,12 @@ const app = createApp({
     },
 
     /* ---------- 题干配图 ---------- */
+    /** 勾「这题有配图」：先记「老师动过」（否则落库请求还在路上时，
+     *  一次轮询就把刚勾上的框打回原样），再立刻落库。 */
+    figToggle(it) {
+      this.markEdited(it, 'needs_figure');
+      this.saveFigure(it);
+    },
     /** 人工那个「有图」开关落库。AI 给的是初值 —— 漏判的代价是那幅图永远没人补，
      *  所以最终以人勾的为准（这也是用户点名要的人工判断逻辑）。 */
     async saveFigure(it) {
@@ -1719,17 +1829,41 @@ const app = createApp({
       this.figPick.page = p;
       this.figPick.draft = null;
     },
-    /** 弹窗里在整页图上拖一个矩形。坐标换算与左栏一致（都是 PDF 点）。 */
+    /** 框选弹窗里整页图的定位容器样式：高度用 aspect-ratio 定死 = 图片高度。
+     *
+     *  ⚠️ 两条都不能省：
+     *  ① **高度来源必须是 aspect-ratio**（而不是让图片在正常流里撑高）——
+     *     容器的 padding-box 高度与图片一致，`figDown` 的鼠标换算和 `figRectStyle`
+     *     的百分比定位才是同一基准。历史 bug 就是把这个 div 当成滚动容器用
+     *     （max-height:62vh），高度变成「可见高度」→ 框歪 + 内容对不上。
+     *  ② 几何读不到时给 A4 兜底，**不能**返回 {} —— 返回 {} 容器高度就是 0，
+     *     弹窗里一片空白，看起来像「图丢了」（左栏有 min-height:120px 兜着，这里没有）。 */
+    figPageStyle() {
+      const pg = this.pv.pages[this.figPick.page];
+      if (!pg || !pg.width || !pg.height) return { aspectRatio: '595 / 842' };
+      return { aspectRatio: pg.width + ' / ' + pg.height };
+    },
+    /** 弹窗里在整页图上拖一个矩形。坐标换算与左栏一致（都是 PDF 点）。
+     *
+     *  ⚠️ 基准必须是「只包着图片、高度由 aspect-ratio 定死的定位容器」——
+     *     这里取 `e.currentTarget` 的 rect，而它同时是矩形定位的包含块，
+     *     两处同一基准才不会歪。若把这个 div 变成滚动容器（历史 bug），
+     *     rect 就变成「可见高度」且不含 scrollTop → 框和鼠标必然对不齐。 */
     figDown(e) {
       if (e.button !== 0) return;
       const box = e.currentTarget;
       const pg = this.pv.pages[this.figPick.page];
       const r = box.getBoundingClientRect();
-      if (!pg || !pg.width || !r.width || !r.height) return;
-      const toXY = (ev) => ({
-        x: (ev.clientX - r.left) / r.width * pg.width,
-        y: (ev.clientY - r.top) / r.height * pg.height,
-      });
+      if (!pg || !pg.width || !pg.height || !r.width || !r.height) return;
+      const toXY = (ev) => {
+        const x = (ev.clientX - r.left) / r.width * pg.width;
+        const y = (ev.clientY - r.top) / r.height * pg.height;
+        // 拖到图外也夹回页内，别把越界坐标发给服务端（会被 422 挡掉）
+        return {
+          x: Math.max(0, Math.min(pg.width, x)),
+          y: Math.max(0, Math.min(pg.height, y)),
+        };
+      };
       const a = toXY(e);
       this.figPick.draft = { page: this.figPick.page, x0: a.x, y0: a.y, x1: a.x, y1: a.y };
       const onMove = (ev) => {

@@ -47,6 +47,14 @@ node 不在 PATH 时只跳过语法检查，结构检查照跑。
 
   这两处的关键点都容易被「顺手改回去」：缩略图改回 fetch 落盘就攒垃圾、
   提醒改成自动判定就丢了人工兜底 —— 所以钉在这里。
+
+  ③（2026-10-07 深夜追加）「框选配图的框跟鼠标选的对不齐，且框出来的内容不是那块」。
+    根因是**几何基准**：`.fig-pick-page` 既是定位容器又被当成滚动容器
+    （max-height:62vh），padding-box 高度 ≠ 图片高度，于是鼠标换算与百分比定位
+    各自按错的高度算。修法照抄左栏 .page-box（滚动在外层 + aspect-ratio 定高）。
+    ⚠️ 这类 bug 的原有断言（「用了 pg.width/pg.height」）必然全绿 ——
+       所以这里断言的是**结构不变式**：滚动不许挂在定位容器上、高度必须由
+       aspect-ratio 来、图片必须绝对定位填满。改 CSS 时先看这几条。
 """
 import json
 import re
@@ -230,6 +238,25 @@ def method_body(src: str, name: str) -> str:
     return m.group(1) if m else ""
 
 
+def top_decl(src: str, name: str) -> str:
+    """抠出一个**顶层**声明（`function name(...) { ... }` 或 `const name = [...];`）。
+
+    ⑨ 段只抽 4 空格缩进的方法体；applyItems 依赖的顶层纯函数/常量得单独取 ——
+    在测试里重抄一份，测的就成了测试自己的副本，等于没测。
+    """
+    m = re.search(rf"\n(function {name}\([^)]*\) \{{[\s\S]*?\n\}})", src)
+    if m:
+        return m.group(1)
+    m = re.search(rf"\n(const {name} = \[[\s\S]*?\];)", src)
+    return m.group(1) if m else ""
+
+
+def css_rule(src: str, selector: str) -> str:
+    """抠出一段 CSS 规则体 `selector { ... }`（不含嵌套块，够用）。"""
+    m = re.search(rf"(?m)^\s*{re.escape(selector)}\s*\{{([^}}]*)\}}", src)
+    return m.group(1) if m else ""
+
+
 # isQNumLine 的用例：(行文本, 应该是题号吗)。
 # 右列每个 False 都对应一次真实的误判 —— 别随手删。
 QNUM_CASES: list[tuple[str, bool]] = [
@@ -370,9 +397,10 @@ def check_figure_and_thumb(src: str) -> None:
     down = method_body(src, "figDown")
     style = method_body(src, "figRectStyle")
     spick = method_body(src, "saveFigurePick")
+    figsty = method_body(src, "figPageStyle")
 
-    check("抠到配图相关的 9 个方法",
-          all([prev, save, warn, clr, pick, turn, down, style, spick]))
+    check("抠到配图相关的 10 个方法",
+          all([prev, save, warn, clr, pick, turn, down, style, spick, figsty]))
 
     # —— 问题2：两条线之间切成了什么，得看得见 ——
     check("缩略图：拼的是 region-image，带 zoom 与 spec", "region-image" in prev
@@ -392,7 +420,8 @@ def check_figure_and_thumb(src: str) -> None:
     # —— 问题1：AI 初判 + 人工勾选 + 手工框选 ——
     check("配图：勾选框绑 needs_figure（这就是「人工判断」的落点）",
           'v-model="it.needs_figure"' in src)
-    check("配图：勾一下立刻落库", '@change="saveFigure(it)"' in src)
+    check("配图：勾一下立刻落库（先记「动过」再落库，见 figToggle）",
+          '@change="figToggle(it)"' in src)
     check("配图：saveFigure 只写 needs_figure，不顺手把别的字段覆盖了",
           "JSON.stringify({ needs_figure: !!it.needs_figure })" in save)
     check("配图：已入库的条目不能再框图", "it.status === 'approved'" in src)
@@ -438,12 +467,46 @@ def check_figure_and_thumb(src: str) -> None:
     check("框选：保存走 figure-crop，保存中禁用按钮",
           "/figure-crop" in spick and "figPick.saving" in src)
 
-    # —— 与轮询/保存的配合 ——
-    check("轮询：保留字段里有 needs_figure（刚勾上不被打回）",
-          "needs_figure: old.needs_figure" in src)
-    kept = re.search(r"return \{ \.\.\.n,[\s\S]*?\};", src)
-    check("轮询：figure_image 反而不能保留（否则覆盖刚框好的图）",
-          kept is not None and "figure_image" not in kept.group(0))
+    # —— 框选几何：定位容器必须与图片严格同尺寸（2026-10-07 深夜反馈）——
+    #    「框和鼠标选的对不齐，而且框出来的内容根本不是那一块」。
+    #    根因：把 max-height/overflow 加在了**定位容器自己**身上 → 它的 padding-box
+    #    高度变成 62vh（可见高度），而图片是整页高度（880px 宽下 A4 约 1188px）。
+    #    于是两处一起歪：① figDown 用容器 rect 换算鼠标坐标且不含 scrollTop；
+    #    ② figRectStyle 的百分比 top 按容器高度解析。
+    #    修法与左栏 .page-box 一致：滚动放外层、内层用 aspect-ratio 定高、图片绝对定位填满。
+    #    ⚠️ 原有的「坐标按页宽高换算」断言只能证明「用了 pg.width/pg.height」，
+    #       对「基准是不是图片」完全没有约束 —— 正是这种全绿但页面不能用的漏网方式。
+    page_rule = css_rule(src, ".fig-pick-page")
+    scroll_rule = css_rule(src, ".fig-pick-scroll")
+    img_rule = css_rule(src, ".fig-pick-page img")
+    fs = method_body(src, "figPageStyle")
+    check("框选几何：抠到 .fig-pick-page / .fig-pick-scroll / img 三段样式 + figPageStyle",
+          all([page_rule, scroll_rule, img_rule, fs]))
+    check("框选几何：滚动挂在外层 wrapper 上（max-height + overflow）",
+          "max-height" in scroll_rule and "overflow" in scroll_rule)
+    check("★ 框选几何：定位容器自己**不**是滚动容器，也没有 border/padding",
+          "max-height" not in page_rule and "overflow" not in page_rule
+          and "border" not in page_rule and "padding" not in page_rule)
+    check("框选几何：定位容器高度由 aspect-ratio 定死（= 图片高度）",
+          "aspectRatio" in fs)
+    check("框选几何：几何缺失时给 A4 兜底（返回 {} 会让容器塌成 0 高、图看不见）",
+          "'595 / 842'" in fs)
+    check("框选几何：图片绝对定位填满容器（与左栏 .page-box 同一套）",
+          "position: absolute" in img_rule and "inset: 0" in img_rule)
+    check("框选几何：模板里容器包在 .fig-pick-scroll 内、且挂 figPageStyle",
+          'class="fig-pick-scroll"' in src
+          and 'class="fig-pick-page" :style="figPageStyle()"' in src)
+    check("框选几何：鼠标换算的基准就是那个定位容器（同一个 rect）",
+          "e.currentTarget" in down and "getBoundingClientRect" in down)
+    check("框选：拖到图外夹回页内（不把越界坐标发给服务端）",
+          "Math.max(0, Math.min(pg.width" in down and "Math.min(pg.height" in down)
+
+    # —— 与轮询/保存的配合（2026-10-08 改成「动过没动过」判定，详见 ⑨ 段）——
+    rf = review_fields(src)
+    check("轮询：needs_figure 在可编辑清单里（老师刚勾上，轮询不能打回）",
+          "'needs_figure'" in rf)
+    check("轮询：figure_image **不**在可编辑清单里（否则覆盖刚框好的图）",
+          "figure_image" not in rf)
     check("保存：saveItem 一并带上 needs_figure",
           "needs_figure: !!it.needs_figure" in method_body(src, "saveItem"))
 
@@ -556,7 +619,70 @@ def check_startline_merge(src: str) -> None:
           "gap: int = 0" in pdf and "gap: int = 14" not in pdf)
 
 
-# ------------------------------------------------- ⑨ 题块编排：真实方法体在 node 里跑行为断言
+# ------------------------------------------------- ⑨ 待审：模型输出同步进文本框
+def review_fields(src: str) -> str:
+    """抠出 REVIEW_FIELDS 的取值清单（方括号里的内容）。"""
+    m = re.search(r"const REVIEW_FIELDS = \[([\s\S]*?)\];", src)
+    return m.group(1) if m else ""
+
+
+def check_review_sync(src: str) -> None:
+    """2026-10-08 反馈：「大模型的输出没办法快速同步放到文本框中」。
+
+    **根因不在接口**（后端 `_item_dict` 每次都返回最新内容），在**前端轮询的合并**：
+    旧写法把可编辑字段**一律保留本地旧值**，而提交后第一次轮询（1.5 秒）识别还没回来、
+    那时本地存下的是**空串** → 之后每一轮都把这个空串保住 →
+    模型输出永远进不了文本框，只有从「历史任务」重新点开该任务才看得到
+    （新列表没有旧值可保留，所以那一次是好的 —— 这个「有时好有时坏」正是它难查的地方）。
+
+    修法（两条一起）：
+    · 字段按**「老师动过没动过」**取舍：没动过 → 以服务端为准（输出自动进文本框）；
+      动过 → 保留本地（不吞正在敲的字）。
+    · 再加一个手动「同步识别结果」按钮，兜住**轮询已经停了**的场景
+      （任务跑完 / 出错都会 stopPoll）。语义刻意保守：只补空，写过的绝不覆盖。
+    """
+    ap = method_body(src, "applyItems")
+    load = method_body(src, "loadItems")
+    sync = method_body(src, "syncModel")
+    mark = method_body(src, "markEdited")
+    ft = method_body(src, "figToggle")
+    save = method_body(src, "saveItem")
+
+    check("抠到 applyItems / loadItems / syncModel / markEdited / figToggle / saveItem",
+          all([ap, load, sync, mark, ft, save]))
+
+    # —— 根因：绝不能「可编辑字段一律保留本地旧值」——
+    check("同步：没动过的字段以服务端为准（模型输出进得来）", "if (!ed[f]) merged[f] = n[f]" in ap)
+    check("同步：动过的字段保留本地（轮询不吞正在敲的字）", "merged[f] = old[f]" in ap)
+    check("同步：手动同步时，动过但为空的那格才用服务端补（只补空）",
+          "fillEmptyOnly && isBlank(old[f])" in ap)
+    check("同步：可编辑字段集中在 REVIEW_FIELDS（不散落在各处）",
+          "REVIEW_FIELDS = [" in src and "REVIEW_FIELDS.forEach" in ap)
+    check("同步：figure_image 不在清单里（它只由服务端写）",
+          "figure_image" not in review_fields(src))
+    check("同步：loadItems 复用同一份合并（不另写一套保字段逻辑）",
+          "this.applyItems(list, false)" in load)
+    check("同步：手动按钮走 fillEmptyOnly=true", "this.applyItems(list, true)" in sync)
+    check("同步：按钮文案与处理函数都在，且带 loading（连点不叠请求）",
+          "同步识别结果" in src and '@click="syncModel"' in src and ':loading="syncing"' in src)
+    check("同步：手动同步也把任务状态一起拉回来（进度/失败数不落后）",
+          "await this.api('/api/batches/' + id)" in sync)
+    check("同步：空值/等价判定是顶层纯函数（tags 是数组，`!==` 会恒真）",
+          "function isBlank" in src and "function sameVal" in src
+          and "x.length === y.length" in src)
+
+    # —— 模板：每个可编辑控件都要记一笔「动过」 ——
+    for f in ("content", "qtype", "difficulty", "knowledge_point", "tags"):
+        check(f"同步：{f} 的控件挂了 markEdited", f"markEdited(it, '{f}')" in src)
+    check("同步：配图勾选先记账再落库",
+          "markEdited(it, 'needs_figure')" in ft and "saveFigure(it)" in ft)
+    check("同步：保存成功后清账（之后重新跟随服务端）",
+          "delete this.edited[it.id]" in save)
+    check("同步：记账只经 markEdited（模板不直接写 edited）",
+          "this.edited[it.id] = {}" in mark and "it.id][f] = true" in mark)
+
+
+# ------------------------------------------------- ⑩ 题块编排：真实方法体在 node 里跑行为断言
 #
 # 为什么不是纯静态断言：本轮改的是**算法**（段 → 编排表 → 题块），
 # 「顺序在 rebuild 后还保不保得住」「新段插到哪」「合并后是不是真的两段」
@@ -573,7 +699,13 @@ JS_SIGS = [
     ("removeBlock(i)", "removeBlock"),
     ("toggleSkip(i)", "toggleSkip"),
     ("blockPayload()", "blockPayload"),
+    ("markEdited(it, f)", "markEdited"),
+    ("applyItems(list, fillEmptyOnly)", "applyItems"),
 ]
+
+# applyItems 依赖的**顶层**声明 —— 必须从 batch.html 里真取，
+# 测试里重抄一份等于测自己的副本（那就白测了）。
+JS_TOP_DECLS = ["REVIEW_FIELDS", "isBlank", "sameVal"]
 
 JS_HEAD = """'use strict';
 const fails = [];
@@ -587,6 +719,7 @@ function fresh() {
     pageList: [1, 2],
     dividers: {}, rects: [], skips: {}, skipKeys: {}, groups: [], _rectSeq: 0, blocks: [],
     dragFrom: null, dragOver: null,
+    items: [], edited: {},
     previewUrl() { return ''; },
 """
 
@@ -682,6 +815,49 @@ check('不提交：取消时整组段一起恢复', s.blocks[0].skipped === fals
 s.toggleSkip(0); s.removeBlock(0);
 check('不提交：删块后标记被清掉（不会越攒越多）', Object.keys(s.skipKeys).length === 0);
 
+// 8) 待审同步：模型输出要能进文本框，但老师敲过的字不能被 1.5 秒一轮的轮询吞掉
+__TOP_DECLS__
+const SRV = (over) => Object.assign({
+  id: 'a', content: '', qtype: '其他', difficulty: '中等', knowledge_point: '',
+  tags: [], needs_figure: false, figure_image: '', status: 'pending', flags: [],
+}, over || {});
+
+// 8.1 复现老 bug：开局本地是空串，模型输出后来才到
+s = fresh();
+s.items = [SRV()];
+s.applyItems([SRV({ content: '模型给的题干', qtype: '解答题', difficulty: '较难',
+                   knowledge_point: '三角函数', tags: ['含参'], needs_figure: true,
+                   figure_image: '/crops/a.png', flags: ['json_repaired'] })], false);
+check('同步：没动过的题干跟随服务端（模型输出进文本框）', s.items[0].content === '模型给的题干');
+check('同步：题型/难度/知识点/标签一起跟随服务端',
+      s.items[0].qtype === '解答题' && s.items[0].difficulty === '较难'
+      && s.items[0].knowledge_point === '三角函数' && s.items[0].tags[0] === '含参');
+check('同步：配图判断跟随服务端（老师没勾就听模型的）', s.items[0].needs_figure === true);
+check('同步：figure_image 只认服务端（本地旧值不许把它覆盖回去）',
+      s.items[0].figure_image === '/crops/a.png');
+check('同步：非可编辑字段（flags）也以服务端为准', s.items[0].flags[0] === 'json_repaired');
+
+// 8.2 老师敲过字 → 轮询不许吞
+s.markEdited(s.items[0], 'content');
+s.applyItems([SRV({ content: '模型又改了一版', tags: ['恒成立'] })], false);
+check('同步：敲过的题干保留本地（轮询不吞正在编辑的字）', s.items[0].content === '模型给的题干');
+check('同步：没敲过的标签照样跟随服务端', s.items[0].tags[0] === '恒成立');
+
+// 8.3 手动「同步识别结果」：只补空，写过的绝不覆盖
+s.markEdited(s.items[0], 'knowledge_point');
+s.items[0].content = '';                       // 老师把题干清空了
+s.items[0].knowledge_point = '我写的知识点';
+const chg = s.applyItems([SRV({ content: '模型版题干', knowledge_point: '模型版知识点' })], true);
+check('手动同步：被清空的题干由模型输出补上', s.items[0].content === '模型版题干');
+check('手动同步：已经写好的知识点不被覆盖（只补空）', s.items[0].knowledge_point === '我写的知识点');
+check('手动同步：返回改动处数（给提示文案用）', chg >= 1);
+
+// 8.4 两边一致时不能报「有更新」（tags 是数组，!== 会恒真）
+s = fresh();
+s.items = [SRV({ content: '同一段话', tags: ['t'] })];
+check('手动同步：本地与服务端一致时不报更新（数组逐项比）',
+      s.applyItems([SRV({ content: '同一段话', tags: ['t'] })], true) === 0);
+
 console.log('');
 if (fails.length) { console.log('❌ 行为验证未通过：' + JSON.stringify(fails)); process.exit(1); }
 console.log('✅ 行为验证全部通过');
@@ -693,6 +869,13 @@ def check_ordering_behavior(src: str) -> None:
     if not node:
         print("  [SKIP] node 不在 PATH —— 跳过题块编排的行为验证")
         return
+    decls = []
+    for name in JS_TOP_DECLS:
+        d = top_decl(src, name)
+        if not d:
+            check(f"行为验证：抠出顶层声明 {name}", False)
+            return
+        decls.append(d)
     parts = [JS_HEAD]
     for sig, name in JS_SIGS:
         body = method_body(src, name)
@@ -700,7 +883,8 @@ def check_ordering_behavior(src: str) -> None:
             check(f"行为验证：抠出 {name} 的真实方法体", False)
             return
         parts.append("    %s {%s\n    },\n" % (sig, body))
-    parts.append(JS_TAIL)
+    # 顶层声明插在待审同步那一段之前（不能塞进 fresh() 的对象字面量里）
+    parts.append(JS_TAIL.replace("__TOP_DECLS__", "\n".join(decls)))
     js = "".join(parts)
 
     with tempfile.TemporaryDirectory() as td:
@@ -773,7 +957,8 @@ def main() -> int:
         "建任务接口": "/api/batches",
         "把裁剪结果映射回块": "crop.items",
         "轮询进度": "startPoll",
-        "轮询不吞正在编辑的字": "保留正在编辑的字段",
+        "轮询：动过的字段才保留本地（其余跟随服务端）": "markEdited",
+        "手动同步模型输出": "syncModel",
         "待审条目编辑": "saveItem",
         "通过入库": "approve",
         "驳回": "reject",
@@ -843,7 +1028,10 @@ def main() -> int:
     print("\n==== ⑧ 起始线语义 + 自由排序合并 ====")
     check_startline_merge(src)
 
-    print("\n==== ⑨ 题块编排（真实方法体在 node 里跑） ====")
+    print("\n==== ⑨ 待审：模型输出同步进文本框 ====")
+    check_review_sync(src)
+
+    print("\n==== ⑩ 题块编排 + 待审同步（真实方法体在 node 里跑） ====")
     check_ordering_behavior(src)
 
     print("\n" + "=" * 60)
