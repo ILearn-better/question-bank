@@ -543,6 +543,72 @@ class LessonSupplementItem(Base):
     __table_args__ = (Index("idx_supplement_items", "supplement_id", "sort_order"),)
 
 
+class LessonPrep(Base):
+    """课前备课（一节课一条，与反馈/作业/课后补充并列）。
+
+    与课后补充（LessonSupplement）的区别：那边是「课后挑好、下次发给学生」，
+    这边是「上课前老师自己准备这节课怎么上」—— 方向不同、内容不同，所以是两张表。
+    粒度一节一条（lesson_id 唯一）：备课一节课一次，改了就是改这一份。
+
+    note_id 是备课与笔记库**双向**联动的枢纽（可空）：
+      - 从笔记库选了一篇 → 指向它（这份备课基于/引用了这篇笔记）。
+      - 点「存成笔记」→ 服务端把结构化内容拼成 Markdown 写进笔记库，
+        再把新/旧笔记的 id 回写到这一列。
+    """
+
+    __tablename__ = "lesson_preps"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    owner_id: Mapped[int] = mapped_column(Integer, nullable=False, default=OWNER_ID, server_default=str(OWNER_ID))
+    lesson_id: Mapped[int] = mapped_column(
+        ForeignKey("lessons.id", ondelete="CASCADE"), nullable=False
+    )
+    student_id: Mapped[int] = mapped_column(
+        ForeignKey("students.id", ondelete="CASCADE"), nullable=False
+    )
+    goal: Mapped[str] = mapped_column(Text, default="", server_default="")         # 教学目标
+    key_points: Mapped[str] = mapped_column(Text, default="", server_default="")  # 重点难点
+    flow: Mapped[str] = mapped_column(Text, default="", server_default="")        # 教学流程
+    materials: Mapped[str] = mapped_column(Text, default="", server_default="")   # 准备材料
+    note_id: Mapped[str | None] = mapped_column(String)                            # 关联/生成的笔记
+    created_at: Mapped[str] = mapped_column(Text, default=_now, server_default=NOW)
+    updated_at: Mapped[str] = mapped_column(Text, default=_now, server_default=NOW)
+
+    items: Mapped[list["LessonPrepItem"]] = relationship(
+        back_populates="prep", cascade="all, delete-orphan", passive_deletes=True
+    )
+
+    __table_args__ = (
+        UniqueConstraint("lesson_id", name="uq_lesson_preps_lesson"),
+        Index("idx_lesson_preps_student", "student_id", "id"),
+    )
+
+
+class LessonPrepItem(Base):
+    """备课里挑的一项材料：一道题 / 一篇笔记（这节课要用的）。
+
+    `title` 是标题快照：内容被删后这条记录还能自解释（显示「（内容已删）」）。
+    与 LessonSupplementItem 同构但独立 —— 语义不同（备课用 vs 发给学生）。
+    """
+
+    __tablename__ = "lesson_prep_items"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    owner_id: Mapped[int] = mapped_column(Integer, nullable=False, default=OWNER_ID, server_default=str(OWNER_ID))
+    prep_id: Mapped[int] = mapped_column(
+        ForeignKey("lesson_preps.id", ondelete="CASCADE"), nullable=False
+    )
+    kind: Mapped[str] = mapped_column(String, nullable=False)     # question | note
+    ref_id: Mapped[str] = mapped_column(String, nullable=False)   # questions.id 或 notes.id
+    title: Mapped[str] = mapped_column(Text, default="", server_default="")
+    sort_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    created_at: Mapped[str] = mapped_column(Text, default=_now, server_default=NOW)
+
+    prep: Mapped["LessonPrep"] = relationship(back_populates="items")
+
+    __table_args__ = (Index("idx_lesson_prep_items", "prep_id", "sort_order"),)
+
+
 class Homework(Base):
     """一次作业的记录（一节课一条）。
 

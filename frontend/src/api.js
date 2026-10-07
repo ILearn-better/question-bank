@@ -159,6 +159,17 @@ export const supplementsApi = {
   print: (id, filename) => download(`/api/supplements/${id}/print`, filename, 'POST'),
 };
 
+/** 课前备课：老师上课前做的准备（一节一条，与反馈/作业/课后补充并列）。
+ *  结构化四段（目标/重难点/流程/准备材料）+ 挑的材料 + 与笔记库双向联动（note_id）。 */
+export const prepApi = {
+  get: (lessonId) => api.get(`/api/lessons/${lessonId}/prep`),
+  /** 存/改：四个字段 + note_id 都是「没传 = 保持」；items 传了（含空数组）= 整组替换。 */
+  save: (lessonId, body) => api.put(`/api/lessons/${lessonId}/prep`, body),
+  remove: (lessonId) => api.del(`/api/lessons/${lessonId}/prep`),
+  /** 把这份备课「写回」笔记库（已关联就更新那篇正文，否则新建落未归档）。 */
+  saveAsNote: (lessonId) => api.post(`/api/lessons/${lessonId}/prep/save-as-note`),
+};
+
 /** 上课文件（讲义 / 课件 / 试卷）：上传后由后端在本机抽文字，供 AI 润色当参考资料。
  *  ⚠️ 接的是纯文本接口，模型不收文件本身 —— 所以发出去的是**抽出来的文字**。 */
 export const lessonFilesApi = {

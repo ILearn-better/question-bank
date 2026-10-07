@@ -2,11 +2,12 @@
 // 设计目标：打开这个人的页面，从上到下就能看完他发生了什么，不用在多个页面之间跳。
 import { computed, onMounted, ref } from 'vue';
 import { useRoute } from 'vue-router';
-import { studentsApi, homeworkApi, supplementsApi } from '../api.js';
+import { studentsApi, homeworkApi, supplementsApi, prepApi } from '../api.js';
 import AbilityRadar from '../components/AbilityRadar.js';
 import FeedbackDialog from '../components/FeedbackDialog.js';
 import HomeworkDialog from '../components/HomeworkDialog.js';
 import SupplementDialog from '../components/SupplementDialog.js';
+import PrepDialog from '../components/PrepDialog.js';
 import { fail, fmtBytes, hhmm, loadCurricula, money, ok, shortDate, STATUS_LABEL, STATUS_TAG } from '../store.js';
 
 /** 作业状态 -> 标签颜色。未交看红：家长沟通里这是必须提的事。 */
@@ -16,7 +17,7 @@ const SUP_TAG = { todo: 'orange', given: 'blue', returned: 'green' };
 
 export default {
   name: 'StudentDetail',
-  components: { AbilityRadar, FeedbackDialog, HomeworkDialog, SupplementDialog },
+  components: { AbilityRadar, FeedbackDialog, HomeworkDialog, SupplementDialog, PrepDialog },
   setup() {
     const route = useRoute();
     const id = Number(route.params.id);
@@ -36,6 +37,9 @@ export default {
     // lesson_id -> 那个批次数组（时间轴上每条课直接取）
     const supsByLesson = ref({});
     const printing = ref(0);
+    // 课前备课：这节课老师自己的准备（结构化四段 + 挑材料 + 关联笔记）
+    const prepLesson = ref(null);
+    const prepsByLesson = ref({});
 
     async function loadSupplements() {
       const map = {};
@@ -53,6 +57,17 @@ export default {
       }
     }
 
+    async function loadPreps() {
+      const map = {};
+      await Promise.all(timeline.value.map(async (it) => {
+        try {
+          const r = await prepApi.get(it.lesson.id);
+          map[it.lesson.id] = r.prep || null;
+        } catch (e) { map[it.lesson.id] = null; }
+      }));
+      prepsByLesson.value = map;
+    }
+
     async function load() {
       loading.value = true;
       try {
@@ -61,6 +76,7 @@ export default {
         folder.value = await studentsApi.folder(id);
         hwRadar.value = await homeworkApi.radar(id);
         await loadSupplements();
+        await loadPreps();
       } catch (e) {
         fail(e.message);
       } finally {
@@ -169,6 +185,22 @@ export default {
       await load();
     }
 
+    /** 「课前备课」：与反馈/作业/课后补充并列的入口，同一节课、同一个位置。 */
+    function openPrep(item) {
+      prepLesson.value = {
+        id: item.lesson.id,
+        student_id: id,
+        student_name: stu.value.name,
+        start_at: item.lesson.start_at,
+        topic: item.lesson.topic,
+      };
+    }
+
+    async function onPrepSaved() {
+      prepLesson.value = null;
+      await loadPreps();
+    }
+
     onMounted(async () => {
       await loadCurricula();
       await load();
@@ -181,6 +213,7 @@ export default {
       hwRadar, homeworkLesson, openHomework, onHomeworkSaved, HW_TAG,
       supplementLesson, supPending, supsByLesson, openSupplement, onSupplementSaved,
       setSupStatus, printSup, removeSup, printing, SUP_TAG,
+      prepLesson, prepsByLesson, openPrep, onPrepSaved,
     };
   },
   template: `
@@ -332,6 +365,10 @@ export default {
               <span class="small muted">{{ item.lesson.duration_min }} 分钟</span>
               <span v-if="item.lesson.amount !== null" class="small muted">{{ money(item.lesson.amount) }}</span>
               <div class="spacer"></div>
+              <button class="btn ghost sm" @click="openPrep(item)"
+                      title="上课前的准备：写四段备课 + 挑这节课要用的材料">
+                {{ prepsByLesson[item.lesson.id] ? '改备课' : '备课' }}
+              </button>
               <button class="btn ghost sm" @click="openFeedback(item)">
                 {{ item.feedback ? '改反馈' : '写反馈' }}
               </button>
@@ -385,6 +422,20 @@ export default {
               <button class="btn sm ghost" @click="removeSup(b)">删</button>
               <div v-if="b.note" class="small muted" style="width:100%">备注：{{ b.note }}</div>
             </div>
+
+            <!-- 课前备课：与反馈/作业/课后补充并列的第四样 -->
+            <div v-if="prepsByLesson[item.lesson.id]" style="margin-top:8px">
+              <span class="tag green">已备课</span>
+              <span v-if="prepsByLesson[item.lesson.id].note_title" class="tag blue" style="margin-left:4px">
+                笔记·{{ prepsByLesson[item.lesson.id].note_title }}
+              </span>
+              <div v-if="prepsByLesson[item.lesson.id].goal" class="small" style="margin-top:4px">
+                教学目标：{{ prepsByLesson[item.lesson.id].goal }}
+              </div>
+              <div v-if="(prepsByLesson[item.lesson.id].items || []).length" class="small muted" style="margin-top:4px">
+                备了 {{ prepsByLesson[item.lesson.id].items.length }} 样材料
+              </div>
+            </div>
           </div>
         </div>
       </div>
@@ -396,5 +447,7 @@ export default {
                     @close="homeworkLesson = null" @saved="onHomeworkSaved" />
     <SupplementDialog v-if="supplementLesson" :lesson="supplementLesson"
                       @close="supplementLesson = null" @saved="onSupplementSaved" />
+    <PrepDialog v-if="prepLesson" :lesson="prepLesson"
+                @close="prepLesson = null" @saved="onPrepSaved" />
   </div>`,
 };

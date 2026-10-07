@@ -82,6 +82,15 @@
   .blk-band.bad .blk-tag { background: #f56c6c; }
   /* 跨页题的第二段：用虚线框标出来，表示它和上一段的块是一道题 */
   .blk-band.cont { box-shadow: inset 0 0 0 2px #909399; background: rgba(144,147,153,.14); }
+  /* 末线以下：刻意不成块，用虚线提醒「这里要框选」，免得看起来像末题凭空丢了 */
+  .tail-hint {
+    position: absolute; left: 0; right: 0; z-index: 3; pointer-events: none;
+    border: 1px dashed #c0c4cc; background: repeating-linear-gradient(
+      45deg, rgba(144,147,153,.06), rgba(144,147,153,.06) 6px,
+      rgba(144,147,153,.14) 6px, rgba(144,147,153,.14) 12px);
+    color: #909399; font-size: 11px; display: flex; align-items: center;
+    justify-content: center; text-align: center;
+  }
   .rect-rect {
     position: absolute; z-index: 6; border: 2px solid #00a870; background: rgba(0, 168, 112, .12);
     pointer-events: none;
@@ -98,6 +107,18 @@
     padding: 8px 10px; margin-bottom: 8px; font-size: 13px;
   }
   .blk-card.bad { border-color: #fbc4c4; background: #fef0f0; }
+  /* 标了「不提交」的块：整张淡掉 + 序号变灰，一眼与要识别的块区分开 */
+  .blk-card.skipped { opacity: .62; border-style: dashed; background: #fafafa; }
+  .blk-card.skipped .blk-no { background: #dcdfe6; color: #909399; }
+  .blk-card.skipped .blk-thumb { filter: grayscale(1); }
+  /* 页面上对应的色带也淡掉（保留边界，别让它看起来像没切） */
+  .blk-band.off { background: transparent !important; box-shadow: inset 0 0 0 2px #dcdfe6; }
+  /* 拖拽排序：拖住 ⋮⋮ 换位。dragging = 手上那块，drag-over = 要落到哪一格 */
+  .blk-card.dragging { opacity: .45; }
+  .blk-card.drag-over { border-color: #409eff; box-shadow: 0 -3px 0 0 #409eff inset; }
+  .drag-handle { cursor: grab; color: #c0c4cc; font-size: 13px; letter-spacing: -2px;
+                 user-select: none; padding: 0 2px; }
+  .drag-handle:active { cursor: grabbing; }
   .blk-no {
     flex: none; width: 30px; text-align: center; font-size: 12px; font-weight: 700;
     color: #409eff; background: #ecf5ff; border-radius: 4px; padding: 2px 0;
@@ -122,13 +143,25 @@
   .fig-warn { color: #e6a23c; font-size: 12.5px; line-height: 1.7; margin-top: 6px; }
 
   /* 框选配图的弹窗 */
+  /* ⚠️ 滚动必须挂在**外层**、定位容器只包住图片本身（与左栏 .page-box 同一套）。
+     曾经把 max-height/overflow 加在 .fig-pick-page 上：那会让它的 padding-box 高度
+     = 62vh（可见高度），而图片实际高度是 880px 宽下的整页高度（A4 约 1188px）。
+     于是两处一起歪：① 鼠标换算用容器 rect 且没算 scrollTop；② 矩形的百分比 top
+     按容器高度解析。表现为「框和鼠标选的对不齐，且框出来的内容根本不是那一块」。 */
+  .fig-pick-scroll {
+    max-height: 62vh; overflow: auto; background: #fff;
+    border: 1px solid #e4e7ed; border-radius: 4px;
+  }
+  /* 定位容器：高度由 aspect-ratio 定死 = 图片高度，且**无** border/padding/滚动，
+     这样 getBoundingClientRect() 与百分比定位才与图片严格同一基准。 */
   .fig-pick-page {
     position: relative; user-select: none; -webkit-user-select: none;
-    border: 1px solid #e4e7ed; border-radius: 4px; overflow: hidden;
-    background: #fff; line-height: 0; cursor: crosshair;
-    max-height: 62vh; overflow-y: auto;
+    line-height: 0; cursor: crosshair;
   }
-  .fig-pick-page img { width: 100%; display: block; pointer-events: none; }
+  .fig-pick-page img {
+    position: absolute; inset: 0; width: 100%; height: 100%;
+    display: block; pointer-events: none;
+  }
   .fig-rect {
     position: absolute; border: 2px solid #67c23a; background: rgba(103, 194, 58, .14);
     pointer-events: none; box-sizing: border-box;
@@ -225,7 +258,9 @@
             <el-button size="small" @click="autoSegment()">自动识别题号铺线</el-button>
             <el-button size="small" type="danger" plain @click="clearDividers">清空分界线</el-button>
             <el-checkbox v-model="snapGaps" size="small">吸附到行间空隙</el-checkbox>
-            <span class="muted-hint">已切 {{ blocks.length }} 个题块</span>
+            <span class="muted-hint">
+              已切 {{ blocks.length }} 个题块<template v-if="skippedCount">（{{ skippedCount }} 块不提交）</template>
+            </span>
             <el-tag v-if="unsplitPageCount" size="small" type="warning" effect="plain">
               {{ unsplitPageCount }} 页整页未分割
             </el-tag>
@@ -237,17 +272,20 @@
 
           <div class="pick-bar">
             <template v-if="tool==='line'">
-              <span>在页面上<b>点击</b>放横线 —— <b>鼠标点在哪，线就落在哪</b>；<b>相邻两线之间</b>自动成为一个题块。</span>
+              <span>在<b>每道题上方</b>点击放一条起始线 —— <b>第一条线以上自动当卷头跳过</b>，<b>相邻两线之间</b>自动成为题块。</span>
               <span class="muted-hint">要删线请按线上的 <b>×</b>（或拖动线微调位置），不会因为点得近就误删。</span>
             </template>
             <template v-else>
-              <span>在页面上<b>拖拽矩形</b>框住一道题（双栏排版、图形题用），松手即加入题块列表。</span>
+              <span>在页面上<b>拖拽矩形</b>框住一道题（双栏、图形题、<b>跨页题</b>用）。跨页题可框多段，再在右侧点「<b>并入上一块</b>」合成一道。</span>
             </template>
           </div>
 
           <div class="hint" style="margin-bottom:8px">
-            第 1 页顶部那块通常是<b>卷头/页眉</b>，确认不需要就点右侧列表里的 ✕ 删掉。
-            跨页题：在下一页首块上点「<b>并入上一页</b>」，两段会拼成一张原貌图。
+            第一条分界线以上自动当<b>卷头/页眉</b>跳过，不用手动删；
+            <b>末线以下不自动成块</b>（免得带上页脚、页码），最后一题请用<b>框选</b>截取。
+            跨页题：分别框出两段 → 在右侧把两块<b>拖到相邻</b> → 点「<b>并入上一块</b>」，拼成一张原貌图（无缝）。
+            像「<b>四、解答题；本题共 5 小题，共 77 分</b>」这种没有题目的结构说明，
+            在右侧卡片上点「<b>不提交</b>」即可跳过识别。
           </div>
 
           <!-- ⚠️ 这里**不做** v-for 全量加载图片：一份几十页的卷子会一次
@@ -257,8 +295,8 @@
             <div v-for="pno in pageList" :key="pno" class="page-wrap" :data-page="pno">
               <div class="page-no-label" style="display:flex;align-items:center;gap:8px">
                 <span>第 {{ pno }} 页 · {{ bandsOf(pno).length }} 块</span>
-                <el-button v-if="cutHead[pno]" size="small" text type="primary"
-                           @click="restoreHead(pno)">恢复本页顶部</el-button>
+                <el-button v-if="skips[pno]" size="small" text type="primary"
+                           @click="restorePage(pno)">恢复本页</el-button>
               </div>
               <div class="page-box" :id="'pg'+pno"
                    :class="tool==='rect' ? 'tool-rect' : 'tool-line'"
@@ -266,11 +304,15 @@
                    @pointerdown="onPageDown(pno, $event)">
                 <img v-if="loadedPages[pno]" :src="pageImg(pno)" alt="" draggable="false">
                 <div v-else class="page-ph">第 {{ pno }} 页</div>
-                <!-- 题块色带（线之间的区间）。奇偶交替上色，一眼能数出切了几块。 -->
+                <!-- 题块色带（两线之间的区间）。奇偶交替上色，一眼能数出切了几块。 -->
                 <div v-for="(b, bi) in bandsView(pno)" :key="'b'+bi"
-                     class="blk-band" :class="[b.parity, { cont: b.cont, bad: b.tooThin }]"
+                     class="blk-band" :class="[b.parity, { cont: b.cont, bad: b.tooThin, off: b.skipped }]"
                      :style="bandStyle(pno, b)">
                   <span class="blk-tag">{{ b.seqLabel }}</span>
+                </div>
+                <!-- 末线以下：刻意不成块，但画出来提醒老师「这里要框选」 -->
+                <div v-if="tailBand(pno)" class="tail-hint" :style="bandStyle(pno, tailBand(pno))">
+                  末线以下 · 请框选截取最后一题
                 </div>
                 <!-- 框选出来的块 -->
                 <div v-for="(r, ri) in rectsOf(pno)" :key="'r'+ri" class="rect-rect" :style="rectStyle(pno, r)"></div>
@@ -280,7 +322,7 @@
                      @pointerdown.stop="startDragDivider(pno, di, $event)">
                   <span v-if="dragTip && dragTip.pno === pno && dragTip.di === di"
                         class="dv-y">第 {{ clampInt(dragTip.y) }} / {{ clampInt(pageHeight(pno)) }} pt</span>
-                  <span class="dv-x" title="删掉这条线（它下面的块会与上一块合并）"
+                  <span class="dv-x" title="删掉这条起始线（它下面这道题会与上一题合并）"
                         @pointerdown.stop.prevent @click.stop="removeDivider(pno, di)">×</span>
                 </div>
                 <div v-if="draft && draft.page===pno" class="crop-rect" :style="rectStyle(pno, draft)"></div>
@@ -300,9 +342,10 @@
               <el-select v-model="curriculumId" placeholder="整批体系" size="small" style="width:150px">
                 <el-option v-for="c in curricula" :key="c.id" :value="c.id" :label="c.name"></el-option>
               </el-select>
+              <span v-if="skippedCount" class="muted-hint">已排除 {{ skippedCount }} 块不提交</span>
               <el-button size="small" type="primary" :loading="submitting"
-                         :disabled="!blocks.length || !curriculumId" @click="submitAll">
-                识别这 {{ blocks.length }} 块
+                         :disabled="!submitCount || !curriculumId" @click="submitAll">
+                识别这 {{ submitCount }} 块
               </el-button>
             </div>
           </template>
@@ -317,21 +360,39 @@
               <div v-if="!blocks.length" class="empty-block" style="padding:24px 0">
                 还没有题块 —— 在上面页面上画分界线或框选
               </div>
-              <div v-for="(b, i) in blocks" :key="b.id" class="blk-card" :class="{ bad: b.tooThin || b.error }">
+              <!-- 每张卡片可拖拽排序：拖住左边 ⋮⋮ 换位，顺序就是最终出题顺序。
+                   拖拽用原生 HTML5 DnD（零依赖），另配 ↑/↓ 兜底（有些环境拖拽不好使）。 -->
+              <div v-for="(b, i) in blocks" :key="b.id" class="blk-card"
+                   :class="{ bad: b.tooThin || b.error, skipped: b.skipped, dragging: dragFrom === i, 'drag-over': dragOver === i && dragFrom !== i }"
+                   draggable="true"
+                   @dragstart="dragStart(i, $event)"
+                   @dragover.prevent="onDragOver(i)"
+                   @drop.prevent="dropOn(i)"
+                   @dragend="dragEnd()">
                 <div class="blk-no">{{ i + 1 }}</div>
                 <div class="blk-body">
                   <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+                    <span class="drag-handle" title="拖住这里换位，顺序就是最终出题顺序">⋮⋮</span>
                     <el-tag size="small" effect="plain" :type="b.source==='rect' ? 'success' : 'primary'">
                       {{ b.source==='rect' ? '框选' : '横线' }}
                     </el-tag>
+                    <el-tag v-if="b.skipped" size="small" type="info" effect="plain">不提交</el-tag>
                     <span class="blk-meta">
                       第 {{ b.startPage }} 页
-                      <template v-if="b.regions.length > 1"> ＋跨到第 {{ b.endPage }} 页</template>
+                      <template v-if="b.regions.length > 1"> ＋跨到第 {{ b.endPage }} 页 · 合 {{ b.regions.length }} 段</template>
                       · 约 {{ b.pct }}% 版面
                     </span>
                     <div style="flex:1"></div>
+                    <!-- 卷面结构说明（「四、解答题；本题共 5 小题，共 77 分」）勾这个就不用送 AI -->
+                    <el-button size="small" text :type="b.skipped ? 'warning' : 'info'"
+                               :title="b.skipped ? '恢复提交' : '这不含题目（如「四、解答题…共 77 分」），不送 AI 识别'"
+                               @click="toggleSkip(i)">{{ b.skipped ? '恢复提交' : '不提交' }}</el-button>
+                    <el-button size="small" text :disabled="i === 0"
+                               title="上移" @click="shiftBlock(i, -1)">↑</el-button>
+                    <el-button size="small" text :disabled="i === blocks.length - 1"
+                               title="下移" @click="shiftBlock(i, 1)">↓</el-button>
                     <el-button v-if="i > 0" size="small" text type="primary"
-                               @click="mergePrev(i)">并入上一页</el-button>
+                               @click="mergePrev(i)">并入上一块</el-button>
                     <el-button size="small" text type="danger" @click="removeBlock(i)">✕</el-button>
                   </div>
                   <div v-if="b.unsplit" class="blk-meta" style="color:#909399">
@@ -341,12 +402,17 @@
                     这一块太薄（可能只是页脚或空白），建议删掉
                   </div>
                   <div v-if="b.error" class="blk-meta" style="color:#f56c6c">裁图失败：{{ b.error }}</div>
+                  <div v-if="b.skipped" class="blk-meta" style="color:#909399">
+                    已标「不提交」—— 提交时跳过它，不送 AI 识别（点「恢复提交」可改）
+                  </div>
                   <!-- 块的即时预览。**这是「两条线之间到底切成了什么」的唯一凭据** ——
                        以前这里只有一句「约 x% 版面」，切歪了也看不出来。
                        走 /region-image（服务端现渲染、不落盘），提交后才换成正式的原貌图。
                        loading=lazy：几十个块不会同时砸向后端。 -->
+                  <!-- draggable="false"：否则从缩略图上起手会拖成「拖图片」，而不是拖这张卡排序 -->
                   <img v-if="b.thumb || b.preview" :src="b.thumb || b.preview" class="blk-thumb"
-                       loading="lazy" alt="题块预览" @click="zoom(b.thumb || b.preview)">
+                       draggable="false" loading="lazy" alt="题块预览"
+                       @click="zoom(b.thumb || b.preview)">
                 </div>
               </div>
             </el-tab-pane>
@@ -379,6 +445,10 @@
                     重跑失败的 {{ currentJob.failed }} 条
                   </el-button>
                   <div style="flex:1"></div>
+                  <!-- 手动同步：轮询在任务跑完/出错时就停了，之后服务端再变就看不到 -->
+                  <el-button size="small" plain :loading="syncing" @click="syncModel">
+                    同步识别结果
+                  </el-button>
                   <el-button size="small" type="primary" plain :disabled="!pendingCount"
                              @click="approveAllPending">全部通过（{{ pendingCount }}）</el-button>
                 </div>
@@ -416,19 +486,22 @@
                         <rich-text :text="it.content"></rich-text>
                         <div class="src-box" style="margin-top:6px">
                           <el-input v-model="it.content" type="textarea" :rows="4"
+                                    @input="markEdited(it, 'content')"
                                     placeholder="识别失败或为空时可以直接在这里补写"></el-input>
                         </div>
 
                         <el-row :gutter="8" style="margin-top:8px">
                           <el-col :span="12">
                             <div class="hint">题型</div>
-                            <el-select v-model="it.qtype" size="small" style="width:100%">
+                            <el-select v-model="it.qtype" size="small" style="width:100%"
+                                       @change="markEdited(it, 'qtype')">
                               <el-option v-for="t in options.qtypes" :key="t" :value="t" :label="t"></el-option>
                             </el-select>
                           </el-col>
                           <el-col :span="12">
                             <div class="hint">难度</div>
-                            <el-select v-model="it.difficulty" size="small" style="width:100%">
+                            <el-select v-model="it.difficulty" size="small" style="width:100%"
+                                       @change="markEdited(it, 'difficulty')">
                               <el-option v-for="d in options.difficulties" :key="d" :value="d" :label="d"></el-option>
                             </el-select>
                           </el-col>
@@ -445,6 +518,7 @@
                             </template>
                           </div>
                           <el-input v-model="it.knowledge_point" size="small"
+                                    @input="markEdited(it, 'knowledge_point')"
                                     placeholder="如：三角函数的图像与性质（留空表示不确定）"></el-input>
                         </div>
 
@@ -452,6 +526,7 @@
                           <div class="hint">标签（回车添加，最多 {{ options.max_tags }} 个）</div>
                           <el-select v-model="it.tags" size="small" multiple filterable allow-create
                                      default-first-option :reserve-keyword="false" style="width:100%"
+                                     @change="markEdited(it, 'tags')"
                                      placeholder="如：含参讨论 / 恒成立">
                           </el-select>
                         </div>
@@ -468,7 +543,7 @@
                              这里的勾选框就是那个人工判断，默认值是模型给的，但以人勾的为准。 -->
                         <div class="fig-box" :class="{ on: it.needs_figure }">
                           <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
-                            <el-checkbox v-model="it.needs_figure" @change="saveFigure(it)">
+                            <el-checkbox v-model="it.needs_figure" @change="figToggle(it)">
                               这题有配图
                             </el-checkbox>
                             <el-tag v-if="it.figure_note" size="small" type="info" effect="plain">
@@ -561,13 +636,18 @@
                      @click="figPick.rects = []">清空重框</el-button>
         </div>
 
-        <div class="fig-pick-page" @pointerdown="figDown($event)">
-          <img :src="pageImg(figPick.page)" alt="" draggable="false">
-          <div v-for="(r, ri) in figPick.rects" :key="'fr' + ri" v-show="r.page === figPick.page"
-               class="fig-rect" :style="figRectStyle(r)">
-            <span class="fig-seq">{{ ri + 1 }}</span>
+        <!-- 滚动在外层，定位容器只包图片（高度由 aspect-ratio 定死）——
+             这样框选坐标与图片严格同一基准，翻页/滚动后也不会歪。 -->
+        <div class="fig-pick-scroll">
+          <div class="fig-pick-page" :style="figPageStyle()"
+               @pointerdown="figDown($event)">
+            <img :src="pageImg(figPick.page)" alt="" draggable="false">
+            <div v-for="(r, ri) in figPick.rects" :key="'fr' + ri" v-show="r.page === figPick.page"
+                 class="fig-rect" :style="figRectStyle(r)">
+              <span class="fig-seq">{{ ri + 1 }}</span>
+            </div>
+            <div v-if="figPick.draft" class="fig-rect draft" :style="figRectStyle(figPick.draft)"></div>
           </div>
-          <div v-if="figPick.draft" class="fig-rect draft" :style="figRectStyle(figPick.draft)"></div>
         </div>
 
         <div class="hint" style="margin-top:6px">
@@ -602,6 +682,34 @@ const AUTO_MAX_TOTAL = 40;   // 整份超过这个数，多半是页码/编号�
 
 /** 一次提交超过这个块数就二次确认 —— 提交多少块就是多少次 AI 调用（花钱、也怕被限流）。 */
 const SUBMIT_MAX = 30;
+
+/** 待审页里**老师可以改**的字段。轮询/手动同步时只对这几项做「谁说了算」的取舍，
+ *  其余字段（status / flags / error / node_path / question_id…）一律以服务端为准。
+ *  ⚠️ `figure_image` 刻意**不在列** —— 它只由服务端写（框选 / 撤掉），
+ *     保留本地旧值会把刚框好的图覆盖回去（实测踩过）。 */
+const REVIEW_FIELDS = ['content', 'qtype', 'difficulty', 'knowledge_point', 'tags', 'needs_figure'];
+
+/** 值算不算「空」：空串 / 纯空白 / 空数组 / null。
+ *  注意布尔（有没有配图）与下拉（题型、难度）**永远有值** ——
+ *  它们本来就不靠「补空」，靠轮询跟随服务端。 */
+function isBlank(v) {
+  if (v === null || v === undefined) return true;
+  if (Array.isArray(v)) return v.length === 0;
+  if (typeof v === 'boolean') return false;
+  return String(v).trim() === '';
+}
+
+/** 两个字段值是否等价。tags 是**数组**，用 `!==` 会恒为真（每轮都当成「有更新」）。 */
+function sameVal(a, b) {
+  if (Array.isArray(a) || Array.isArray(b)) {
+    const x = Array.isArray(a) ? a : [];
+    const y = Array.isArray(b) ? b : [];
+    return x.length === y.length && x.every((v, i) => v === y[i]);
+  }
+  if (typeof a === 'boolean' || typeof b === 'boolean') return !!a === !!b;
+  return String(a === null || a === undefined ? '' : a)
+      === String(b === null || b === undefined ? '' : b);
+}
 
 /** 这一行看起来像不像「一道题的开头」。
  *
@@ -682,11 +790,25 @@ const app = createApp({
       dragTip: null,             // { pno, di, y } 拖动中的读数
       pv: { count: 0, pages: {} },
       dividers: {},
-      rects: [],                // [{page,x0,y0,x1,y1}] 框选出来的
+      rects: [],                // [{gid,page,x0,y0,x1,y1}] 框选出来的
+      _rectSeq: 0,              // 框选段的稳定序号（编排按 key 引用它，删段后数组下标会前移、不可靠）
       draft: null,
       cropBusy: false,
-      mergeFirstOf: {},         // { pageNo: true } = 该页首块与上一页末块合并
-      cutHead: {},              // { pageNo: y } = 本页从这个 y 开始算（删掉页眉块用）
+      // 起始线语义：每页第一条线以上自动当卷头跳过，不单独存「起点」。
+      // skips = { pageNo: true } 整页被跳过（删掉「整页一块」时用，画线即恢复）。
+      skips: {},
+      // skipKeys = { 段key: true } 这些段所在的题块**不提交识别**。
+      // 卷面上「四、解答题；本题共 5 小题，共 77 分」这类结构说明被切成块后没题可识别，
+      // 提交时直接跳过（连裁图都不做 —— 裁了会在 crops/ 里攒没人引用的垃圾图）。
+      // ⚠️ 挂在**段 key** 上而不是 blocks 下标：blocks 是 rebuild 的产物，每次都会重建。
+      skipKeys: {},
+      // groups = [[段key…]…] 题块**编排表**：外层顺序 = 出题顺序（可拖拽换位），
+      // 内层 = 这一块由哪几段拼成（跨页题就是多段）。段 key：线块 'L{页}_{y×10}'、框选 'R{gid}'。
+      // ⚠️ groups 是**源头**（用户意图），blocks 是 rebuild 的产物（渲染用）——别把两者搞混。
+      //   以前没有它，每次 rebuild 都按页面位置重排 → 用户拖过的顺序会被下一次画线冲掉。
+      groups: [],
+      // 拖拽排序中的下标：dragFrom = 正在拖的那块，dragOver = 悬停到的目标块
+      dragFrom: null, dragOver: null,
       // 提交
       curriculumId: null,
       submitting: false,
@@ -699,6 +821,11 @@ const app = createApp({
       items: [],
       jobs: [],
       _poll: null,
+      // edited = { 条目id: { 字段: true } } 老师**真的动过**的字段。
+      // 轮询每 1.5 秒把列表换一次：动过的保留本地（不吞正在敲的字），
+      // 没动过的必须以服务端为准 —— 否则识别结果永远进不来（见 applyItems）。
+      edited: {},
+      syncing: false,           // 「同步识别结果」按钮的 loading
       // 框选配图弹窗。rects 是**已确认的段**（跨页时会有多段，服务端竖拼成一张），
       // draft 是正在拖的那个矩形。
       figPick: { show: false, item: null, page: 1, rects: [], draft: null, saving: false },
@@ -716,13 +843,16 @@ const app = createApp({
       if (this.pv.count <= 1) return 0;
       let n = 0;
       this.pageList.forEach((pno) => {
-        if (this.cutHead[pno] || this.mergeFirstOf[pno]) return;
+        if (this.skips[pno]) return;
         if ((this.dividers[pno] || []).length) return;
         if (this.rects.some(r => r.page === pno)) return;   // 用框选切过的也算切过
         n++;
       });
       return n;
     },
+    /** 标了「不提交」的块数 / 真正要提交识别的块数（按钮与提示都看这两个）。 */
+    skippedCount() { return this.blocks.filter(b => b.skipped).length; },
+    submitCount() { return this.blocks.length - this.skippedCount; },
     jobPct() {
       const j = this.currentJob;
       if (!j || !j.total) return 0;
@@ -780,8 +910,10 @@ const app = createApp({
       this.dividers = {};
       this.rects = [];
       this.draft = null;
-      this.mergeFirstOf = {};
-      this.cutHead = {};
+      this.skips = {};
+      this.groups = [];
+      this.dragFrom = null;
+      this.dragOver = null;
       this.blocks = [];
       this.dragTip = null;
       this.teardownLazy();
@@ -930,6 +1062,8 @@ const app = createApp({
       const p = this.toPdfXY(pno, e);
       if (!p) return;
 
+      if (this.skips[pno]) delete this.skips[pno];   // 重新画线 = 恢复本页
+
       let ty = p.y;
       if (this.snapGaps) {
         const s = this.snapY(pno, ty);
@@ -981,8 +1115,7 @@ const app = createApp({
     },
     clearDividers() {
       this.dividers = {};
-      this.mergeFirstOf = {};
-      this.cutHead = {};
+      this.skips = {};
       this.rebuild();
     },
     /** 只算不写：返回 { plan: {pno: [y…]}, total, pages }。
@@ -1047,6 +1180,7 @@ const app = createApp({
     startRect(pno, e) {
       const p = this.toPdfXY(pno, e);
       if (!p) return;
+      if (this.skips[pno]) delete this.skips[pno];   // 重新框选 = 恢复本页
       this.draft = { page: pno, x0: p.x, y0: p.y, x1: p.x, y1: p.y };
       const onMove = (ev) => {
         const q = this.toPdfXY(pno, ev);
@@ -1062,6 +1196,7 @@ const app = createApp({
         if (!c || !pg || !pg.width) return;
         if (Math.abs(c.x1 - c.x0) < pg.width * 0.04 || Math.abs(c.y1 - c.y0) < pg.height * 0.01) return;
         this.rects.push({
+          gid: 'r' + (++this._rectSeq),
           page: pno,
           x0: Math.min(c.x0, c.x1), y0: Math.min(c.y0, c.y1),
           x1: Math.max(c.x0, c.x1), y1: Math.max(c.y0, c.y1),
@@ -1073,33 +1208,60 @@ const app = createApp({
     },
 
     /* ---------- 从「线 + 框」算出题块列表 ---------- */
-    /** 每页的线间区间（只算几何，不管有没有跨页合并）。
-     *  起点是 cutHead[pno]（默认 0）—— 「删掉首块（页眉）」就是把它抬到第一块的下沿。 */
+    /** 每页的题块区间（**起始线语义**：线画在每题上方）。
+     *  第一条线以上 = 卷头/页眉，自动跳过、不成为题块；
+     *  相邻两线之间 = 一道题。
+     *  ⚠️ 末线以下到页底**不再自动成块** —— 那里通常是页脚、页码，带上就是脏图。
+     *     最后一题请用「框选」自由截取，见 tailBand() 的虚线提示。
+     *  一条线都没有 → 整页一块（多页卷子里即「整页作为一道题」，unsplit 标记出来）。 */
     bandsOf(pno) {
       const pg = this.pv.pages[pno];
       if (!pg) return [];
-      const start = this.cutHead[pno] || 0;
-      const ds = (this.dividers[pno] || []).filter(d => d > start + 2).sort((a, b) => a - b);
-      const bs = [start, ...ds, pg.height];
+      const ds = (this.dividers[pno] || []).slice().sort((a, b) => a - b);
       const out = [];
-      for (let i = 0; i < bs.length - 1; i++) {
-        if (bs[i + 1] - bs[i] > 2) {
-          out.push({ y0: bs[i], y1: bs[i + 1], idx: i });
-        }
+      if (!ds.length) {
+        out.push({
+          y0: 0, y1: pg.height, idx: 0,
+          unsplit: this.pv.count > 1 && !this.rects.some(r => r.page === pno),
+        });
+        return out;
+      }
+      // 卷头（0 → 第一条线）与末线以下都不成块 → 只在相邻两线之间成块
+      for (let i = 0; i < ds.length - 1; i++) {
+        if (ds[i + 1] - ds[i] > 2) out.push({ y0: ds[i], y1: ds[i + 1], idx: i, unsplit: false });
       }
       return out;
     },
-    /** 画色带时要的附加信息：第几块、奇偶色、是否跨页续段、是否太薄。 */
+    /** 末线以下那一块 —— 刻意不自动成块，但要让人**看得见**，提示去框选。
+     *  不留这块提示的话，「末题凭空消失」看起来就像 bug。 */
+    tailBand(pno) {
+      const pg = this.pv.pages[pno];
+      if (!pg || !pg.height || this.skips[pno]) return null;
+      const ds = (this.dividers[pno] || []).slice().sort((a, b) => a - b);
+      if (!ds.length) return null;                 // 整页一块的情况由 unsplit 块自己覆盖
+      const last = ds[ds.length - 1];
+      if (pg.height - last <= 2) return null;
+      return { y0: last, y1: pg.height };
+    },
+    /** 段的稳定 key：线块 'L{页}_{y×10}'（×10 取整，避免浮点抖动造成 key 漂移）、框选 'R{gid}'。 */
+    segKey(pno, gy) {
+      return 'L' + pno + '_' + Math.round(gy * 10);
+    },
+    /** 画色带时要的附加信息：第几块、奇偶色、是否太薄。
+     *  ⚠️ 按**段的 key** 认块，不再按 anchorPage+anchorY0 —— 块可能是多段拼的。 */
     bandsView(pno) {
-      return this.bandsOf(pno).map(b => {
-        const blk = this.blocks.find(x => x.source === 'line' && x.anchorPage === pno
-                                          && Math.abs(x.anchorY0 - b.y0) < 0.5);
+      return this.bandsOf(pno).map((b) => {
+        const key = this.segKey(pno, b.y0);
+        const blk = this.blocks.find(x => (x.keys || []).indexOf(key) >= 0);
         return {
           ...b,
           parity: (blk ? blk.seq : b.idx) % 2 ? 'odd' : 'even',
           seqLabel: blk ? String(blk.seq) : '',
-          cont: !!(blk && blk.regions[0].page !== pno),   // 本页不是它的第一段 → 是续段
           tooThin: !!(blk && blk.tooThin),
+          // 标了「不提交」的块在页面上也淡掉，一眼看出它不会被送去识别
+          skipped: !!(blk && blk.skipped),
+          // 这一块是从别的页开始的（跨页合并的后一段）——画成灰色，一眼看出是续段
+          cont: !!(blk && blk.startPage && blk.startPage !== pno),
         };
       });
     },
@@ -1123,44 +1285,79 @@ const app = createApp({
         height: (Math.abs(r.y1 - r.y0) / pg.height * 100) + '%',
       };
     },
-    /** 重建题块列表。每次增删线/框都调它 —— 保持列表与画面一致，不存中间态。 */
+    /** 重建题块列表。源是「线 + 框」切出的**段**，编排是 groups（块 = 有序的段列表）。
+     *  ⚠️ **顺序由 groups 决定，rebuild 绝不按页面位置重排已存在的块** ——
+     *     否则用户拖过的顺序会在下一次画线时被冲掉。新段只按自然位置插进 groups。 */
     rebuild() {
-      const out = [];
-      const pages = this.pageList;
-      pages.forEach((pno, pi) => {
+      const segs = [];
+      this.pageList.forEach((pno) => {
         const pg = this.pv.pages[pno];
         if (!pg || !pg.width) return;          // 这一页几何没准备好，跳过而不是抛错
-        this.bandsOf(pno).forEach((b, bi) => {
-          const region = { page: pno, x0: 0, y0: b.y0, x1: pg.width, y1: b.y1 };
-          // 该页首块且标了「并入上一页」→ 挂到上一个块上（跨页题）
-          if (bi === 0 && this.mergeFirstOf[pno] && out.length) {
-            out[out.length - 1].regions.push(region);
-            return;
-          }
-          out.push({
-            id: 'L' + pno + '_' + bi,
-            source: 'line',
-            anchorPage: pno, anchorY0: b.y0,
-            regions: [region],
+        if (this.skips[pno]) return;           // 整页被跳过的页不产块
+        this.bandsOf(pno).forEach((b) => {
+          segs.push({
+            key: this.segKey(pno, b.y0), kind: 'line', pno, y0: b.y0,
+            region: { page: pno, x0: 0, y0: b.y0, x1: pg.width, y1: b.y1 },
             tooThin: (b.y1 - b.y0) < pg.height * 0.03,
-            // 「整页未分割」：这页一条线都没有、也没被框选或调过。
-            // 多页文档里它意味着「整页作为一道题」，得让人看见。
-            unsplit: this.pv.count > 1 && !(this.dividers[pno] || []).length
-                     && !this.cutHead[pno] && !this.rects.some(r => r.page === pno),
-            thumb: null, error: null,
+            unsplit: !!b.unsplit,
           });
         });
       });
-      this.rects.forEach((r, ri) => {
-        const pg = this.pv.pages[r.page];
-        out.push({
-          id: 'R' + ri, source: 'rect', anchorPage: r.page, anchorY0: r.y0,
-          regions: [{ page: r.page, x0: r.x0, y0: r.y0, x1: r.x1, y1: r.y1 }],
-          tooThin: false, thumb: null, error: null,
+      this.rects.forEach((r) => {
+        segs.push({
+          key: 'R' + r.gid, kind: 'rect', pno: r.page, y0: r.y0,
+          region: { page: r.page, x0: r.x0, y0: r.y0, x1: r.x1, y1: r.y1 },
+          tooThin: false, unsplit: false,
         });
       });
-      // 按「起始页 + 起始 y」排 —— 框选的块也要落在它该在的位置上
-      out.sort((a, b) => (a.anchorPage - b.anchorPage) || (a.anchorY0 - b.anchorY0));
+      // 自然顺序：只用来决定「新段插在哪」+「首次加载时的初始编排」，不覆盖用户拖过的顺序
+      segs.sort((a, b) => (a.pno - b.pno) || (a.y0 - b.y0) || (a.kind === 'line' ? -1 : 1));
+      const byKey = new Map(segs.map(s => [s.key, s]));
+
+      // ① 丢掉已经不存在的段（线被删、框被删、整页跳过…），块内与块间顺序保持不变
+      const alive = new Set(byKey.keys());
+      const groups = this.groups.map(g => g.filter(k => alive.has(k))).filter(g => g.length);
+      // ② 新出现的段：插到「自然顺序里它前面最近的、已在编排里的段」所属块的**后面**
+      const used = new Set();
+      groups.forEach(g => g.forEach(k => used.add(k)));
+      segs.forEach((s, i) => {
+        if (used.has(s.key)) return;
+        let anchor = null;
+        for (let j = i - 1; j >= 0; j--) {
+          if (used.has(segs[j].key)) { anchor = segs[j].key; break; }
+        }
+        if (anchor === null) {
+          groups.unshift([s.key]);
+        } else {
+          const gi = groups.findIndex(g => g.indexOf(anchor) >= 0);
+          groups.splice(gi + 1, 0, [s.key]);
+        }
+        used.add(s.key);
+      });
+      this.groups = groups;
+      // ③ 「不提交」标记只留还活着的段（线/框删了，标记跟着走，否则会越攒越多）
+      const sk = {};
+      groups.forEach(g => g.forEach((k) => { if (this.skipKeys[k]) sk[k] = true; }));
+      this.skipKeys = sk;
+
+      const out = groups.map((g) => {
+        const items = g.map(k => byKey.get(k)).filter(Boolean);
+        const first = items[0];
+        return {
+          id: g.join('|'),
+          keys: g.slice(),
+          // 判定用「任一段被标 → 这整块不提交」：合并进来的段不会把标记洗掉
+          skipped: g.some(k => !!this.skipKeys[k]),
+          source: first.kind,
+          mixed: items.length > 1,
+          anchorPage: first.pno, anchorY0: first.y0,
+          regions: items.map(it => it.region),
+          tooThin: items.some(it => it.tooThin),
+          unsplit: items.length === 1 && !!first.unsplit,
+          thumb: null, error: null,
+        };
+      });
+
       out.forEach((b, i) => {
         b.seq = i + 1;
         b.startPage = b.regions[0].page;
@@ -1171,82 +1368,134 @@ const app = createApp({
           h += (r.y1 - r.y0) / (pg ? pg.height : 1);
         });
         b.pct = Math.round(Math.min(1, h) * 100);
-        // 即时预览地址。放在这里算而不是构造块时算：跨页合并会把后一段 push 进
-        // 前一块的 regions，那时才拿得到完整区域。
+        // 即时预览地址。放在这里算而不是构造块时算：合并会把后一段并入前一块，那时才拿得到完整区域。
         b.preview = this.previewUrl(b.regions);
       });
       this.blocks = out;
     },
-    /** 把第 i 块并入它上面那一块（跨页题的用法：下一页首块 → 并入上一页末块）。
-     *  mergeFirstOf 记下「这一页的首块要跟着上一页走」，这样 rebuild() 之后仍是合并态。 */
+    /** 把第 i 块并入**列表里的上一块**（跨页题：先把两段拖到相邻，再点这里）。
+     *  ⚠️ 只认列表顺序、不要求两段在页面上相邻 —— 这正是绕开
+     *     「中间隔着别的块」的办法：**先拖拽排序把两块排到一起，再合并**。
+     *     所以这里不再限制来源（线块/框选块都能合），也不再按 gid 记 joinPrev。 */
     mergePrev(i) {
-      const cur = this.blocks[i];
-      const prev = i > 0 ? this.blocks[i - 1] : null;
-      if (!cur || !prev) return;
-      // 只有两页交接处（上一块在别的页）才谈得上跨页；
-      // 同页相邻两块要合并，正确做法是删掉中间那条分界线（点它一下即可）。
-      if (cur.startPage === prev.startPage) {
-        ElementPlus.ElMessage.info('同一页内合并请直接点掉中间那条分界线');
-        return;
-      }
-      if (cur.source === 'line' && this.bandsOf(cur.anchorPage)[0]
-          && Math.abs(this.bandsOf(cur.anchorPage)[0].y0 - cur.anchorY0) < 0.5) {
-        this.mergeFirstOf[cur.anchorPage] = true;
-      } else if (cur.source === 'rect') {
-        this.rects = this.rects.filter(r => !(r.page === cur.anchorPage && Math.abs(r.y0 - cur.anchorY0) < 0.5));
-      } else {
-        ElementPlus.ElMessage.info('这一块不是该页首块，无法并入上一页 —— 请点掉它上面那条分界线');
-        return;
-      }
+      if (i <= 0 || i >= this.groups.length) return;
+      this.groups[i - 1] = this.groups[i - 1].concat(this.groups[i]);
+      this.groups.splice(i, 1);
       this.rebuild();
     },
-    /** 删掉一个块。
-     *  横线块 = 去掉它的上边界（与上一块合并）；该页首块则把页顶切到它的下沿。
-     *  框选块 = 从框列表里摘掉。 */
-    removeBlock(i) {
+    /** 勾/取消「不提交」—— 卷面结构说明（「四、解答题；本题共 5 小题，共 77 分」）用。
+     *  合并过的块含多段，逐段一起标/一起撤，之后再合并或拆分都不会漏。
+     *  ⚠️ 标记落在段 key 上（不是 blocks 下标），所以 rebuild 之后依然有效。 */
+    toggleSkip(i) {
+      const g = this.groups[i];
       const b = this.blocks[i];
-      if (!b) return;
-      if (b.source === 'rect') {
-        this.rects = this.rects.filter(r => !(r.page === b.anchorPage && Math.abs(r.y0 - b.anchorY0) < 0.5));
-      } else {
-        const dv = this.dividers[b.anchorPage] || [];
-        if (b.anchorY0 > (this.cutHead[b.anchorPage] || 0) + 2) {
-          // 非首块：去掉它上边那条分界线，它就与上一块合成一块
-          this.dividers[b.anchorPage] = dv.filter(d => Math.abs(d - b.anchorY0) > 0.5);
-        } else {
-          // 首块（页眉/卷头）：把本页起点抬到这块的下沿
-          const bands = this.bandsOf(b.anchorPage);
-          if (bands.length) this.cutHead[b.anchorPage] = bands[0].y1;
-        }
-      }
+      if (!g) return;
+      const on = !(b && b.skipped);
+      const sk = Object.assign({}, this.skipKeys);
+      g.forEach((k) => { if (on) sk[k] = true; else delete sk[k]; });
+      this.skipKeys = sk;
       this.rebuild();
     },
-    /** 恢复本页顶部（撤销「删掉首块」）。 */
-    restoreHead(pno) {
-      delete this.cutHead[pno];
-      delete this.mergeFirstOf[pno];
+    /** 上移/下移一块（d = -1 / +1）。**顺序就是最终出题顺序**，随提交一起发出去。 */
+    shiftBlock(i, d) {
+      const j = i + d;
+      if (i < 0 || i >= this.groups.length || j < 0 || j >= this.groups.length) return;
+      const g = this.groups[i];
+      this.groups[i] = this.groups[j];
+      this.groups[j] = g;
+      this.rebuild();
+    },
+    /* ---------- 拖拽排序 ---------- */
+    dragStart(i, e) {
+      this.dragFrom = i;
+      this.dragOver = null;
+      try {
+        e.dataTransfer.effectAllowed = 'move';
+        e.dataTransfer.setData('text/plain', String(i));
+      } catch (err) { /* 少数环境不给 dataTransfer，不影响排序本身 */ }
+    },
+    onDragOver(i) {
+      if (this.dragFrom === null) return;
+      this.dragOver = i;
+    },
+    dropOn(i) {
+      const from = this.dragFrom;
+      this.dragFrom = null; this.dragOver = null;
+      if (from === null || from === i || from < 0 || from >= this.groups.length) return;
+      const g = this.groups.splice(from, 1)[0];
+      this.groups.splice(Math.min(i, this.groups.length), 0, g);
+      this.rebuild();
+    },
+    dragEnd() { this.dragFrom = null; this.dragOver = null; },
+    /** 删掉一块 = 撤掉构成它的所有线/框（整页一块则标记整页跳过，画线即恢复）。
+     *  线块删的是它**顶部那条起始线**（与上一块合并）；合并过的块则整组一起撤。 */
+    removeBlock(i) {
+      const g = this.groups[i];
+      const b = this.blocks[i];
+      if (!g) return;
+      // 删块 = 这块的一切都撤掉，包括「不提交」标记。
+      // ⚠️ 必须显式清：删线后段会以**新身份**重建（如整页块退回 unsplit），
+      //    段 key 若恰好相同，旧标记会让新块一出现就是灰的。
+      const sk = Object.assign({}, this.skipKeys);
+      g.forEach((k) => { delete sk[k]; });
+      this.skipKeys = sk;
+      if (b && b.unsplit) {
+        this.skips[b.anchorPage] = true;      // 整页一块 → 整页跳过（不再把起点抬到页底）
+        this.groups.splice(i, 1);
+        this.rebuild();
+        return;
+      }
+      const gids = new Set();
+      g.forEach((k) => {
+        if (k.charAt(0) === 'R') { gids.add(k.slice(1)); return; }
+        const parts = k.slice(1).split('_');
+        const pno = +parts[0], y = (+parts[1]) / 10;
+        this.dividers[pno] = (this.dividers[pno] || []).filter(d => Math.abs(d - y) > 0.5);
+      });
+      if (gids.size) this.rects = this.rects.filter(r => !gids.has(String(r.gid)));
+      this.groups.splice(i, 1);
+      this.rebuild();
+    },
+    /** 恢复本页（撤销「整页跳过」）。 */
+    restorePage(pno) {
+      delete this.skips[pno];
       this.rebuild();
     },
 
     /* ---------- 提交 ---------- */
+    /** 只发**要识别**的块。⚠️ 标了「不提交」的块连裁图都不发 ——
+     *  裁了就成了 crops/ 里没人引用的图（实测踩过「题库 0 行、盘上 92 张图」）。
+     *  ⚠️ 发出去的数组下标与 blocks 下标**不再一一对应**，回填时必须按 todo 映射。 */
     blockPayload() {
-      return this.blocks.map(b => ({
-        regions: b.regions.map(r => ({ page: r.page, x0: r.x0, y0: r.y0, x1: r.x1, y1: r.y1 })),
-      }));
+      const out = [];
+      this.blocks.forEach((b) => {
+        if (b.skipped) return;
+        out.push({
+          regions: b.regions.map(r => ({ page: r.page, x0: r.x0, y0: r.y0, x1: r.x1, y1: r.y1 })),
+        });
+      });
+      return out;
     },
     async submitAll() {
-      if (!this.blocks.length || !this.curriculumId) return;
+      if (!this.curriculumId) return;
+      const todo = this.blocks.filter(b => !b.skipped);
+      if (!todo.length) {
+        ElementPlus.ElMessage.warning('没有要提交的题块 —— 都被标成「不提交」了');
+        return;
+      }
       // 三件事都值得让老师停一下再决定，合并成一个对话框 ——
       // 挨个弹只会被无脑点掉。
-      const thin = this.blocks.filter(b => b.tooThin).length;
+      const thin = todo.filter(b => b.tooThin).length;
       const warns = [];
       if (this.unsplitPageCount) {
         warns.push(`有 ${this.unsplitPageCount} 页还没画分界线，会整页作为一道题`);
       }
       if (thin) warns.push(`有 ${thin} 个题块高度不足整页的 3%（可能只是页眉、页脚或空白）`);
-      if (this.blocks.length > SUBMIT_MAX) {
-        warns.push(`这次要提交 ${this.blocks.length} 块，会发出同样多次 AI 识别请求`);
+      if (todo.length > SUBMIT_MAX) {
+        warns.push(`这次要提交 ${todo.length} 块，会发出同样多次 AI 识别请求`);
       }
+      // 「不提交」不进确认框：那是老师**故意**标的，每次都弹一次只会被无脑点掉。
+      // 它只以一行小字挂在按钮旁边（见模板），要改随时点回卡片上的开关。
       if (warns.length) {
         try {
           await ElementPlus.ElMessageBox.confirm(
@@ -1262,24 +1511,22 @@ const app = createApp({
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ blocks: this.blockPayload() }),
         });
+        // ⚠️ 服务端的 index 是**发出去的数组**下标，而发出去时已滤掉「不提交」的块，
+        //    所以要用 todo 映射回真正的题块，不能拿它当 blocks 下标。
         let ok = 0;
-        crop.items.forEach(r => {
-          const b = this.blocks[r.index];
-          if (!b) return;
-          if (r.url) { b.thumb = r.url; b.error = null; ok++; }
-          else { b.error = r.error; }
-        });
-        if (!ok) { ElementPlus.ElMessage.error('一块都没裁出来，请检查分割线'); return; }
         const items = [];
-        this.blocks.forEach((b, i) => {
-          const r = crop.items.find(x => x.index === i);
-          if (!r || !r.url) return;
+        crop.items.forEach((r) => {
+          const b = todo[r.index];
+          if (!b) return;
+          if (!r.url) { b.error = r.error; return; }
+          b.thumb = r.url; b.error = null; ok++;
           items.push({
             image: r.url, page_no: b.startPage, region: [
               b.regions[0].x0, b.regions[0].y0, b.regions[0].x1, b.regions[0].y1],
             document_id: this.doc.id, doc_filename: this.doc.filename,
           });
         });
+        if (!ok) { ElementPlus.ElMessage.error('一块都没裁出来，请检查分割线'); return; }
         // ② 建任务并开始并行识别
         const job = await this.api('/api/batches', {
           method: 'POST',
@@ -1325,22 +1572,65 @@ const app = createApp({
         if (!this.currentJob.finished) this.startPoll(id);
       } catch (e) { ElementPlus.ElMessage.error(e.message); }
     },
-    async loadItems(jobId) {
-      const list = await this.api('/api/batches/' + jobId + '/items');
-      // 保留正在编辑的字段：轮询每 1.5 秒覆盖一次，直接换掉会把用户刚敲的字吞了
+    /** 记一笔「这个字段老师动过」。模板上每个可编辑控件都挂它。 */
+    markEdited(it, f) {
+      if (!this.edited[it.id]) this.edited[it.id] = {};
+      this.edited[it.id][f] = true;
+    },
+    /** 把服务端的待审列表合进界面，返回改动处数。
+     *
+     *  ⚠️⚠️ **不能**写成「可编辑字段一律保留本地旧值」—— 那是老 bug 的根源：
+     *    提交后第一次轮询（1.5 秒）识别还没回来，本地存下的是**空串**，
+     *    之后每一轮都把这个空串保住 → **模型输出永远进不了文本框**，
+     *    只有从「历史任务」重新点开该任务时才看得到（那时没有旧值可保留）。
+     *  现在按「动过没动过」分开算：
+     *    · 没动过 → 以服务端为准（识别结果一出来就自动进文本框）
+     *    · 动过   → 保留本地；fillEmptyOnly（手动同步）时，本地为空才用服务端补上
+     *    · 其余字段（status / flags / error / figure_image…）永远服务端说了算
+     */
+    applyItems(list, fillEmptyOnly) {
       const byId = {};
       this.items.forEach(i => { byId[i.id] = i; });
-      this.items = list.map(n => {
+      let changed = 0;
+      const out = list.map((n) => {
         const old = byId[n.id];
-        if (!old) return n;
-        // 只保留「用户可能正在编辑」的字段，其余以服务端为准。
-        // needs_figure 必须在列：老师刚勾上、请求还在路上时，轮询不能把它打回原样。
-        // figure_image 反之**不能**保留 —— 它只由服务端写（框选/撤掉），
-        // 保留旧值会把刚框好的图覆盖回去。
-        return { ...n, content: old.content, qtype: old.qtype,
-                 difficulty: old.difficulty, knowledge_point: old.knowledge_point,
-                 tags: old.tags, needs_figure: old.needs_figure };
+        if (!old) { changed++; return n; }      // 新条目就是「有更新」
+        const merged = { ...n };
+        const ed = this.edited[n.id] || {};
+        REVIEW_FIELDS.forEach((f) => {
+          if (!ed[f]) merged[f] = n[f];
+          else if (fillEmptyOnly && isBlank(old[f])) merged[f] = n[f];
+          else merged[f] = old[f];
+          if (!sameVal(merged[f], old[f])) changed++;
+        });
+        return merged;
       });
+      this.items = out;
+      return changed;
+    },
+    async loadItems(jobId) {
+      const list = await this.api('/api/batches/' + jobId + '/items');
+      this.applyItems(list, false);
+    },
+    /** 「同步识别结果」：手动立刻拉一次（任务 + 条目）。
+     *
+     *  为什么有按钮还需要它：**轮询在任务跑完或出错时就停了**，那之后服务端再变就看不到；
+     *  从「历史任务」点开旧任务时也一样。语义刻意保守 —— 老师写过的内容**绝不覆盖**，
+     *  只在那一格是空的时候把模型输出补上。
+     */
+    async syncModel() {
+      if (!this.currentJob) return;
+      const id = this.currentJob.id;
+      this.syncing = true;
+      try {
+        const job = await this.api('/api/batches/' + id);
+        const list = await this.api('/api/batches/' + id + '/items');
+        const n = this.applyItems(list, true);
+        this.currentJob = job;
+        ElementPlus.ElMessage.success(n ? `已同步 ${n} 处更新` : '已是最新，没有新的模型输出');
+      } catch (e) {
+        ElementPlus.ElMessage.error(e.message);
+      } finally { this.syncing = false; }
     },
 
     /* ---------- 审核 ---------- */
@@ -1357,6 +1647,8 @@ const app = createApp({
           }),
         });
         Object.assign(it, r);
+        // 已落库 → 不再有「本地未保存的修改」，这几项重新跟随服务端
+        delete this.edited[it.id];
         ElementPlus.ElMessage.success('已保存');
         return true;
       } catch (e) {
@@ -1473,6 +1765,12 @@ const app = createApp({
     },
 
     /* ---------- 题干配图 ---------- */
+    /** 勾「这题有配图」：先记「老师动过」（否则落库请求还在路上时，
+     *  一次轮询就把刚勾上的框打回原样），再立刻落库。 */
+    figToggle(it) {
+      this.markEdited(it, 'needs_figure');
+      this.saveFigure(it);
+    },
     /** 人工那个「有图」开关落库。AI 给的是初值 —— 漏判的代价是那幅图永远没人补，
      *  所以最终以人勾的为准（这也是用户点名要的人工判断逻辑）。 */
     async saveFigure(it) {
@@ -1531,17 +1829,41 @@ const app = createApp({
       this.figPick.page = p;
       this.figPick.draft = null;
     },
-    /** 弹窗里在整页图上拖一个矩形。坐标换算与左栏一致（都是 PDF 点）。 */
+    /** 框选弹窗里整页图的定位容器样式：高度用 aspect-ratio 定死 = 图片高度。
+     *
+     *  ⚠️ 两条都不能省：
+     *  ① **高度来源必须是 aspect-ratio**（而不是让图片在正常流里撑高）——
+     *     容器的 padding-box 高度与图片一致，`figDown` 的鼠标换算和 `figRectStyle`
+     *     的百分比定位才是同一基准。历史 bug 就是把这个 div 当成滚动容器用
+     *     （max-height:62vh），高度变成「可见高度」→ 框歪 + 内容对不上。
+     *  ② 几何读不到时给 A4 兜底，**不能**返回 {} —— 返回 {} 容器高度就是 0，
+     *     弹窗里一片空白，看起来像「图丢了」（左栏有 min-height:120px 兜着，这里没有）。 */
+    figPageStyle() {
+      const pg = this.pv.pages[this.figPick.page];
+      if (!pg || !pg.width || !pg.height) return { aspectRatio: '595 / 842' };
+      return { aspectRatio: pg.width + ' / ' + pg.height };
+    },
+    /** 弹窗里在整页图上拖一个矩形。坐标换算与左栏一致（都是 PDF 点）。
+     *
+     *  ⚠️ 基准必须是「只包着图片、高度由 aspect-ratio 定死的定位容器」——
+     *     这里取 `e.currentTarget` 的 rect，而它同时是矩形定位的包含块，
+     *     两处同一基准才不会歪。若把这个 div 变成滚动容器（历史 bug），
+     *     rect 就变成「可见高度」且不含 scrollTop → 框和鼠标必然对不齐。 */
     figDown(e) {
       if (e.button !== 0) return;
       const box = e.currentTarget;
       const pg = this.pv.pages[this.figPick.page];
       const r = box.getBoundingClientRect();
-      if (!pg || !pg.width || !r.width || !r.height) return;
-      const toXY = (ev) => ({
-        x: (ev.clientX - r.left) / r.width * pg.width,
-        y: (ev.clientY - r.top) / r.height * pg.height,
-      });
+      if (!pg || !pg.width || !pg.height || !r.width || !r.height) return;
+      const toXY = (ev) => {
+        const x = (ev.clientX - r.left) / r.width * pg.width;
+        const y = (ev.clientY - r.top) / r.height * pg.height;
+        // 拖到图外也夹回页内，别把越界坐标发给服务端（会被 422 挡掉）
+        return {
+          x: Math.max(0, Math.min(pg.width, x)),
+          y: Math.max(0, Math.min(pg.height, y)),
+        };
+      };
       const a = toXY(e);
       this.figPick.draft = { page: this.figPick.page, x0: a.x, y0: a.y, x1: a.x, y1: a.y };
       const onMove = (ev) => {
