@@ -22,16 +22,18 @@ from datetime import datetime
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
-from fastapi.responses import FileResponse
-from sqlalchemy import select
+from fastapi.responses import FileResponse, Response
+from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from .. import config
 from ..adapters import office as office_adapter
 from ..adapters import pdf as pdf_adapter
 from ..db import get_db
-from ..models import Document
-from ..schemas import CropIn, CropStripIn
+from ..migrate import backup_db
+from ..models import Document, Question, QuestionNode
+from ..schemas import BatchCropIn, CropIn, CropStripIn
+from ..services import crops
 
 router = APIRouter(prefix="/api", tags=["documents"])
 
@@ -257,7 +259,14 @@ def build_preview(
 # ---------------------------------------------------------------- 页面视图
 @router.get("/documents/{doc_id}/pages")
 def doc_page_count(doc_id: str, db: Session = Depends(get_db)):
-    return {"page_count": pdf_adapter.page_count(str(_page_source(db, doc_id)))}
+    try:
+        return {"page_count": pdf_adapter.page_count(str(_page_source(db, doc_id)))}
+    except HTTPException:
+        raise
+    except Exception as e:
+        # 损坏的 PDF / 渲染库报错 —— 转成 4xx 并把原因说出来。
+        # 直接抛出去会变成 500「Internal Server Error」，前端只能显示一行没有信息量的字。
+        raise HTTPException(422, f"读不出这份文档的页面：{e}") from e
 
 
 @router.get("/documents/{doc_id}/pages/{pno}/image")
@@ -278,6 +287,12 @@ def doc_page_lines(doc_id: str, pno: int, db: Session = Depends(get_db)):
         return pdf_adapter.page_lines(str(_page_source(db, doc_id)), pno)
     except ValueError as e:            # 同上：页码越界
         raise HTTPException(422, str(e)) from e
+    except HTTPException:
+        raise
+    except Exception as e:
+        # 单页取不出来**不该拖垮整份文档** —— 前端逐页容错，会把它当「这页没有文字层」。
+        # 这里给 4xx + 原因，方便在控制台看出是哪一页、为什么。
+        raise HTTPException(422, f"第 {pno} 页读不出文字层：{e}") from e
 
 
 @router.post("/documents/{doc_id}/crop")
@@ -302,6 +317,102 @@ def doc_crop_strip(doc_id: str, payload: CropStripIn, db: Session = Depends(get_
     return {"url": f"/api/crops/{name}"}
 
 
+@router.get("/documents/{doc_id}/region-image")
+def doc_region_image(
+    doc_id: str,
+    spec: str,
+    zoom: float = Query(1.5, ge=0.5, le=3.0),
+    db: Session = Depends(get_db),
+):
+    """把一个（或几个，跨页竖拼）区域渲染成 PNG **直接返回、不写盘**。
+
+    给「分割线之间到底切成了什么」做即时预览：老师画完线，右栏每一块后面
+    立刻能看到那块的样子，不用等提交。
+
+    为什么必须是不落盘的：
+        `data/uploads/crops/` 是**资产**目录 —— 里面每张图都有数据库行引用它，
+        删的时候靠引用计数回收。预览图没有任何行引用，攒多了就是纯垃圾
+        （实测踩过：题库 0 行、盘上 92 张图）。所以预览走内存直出。
+
+    为什么用 GET + 查询串而不是 POST body：
+        它要能直接当 `<img src="...">` 用 —— 浏览器才会替我们做缓存、
+        懒加载与并发控制。POST 做不到这些。
+
+    spec 形如 `1:40,90,550,300`（页: x0,y0,x1,y1），跨页用 `;` 连接：
+        `1:40,540,550,800;2:40,90,550,320`
+    """
+    path = _page_source(db, doc_id)
+    regions = _parse_region_spec(spec)
+    try:
+        png = pdf_adapter.render_region_png(str(path), regions, zoom=zoom)
+    except ValueError as e:
+        raise HTTPException(422, str(e)) from e
+    return Response(
+        content=png,
+        media_type="image/png",
+        # 同一份原件的同一块切出来是确定的 —— 让浏览器别重复问。
+        # private：这是学生卷子，不进中间缓存。
+        headers={"Cache-Control": "private, max-age=600"},
+    )
+
+
+def _parse_region_spec(spec: str) -> list[tuple[int, float, float, float, float]]:
+    """把 `页:x0,y0,x1,y1` 用 `;` 连起来的串解析成区域列表。
+
+    写错就 422 说清楚哪个片段不对 —— 前端拼 URL 的地方不止一处
+    （块缩略图、配图框选），静默当成「空区域」会让图整片不显示却查不出原因。
+    """
+    out: list[tuple[int, float, float, float, float]] = []
+    for part in (spec or "").split(";"):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            pno_s, coords = part.split(":", 1)
+            nums = [float(x) for x in coords.split(",")]
+            if len(nums) != 4:
+                raise ValueError
+            out.append((int(pno_s), nums[0], nums[1], nums[2], nums[3]))
+        except ValueError as e:
+            raise HTTPException(
+                422, f"区域写法不对：{part}（应为 页:x0,y0,x1,y1）"
+            ) from e
+    if not out:
+        raise HTTPException(422, "没有给出要预览的区域")
+    return out
+
+
+@router.post("/documents/{doc_id}/batch-crop")
+def doc_batch_crop(doc_id: str, payload: BatchCropIn, db: Session = Depends(get_db)):
+    """一次裁出**很多**题块的原貌图（批量入库用）。
+
+    为什么不复用 /crop 逐个调：一次提交 30 个块，逐个走 HTTP 就是 30 次往返 +
+    30 次「打开 PDF 文档」的开销（pymupdf 每次都要重新 open 同一个文件）。
+    这里在同一个 _page_source 上循环裁，只有一轮往返。
+
+    逐块容错：某一块裁不出来（越界、空区域）不该让整次提交失败 ——
+    返回里那个位置的 error 非空，前端据此把它标红让老师重新画，其余照常入库。
+    """
+    path = _page_source(db, doc_id)
+    out = []
+    for i, block in enumerate(payload.blocks):
+        regions = [(r.page, r.x0, r.y0, r.x1, r.y1) for r in block.regions]
+        if not regions:
+            out.append({"index": i, "url": None, "error": "空区域"})
+            continue
+        try:
+            pno, x0, y0, x1, y1 = regions[0]
+            if len(regions) == 1:
+                name = pdf_adapter.crop_region(str(path), pno, [x0, y0, x1, y1], CROPS_DIR)
+            else:
+                name = pdf_adapter.crop_regions(str(path), regions, CROPS_DIR, gap=payload.gap)
+            out.append({"index": i, "url": f"/api/crops/{name}", "error": None})
+        except ValueError as e:
+            out.append({"index": i, "url": None, "error": str(e)})
+    ok = sum(1 for x in out if x["url"])
+    return {"total": len(out), "ok": ok, "items": out}
+
+
 @router.get("/crops/{name}")
 def get_crop(name: str):
     p = config.CROPS_DIR / os.path.basename(name)
@@ -310,3 +421,134 @@ def get_crop(name: str):
     # 按扩展名给 MIME，不写死 png —— 目录里将来混进别的格式也不用改这里
     media = mimetypes.guess_type(p.name)[0] or "image/png"
     return FileResponse(str(p), media_type=media)
+
+
+# ---------------------------------------------------------------- 删除文档
+def _unlink(path: Path) -> list[str]:
+    """删一个文件，返回「真删掉了」的文件名。不存在或删不动都当没事发生。"""
+    try:
+        if path.is_file():
+            path.unlink()
+            return [path.name]
+    except OSError:
+        pass
+    return []
+
+
+def _delete_impact(db: Session, doc: Document) -> dict:
+    """删这份文档会动到什么 —— 前端在确认框里先把账摊开给人看。
+
+    两个数字都算的是「**真的**会少掉多少」：
+      · 题目数 —— 挂在它下面的题（按 document_id 认，就是它）
+      · 截图数 —— 这些题引用的截图，再扣掉别处也在用的（引用计数）
+    宁可这里多查一次，也好过用户点完「删除」才发现带走了不该带的东西。
+    """
+    qs = db.scalars(select(Question).where(Question.document_id == doc.id)).all()
+    mine: set[str] = set()
+    for q in qs:
+        mine |= crops.crop_names(q.image, q.answer_image)
+    # 预演：把这几道题当作已经删掉，看还剩谁在引用这些图
+    freed = mine - crops.referenced_crops(db, exclude_qids=[q.id for q in qs])
+
+    files: list[dict] = []
+    src = config.abs_from_data(doc.file_path)
+    if src and Path(src).is_file():
+        files.append({"kind": "source", "name": Path(src).name,
+                      "bytes": Path(src).stat().st_size})
+    conv = _preview_pdf_path(doc)
+    if conv.is_file():
+        files.append({"kind": "converted", "name": conv.name, "bytes": conv.stat().st_size})
+    cache = config.PAGES_CACHE / doc.id
+    if cache.is_dir():
+        files.append({"kind": "pages", "name": f"{doc.id}/",
+                      "bytes": sum(p.stat().st_size for p in cache.rglob("*") if p.is_file())})
+
+    return {
+        "id": doc.id,
+        "filename": doc.filename,
+        "filetype": doc.filetype,
+        "created_at": doc.created_at,
+        "questions": len(qs),
+        "crops": len(freed),
+        "files": files,
+        "bytes": sum(f["bytes"] for f in files),
+    }
+
+
+@router.get("/documents/{doc_id}/delete-impact")
+def delete_impact(doc_id: str, db: Session = Depends(get_db)):
+    """纯读取：删之前先看会删掉什么。不写任何东西，可以随便点。"""
+    return _delete_impact(db, _doc_or_404(db, doc_id))
+
+
+@router.delete("/documents/{doc_id}")
+def delete_document(
+    doc_id: str,
+    with_questions: bool = Query(False, description="true = 连同该文档下已录入的题目一起删"),
+    db: Session = Depends(get_db),
+):
+    """删除一份卷子**及它落盘的每一处**。
+
+    一份文档在磁盘上不止一个文件：原件、Word 转出的 PDF（页面视图的数据源）、
+    页面渲染图缓存。以前只能去 data/ 目录里自己翻着删，漏掉哪一处都不会报错 ——
+    表现是「下次打开还看到旧页面图」，或者几十 MB 悄悄占着。这里一次清干净。
+
+    ⚠️ with_questions 默认 false：**删文档 ≠ 删题**。题目是独立资产 ——
+    有自己的文本、截图，可能已经出过卷、有学生做过。把它们跟着文档一起带走，
+    是用户没说过的事。真要一起删，得调用方明确表态（前端默认不勾）。
+    不删题时会把题的 document_id 清空（来源名 doc_filename 保留），
+    免得题库里留一堆指向已删文档的 id。
+
+    删行之前先备份一次数据库：文件删了回不来，至少让「当时哪几道题挂在它下面」
+    有据可查（备份在 设置 → 数据备份，超出保留份数自动清最旧的）。
+    """
+    doc = _doc_or_404(db, doc_id)
+    filename = doc.filename
+    src_path = config.abs_from_data(doc.file_path)
+    conv_path = _preview_pdf_path(doc)
+
+    questions = db.scalars(select(Question).where(Question.document_id == doc_id)).all()
+    q_ids = [q.id for q in questions]
+
+    # 会释放哪些截图必须在删行**之前**算 —— 删完就问不出来了
+    freed: set[str] = set()
+    if questions:
+        mine: set[str] = set()
+        for q in questions:
+            mine |= crops.crop_names(q.image, q.answer_image)
+        freed = mine - crops.referenced_crops(db, exclude_qids=q_ids)
+
+    backup = ""
+    try:
+        made = backup_db("del-doc")
+        backup = made.name if made else ""
+    except Exception:            # noqa: BLE001
+        pass                     # 备份失败不该挡住「用户想删东西」这件事
+
+    if with_questions and q_ids:
+        # 顺序不能反：question_nodes 有指向 questions 的外键，且是真生效的
+        db.execute(delete(QuestionNode).where(QuestionNode.question_id.in_(q_ids)))
+        db.execute(delete(Question).where(Question.id.in_(q_ids)))
+    else:
+        for q in questions:
+            q.document_id = None
+    db.execute(delete(Document).where(Document.id == doc_id))
+    db.commit()
+
+    # 库改完才动文件：中途失败也不会留下「文件没了、记录还在」的空壳
+    files_removed: list[str] = []
+    if src_path:
+        files_removed += _unlink(Path(src_path))
+    files_removed += _unlink(conv_path)
+    # 页面缓存是一整个目录，且里面可能有 rmtree 删不掉的句柄 —— 忽略失败
+    shutil.rmtree(config.PAGES_CACHE / doc_id, ignore_errors=True)
+
+    return {
+        "ok": True,
+        "filename": filename,
+        "questions_removed": len(q_ids) if with_questions else 0,
+        "questions_kept": 0 if with_questions else len(q_ids),
+        "crops_removed": crops.purge(freed),
+        "files_removed": files_removed,
+        "backup": backup,
+    }

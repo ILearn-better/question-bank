@@ -162,6 +162,12 @@ class Question(Base):
     analysis: Mapped[str | None] = mapped_column(Text)
     image: Mapped[str] = mapped_column(Text, default="", server_default="")
     answer_image: Mapped[str] = mapped_column(Text, default="", server_default="")
+    # 题干补充配图 —— 题干里那幅「如图」的图，单独框出来的一张。
+    # 与 image 不是一回事：image 是**整道题**的原貌截图（含全部文字），
+    # 出卷选「图片」形态时印的是它，框出来的这幅图自然也在里面；
+    # 而选「文本」形态时 image 整张都不印，题里的图就只能靠这一列补上。
+    # 所以两列必须分开存，出卷时按形态取用（见 services/paper_export.py）。
+    figure_image: Mapped[str] = mapped_column(Text, default="", server_default="")
     created_at: Mapped[str | None] = mapped_column(Text)
     # —— 新增（M1 多体系化）——
     curriculum_id: Mapped[int | None] = mapped_column(ForeignKey("curricula.id"))
@@ -172,6 +178,16 @@ class Question(Base):
     last_used_at: Mapped[str | None] = mapped_column(Text)
     stem_format: Mapped[str] = mapped_column(String, default="text", server_default="text")
     tags: Mapped[str] = mapped_column(Text, default="[]", server_default="[]")
+    # 每题分值。可空是刻意的：老数据没有分值，出卷时按「不标分值」处理，
+    # 绝不拿 0 或某个默认值去填 —— 印错分数的试卷比不印分数严重得多。
+    score: Mapped[float | None] = mapped_column(REAL)
+    # 出卷时这一题优先印哪种形态。录题时「原貌图」和「识别文本」常常同时在，
+    # 到底印哪个是老师对**这一题**的判断（公式题印文本更清楚、图形题只能印图），
+    # 替他定就是印错。所以每题存一个偏好，出卷时还能整卷统一覆盖。
+    #   auto  —— 有文本用文本，没文本用图（默认；也兼容老数据）
+    #   text  —— 强制用文本（没有文本时自动退回图，不印空白题）
+    #   image —— 强制用图（没有图时自动退回文本）
+    render_prefer: Mapped[str] = mapped_column(String, default="auto", server_default="auto")
 
     __table_args__ = (Index("idx_questions_curr", "curriculum_id", "node_id"),)
 
@@ -190,6 +206,98 @@ class QuestionNode(Base):
     weight: Mapped[float] = mapped_column(REAL, default=1.0, server_default="1.0")
 
     __table_args__ = (Index("idx_qn_node", "node_id"),)
+
+
+class BatchJob(Base):
+    """批量入库任务：一次提交的一批题块，共用一次并行识别。
+
+    ⚠️ 为什么待审条目单独一张表，而不是给 questions 加个 status 字段：
+        - questions 的语义保持纯粹（「已确认可用的题」），出卷 / 作业 / 反馈 /
+          笔记插题这些下游一行都不用改；
+        - 驳回的、识别失败的脏数据**永远进不了题库**；
+        - 批量导入中途失败只影响这张表，不会在 questions 里留下半截题目。
+      也就是说「待审」只是批量导入这条入口的中间状态，不是题目的必经状态。
+
+    ⚠️ 为什么叫 batch 而不是 import：`import` 是 Python 关键字，
+       表名/模块名带上它，写 `from app.services import import_xxx` 时处处别扭。
+    """
+
+    __tablename__ = "batch_jobs"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    owner_id: Mapped[int] = mapped_column(Integer, nullable=False, default=OWNER_ID, server_default=str(OWNER_ID))
+    # queued 刚建好 / running 识别中 / done 全部完成 / partial 有失败 / failed 一条没成
+    status: Mapped[str] = mapped_column(String, default="queued", server_default="queued")
+    total: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    done: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    failed: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    # 整批指定的体系。**刻意不让模型判体系** —— 一份卷子一套体系，
+    # 模型判错的代价是整批错到出卷，而老师选一次的成本是零。
+    curriculum_id: Mapped[int | None] = mapped_column(ForeignKey("curricula.id"))
+    document_id: Mapped[str | None] = mapped_column(String)
+    doc_filename: Mapped[str | None] = mapped_column(String)
+    error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[str | None] = mapped_column(Text)
+    finished_at: Mapped[str | None] = mapped_column(Text)
+
+    items: Mapped[list["BatchItem"]] = relationship(
+        back_populates="job", cascade="all, delete-orphan", order_by="BatchItem.seq"
+    )
+
+
+class BatchItem(Base):
+    """待审条目：一个题块 + 模型给出的结构化结果。"""
+
+    __tablename__ = "batch_items"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    job_id: Mapped[str] = mapped_column(
+        ForeignKey("batch_jobs.id", ondelete="CASCADE"), nullable=False
+    )
+    seq: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    document_id: Mapped[str | None] = mapped_column(String)
+    doc_filename: Mapped[str | None] = mapped_column(String)
+    page_no: Mapped[int | None] = mapped_column(Integer)
+    region: Mapped[str | None] = mapped_column(Text)          # JSON [x0,y0,x1,y1]，PDF 点坐标
+    image: Mapped[str] = mapped_column(Text, default="", server_default="")   # 原貌图 URL
+
+    # ---- 题干配图（「如图」那张图）----
+    # 为什么要单独一套：整块原貌图里当然有图，但**出卷走文本形态时原貌图整张都用不上**，
+    # 题里的图就丢了。所以让模型先判断「这题要不要图」，再由老师框选出那一幅存下来。
+    #
+    # needs_figure 是 AI 给的初值（0/1），**待在待审页被老师改** —— 模型判图不可靠，
+    # 用户点名要求「再加上人工判断逻辑」。所以这里存的是「当前结论」，
+    # AI 的原话另存在 figure_note 里，页面才能显示「模型说有图，你确认了没」。
+    needs_figure: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    figure_note: Mapped[str | None] = mapped_column(Text)     # 模型对这张图的描述
+    figure_image: Mapped[str] = mapped_column(Text, default="", server_default="")  # 老师框选的配图
+
+    # ---- 模型给的那几列。列名与 questions 对齐，通过时直接搬过去 ----
+    content: Mapped[str | None] = mapped_column(Text)
+    qtype: Mapped[str | None] = mapped_column(String)
+    difficulty: Mapped[str | None] = mapped_column(String)
+    # 模型给的是**名字**（自由文本），不是 node_id：它不可能知道我们的节点 id。
+    # 落库时在所选体系的知识树里做模糊匹配填 node_id，匹配不上就只留名字。
+    knowledge_point: Mapped[str | None] = mapped_column(String)
+    node_id: Mapped[int | None] = mapped_column(ForeignKey("nodes.id"))
+    tags: Mapped[str] = mapped_column(Text, default="[]", server_default="[]")
+    confidence: Mapped[str | None] = mapped_column(String)     # high | medium | low
+    note: Mapped[str | None] = mapped_column(Text)             # 模型自述的不确定点
+
+    # 后端校验留下的痕迹。JSON 数组，例如 ["qtype_fallback","json_repaired"]。
+    # 有它才能让审核页把「模型自己拿的主意」标出来 —— 没标的话老师看不出来
+    # 这个「解答题」是模型判断的，还是枚举不合法被后端兜的。
+    flags: Mapped[str] = mapped_column(Text, default="[]", server_default="[]")
+    raw: Mapped[str | None] = mapped_column(Text)              # 模型原始返回（截断），排查用
+    status: Mapped[str] = mapped_column(String, default="pending", server_default="pending")
+    question_id: Mapped[str | None] = mapped_column(String)     # 通过后指向生成的题目
+    error: Mapped[str | None] = mapped_column(Text)             # 单条失败原因
+    created_at: Mapped[str | None] = mapped_column(Text)
+    reviewed_at: Mapped[str | None] = mapped_column(Text)
+
+    job: Mapped["BatchJob"] = relationship(back_populates="items")
+
+    __table_args__ = (Index("idx_batch_items_job", "job_id", "status"),)
 
 
 # ============================================================
@@ -317,7 +425,7 @@ class Lesson(Base):
 
 
 class Feedback(Base):
-    """课后反馈（一节一条，四段式）。"""
+    """课后反馈（一节一条，五段式）。"""
 
     __tablename__ = "feedbacks"
 
@@ -329,14 +437,15 @@ class Feedback(Base):
     student_id: Mapped[int] = mapped_column(
         ForeignKey("students.id", ondelete="CASCADE"), nullable=False
     )
+    course_content: Mapped[str] = mapped_column(Text, default="", server_default="")  # 课程内容（本次讲了什么）
     performance: Mapped[str | None] = mapped_column(Text)   # 课堂表现
     problems: Mapped[str | None] = mapped_column(Text)      # 存在问题
     homework: Mapped[str | None] = mapped_column(Text)      # 作业布置
     next_plan: Mapped[str | None] = mapped_column(Text)     # 下次安排
     # 整篇正文：按润色模板整理成文的成品（可直接发给家长）。
-    # 上面四个字段是老师随手写的**原料**，这里是**成品** —— 两者并存，导出时二选一。
-    # 之所以单独存一列而不是让 AI 把长文拆回四个字段：那些栏目标题
-    # （【本次课堂内容】【易错内容】【作业预计时长】…）根本塞不进「四段」这个形状里。
+    # 上面五个字段是老师随手写的**原料**，这里是**成品** —— 两者并存，导出时二选一。
+    # 之所以单独存一列而不是让 AI 把长文拆回几个字段：那些栏目标题
+    # （【易错内容】【作业预计时长】…）根本塞不进「五段」这个形状里。
     doc: Mapped[str] = mapped_column(Text, default="", server_default="")
     rating: Mapped[int | None] = mapped_column(Integer)     # 1-5 综合状态
     share_to_parent: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
@@ -675,9 +784,43 @@ class FeedbackDocTemplate(Base):
     __table_args__ = (Index("idx_fb_doc_templates_owner", "owner_id", "sort_order"),)
 
 
+class PaperTemplate(Base):
+    """出卷的「卷种样式」：一套卷面长什么样，决定导出 HTML / Word / PDF 的版式。
+
+    为什么存数据库而不是把四套写死在渲染代码里：
+      高考 / 中考 / DSE / A-Level 只是**起点**。同一场考试不同年份、不同学校
+      的抬头和说明都不一样，写死等于每次改一行说明都要改代码。
+      存成数据后，「复制内置模板 → 改两个字段」就是一次普通的界面操作。
+
+    形状（四个 JSON 字段，都在 services/paper_style.py 里解析）：
+      paper    抬头区 —— 副标题、考试说明、注意事项逐条、姓名栏字段
+      style    排版   —— 字号、行距、页边距、题间距、答题留白、题号样式
+      sections 分区   —— 按题型把题目分组（"一、选择题" / "Section A"）
+      sample   示例   —— 一句「这套长什么样」的说明，仅供界面上给人看
+
+    sections 为空数组 = **不分区**，题目按用户排的顺序平铺（自定义模板的默认形态）。
+    is_builtin：内置模板允许改但不允许删 —— 删了下次启动种子又会建回来，反而迷惑。
+    """
+
+    __tablename__ = "paper_templates"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    owner_id: Mapped[int] = mapped_column(Integer, nullable=False, default=OWNER_ID, server_default=str(OWNER_ID))
+    name: Mapped[str] = mapped_column(String, nullable=False)
+    code: Mapped[str] = mapped_column(String, default="", server_default="")   # 内置标识，如 gaokao
+    paper: Mapped[str] = mapped_column(Text, default="{}", server_default="{}")
+    style: Mapped[str] = mapped_column(Text, default="{}", server_default="{}")
+    sections: Mapped[str] = mapped_column(Text, default="[]", server_default="[]")
+    sample: Mapped[str] = mapped_column(Text, default="", server_default="")
+    is_builtin: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    sort_order: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    created_at: Mapped[str] = mapped_column(Text, default=_now, server_default=NOW)
+
+    __table_args__ = (Index("idx_paper_templates_owner", "owner_id", "sort_order"),)
+
+
 class AiSetting(Base):
     """AI 润色的接口配置（单行，owner_id 唯一）。
-
     走 OpenAI 兼容的 /chat/completions 协议：DeepSeek、通义、Kimi、本地 Ollama / vLLM
     都是这个格式，所以只存 base_url + model + api_key 就能对接绝大多数服务，
     不需要为每家写一个适配器。

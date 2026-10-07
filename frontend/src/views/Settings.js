@@ -2,7 +2,7 @@
 // 「系统信息」这一块不是装饰 —— 它把 Phase 0 重构的三个验收项直接摆出来：
 // 迁移到哪个版本、WAL 有没有开、外键约束到底生效了没有。
 import { computed, onMounted, reactive, ref } from 'vue';
-import { abilityApi, aiApi, curriculumApi, homeworkApi, systemApi } from '../api.js';
+import { abilityApi, aiApi, curriculumApi, homeworkApi, paperTemplatesApi, systemApi } from '../api.js';
 import { fail, loadCurricula, loadDims, money, ok, todayISO } from '../store.js';
 
 export default {
@@ -228,6 +228,55 @@ export default {
       }
     }
 
+    // ---- 卷种样式（高考 / 中考 / DSE / A-Level 的出卷版面）----
+    const paperTpls = ref([]);
+
+    async function loadPaperTpls() {
+      try {
+        const r = await paperTemplatesApi.list();
+        paperTpls.value = r.items || [];
+      } catch (e) {
+        fail(e.message);
+      }
+    }
+
+    /** 复制一份再改 —— 这是改样式的**正确入口**。
+     *  直接改内置的也能改，但日后升级内置取值时分不清哪份是自己的改动。 */
+    async function copyPaperTpl(t) {
+      const name = prompt('新样式的名称', `${t.name}（我的）`);
+      if (name === null) return;                    // 取消
+      try {
+        await paperTemplatesApi.copy(t.id, name.trim());
+        ok('已复制一份，去出卷页就能选它');
+        await loadPaperTpls();
+      } catch (e) {
+        fail(e.message);
+      }
+    }
+
+    async function renamePaperTpl(t) {
+      const name = prompt('新名称', t.name);
+      if (name === null || !name.trim()) return;
+      try {
+        await paperTemplatesApi.update(t.id, { name: name.trim() });
+        ok('已改名');
+        await loadPaperTpls();
+      } catch (e) {
+        fail(e.message);
+      }
+    }
+
+    async function removePaperTpl(t) {
+      if (!confirm(`删除样式「${t.name}」？出卷时就选不到它了；已经导出的卷子不受影响。`)) return;
+      try {
+        await paperTemplatesApi.remove(t.id);
+        ok('已删除');
+        await loadPaperTpls();
+      } catch (e) {
+        fail(e.message);
+      }
+    }
+
     async function doBackup() {
       busy.value = 'backup';
       try {
@@ -260,12 +309,13 @@ export default {
       return (n / 1024 / 1024).toFixed(2) + ' MB';
     }
 
-    onMounted(() => { load(); loadAi(); });
+    onMounted(() => { load(); loadAi(); loadPaperTpls(); });
 
     return {
       info, backups, fk, curricula, dims, newCurr, newDim, busy,
       hwDims, newHwDim, addHwDim, disableHwDim,
       addCurriculum, addDim, disableDim, doBackup, runFkCheck, fmtSize, money, todayISO,
+      paperTpls, copyPaperTpl, renamePaperTpl, removePaperTpl,
       ai, aiForm, aiTest, saveAi, clearAiKey, testAi,
       providers, aiProvider, curProvider, pickProvider, aiUrlWarn, aiDirty,
     };
@@ -426,6 +476,33 @@ export default {
         <input type="text" v-model="newHwDim.name" placeholder="新作业维度名称">
         <button class="btn" style="flex:none" @click="addHwDim">添加</button>
       </div>
+    </div>
+
+    <div class="card">
+      <h2>卷种样式</h2>
+      <div class="small muted" style="margin-bottom:10px">
+        出卷时的版面：抬头、字号、页边距、题号形态，以及按题型/难度分区
+        （高考的「一、选择题」、DSE 的「Section A(1)」）。内置四套，<strong>改得了、删不了</strong>——
+        删了下次启动会建回来。要改成自己学校的抬头，请先「复制」一份再改：
+        直接改内置的，日后升级内置取值时就分不清哪份是自己的了。
+      </div>
+      <table class="tbl">
+        <thead><tr><th>#</th><th>样式</th><th>抬头</th><th>来源</th><th></th></tr></thead>
+        <tbody>
+          <tr v-for="(t, i) in paperTpls" :key="t.id">
+            <td class="muted small">{{ i + 1 }}</td>
+            <td>{{ t.name }}</td>
+            <td class="muted small">{{ t.paper.subtitle || '—' }}</td>
+            <td><span class="tag" :class="{ blue: t.is_builtin }">{{ t.is_builtin ? '内置' : '自定义' }}</span></td>
+            <td style="text-align:right;white-space:nowrap">
+              <button class="btn ghost sm" @click="copyPaperTpl(t)">复制</button>
+              <button class="btn ghost sm" @click="renamePaperTpl(t)">改名</button>
+              <button v-if="!t.is_builtin" class="btn ghost sm" style="color:var(--danger)"
+                      @click="removePaperTpl(t)">删除</button>
+            </td>
+          </tr>
+        </tbody>
+      </table>
     </div>
 
     <div class="card">

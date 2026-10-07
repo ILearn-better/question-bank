@@ -28,9 +28,11 @@ from sqlalchemy.orm import Session
 from .. import config
 from ..models import AiSetting
 
-# 反馈的四段字段（润色只处理这几个键，别的键原样返回）
-FIELDS = ("performance", "problems", "homework", "next_plan")
+# 反馈的五段字段（润色只处理这几个键，别的键原样返回）。
+# 课程内容排最前：先告诉 AI「讲了什么」，它才能把模板的【本次课堂内容】栏写对。
+FIELDS = ("course_content", "performance", "problems", "homework", "next_plan")
 FIELD_CN = {
+    "course_content": "课程内容",
     "performance": "课堂表现",
     "problems": "存在问题",
     "homework": "作业布置",
@@ -69,13 +71,15 @@ DOC_SYSTEM_PROMPT = (
 PROVIDERS = [
     {
         "id": "deepseek",
-        "name": "DeepSeek（便宜、中文好）",
+        "name": "DeepSeek（便宜、中文好，且支持识图）",
         "base_url": "https://api.deepseek.com",
-        "model": "deepseek-chat",
-        "models": ["deepseek-chat", "deepseek-reasoner"],
-        "note": "润色这种活 deepseek-chat 就够，价格便宜。deepseek-reasoner 更贵、"
-                "擅长推理题，润色用不上。地址填 https://api.deepseek.com 即可，"
-                "别填 platform.deepseek.com（那是控制台网页，不是接口）。",
+        "model": "deepseek-flash",
+        "models": ["deepseek-flash", "deepseek-v4-pro"],
+        "note": "deepseek-flash 支持图片输入（2026-10-05 实测：整页试卷 + 复杂公式识别 6/6 全对），"
+                "润色和公式识别一个模型就够；deepseek-v4-pro 是纯文本。"
+                "⚠️ 识图务必传 reasoning_effort=low，否则默认 high 会让推理吃掉 95% 的输出预算"
+                "（实测 4097 → 402 tokens）。"
+                "地址填 https://api.deepseek.com 即可，别填 platform.deepseek.com（那是控制台网页，不是接口）。",
         "keys_url": "https://platform.deepseek.com/api_keys",
     },
     {
@@ -223,7 +227,12 @@ def save_config(db: Session, payload, keep_key_when_empty: bool = True) -> dict:
     return masked(get_config(db))
 
 
-def _chat_url(base_url: str) -> str:
+# ---------------------------------------------------------------- 公共调用层
+# chat_url / post_json / extract_content 三个函数是**跨模块复用**的：
+# 本模块的「润色」与 vision.py 的「公式识别」走同一套 HTTP 细节。
+# 各写各的迟早会在「超时怎么报错」「响应格式怎么兜底」上出现偏差 ——
+# 而那种偏差的表现是「有时候不灵」，最难查。改这里要同时想到两个调用方。
+def chat_url(base_url: str) -> str:
     """把用户填的地址补全成 chat/completions。
 
     允许填 `https://api.deepseek.com`、`.../v1`、甚至完整的 `.../v1/chat/completions`，
@@ -239,7 +248,7 @@ def _chat_url(base_url: str) -> str:
     return url + "/v1/chat/completions"
 
 
-def _post_json(url: str, body: dict, headers: dict, timeout: int) -> dict:
+def post_json(url: str, body: dict, headers: dict, timeout: int) -> dict:
     req = urllib.request.Request(
         url,
         data=json.dumps(body).encode("utf-8"),
@@ -266,7 +275,7 @@ def _post_json(url: str, body: dict, headers: dict, timeout: int) -> dict:
         raise AiError(f"AI 接口返回的不是 JSON：{raw[:200]}") from e
 
 
-def _extract_content(data: dict) -> str:
+def extract_content(data: dict) -> str:
     """从响应里取正文。兼容 OpenAI 风格与少数只回 content 字符串的实现。"""
     try:
         choices = data.get("choices") or []
@@ -284,13 +293,13 @@ def _extract_content(data: dict) -> str:
 
 
 def assemble_draft(fields: dict, context: dict, draft: str | None = None) -> str:
-    """把四段记录 + 课程信息拼成一篇「原始记录」，交给 AI 整理。
+    """把五段记录 + 课程信息拼成一篇「原始记录」，交给 AI 整理。
 
     刻意**不**在这里排成模板的样子：怎么排是 AI 的活（它才读得懂模板要什么）。
     这里只负责把信息如实、完整地传过去，并标明哪一段是什么 ——
     少标一个标签，模型就可能把「作业布置」当成「课堂表现」混进正文里。
 
-    给了 draft（老师自己写的整篇草稿）就优先用它：那种情况下再拼四段是多余的。
+    给了 draft（老师自己写的整篇草稿）就优先用它：那种情况下再拼五段是多余的。
     """
     if draft and draft.strip():
         return draft.strip()
@@ -369,13 +378,13 @@ def polish_document(
         "temperature": 0.3,          # 润色要稳，不要发挥
         "stream": False,
     }
-    data = _post_json(
-        _chat_url(cfg["base_url"]),
+    data = post_json(
+        chat_url(cfg["base_url"]),
         body,
         {"Authorization": f"Bearer {cfg['api_key']}"},
         int(timeout_cap or cfg["timeout"]),
     )
-    text = _extract_content(data).strip()
+    text = extract_content(data).strip()
     if text.startswith("```"):        # 有些模型习惯包个代码块，剥掉
         text = text.split("\n", 1)[-1] if "\n" in text else text
         if text.rstrip().endswith("```"):
@@ -406,8 +415,8 @@ def test_connection(db: Session, override: dict | None = None) -> dict:
             cfg[key] = int(val) if key == "timeout" else str(val).strip()
     if not (cfg["base_url"] and cfg["model"] and cfg["api_key"]):
         raise AiError("地址 / 模型 / 密钥还没填全，先填完再测试")
-    data = _post_json(
-        _chat_url(cfg["base_url"]),
+    data = post_json(
+        chat_url(cfg["base_url"]),
         {
             "model": cfg["model"],
             "messages": [{"role": "user", "content": "回复两个字：正常"}],
@@ -417,4 +426,4 @@ def test_connection(db: Session, override: dict | None = None) -> dict:
         {"Authorization": f"Bearer {cfg['api_key']}"},
         min(30, int(cfg["timeout"])),
     )
-    return {"ok": True, "reply": _extract_content(data)[:80], "model": cfg["model"]}
+    return {"ok": True, "reply": extract_content(data)[:80], "model": cfg["model"]}

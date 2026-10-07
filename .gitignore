@@ -28,6 +28,11 @@ cookies.json
 .DS_Store
 Thumbs.db
 
+# 真实卷子样本
+# samples/ 根目录下的自制样例可以提交；但真实真题卷（学科网水印材料、
+# 中国香港考评局 DSE 卷）有版权、且单文件几十 MB，只留在本机做识别验证。
+samples/2025真题/
+
 # 临时 / 调试文件
 # 提交时用 git add -A 很容易把它们误带进仓库（真发生过：_debug.html 被提交了一次）。
 _debug.html

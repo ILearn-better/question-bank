@@ -2,7 +2,7 @@
 """请求 / 响应模型。输入一律用 Pydantic 校验，输出为便于前端消费的字典结构。"""
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -43,6 +43,13 @@ class QuestionIn(BaseModel):
     year: Optional[int] = None
     stem_format: str = "text"
     tags: List[str] = Field(default_factory=list)
+    # 每题分值。可空 —— 不填就不标，绝不会凭空显示一个假分数。
+    # ge=0 挡掉负数：负分只可能来自手滑，落到出卷里就是印错的试卷。
+    score: Optional[float] = Field(default=None, ge=0, le=200)
+    # 出卷时优先印哪种形态（见 models.Question.render_prefer）。
+    # 用 Literal 挡掉拼错的值 —— 拼错的字符串不会报错，只会让这一题静默用回默认，
+    # 排查时完全看不出问题在哪。
+    render_prefer: Literal["auto", "text", "image"] = "auto"
 
     @field_validator("content", "answer", "answer_image", "analysis", "image", "doc_filename", mode="before")
     @classmethod
@@ -72,6 +79,10 @@ class QuestionPatch(BaseModel):
     node_id: Optional[int] = None
     source: Optional[str] = None
     year: Optional[int] = None
+    score: Optional[float] = Field(default=None, ge=0, le=200)
+    render_prefer: Optional[Literal["auto", "text", "image"]] = None
+    # 题干里那幅「如图」的图。传空串 = 撤掉（服务端按引用计数回收那张图）。
+    figure_image: Optional[str] = None
 
 
 # ============================================================ 笔记
@@ -236,6 +247,7 @@ class AbilityScoreIn(BaseModel):
 class FeedbackIn(BaseModel):
     """课后反馈。刻意全部可选 —— 允许只写一句话就存，记录成本是生命线。"""
 
+    course_content: Optional[str] = None
     performance: Optional[str] = None
     problems: Optional[str] = None
     homework: Optional[str] = None
@@ -246,7 +258,7 @@ class FeedbackIn(BaseModel):
     # 配图 URL 数组（走现成的 POST /api/uploads/image 上传，服务端按魔数校验格式）
     images: List[str] = Field(default_factory=list)
     # 整篇正文：AI 按模板整理成文的成品。
-    # 注意语义与四段不同：四段是「老师写的原料」，doc 是「可以直接发给家长的成品」。
+    # 注意语义与五段不同：五段是「老师写的原料」，doc 是「可以直接发给家长的成品」。
     # 传 None 表示不动它（所以想清空必须显式传空串）—— 少了这个区分，
     # 任何没带 doc 字段的调用都会把用户辛苦整理出的整篇正文抹掉。
     doc: Optional[str] = None
@@ -297,10 +309,10 @@ class ImageRemoveIn(BaseModel):
 class PolishIn(BaseModel):
     """整篇润色请求。
 
-    以前是按字段润色（返回 JSON 回填四个输入框）；现在整体润色：
-    把四段拼成一篇原始记录 → AI 照模板整理成一篇文档 → 整篇返回。
+    以前是按字段润色（返回 JSON 回填几个输入框）；现在整体润色：
+    把五段拼成一篇原始记录 → AI 照模板整理成一篇文档 → 整篇返回。
 
-    fields   四段原文（常规情况）
+    fields   五段原文（常规情况）
     draft    也可以直接给一篇整篇草稿，给了就优先用它
     template_id / template_content
              仿照的模板。content 优先于 id —— 老师在弹窗里改了模板内容就该按改过的来
@@ -329,6 +341,20 @@ class AiTestIn(BaseModel):
     timeout: Optional[int] = Field(default=None, ge=5, le=300)
 
 
+class RecognizeIn(BaseModel):
+    """公式 / 题干识别请求。
+
+    image 收 base64（`data:image/png;base64,...` 或裸 base64 都行），**不收 URL**。
+    理由：要识别的图可能还没落盘 —— 老师刚框选完、题还没保存；即便已落盘，
+    让后端去反查「这个 URL 对应磁盘上哪个文件」也只是多一处会错的地方。
+    前端多走一步 fetch → FileReader，换来后端完全不关心图片从哪来。
+    """
+
+    image: str
+    mode: str = "question"          # question（题干）/ formula（纯公式）
+    hint: Optional[str] = None      # 老师额外给的一句话提示，可空
+
+
 class DimIn(BaseModel):
     name: str
     curriculum_id: Optional[int] = None
@@ -354,3 +380,104 @@ class HomeworkIn(BaseModel):
     status: str = "submitted"
     note: Optional[str] = None
     scores: List[HomeworkScoreIn] = Field(default_factory=list)
+
+
+# ============================================================ 出卷样式
+class PaperTemplateIn(BaseModel):
+    """卷种样式模板。三个字段的形状见 services/paper_style.py。
+
+    都不给默认值而是 Optional：**没传 = 不改这一块**。
+    这是有意的 —— 只改名字时不该把排版一起重置回默认值。
+    （新建时三个都不传，等于建一套全默认的模板，也是有效的用法。）
+
+    sections 是列表、paper/style 是字典，类型分开写：混成一个 dict 的话，
+    前端传错形状只会在渲染时才炸，而那时候已经过了一层 HTTP。
+    """
+
+    name: str = ""
+    paper: Optional[Dict[str, Any]] = None
+    style: Optional[Dict[str, Any]] = None
+    sections: Optional[List[Dict[str, Any]]] = None
+    sample: str = ""
+    sort_order: int = 0
+
+
+class PaperTemplateCopyIn(BaseModel):
+    """由现有模板复制一份（含一份全默认的空模板：source_id 不传即可）。"""
+
+    source_id: Optional[int] = None
+    name: str = ""
+
+
+# ============================================================ 批量入库
+class BatchRegionIn(BaseModel):
+    """一个题块在页面上的范围（PDF 点坐标，左上角为原点）。"""
+
+    page: int
+    x0: float
+    y0: float
+    x1: float
+    y1: float
+
+
+class BatchBlockIn(BaseModel):
+    """一个题块。`regions` 一条 = 不跨页；多条 = 跨页题，服务端竖拼成一张原貌图。
+
+    为什么块里是**列表**而不是单个矩形：一道题跨页在真卷里很常见（尤其解答题），
+    而题目只有一个 image 字段。拼成一张就不用为此加字段，尺寸换算也统一在
+    `adapters/pdf.py` 的 crop_regions 里做（它已经为「录题页跨页选段」写好并实测过）。
+    """
+
+    regions: List[BatchRegionIn]
+
+
+class BatchCropIn(BaseModel):
+    blocks: List[BatchBlockIn]
+    gap: int = 14
+
+
+class BatchItemIn(BaseModel):
+    """提交上来的一个题块。image 由 batch-crop 先落盘，这里只带 URL。"""
+
+    image: str
+    page_no: Optional[int] = None
+    # 主矩形（PDF 点坐标），只作定位线索留档；跨页块这里存第一段。
+    region: Optional[List[float]] = None
+    document_id: Optional[str] = None
+    doc_filename: Optional[str] = None
+
+
+class BatchJobIn(BaseModel):
+    curriculum_id: Optional[int] = None      # 整批体系。必填（服务端会校验）
+    document_id: Optional[str] = None
+    doc_filename: Optional[str] = None
+    items: List[BatchItemIn] = Field(default_factory=list)
+    # start=False 只建任务不发起识别。给测试用，也留给「先建好、回头再跑」的场景。
+    start: bool = True
+
+
+class BatchItemPatch(BaseModel):
+    """审核时改条目。**只改传上来的字段** —— 没传的保持原样。"""
+
+    content: Optional[str] = None
+    qtype: Optional[str] = None
+    difficulty: Optional[str] = None
+    knowledge_point: Optional[str] = None
+    node_id: Optional[int] = None
+    tags: Optional[List[str]] = None
+    # 「这题要不要配图」。AI 给初值，老师可改 —— 改的就是这个字段。
+    needs_figure: Optional[bool] = None
+    figure_note: Optional[str] = None
+    # 配图 URL。传空串 = 撤掉配图（服务端按引用计数回收那张图）。
+    figure_image: Optional[str] = None
+
+
+class FigureCropIn(BaseModel):
+    """给某一条待审条目框一幅配图（题干里那句「如图」的那张图）。
+
+    跟 BatchCropIn 一样是「块 = 矩形列表」，因为图也可能跨页 ——
+    真卷里图象画在下一页顶端并不少见。跨页时服务端竖拼成一张。
+    """
+
+    regions: List[BatchRegionIn]
+    gap: int = 14

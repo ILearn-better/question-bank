@@ -12,7 +12,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from . import config
-from .models import Curriculum, FeedbackDocTemplate, FeedbackTemplate, Node
+from .models import Curriculum, FeedbackDocTemplate, FeedbackTemplate, Node, PaperTemplate
 
 # 用户当前实际教授的体系（2026-09-20 确认）
 DEFAULT_CURRICULA: list[dict] = [
@@ -87,12 +87,16 @@ def _insert_subtree(
 
 # ---------------------------------------------------------------- 反馈模板
 # 内置四套，覆盖四种常见场景。短语写得越具体，家长越觉得「老师真的在看我的孩子」；
-# seeds 是骨架文本（可空），选了模板且四段为空时直接填进去，省掉从零组织语言。
+# seeds 是骨架文本（可空），选了模板且各段为空时直接填进去，省掉从零组织语言。
 # 注意：这些只是**起点**，用户可另存自己的模板；内置模板允许改文案但不允许删。
+# ⚠️ ensure 只补不覆盖：2026-10-07 加 course_content 短语组时，老库里已存在的同名
+#    内置模板**不会**自动更新（用户可能改过文案，不能覆盖）。前端做了兜底 ——
+#    模板短语里缺哪个键就用默认组（FeedbackDialog.js 的 PHRASES）补上。
 BUILTIN_TEMPLATES: list[dict] = [
     {
         "name": "常规课（推荐）",
         "phrases": {
+            "course_content": ["讲评上次作业 + 新课讲解", "新知识点讲解 + 随堂练习", "例题精讲 + 变式训练", "按讲义推进，完成 ______ 节"],
             "performance": ["状态不错，配合度高", "前半段注意力较集中", "主动提问，思路跟得紧", "略疲倦，节奏放慢后好转"],
             "problems": ["计算跳步导致失分", "审题不够仔细，条件看漏", "步骤书写不规范", "知识点迁移能力偏弱"],
             "homework": ["课后练习 P32 第 1-8 题", "错题重做一遍", "本周完成一套限时训练", "暂无，先巩固课上内容"],
@@ -103,6 +107,7 @@ BUILTIN_TEMPLATES: list[dict] = [
     {
         "name": "考后讲评",
         "phrases": {
+            "course_content": ["整卷讲评，重点讲大题", "按错因分块讲评", "选择题 + 填空题快速过，大题细讲", "讲评 + 同类题变式再练"],
             "performance": ["订正态度认真，追问到位", "对失分点接受度高", "情绪略低，已做疏导", "能自己找到错因"],
             "problems": ["时间分配不合理，后面大题没写完", "选择填空失分偏多", "大题步骤分丢得多", "会做的题抄错/算错"],
             "homework": ["本次试卷重做一遍（限时）", "错题整理到错题本", "按错因分类订正", "针对弱项做 10 道专项"],
@@ -116,6 +121,7 @@ BUILTIN_TEMPLATES: list[dict] = [
     {
         "name": "作业辅导",
         "phrases": {
+            "course_content": ["作业逐题讲解", "只讲错题，其余对答案", "先梳理知识点再做题", "带着做压轴题"],
             "performance": ["能独立完成大部分题目", "卡住的题愿意先自己想", "提示后能自行完成", "主动标记了不会的题"],
             "problems": ["同一类题反复错", "喜欢直接看答案", "过程写得过于简略", "基础运算还不熟练"],
             "homework": ["错题重做并写出思路", "把卡住的题整理成一张纸", "明天先交作业再讲新内容", "补完上次缺的练习"],
@@ -126,6 +132,7 @@ BUILTIN_TEMPLATES: list[dict] = [
     {
         "name": "家长沟通（简短）",
         "phrases": {
+            "course_content": ["继续本周专题", "复习巩固 + 小测", "讲了 ______，练了 ______", "查漏补缺"],
             "performance": ["本节状态正常", "比上次进步明显", "今天效率很高", "情绪不错"],
             "problems": ["基础题还是粗心", "这周练习量不够", "需要家长帮忙盯一下作业", "最近状态有点松"],
             "homework": ["本周完成 ______", "每天 15 分钟计算练习", "完成错题重做", "周末做一套卷子"],
@@ -226,10 +233,216 @@ def ensure_feedback_doc_templates(db: Session) -> int:
     return added
 
 
+# ---------------------------------------------------------------- 卷种样式模板
+# 四套内置卷种：高考 / 中考 / DSE / A-Level。
+#
+# ⚠️ 这是**起点**，不是标准答案。同一场考试不同年份、不同省份、不同学校
+#    的抬头和注意事项都不一样，所以这些字段全部可改（内置模板也能改，只是不能删）。
+#    老师的正确用法是：复制一份内置模板 → 按本地区真题微调 → 存成自己的。
+#
+# 分区为什么有的按题型、有的按难度：
+#   高考 / 中考的卷面结构是「一、选择题 二、填空题 三、解答题」——按**题型**切；
+#   A-Level 和 DSE Paper 1 的 Section A / B 是按**难度阶梯**切的
+#   （DSE 是 Section A(1) 较易 / A(2) 中等 / B 较难），只按题型分还原不了。
+#   所以 sections 支持 qtypes 与 difficulties 两个维度，两个都给了就必须同时命中。
+#
+# note 里的 {count} / {total} 是占位符：题数和总分导出时按实际算，
+# 写死数字的话老师增删一道题就得回来改模板，那就没人用了。
+BUILTIN_PAPER_TEMPLATES: list[dict] = [
+    {
+        "code": "gaokao",
+        "name": "高考数学（全国卷）",
+        "sample": "抬头带考试说明 + 注意事项，开头有「题号/得分」登分表；"
+                  "分「一、选择题 / 二、填空题 / 三、解答题」三区，分区说明里给分值，每题后不重复标。",
+        "paper": {
+            "subtitle": "普通高等学校招生全国统一考试",
+            "exam_note": "满分 150 分，考试用时 120 分钟",
+            "instructions_title": "注意事项",
+            "instructions": [
+                "答卷前，考生务必将自己的姓名、考生号等填写在答题卡和试卷指定位置上。",
+                "回答选择题时，选出每小题答案后，用铅笔把答题卡上对应题目的答案标号涂黑。"
+                "如需改动，用橡皮擦干净后，再选涂其他答案标号。回答非选择题时，将答案写在答题卡上。"
+                "写在本试卷上无效。",
+                "考试结束后，将本试卷和答题卡一并交回。",
+            ],
+            "fill_fields": ["姓名", "班级", "考号"],
+            "score_table": True,
+        },
+        "style": {
+            "font_size": 11.5,
+            "title_size": 16.0,
+            "section_size": 13.0,
+            "line_height": 1.8,
+            "margin_mm": [16.0, 14.0],
+            "question_gap": 14.0,
+            "number_style": "1.",
+            "show_score": False,
+            "answer_space": 0,
+        },
+        "sections": [
+            {"title": "一、选择题", "qtypes": ["选择题"],
+             "note": "本题共 {count} 小题，每小题 5 分，共 {total} 分。"},
+            {"title": "二、填空题", "qtypes": ["填空题"],
+             "note": "本题共 {count} 小题，每小题 5 分，共 {total} 分。"},
+            {"title": "三、解答题", "qtypes": ["解答题", "证明题", "应用题"],
+             "note": "本题共 {count} 小题，共 {total} 分。解答应写出文字说明、证明过程或演算步骤。"},
+        ],
+    },
+    {
+        "code": "zhongkao",
+        "name": "中考数学",
+        "sample": "抬头带考试说明和答题卡注意事项；分「一、选择题 / 二、填空题 / 三、解答题」三区。"
+                  "满分与时长各地不同，复制一份改成你们市的。",
+        "paper": {
+            "subtitle": "初中学业水平考试",
+            "exam_note": "满分 120 分，考试时间 120 分钟",
+            "instructions_title": "注意事项",
+            "instructions": [
+                "答题前，考生务必将自己的姓名、准考证号填写在答题卡上。",
+                "选择题用 2B 铅笔填涂，非选择题用 0.5 毫米黑色签字笔书写。",
+                "答案必须写在答题卡各题目指定区域内，写在试卷上无效。",
+            ],
+            "fill_fields": ["姓名", "班级", "准考证号"],
+            "score_table": False,
+        },
+        "style": {
+            "font_size": 11.5,
+            "title_size": 16.0,
+            "section_size": 13.0,
+            "line_height": 1.8,
+            "margin_mm": [16.0, 14.0],
+            "question_gap": 14.0,
+            "number_style": "1.",
+            "show_score": False,
+            "answer_space": 0,
+        },
+        "sections": [
+            {"title": "一、选择题", "qtypes": ["选择题"],
+             "note": "本大题共 {count} 小题，每小题 3 分，共 {total} 分。"},
+            {"title": "二、填空题", "qtypes": ["填空题"],
+             "note": "本大题共 {count} 小题，每小题 3 分，共 {total} 分。"},
+            {"title": "三、解答题", "qtypes": ["解答题", "证明题", "应用题"],
+             "note": "本大题共 {count} 小题，共 {total} 分。解答应写出文字说明、证明过程或演算步骤。"},
+        ],
+    },
+    {
+        "code": "dse",
+        "name": "DSE 数学（英文卷）",
+        "sample": "英文抬头 + INSTRUCTIONS；Section 按**难度阶梯**分（对应库里的 基础/中档/拔高），"
+                  "因为 DSE Paper 1 的 Section A(1)/A(2)/B 就是按难度切的，不是按题型。"
+                  "解答题下方留 6 行作答横线。",
+        "paper": {
+            "subtitle": "HONG KONG DIPLOMA OF SECONDARY EDUCATION EXAMINATION",
+            "exam_note": "Time allowed: 2 hours 15 minutes　　This paper must be answered in English",
+            "instructions_title": "INSTRUCTIONS",
+            "instructions": [
+                "Read carefully the instructions on the Answer Sheet.",
+                "This paper consists of THREE sections, A(1), A(2) and B.",
+                "Attempt ALL questions in this paper.",
+                "Unless otherwise specified, all working must be clearly shown.",
+                "Unless otherwise specified, numerical answers should be either exact or "
+                "correct to 3 significant figures.",
+                "The diagrams in this paper are not necessarily drawn to scale.",
+            ],
+            "fill_fields": ["Candidate Number", "Name"],
+            "score_table": False,
+        },
+        "style": {
+            "font_size": 11.5,
+            "title_size": 15.0,
+            "section_size": 13.0,
+            "line_height": 1.8,
+            "margin_mm": [16.0, 14.0],
+            "question_gap": 14.0,
+            "number_style": "1.",
+            "show_score": True,
+            "score_unit": "marks",
+            "answer_space": 6,
+            "answer_space_types": ["解答题", "证明题", "应用题"],
+        },
+        "sections": [
+            {"title": "Section A(1)", "difficulties": ["基础"],
+             "note": "Answer ALL questions in this section."},
+            {"title": "Section A(2)", "difficulties": ["中档"],
+             "note": "Answer ALL questions in this section."},
+            {"title": "Section B", "difficulties": ["拔高"],
+             "note": "Answer ALL questions in this section."},
+        ],
+    },
+    {
+        "code": "alevel",
+        "name": "A-Level 数学（英文卷）",
+        "sample": "英文抬头 + INSTRUCTIONS；Section A 短题 / Section B 长题（按难度切）；"
+                  "题号用「Question 1」，每题后标分值如 (4 marks)。",
+        "paper": {
+            "subtitle": "A LEVEL MATHEMATICS",
+            "exam_note": "Time allowed: 2 hours",
+            "instructions_title": "INSTRUCTIONS",
+            "instructions": [
+                "Answer ALL questions.",
+                "Write your answers in the spaces provided on this paper.",
+                "You must show all necessary working clearly.",
+                "Give non-exact numerical answers correct to 3 significant figures.",
+            ],
+            "fill_fields": ["Candidate Name", "Candidate Number", "Centre Number"],
+            "score_table": False,
+        },
+        "style": {
+            "font_size": 11.5,
+            "title_size": 15.0,
+            "section_size": 13.0,
+            "line_height": 1.8,
+            "margin_mm": [16.0, 14.0],
+            "question_gap": 14.0,
+            "number_style": "Question 1",
+            "show_score": True,
+            "score_unit": "marks",
+            "answer_space": 6,
+            "answer_space_types": ["解答题", "证明题", "应用题"],
+        },
+        "sections": [
+            {"title": "Section A", "difficulties": ["基础", "中档"],
+             "note": "Answer ALL questions in this section."},
+            {"title": "Section B", "difficulties": ["拔高"],
+             "note": "Answer ALL questions in this section."},
+        ],
+    },
+]
+
+
+def ensure_paper_templates(db: Session) -> int:
+    """内置卷种只补不覆盖：已存在同名内置模板就跳过（用户可能改过它的抬头）。
+
+    按 **name** 判重而不是 code：用户复制出来的模板 name 会带「副本」，
+    code 是空的，所以不会跟内置的撞上；而改名过的内置模板也不会被重复插入。
+    """
+    existing = {t.name for t in db.scalars(select(PaperTemplate))}
+    added = 0
+    for i, spec in enumerate(BUILTIN_PAPER_TEMPLATES):
+        if spec["name"] in existing:
+            continue
+        db.add(PaperTemplate(
+            owner_id=config.OWNER_ID,
+            name=spec["name"],
+            code=spec["code"],
+            paper=json.dumps(spec["paper"], ensure_ascii=False),
+            style=json.dumps(spec["style"], ensure_ascii=False),
+            sections=json.dumps(spec["sections"], ensure_ascii=False),
+            sample=spec["sample"],
+            is_builtin=1,
+            sort_order=i,
+        ))
+        added += 1
+    if added:
+        db.commit()
+    return added
+
+
 def seed_all(db: Session) -> dict:
     return {
         "curricula_added": ensure_curricula(db),
         "nodes_imported": import_legacy_tree(db),
         "templates_added": ensure_feedback_templates(db),
         "doc_templates_added": ensure_feedback_doc_templates(db),
+        "paper_templates_added": ensure_paper_templates(db),
     }

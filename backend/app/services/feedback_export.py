@@ -8,8 +8,8 @@
   · **pdf** —— 先出 docx，再交给 adapters/office.py 用本机 Word 导出（版式最准）。
     没有 Word 时抛 PdfUnavailable，由路由翻成 503 并给可照做的提示。
 
-内容组织：整篇正文（AI 按模板整理出的成品）**优先**，没有就退回四段式
-（课堂表现 / 存在问题 / 作业布置 / 下次安排）+ 综合状态 + 能力评分 + 配图。
+内容组织：整篇正文（AI 按模板整理出的成品）**优先**，没有就退回五段式
+（课程内容 / 课堂表现 / 存在问题 / 作业布置 / 下次安排）+ 综合状态 + 能力评分 + 配图。
 空字段**不输出标题**——留一堆「（空）」比不写更难看，这是给家长看的正式文本。
 """
 from __future__ import annotations
@@ -20,8 +20,10 @@ import re
 from ..adapters import office
 from . import storage
 
-# 反馈导出的四个字段：(键, 中文标题)
+# 反馈导出的五个字段：(键, 中文标题)。课程内容排最前 ——
+# 先说讲了什么，再说表现如何，与推荐润色模板的栏目顺序一致。
 SECTIONS = [
+    ("course_content", "课程内容"),
     ("performance", "课堂表现"),
     ("problems", "存在问题"),
     ("homework", "作业布置"),
@@ -197,7 +199,7 @@ def build_txt(fb: dict, ctx: dict, doc: str | None = None) -> bytes:
     """纯文本。刻意不带图片（需求明确：txt 不用图片）。
 
     doc 是整篇正文（AI 整理的成品）。有它就整篇导出 —— 那是老师确认过的正式文本；
-    没有才退回四段式。不把两者混在一起拼：同一件事写两遍，家长会觉得乱。
+    没有才退回五段式。不把两者混在一起拼：同一件事写两遍，家长会觉得乱。
     """
     if (doc or "").strip():
         lines: list[str] = [doc.strip(), ""]

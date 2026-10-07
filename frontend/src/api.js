@@ -113,7 +113,7 @@ export const feedbackApi = {
   save: (lessonId, body) => api.put(`/api/lessons/${lessonId}/feedback`, body),
   remove: (lessonId) => api.del(`/api/lessons/${lessonId}/feedback`),
 
-  /** 反馈模板（四段的可复用文本 + 快捷短语）。存数据库，用户可自己加。 */
+  /** 反馈模板（五段的可复用文本 + 快捷短语）。存数据库，用户可自己加。 */
   templates: () => api.get('/api/feedback-templates'),
   createTemplate: (body) => api.post('/api/feedback-templates', body),
   removeTemplate: (id) => api.del(`/api/feedback-templates/${id}`),
@@ -133,12 +133,12 @@ export const feedbackApi = {
   deleteImage: (lessonId, url) =>
     api.post('/api/feedbacks/image/remove', { lesson_id: lessonId, url }),
 
-  /** AI 整篇润色：四段记录进去，一整篇文档出来（建议稿，需老师确认）。
+  /** AI 整篇润色：五段记录进去，一整篇文档出来（建议稿，需老师确认）。
    *  注意：会把内容发到第三方 AI 服务，界面必须先提示。 */
   polish: (lessonId, body) => api.post(`/api/lessons/${lessonId}/feedback/polish`, body),
 
   /** 导出 txt / docx / pdf。
-   *  source：auto（默认，有整篇就导整篇）/ doc（强制整篇）/ fields（强制四段）。 */
+   *  source：auto（默认，有整篇就导整篇）/ doc（强制整篇）/ fields（强制五段）。 */
   downloadExport: (lessonId, format, filename, source = 'auto') =>
     download(`/api/lessons/${lessonId}/feedback/export` + qs({ format, source }), filename),
 };
@@ -202,6 +202,21 @@ export const papersApi = {
   /** 导出/预览合成一个 URL：HTML 是 inline（直接看），Word/PDF 是下载。
    *  这样前端只要 window.open，不用把二进制读进 fetch 再自己造 Blob。 */
   exportUrl: (params) => '/api/papers/export' + qs(params),
+};
+
+/** 卷种样式模板（高考 / 中考 / DSE / A-Level，四套内置 + 自己复制改的）。
+ *  返回的每一项都带**解析后**的 paper / style / sections —— 界面显示的字段
+ *  和导出时用的字段是同一套，不会出现「界面上改了却没生效」。 */
+export const paperTemplatesApi = {
+  list: () => api.get('/api/paper-templates'),
+  get: (id) => api.get(`/api/paper-templates/${id}`),
+  create: (body) => api.post('/api/paper-templates', body),
+  /** 复制一份再改 —— 「可扩展」真正好用的路径：挑一套最像的复制，比从零填省事。 */
+  copy: (sourceId, name) => api.post('/api/paper-templates/copy', { source_id: sourceId, name }),
+  /** 改模板：**没传的块保持原样**（只改名字不该把排版重置回默认）。 */
+  update: (id, body) => api.patch(`/api/paper-templates/${id}`, body),
+  /** 内置的改得了、删不了（删了下次启动种子又建回来）。 */
+  remove: (id) => api.del(`/api/paper-templates/${id}`),
 };
 
 export const notesApi = {

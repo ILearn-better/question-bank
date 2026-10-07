@@ -81,40 +81,12 @@ def page_lines(path: str | os.PathLike, pno: int) -> dict:
 
 
 # ---------------------------------------------------------------- 裁剪
-def crop_region(
-    path: str | os.PathLike, pno: int, rect, out_dir: str | os.PathLike, zoom: float = 3.0
-) -> str:
-    """按 PDF 坐标矩形裁剪高清区域图（默认 3 倍分辨率，打印不糊）。返回文件名。"""
-    os.makedirs(out_dir, exist_ok=True)
-    name = f"{uuid.uuid4().hex[:12]}.png"
-    out = os.path.join(out_dir, name)
-    x0, y0, x1, y1 = rect
-    clip = pymupdf.Rect(min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1))
-    with pymupdf.open(path) as doc:
-        page = _page(doc, pno)
-        clip = clip & page.rect          # 限制在页面范围内
-        if clip.is_empty:
-            raise ValueError("裁剪区域为空")
-        pix = page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom), clip=clip)
-        pix.save(out)
-    return name
+def _clip_pixmaps(path: str | os.PathLike, regions, zoom: float) -> list:
+    """把若干区域渲染成 pixmap 列表。越界的页、空区域**跳过**（不抛错）。
 
-
-def crop_regions(
-    path: str | os.PathLike, regions, out_dir: str | os.PathLike, zoom: float = 3.0, gap: int = 14
-) -> str:
-    """把多个区域（可跨页）竖着拼成一张图。返回文件名。
-
-    用途：一道题跨了页（Word/PDF 里很常见，尤其解答题）。
-    如果按「一题一张原貌图」来做，跨页题就必须存两张 —— 但题目只有一个 image 字段。
-    这里直接拼成一张，跨页题的原貌图也就是一张，数据模型不用动。
-
-    regions 形如 [(page, x0, y0, x1, y1), ...]。
+    单段裁剪与跨页拼接共用这一份取图逻辑 —— 两处各写一遍的话，
+    「区域要 & page.rect 收进页内」这种细节迟早只在一处生效。
     """
-    os.makedirs(out_dir, exist_ok=True)
-    name = f"{uuid.uuid4().hex[:12]}.png"
-    out = os.path.join(out_dir, name)
-
     pixmaps = []
     with pymupdf.open(path) as doc:
         for pno, x0, y0, x1, y1 in regions:
@@ -125,31 +97,81 @@ def crop_regions(
             if clip.is_empty:
                 continue
             pixmaps.append(page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom), clip=clip))
+    return pixmaps
 
-    if not pixmaps:
-        raise ValueError("裁剪区域为空")
+
+def _stack_png(pixmaps, gap: int) -> bytes:
+    """把若干 pixmap 竖着拼成一张 PNG 的**字节**。只有一张时直接返回它。
+
+    拼接做法：新建一个 PDF 页，把各区域图按顺序 insert_image 进去再整体渲染。
+    不用 Pixmap.copy/set_origin —— 那套 API 的定位语义各家版本行为不一，
+    实测会贴出一张全白的图（真实踩过的坑），而 insert_image 的行为是文档化的。
+    """
     if len(pixmaps) == 1:
-        pixmaps[0].save(out)
-        return name
+        return pixmaps[0].tobytes("png")
 
-    # 拼接做法：新建一个 PDF 页，把各区域图按顺序 insert_image 进去再整体渲染。
-    # 不用 Pixmap.copy/set_origin —— 那套 API 的定位语义各家版本行为不一，
-    # 实测会贴出一张全白的图（真实踩过的坑），而 insert_image 的行为是文档化的。
     width = max(p.width for p in pixmaps)
     height = sum(p.height for p in pixmaps) + gap * (len(pixmaps) - 1)
 
     out_doc = pymupdf.open()
-    page = out_doc.new_page(width=width, height=height)
-    y = 0
-    for p in pixmaps:
-        # 统一成无 alpha 的 RGB，否则 insert_image 会因色彩空间不一致而报错
-        rgb = p if (p.alpha == 0 and p.colorspace == pymupdf.csRGB) else pymupdf.Pixmap(pymupdf.csRGB, p)
-        page.insert_image(pymupdf.Rect(0, y, rgb.width, y + rgb.height), pixmap=rgb)
-        y += rgb.height + gap
-    result = page.get_pixmap(matrix=pymupdf.Matrix(1, 1), alpha=False)
-    result.save(out)
-    out_doc.close()
+    try:
+        page = out_doc.new_page(width=width, height=height)
+        y = 0
+        for p in pixmaps:
+            # 统一成无 alpha 的 RGB，否则 insert_image 会因色彩空间不一致而报错
+            rgb = p if (p.alpha == 0 and p.colorspace == pymupdf.csRGB) else pymupdf.Pixmap(pymupdf.csRGB, p)
+            page.insert_image(pymupdf.Rect(0, y, rgb.width, y + rgb.height), pixmap=rgb)
+            y += rgb.height + gap
+        return page.get_pixmap(matrix=pymupdf.Matrix(1, 1), alpha=False).tobytes("png")
+    finally:
+        out_doc.close()
+
+
+def crop_region(
+    path: str | os.PathLike, pno: int, rect, out_dir: str | os.PathLike, zoom: float = 3.0
+) -> str:
+    """按 PDF 坐标矩形裁剪高清区域图（默认 3 倍分辨率，打印不糊）。返回文件名。"""
+    return crop_regions(path, [(pno, rect[0], rect[1], rect[2], rect[3])], out_dir, zoom=zoom)
+
+
+def crop_regions(
+    path: str | os.PathLike, regions, out_dir: str | os.PathLike, zoom: float = 3.0, gap: int = 14
+) -> str:
+    """把多个区域（可跨页）竖着拼成一张图，**落盘**并返回文件名。
+
+    用途：一道题跨了页（Word/PDF 里很常见，尤其解答题）。
+    如果按「一题一张原貌图」来做，跨页题就必须存两张 —— 但题目只有一个 image 字段。
+    这里直接拼成一张，跨页题的原貌图也就是一张，数据模型不用动。
+
+    regions 形如 [(page, x0, y0, x1, y1), ...]。
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    pixmaps = _clip_pixmaps(path, regions, zoom)
+    if not pixmaps:
+        raise ValueError("裁剪区域为空")
+    name = f"{uuid.uuid4().hex[:12]}.png"
+    with open(os.path.join(out_dir, name), "wb") as fh:
+        fh.write(_stack_png(pixmaps, gap))
     return name
+
+
+def render_region_png(
+    path: str | os.PathLike, regions, zoom: float = 1.5, gap: int = 14
+) -> bytes:
+    """渲染若干区域并竖拼成 PNG，**不落盘**，直接返回字节。
+
+    这是给「预览」用的，与 crop_regions 的关键差别就是**不写文件**：
+    老师画完分界线要马上看到这一块切出来什么样，但这时还没提交 ——
+    `data/uploads/crops/` 是提交后的资产目录，每张图都要靠引用计数才有
+    清理依据。往里塞一堆没人引用的预览图，等于给未来的自己挖坑
+    （实测过一次：题库 0 行、盘上 92 张图）。
+
+    分辨率也低一档（默认 1.5 倍）：缩略图看的是「切得对不对」，不是印刷质量。
+    """
+    pixmaps = _clip_pixmaps(path, regions, zoom)
+    if not pixmaps:
+        raise ValueError("区域为空，或超出了页面范围")
+    return _stack_png(pixmaps, gap)
 
 
 # ---------------------------------------------------------------- 内容块解析

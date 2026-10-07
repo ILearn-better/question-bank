@@ -3,7 +3,7 @@
 // 设计原则（开发文档 §6.5）：目标是「上完一节课 3 分钟内记完」。
 // 具体手段：
 //   · 从课表点进来就是这门课，不用先选学生再选时间
-//   · 四段式各自带快捷短语，一点即插，省掉打字
+//   · 五段式各自带快捷短语，一点即插，省掉打字
 //   · 能力评分「允许只打部分」，没打的下次仍按历史值算，绝不强制填满
 //   · 所有字段都可留空 —— 只写一句话也能存。卡住一次，这个工具就会被弃用。
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue';
@@ -12,8 +12,11 @@ import { fail, fmtBytes as fmtBytesShared, hhmm, ok, shortDate, warn } from '../
 import { needLocalCopyMessage, pickPastedAsset } from '../pasteAsset.js';
 import Modal from './Modal.js';
 
-// 四段字段的键与中文名。多处要用（拼原始记录、渲染、存模板），集中一份。
+// 反馈的五个字段：键与中文名。多处要用（拼原始记录、渲染、存模板），集中一份。
+// 课程内容排最前 —— 先说讲了什么，再说表现如何（与推荐润色模板的栏目顺序一致；
+// 2026-10-07 用户需求：模板的【本次课堂内容】栏以前没料可写，加这段补上）。
 const FIELDS = [
+  { key: 'course_content', label: '课程内容' },
   { key: 'performance', label: '课堂表现' },
   { key: 'problems', label: '存在问题' },
   { key: 'homework', label: '作业布置' },
@@ -22,6 +25,7 @@ const FIELDS = [
 
 // 快捷短语：一点即插。写得越具体，家长越觉得「老师真的在看我的孩子」。
 const PHRASES = {
+  course_content: ['讲评上次作业 + 新课讲解', '新知识点讲解 + 随堂练习', '例题精讲 + 变式训练', '复习巩固 + 小测'],
   performance: ['状态不错，配合度高', '前半段注意力较集中', '主动提问，思路跟得紧', '略疲倦，节奏放慢后好转'],
   problems: ['计算跳步导致失分', '审题不够仔细，条件看漏', '步骤书写不规范', '知识点迁移能力偏弱'],
   homework: ['课后练习 P32 第 1-8 题', '错题重做一遍', '本周完成一套限时训练', '暂无，先巩固课上内容'],
@@ -39,6 +43,7 @@ export default {
     const dims = ref([]);
     const saving = ref(false);
     const form = reactive({
+      course_content: '',
       performance: '',
       problems: '',
       homework: '',
@@ -69,8 +74,8 @@ export default {
     const uploading = ref(false);
 
     // ---- 整篇正文 ----
-    // 四段是老师随手写的**原料**，doc 是整理成文、可以直接发给家长的**成品**。
-    // 两者并存：润色只写 doc，绝不动四段（老师写的东西不能被 AI 反向覆盖）。
+    // 五段是老师随手写的**原料**，doc 是整理成文、可以直接发给家长的**成品**。
+    // 两者并存：润色只写 doc，绝不动五段（老师写的东西不能被 AI 反向覆盖）。
     const doc = ref('');
 
     // ---- 上课文件（给 AI 当参考资料） ----
@@ -117,6 +122,7 @@ export default {
         const fb = await feedbackApi.get(props.lesson.id);
         if (fb) {
           existing.value = true;
+          form.course_content = fb.course_content || '';
           form.performance = fb.performance || '';
           form.problems = fb.problems || '';
           form.homework = fb.homework || '';
@@ -136,7 +142,7 @@ export default {
           const r = await feedbackApi.docTemplates();
           docTemplates.value = r.items || [];
           // 默认选第一个（内置就是「完整课堂反馈（推荐）」）——
-          // 不预选的话，第一次点润色只能得到干巴巴的四段，没人知道还有个模板能用。
+          // 不预选的话，第一次点润色只能得到干巴巴的五段，没人知道还有个模板能用。
           const first = docTemplates.value[0];
           if (first) {
             docTemplateId.value = first.id;
@@ -194,6 +200,7 @@ export default {
       saving.value = true;
       try {
         const payload = {
+          course_content: form.course_content || null,
           performance: form.performance || null,
           problems: form.problems || null,
           homework: form.homework || null,
@@ -248,14 +255,14 @@ export default {
 
     /** 选模板：
      *  · 快捷短语一定跟着换（这是模板最直接的用处）
-     *  · 四段文本只在**空的时候**填骨架 —— 已经写了内容的字段绝不默默覆盖，
+     *  · 五段文本只在**空的时候**填骨架 —— 已经写了内容的字段绝不默默覆盖，
      *    先问一句再动。反馈是老师一个字一个字写出来的，被清掉比多问一句难受得多。 */
     function applyTemplate() {
       const t = currentTpl();
       if (!t) { phrases.value = { ...PHRASES }; return; }
       phrases.value = { ...PHRASES, ...(t.phrases || {}) };
       const seeds = t.seeds || {};
-      const keys = ['performance', 'problems', 'homework', 'next_plan'];
+      const keys = ['course_content', 'performance', 'problems', 'homework', 'next_plan'];
       const filled = keys.filter(k => (form[k] || '').trim());
       const seedKeys = keys.filter(k => (seeds[k] || '').trim());
       if (!seedKeys.length) return;
@@ -273,10 +280,11 @@ export default {
       try {
         const r = await feedbackApi.createTemplate({
           name,
-          // 短语用当前工具栏里那组；四段文本存成「骨架」，
+          // 短语用当前工具栏里那组；五段文本存成「骨架」，
           // 相当于把这篇写好的反馈变成下次的起点。
           phrases: phrases.value,
           seeds: {
+            course_content: form.course_content || '',
             performance: form.performance || '',
             problems: form.problems || '',
             homework: form.homework || '',
@@ -446,8 +454,8 @@ export default {
     const rawUrl = (id) => lessonFilesApi.rawUrl(id);
 
     /* ================= AI 润色（整篇） ================= */
-    // 逻辑：四段记录拼成一篇「原始记录」→ 连同模板一起发给 AI → 拿回一整篇文档。
-    // 以前是按字段分别润色、逐框回填，那样得到的是四段碎语，成不了给家长看的文档。
+    // 逻辑：五段记录拼成一篇「原始记录」→ 连同模板一起发给 AI → 拿回一整篇文档。
+    // 以前是按字段分别润色、逐框回填，那样得到的是五段碎语，成不了给家长看的文档。
 
     const currentDocTpl = () => docTemplates.value.find(t => String(t.id) === String(docTemplateId.value)) || null;
 
@@ -481,7 +489,7 @@ export default {
      *  上一次没采用的结果会留着 —— 不小心关了窗口不至于把结果弄丢。 */
     function openPolish() {
       if (!Object.values(fieldsPayload()).some(v => (v || '').trim())) {
-        return warn('四个字段都是空的，先写点内容再润色');
+        return warn('五个字段都是空的，先写点内容再润色');
       }
       polishError.value = '';
       showPolishAsk.value = true;
@@ -585,7 +593,7 @@ export default {
     }
 
     function clearDoc() {
-      if (!window.confirm('清空整篇正文？四段快记不受影响。')) return;
+      if (!window.confirm('清空整篇正文？五段快记不受影响。')) return;
       doc.value = '';
     }
 
@@ -593,6 +601,7 @@ export default {
     /** 当前表单的「指纹」，用来和刚打开/刚保存时那份比对。 */
     function snapshot() {
       return JSON.stringify({
+        course_content: form.course_content || '',
         performance: form.performance || '',
         problems: form.problems || '',
         homework: form.homework || '',
@@ -617,7 +626,7 @@ export default {
       return `${base}.${ext}`;
     }
 
-    /** 有整篇正文就默认导整篇（那是老师确认过的成品），没有就导四段。 */
+    /** 有整篇正文就默认导整篇（那是老师确认过的成品），没有就导五段。 */
     const exportMode = computed(
       () => (doc.value.trim() ? exportSource.value : 'fields'),
     );
@@ -671,6 +680,7 @@ export default {
     </div>
 
     <div v-for="f in [
+        { key:'course_content', label:'课程内容', ph:'本次讲了什么？（讲评 / 新课 / 练习）' },
         { key:'performance', label:'课堂表现', ph:'今天课上怎么样？' },
         { key:'problems',    label:'存在问题', ph:'哪里卡住了？' },
         { key:'homework',    label:'作业布置', ph:'布置了什么？' },
@@ -746,7 +756,7 @@ export default {
       </div>
     </div>
 
-    <!-- 整篇正文：四段是原料，这一篇是成品。导出时优先用它。 -->
+    <!-- 整篇正文：五段是原料，这一篇是成品。导出时优先用它。 -->
     <div class="field">
       <label>
         整篇正文
@@ -806,8 +816,8 @@ export default {
   <!-- 存为反馈模板（快捷短语 + 骨架文本） -->
   <Modal v-if="showTplSave" title="存为反馈模板" @close="showTplSave = false">
     <p class="muted small" style="margin-top:0">
-      会把<strong>当前的快捷短语</strong>和<strong>四段文字</strong>一起存成模板。
-      下次选它，短语直接可用；四段文本会在字段为空时自动填入，已经写了内容则会先问你。
+          会把<strong>当前的快捷短语</strong>和<strong>五段文字</strong>一起存成模板。
+          下次选它，短语直接可用；五段文本会在字段为空时自动填入，已经写了内容则会先问你。
     </p>
     <div class="field">
       <label>模板名称</label>
@@ -857,7 +867,7 @@ export default {
         <label>仿照的模板 <span class="muted small">（决定分几个栏目、什么语气；整段会一起发给 AI）</span></label>
         <div class="row">
           <select v-model="docTemplateId" @change="applyDocTemplate">
-            <option value="">不套用模板（只把四段整理成一篇）</option>
+            <option value="">不套用模板（只把五段整理成一篇）</option>
             <option v-for="t in docTemplates" :key="t.id" :value="t.id">{{ t.name }}</option>
           </select>
           <button class="btn sm" style="flex:none" @click="showDocTplSave = true">存为新模板</button>
@@ -964,11 +974,11 @@ export default {
         </label>
         <label class="small" style="display:flex;align-items:center;gap:6px">
           <input type="radio" value="fields" v-model="exportSource">
-          四段快记
+          五段快记
         </label>
       </div>
       <div v-else class="small muted">
-        还没有整篇正文，将按四段快记导出。点「AI 润色」可以生成一篇完整的。
+        还没有整篇正文，将按五段快记导出。点「AI 润色」可以生成一篇完整的。
       </div>
     </div>
     <p class="muted small" style="margin-top:0">

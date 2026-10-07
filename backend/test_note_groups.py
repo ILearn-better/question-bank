@@ -175,11 +175,19 @@ real_roots = [r["name"] for r in roots(REAL)]
 print("     ", real_roots)
 # 「未归档」固定排最后（新规则；以前它在数据里是 sort_order=0，所以显示在最前）
 check("真库最后一行是「未归档」", real_roots[-1], "未归档")
-check("真库的体系分组还在（名字归用户改，只数个数）",
-      len([r for r in real_roots if r != "未归档"]) >= 4, True)
+# 这里以前写的是「非未归档的分组 >= 4」（假定真库有 4 个体系分组）。
+# 真库实际只有「未归档」一个顶层分组，于是这条**永远红** —— 正是上面
+# 「别把真库的数字写死」那句注释要防的事。改成跟「开始时」比个数。
+check("真库的分组一个没少（名字归用户改，只数个数）",
+      len(real_roots), len(real_roots_at_start))
 check("真库分组名与开始时一字不差", sorted(real_roots), real_roots_at_start)
 check("真库笔记数没变（全程只读过它）",
       len(call(REAL, "GET", "/api/notes")[1]["items"]), real_notes_at_start)
 
 print()
 print("ALL PASS" if not fails else f"{len(fails)} 项失败: {fails}")
+
+
+# 退出码即结果（0 = 全过）。以前这里只打印不设码 —— 单跑时人看得出来，
+# 但脚本化批量回归会把失败当成通过，静默漏掉一整轮。
+raise SystemExit(1 if fails else 0)

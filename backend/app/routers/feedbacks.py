@@ -10,7 +10,6 @@ import json
 import mimetypes
 import re
 from pathlib import Path
-from typing import Optional
 from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile
@@ -24,7 +23,6 @@ from ..db import get_db
 from ..models import (
     AbilityDim,
     AbilityScore,
-    AiSetting,
     Feedback,
     FeedbackDocTemplate,
     FeedbackTemplate,
@@ -33,8 +31,6 @@ from ..models import (
     Student,
 )
 from ..schemas import (
-    AiSettingIn,
-    AiTestIn,
     DimIn,
     DocTemplateIn,
     FeedbackIn,
@@ -85,11 +81,12 @@ def _serialize(fb: Feedback, scores: list[AbilityScore], dims: dict[int, str]) -
         "id": fb.id,
         "lesson_id": fb.lesson_id,
         "student_id": fb.student_id,
+        "course_content": fb.course_content or "",
         "performance": fb.performance,
         "problems": fb.problems,
         "homework": fb.homework,
         "next_plan": fb.next_plan,
-        # 整篇正文（AI 按模板整理的成品）。四段是原料，这个是可直接发家长的成品。
+        # 整篇正文（AI 按模板整理的成品）。五段是原料，这个是可直接发家长的成品。
         "doc": fb.doc or "",
         "rating": fb.rating,
         "share_to_parent": fb.share_to_parent,
@@ -212,7 +209,7 @@ def _write_feedback_txt(db: Session, ls: Lesson, fb: Feedback) -> dict:
     scores = list(db.scalars(select(AbilityScore).where(AbilityScore.lesson_id == ls.id)).all())
     has_text = bool((fb.doc or "").strip()) or any(
         (getattr(fb, k) or "").strip()
-        for k in ("performance", "problems", "homework", "next_plan")
+        for k in ("course_content", "performance", "problems", "homework", "next_plan")
     )
     if not has_text and not scores:
         # 内容被清空了：旧的快照要收掉，不能留个空壳让人以为这节写过反馈
@@ -243,6 +240,9 @@ def upsert_feedback(lid: int, payload: FeedbackIn, db: Session = Depends(get_db)
         fb = Feedback(owner_id=config.OWNER_ID, lesson_id=lid, student_id=ls.student_id)
         db.add(fb)
     old_images = {rel for rel in (storage.url_to_rel(u) for u in _parse_images(fb.images)) if rel}
+    # course_content 列是非空的（没写 = 空串，不是 NULL），而 schema 默认 None ——
+    # 旧前端不带这个字段、或新前端空值时传 null，都得归一成空串，否则撞 NOT NULL → 500。
+    fb.course_content = payload.course_content or ""
     fb.performance = payload.performance
     fb.problems = payload.problems
     fb.homework = payload.homework
@@ -577,9 +577,9 @@ def export_feedback(
 ):
     """导出。source 决定导哪一份内容：
 
-      · auto（默认）—— 有整篇正文就导整篇（老师确认过的成品），否则退回四段。
-      · doc         —— 强制整篇；没有就报错，而不是默默导成四段（那会让人以为导错了）。
-      · fields      —— 强制四段。
+      · auto（默认）—— 有整篇正文就导整篇（老师确认过的成品），否则退回五段。
+      · doc         —— 强制整篇；没有就报错，而不是默默导成五段（那会让人以为导错了）。
+      · fields      —— 强制五段。
     """
     ls = _lesson_or_404(db, lid)
     fb = db.scalar(select(Feedback).where(Feedback.lesson_id == lid))
@@ -641,37 +641,13 @@ def export_feedback(
 
 
 # ---------------------------------------------------------------- AI 润色
-@router.get("/ai/providers")
-def get_ai_providers():
-    """服务商预设（地址 / 模型名 / 申请密钥的入口）。纯静态、无密钥。"""
-    return ai_polish.providers()
-
-
-@router.get("/ai/settings")
-def get_ai_settings(db: Session = Depends(get_db)):
-    return ai_polish.masked(ai_polish.get_config(db))
-
-
-@router.put("/ai/settings")
-def put_ai_settings(payload: AiSettingIn, db: Session = Depends(get_db)):
-    """保存配置。api_key 传空串表示「不改」—— 前端拿到的是脱敏值，回填会把真 key 冲掉。"""
-    return ai_polish.save_config(db, payload)
-
-
-@router.post("/ai/test")
-def test_ai(payload: Optional[AiTestIn] = None, db: Session = Depends(get_db)):
-    """测试连接。可以带上还没保存的表单值 —— 填完就能试，不必先保存。"""
-    try:
-        return ai_polish.test_connection(db, payload.model_dump() if payload else None)
-    except ai_polish.AiError as e:
-        raise HTTPException(502, str(e)) from e
-
-
+# ⚠️ AI 的「配置 / 测试连接 / 公式识别」接口已迁到 routers/ai.py（路径不变，
+#    仍是 /api/ai/*）。这里只留「用 AI 润色这篇反馈」—— 那才是反馈业务本身。
 @router.post("/lessons/{lid}/feedback/polish")
 def polish_feedback(lid: int, payload: PolishIn, db: Session = Depends(get_db)):
     """AI 整篇润色。
 
-    逻辑：把四段记录 + 课程信息拼成一篇「原始记录」，再让 AI 照着老师选的模板
+    逻辑：把五段记录 + 课程信息拼成一篇「原始记录」，再让 AI 照着老师选的模板
     整理成一篇正式的反馈文档，**整篇**返回。
 
     ⚠️ 这里会把反馈正文发到第三方 AI 服务 —— 界面必须事先说清楚，且只能由老师主动触发。

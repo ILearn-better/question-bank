@@ -149,6 +149,10 @@ st, rep = upload(SCRATCH, "/api/notes-backup/import", "backup.zip", blob)
 check("真导入成功", st, 200)
 check("报告：新建 = 真库篇数", rep["notes_created"], len(real_notes))
 t, scratch_notes = notes_of(SCRATCH)
+# 第一次导入后的分组数 —— 后面「再导一次」要跟它比。
+# ⚠️ 别写成「应该 == 5」：那等于把**这家真库当前的分组结构**写死，
+#    用户加/删一个分组，这条就假红（本节顶部同一段注释也是这个意思）。
+roots_after_first = len(t["roots"])
 check("临时库里笔记数一致", t["total"], len(real_notes))
 check("id 原样保留（换设备后链接不变）", sorted(x[0] for x in scratch_notes), sorted(x[0] for x in real_notes))
 check("标题一致", sorted(x[1] for x in scratch_notes), sorted(x[1] for x in real_notes))
@@ -161,7 +165,7 @@ check("全部跳过", rep2["notes_skipped"], len(real_notes))
 check("没有新建笔记", rep2["notes_created"], 0)
 t, again = notes_of(SCRATCH)
 check("笔记数没变（导入两次 == 导入一次）", t["total"], len(real_notes))
-check("分组也没变多（同一个包导两次不会长两套）", len(t["roots"]), 5)
+check("分组也没变多（同一个包导两次不会长两套）", len(t["roots"]), roots_after_first)
 
 print("\n==== ④ 覆盖模式 ====")
 st, rep3 = upload(SCRATCH, "/api/notes-backup/import", "backup.zip", blob, "?overwrite=true")
@@ -321,3 +325,8 @@ check("已有分组不会被重复建", names.count("IB 数学"), 1)
 check("分组顺序跟着包走", names[:2], ["IB 数学", "空分组"])
 
 print("\n" + ("ALL PASS" if not fails else f"{len(fails)} 项失败: {fails}"))
+
+
+# 退出码即结果（0 = 全过）。以前这里只打印不设码 —— 单跑时人看得出来，
+# 但脚本化批量回归会把失败当成通过，静默漏掉一整轮。
+raise SystemExit(1 if fails else 0)

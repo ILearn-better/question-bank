@@ -291,6 +291,7 @@ def student_timeline(sid: int, limit: int = 100, db: Session = Depends(get_db)):
                 if fb is None
                 else {
                     "id": fb.id,
+                    "course_content": fb.course_content,
                     "performance": fb.performance,
                     "problems": fb.problems,
                     "homework": fb.homework,

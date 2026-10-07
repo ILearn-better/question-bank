@@ -8,3 +8,9 @@ alembic>=1.13
 # Word 页面视图：调用本机 Microsoft Word 把 .docx 导出成带版式的 PDF。
 # 仅 Windows 需要（且仅当要录入 Word 试卷时需要）；缺失时 Word 文档自动回退内容块模式。
 pywin32>=306; sys_platform == "win32"
+# 把 LaTeX 公式渲染成图片 —— 导出 PDF 用（PyMuPDF 自己不会渲染 LaTeX）。
+# 2026-10-05 为验证「公式识别」能力已装入本机 venv；方案见 docs/批量导入与卷种样式方案.md §3.1.4 / P7。
+matplotlib>=3.8
+# 公式识别前把截图压小再送模型（见 app/services/vision.py）。
+# 少装它会让识别请求体大好几倍 —— 整页渲染图是 3 倍分辨率，base64 后还要再涨 33%。
+Pillow>=10
