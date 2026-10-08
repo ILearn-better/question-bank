@@ -14,3 +14,7 @@ matplotlib>=3.8
 # 公式识别前把截图压小再送模型（见 app/services/vision.py）。
 # 少装它会让识别请求体大好几倍 —— 整页渲染图是 3 倍分辨率，base64 后还要再涨 33%。
 Pillow>=10
+# 课表 Excel 导入（app/services/schedule_import.py）。只用它读 .xlsx、生成模板，
+# 不需要 pandas —— 为读一张几行的表拖进 numpy/pandas 不划算（numpy 已经因为 matplotlib 在了，
+# 但 pandas 是另一回事）。
+openpyxl>=3.1

@@ -1,20 +1,25 @@
 // 课表与课时费。按「记录入口」来设计：排课、标记完成、看本月账，都在一页完成。
+//
+// 两种视图（2026-10-08 加）：
+//   · 月历 —— 默认。一个月铺成一屏，一眼看出「哪天有课、哪天空着」，
+//             排课/调课这类「按天想事」的操作都在这里做。
+//   · 列表 —— 原来的按天分组，顺着一行行往下看。适合核对某一周的细节。
+// 两份视图读同一份 lessons 数据，切换不重新请求。
 import { computed, onMounted, reactive, ref, watch } from 'vue';
 import { lessonsApi } from '../api.js';
+import { lessonsByDate, monthGrid, shiftPeriod, WEEK_HEADS } from '../calendar.js';
 import Modal from '../components/Modal.js';
+import ScheduleImportDialog from '../components/ScheduleImportDialog.js';
 import {
   currentPeriod, fail, hhmm, loadCurricula, loadStudents, money, ok,
-  shortDate, state, STATUS_LABEL, STATUS_TAG,
+  shortDate, state, STATUS_LABEL, STATUS_TAG, todayISO,
 } from '../store.js';
 
-const WEEK = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'];
-
 function emptyLesson() {
-  const today = new Date().toISOString().slice(0, 10);
   return {
     student_id: null,
     curriculum_id: null,
-    date: today,
+    date: todayISO(),
     time: '19:00',
     duration_min: 60,
     status: 'scheduled',
@@ -27,7 +32,7 @@ function emptyLesson() {
 
 export default {
   name: 'Schedule',
-  components: { Modal },
+  components: { Modal, ScheduleImportDialog },
   setup() {
     const period = ref(currentPeriod());
     const lessons = ref([]);
@@ -37,6 +42,8 @@ export default {
     const form = reactive(emptyLesson());
     const saving = ref(false);
     const busy = ref(0);
+    const view = ref('calendar');          // calendar | list
+    const importing = ref(false);
 
     async function load() {
       loading.value = true;
@@ -52,7 +59,18 @@ export default {
       }
     }
 
-    // 按日期分组，同一天的课排在一起
+    // ---------------- 月历 ----------------
+    const grid = computed(() => monthGrid(period.value));
+    const byDay = computed(() => lessonsByDate(lessons.value));
+
+    function shift(delta) {
+      period.value = shiftPeriod(period.value, delta);
+    }
+    function goToday() {
+      period.value = currentPeriod();
+    }
+
+    // ---------------- 列表 ----------------
     const grouped = computed(() => {
       const map = new Map();
       for (const ls of lessons.value) {
@@ -62,7 +80,7 @@ export default {
       }
       return [...map.entries()].map(([day, items]) => ({
         day,
-        weekday: WEEK[new Date(day + 'T00:00').getDay()],
+        weekday: WEEK_HEADS[new Date(day + 'T00:00').getDay()],
         items,
         minutes: items.filter((x) => x.status === 'done' || x.status === 'makeup')
           .reduce((s, x) => s + (x.duration_min || 0), 0),
@@ -158,6 +176,11 @@ export default {
       }
     }
 
+    // Excel 导入完成后：可能有跨月的新课，直接重载当前月即可
+    async function onImported() {
+      await load();
+    }
+
     watch(period, load);
 
     onMounted(async () => {
@@ -168,16 +191,30 @@ export default {
 
     return {
       period, lessons, monthly, loading, grouped, editing, form, saving, busy, state,
-      openCreate, openEdit, save, complete, remove, onStudentChange,
-      hhmm, money, shortDate, STATUS_LABEL, STATUS_TAG,
+      view, importing, grid, byDay, WEEK_HEADS,
+      openCreate, openEdit, save, complete, remove, onStudentChange, shift, goToday, onImported,
+      hhmm, money, shortDate, todayISO, STATUS_LABEL, STATUS_TAG,
     };
   },
   template: `
   <div>
     <div class="page-head">
       <h1>课表</h1>
-      <div style="max-width:170px"><input type="month" v-model="period"></div>
+
+      <div class="seg">
+        <button :class="{ on: view === 'calendar' }" @click="view = 'calendar'">月历</button>
+        <button :class="{ on: view === 'list' }" @click="view = 'list'">列表</button>
+      </div>
+
+      <div class="cal-nav">
+        <button class="btn ghost sm" title="上一个月" @click="shift(-1)">‹</button>
+        <div style="width:136px"><input type="month" v-model="period"></div>
+        <button class="btn ghost sm" title="下一个月" @click="shift(1)">›</button>
+        <button class="btn ghost sm" @click="goToday()">本月</button>
+      </div>
+
       <div class="spacer"></div>
+      <button class="btn" @click="importing = true">导入 Excel</button>
       <button class="btn primary" @click="openCreate()">＋ 排课</button>
     </div>
 
@@ -189,13 +226,50 @@ export default {
     </div>
 
     <div class="grid cols-3" style="margin-top:14px; align-items:start">
-      <div style="grid-column: span 2">
-        <div class="card">
+      <div :style="view === 'calendar' ? 'grid-column: 1 / -1' : 'grid-column: span 2'">
+
+        <!-- ============ 月历 ============ -->
+        <div v-if="view === 'calendar'" class="card">
+          <div v-if="loading" class="empty">加载中…</div>
+          <template v-else>
+            <div class="cal-head">
+              <span v-for="w in WEEK_HEADS" :key="w">{{ w }}</span>
+            </div>
+            <div class="cal-grid">
+              <div v-for="(c, i) in grid" :key="i" class="cal-cell"
+                   :class="{ out: c.out, today: c.date === todayISO() }">
+                <template v-if="c.date">
+                  <div class="cal-day">
+                    <span>{{ c.day }}</span>
+                    <span v-if="byDay.get(c.date)" class="cal-count">{{ byDay.get(c.date).length }} 节</span>
+                  </div>
+                  <div class="cal-items">
+                    <div v-for="ls in (byDay.get(c.date) || [])" :key="ls.id"
+                         class="cal-item" :class="STATUS_TAG[ls.status] || 'plain'"
+                         :title="ls.student_name + ' ' + hhmm(ls.start_at) + ' ' + ls.duration_min + '分钟' + (ls.topic ? ' · ' + ls.topic : '')"
+                         @click="openEdit(ls)">
+                      <span class="t">{{ hhmm(ls.start_at) }}</span>
+                      <span class="n">{{ ls.student_name }}</span>
+                    </div>
+                  </div>
+                  <button class="cal-add" title="这天加一节课" @click="openCreate(c.date)">＋</button>
+                </template>
+              </div>
+            </div>
+            <div class="small muted" style="margin-top:10px">
+              点日历上的课就能直接改（改完、标记完成都在弹窗里）；
+              鼠标移到某天格子上，右下角会出现 ＋ 可以加课。
+            </div>
+          </template>
+        </div>
+
+        <!-- ============ 列表 ============ -->
+        <div v-else class="card">
           <h2>课时记录</h2>
           <div v-if="loading" class="empty">加载中…</div>
           <div v-else-if="!grouped.length" class="empty">
             这个月还没有课时记录
-            <div class="small" style="margin-top:6px">点右上角「排课」开始</div>
+            <div class="small" style="margin-top:6px">点右上角「排课」，或用「导入 Excel」批量排</div>
           </div>
           <template v-else>
             <div v-for="g in grouped" :key="g.day" style="margin-bottom:14px">
@@ -330,5 +404,7 @@ export default {
         <button class="btn primary" :disabled="saving" @click="save">{{ saving ? '保存中…' : '保存' }}</button>
       </template>
     </Modal>
+
+    <ScheduleImportDialog v-if="importing" @close="importing = false" @done="onImported" />
   </div>`,
 };

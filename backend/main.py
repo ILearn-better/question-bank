@@ -35,6 +35,7 @@ from app.routers import (                                   # noqa: E402
     feedbacks,
     homeworks,
     lesson_files,
+    lesson_import,
     lessons,
     note_folders,
     notes,
@@ -161,6 +162,9 @@ async def add_revalidate_header(request, call_next):
 app.include_router(dashboard.router)
 app.include_router(ai.router)
 app.include_router(students.router)
+# 课表 Excel 导入。**必须在 lessons 之前**：它是 /api/lessons/import/...，
+# 虽然当前与 /api/lessons/{lid}/... 不撞，但先注册具体的总是更稳。
+app.include_router(lesson_import.router)
 app.include_router(lessons.router)
 app.include_router(feedbacks.router)
 app.include_router(lesson_files.router)

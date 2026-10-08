@@ -108,6 +108,14 @@ export const lessonsApi = {
   monthly: (period) => api.get('/api/billing/monthly', { period }),
 };
 
+/** 课表 Excel 导入。预览与确认是两步 —— 见 routers/lesson_import.py 的说明。 */
+export const scheduleImportApi = {
+  /** 模板下载：交给 download() 用（它会处理失败时的 JSON 报错） */
+  templateUrl: () => '/api/lessons/import/template',
+  preview: (formData) => api.upload('/api/lessons/import/preview', formData),
+  commit: (body) => api.post('/api/lessons/import/commit', body),
+};
+
 export const feedbackApi = {
   get: (lessonId) => api.get(`/api/lessons/${lessonId}/feedback`),
   save: (lessonId, body) => api.put(`/api/lessons/${lessonId}/feedback`, body),
