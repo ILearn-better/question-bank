@@ -19,6 +19,8 @@ import { fail, ok, warn } from '../store.js';
 import Modal from '../components/Modal.js';
 import QuestionPicker from '../components/QuestionPicker.js';
 
+import { ensureLibs, renderRichEl, resetLibs } from '../mathRender.js';
+
 const SAMPLE = `# 新笔记
 
 在这里写内容，支持 **Markdown**：标题、列表、表格、代码块、引用都行。
@@ -39,82 +41,6 @@ $$x = \\frac{-b \\pm \\sqrt{b^2 - 4ac}}{2a}$$
 
 工具栏「画笔」打开后，可以直接在预览上画：红/黄/蓝三色、橡皮、粗细可调，支持撤销。
 `;
-
-// 按需加载的外部库 —— 全部走本地 vendor，不碰外网。
-//   · 不放 index.html：<script src> 不带 defer 会阻塞 HTML 解析，
-//     而这几个库只有本页用得上，放全局等于让每个页面首屏都多等一次。
-//   · 不引 CDN：实测这台机器冷启动拉 unpkg 要 29s，还经常直接超时
-//     （WinError 10060），笔记页会长时间停在"正在加载编辑器…"。
-//     文件在 frontend/vendor/ 下，随仓库一起走，离线也能用。
-// 版本（升级时按这个换文件）：
-//   marked 12.0.2 · dompurify 3.1.6 · katex 0.16.9
-// katex.min.css 里的 font url 是相对路径 fonts/xxx.woff2，
-// 因此字体必须放在 /vendor/katex/fonts/ 下（已就位，20 个 woff2）。
-const LIBS = {
-  marked: '/vendor/marked.min.js',
-  purify: '/vendor/purify.min.js',
-  katex: '/vendor/katex/katex.min.js',
-  autoRender: '/vendor/katex/auto-render.min.js',
-  katexCss: '/vendor/katex/katex.min.css',
-};
-
-let libsPromise = null;
-
-/** 把 LaTeX 惯用的 \(…\) / \[…\] 归一成 $…$ / $$…$$。
- *
- *  为什么必须放在 marked **之前**：Markdown 里 `\(` 是「转义的左括号」，
- *  marked 会把反斜杠吃掉 —— 等轮到 KaTeX 时它已经变成 `(x)` 了，
- *  光在 auto-render 那边多配几个定界符是没用的（实测就是这个原因渲染不出来）。
- *  后端导出（services/notes_export.py 的 normalize_math）有一份等价实现，
- *  改一处要记得改另一处 —— 不然会出现「预览能渲染、导出的 Word 里还是原文」。
- *
- *  代码块与行内代码里的内容**不动**：那是要展示的代码本身，改写它才是错的。
- */
-function normalizeMath(md) {
-  const conv = (s) => s
-    .replace(/\\\[([\s\S]+?)\\\]/g, (m, tex) => `$$${tex}$$`)
-    .replace(/\\\(([\s\S]+?)\\\)/g, (m, tex) => `$${tex}$`);
-  const inText = (seg) => seg.split(/(`[^`\n]*`)/)
-    .map((p, i) => (i % 2 ? p : conv(p))).join('');
-  return String(md || '').split(/(```[\s\S]*?```)/)
-    .map((s, i) => (i % 2 ? s : inText(s))).join('');
-}
-
-function loadScript(src) {
-  return new Promise((resolve, reject) => {
-    const s = document.createElement('script');
-    s.src = src;
-    s.async = true;
-    s.onload = () => resolve(src);
-    s.onerror = () => reject(new Error('加载失败 ' + src));
-    document.head.appendChild(s);
-  });
-}
-
-/** 只加载一次（结果缓存在模块作用域，切页面来回也不重复拉）。 */
-function ensureLibs() {
-  if (libsPromise) return libsPromise;
-  libsPromise = (async () => {
-    if (!document.querySelector('link[data-katex]')) {
-      const l = document.createElement('link');
-      l.rel = 'stylesheet';
-      l.href = LIBS.katexCss;
-      l.dataset.katex = '1';
-      document.head.appendChild(l);
-    }
-    await Promise.all([
-      loadScript(LIBS.marked),
-      loadScript(LIBS.purify),
-      loadScript(LIBS.katex),
-    ]);
-    // ⚠️ auto-render **必须等 katex**：它一加载就把 window.katex 抓进闭包，
-    //    并行加载时它先到就抓了个 undefined，之后一渲染公式就报
-    //    "Cannot read properties of undefined (reading 'ParseError')"。
-    //    （踩过：四个脚本并行时公式静默不渲染，预览里一直是 $…$ 原文。）
-    await loadScript(LIBS.autoRender);
-  })();
-  return libsPromise;
-}
 
 const PEN_COLORS = [
   { name: '红', value: '#e53935' },
@@ -950,27 +876,7 @@ export default {
         outline.value = [];
         return;
       }
-      const md = normalizeMath(src);
-      const raw = window.marked.parse(md, { breaks: true, gfm: true });
-      el.innerHTML = window.DOMPurify ? window.DOMPurify.sanitize(raw) : raw;
-
-      // 公式在消毒**之后**渲染：KaTeX 自己生成的 DOM 是可信的，也没必要再过一遍消毒
-      if (window.renderMathInElement) {
-        try {
-          window.renderMathInElement(el, {
-            // 除 $…$ / $$…$$ 外，也认 LaTeX 惯用的 \(…\) 与 \[…\] ——
-            // 从别处（讲义/网页/PDF 复制）粘过来常常是那种写法，
-            // 只认 $ 的话用户看到的就是一段带反斜杠的原文，很难自己猜出原因。
-            delimiters: [
-              { left: '$$', right: '$$', display: true },
-              { left: '\\[', right: '\\]', display: true },
-              { left: '$', right: '$', display: false },
-              { left: '\\(', right: '\\)', display: false },
-            ],
-            throwOnError: false,
-          });
-        } catch (e) { /* 公式写错不该让整篇笔记渲染不出来 */ }
-      }
+      renderRichEl(el, src);   // Markdown + 公式的渲染管线统一在 src/mathRender.js
 
       buildOutline();
       nextTick(() => { sizeCanvas(); redraw(); });
@@ -1246,8 +1152,8 @@ export default {
     let ro = null;
     let zenMemo = null;          // 进全屏前的两侧栏状态（退出时恢复）
 
-    /** 加载 Markdown / 公式库。失败必须能重试：libsPromise 是个模块级缓存，
-     *  一旦 reject 就一直 reject —— 不重置的话，页面内切来切去永远好不了，
+    /** 加载 Markdown / 公式库。失败必须能重试：ensureLibs() 的 Promise 是个模块级缓存，
+     *  一旦 reject 就一直 reject —— 不 resetLibs() 的话，页面内切来切去永远好不了，
      *  只能整页刷新（用户看到的就是「公式怎么都不渲染」）。 */
     function initLibs() {
       libState.value = 'loading';
@@ -1257,7 +1163,7 @@ export default {
         .catch((e) => {
           libState.value = 'error';
           libError.value = e && e.message ? e.message : '加载失败';
-          libsPromise = null;            // 允许重试（下次点「重试」真的会再去拉）
+          resetLibs();                   // 允许重试（下次点「重试」真的会再去拉）
         });
     }
 

@@ -235,12 +235,16 @@
   </div>
 
   <div class="main">
-    <div v-if="!doc" class="empty-block">先在上方选择或上传一份试卷</div>
-
-    <el-row v-else :gutter="16">
+    <el-row :gutter="16">
       <!-- ===================== 左：卷面预览（整页识别的输入） ===================== -->
       <el-col :span="13">
-        <el-card shadow="never">
+        <!-- 没选卷子时这里给个明确的落点。
+             ⚠️ 注意「历史任务」**不能**跟着一起藏起来（它在右栏、不依赖 doc）——
+             否则打开页面没选卷子时，连上次识别的结果都回看不了。 -->
+        <el-card v-if="!doc" shadow="never">
+          <div class="empty-block">先在上方选择或上传一份试卷</div>
+        </el-card>
+        <el-card v-else shadow="never">
           <template #header>
             <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
               <p class="panel-title">🤖 AI 整页识别（实验）</p>
@@ -344,6 +348,9 @@
 
       <!-- ===================== 右：题块 / 任务 / 待审 ===================== -->
       <el-col :span="11">
+        <!-- ⚠️ 这张卡片**不能**跟着 doc 一起藏：里面的「待审」和「手动分割」跟当前
+             选没选卷子无关（待审是挂在任务上的），而「历史任务」更要随时能回看。
+             只有「识别范围 + 提交」那一段才是真的要落在某份卷子上（见下面的 v-if）。 -->
         <el-card shadow="never" style="margin-bottom:16px">
           <template #header>
             <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
@@ -363,7 +370,8 @@
             其余体系匹配不上属正常，名字会原样保留。
           </div>
 
-          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+          <!-- 识别范围 / 提交按钮：这一步必须落在「当前这份卷子」上 -->
+          <div v-if="doc" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
             <span class="muted-hint">识别范围</span>
             <el-radio-group v-model="aiPageScope" size="small">
               <el-radio-button value="all">全部 {{ pageList.length }} 页</el-radio-button>
@@ -379,8 +387,12 @@
               AI 识别这 {{ aiPageCount }} 页
             </el-button>
           </div>
-          <div class="hint" style="margin-top:6px">
+          <div v-if="doc" class="hint" style="margin-top:6px">
             每页一次请求（一次约 5–20 秒）· 一次最多 {{ maxPages }} 页
+          </div>
+          <div v-else class="hint" style="margin:0">
+            还没选卷子 —— 先在上方<b>选择或上传一份试卷</b>，再开始识别。<br>
+            下面的「手动分割 / 待审」和历史任务<b>不受影响</b>，随时可以点开回看。
           </div>
 
           <el-tabs v-model="tab">
@@ -998,8 +1010,11 @@ const app = createApp({
         this.curricula = await this.api('/api/curricula');
         if (this.curricula.length) this.curriculumId = this.curricula[0].id;
         this.docs = await this.api('/api/documents');
+        // ⚠️ **刻意不自动打开第一份**（理由同 entry.html）：省掉每次打开都要等的
+        //    那一次文档加载（页面几何 + 自动铺线），停在「选择试卷」的空状态。
+        //    ?doc=<id> 直达始终生效。
         const want = new URLSearchParams(location.search).get('doc');
-        const target = (want && this.docs.find(d => d.id === want)) || this.docs[0] || null;
+        const target = want ? this.docs.find(d => d.id === want) : null;
         if (target) { this.docId = target.id; await this.loadDoc(target.id); }
         await this.loadJobs();
       } catch (e) { ElementPlus.ElMessage.error(e.message); }
