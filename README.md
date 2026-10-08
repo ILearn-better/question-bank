@@ -228,9 +228,11 @@ question-bank/
 │   │   ├── taxonomy.py         # 题型 / 难度 / 置信度取值的**唯一出处**（提示词、校验、前端共用）
 │   │   ├── adapters/           # pdf.py（唯一 import pymupdf）/ office.py（Word COM，唯一 import win32com）
 │   │   │                       # notes_math.py + katex_mathml.js（公式 → Word 原生公式 OMML）
-│   │   ├── routers/            # dashboard / students / lessons / feedbacks / curriculum / questions
-│   │   │                       # papers / documents / notes / uploads / system / ai / batches
+│   │   ├── routers/            # dashboard / students / lessons / lesson_import（课表 Excel 导入）
+│   │   │                       # feedbacks / curriculum / questions / papers / documents / notes
+│   │   │                       # uploads / system / ai / batches
 │   │   └── services/           # billing（课时费）/ mastery（掌握度）/ paper_export（出卷排版）
+│   │                           # schedule_import（课表 Excel 解析 + 模板，**不碰库**）
 │   │                           # images（按魔数校验图片）/ notes_export（笔记导出 Word/PDF）
 │   │                           # note_questions（题 → 笔记的块 + 快照图 + 两版渲染）
 │   │                           # vision（图 → LaTeX）/ batch_import（批量：提示词+解析+并行识别）
@@ -244,6 +246,7 @@ question-bank/
 │       └── backups/            # 数据库备份，保留最近 10 份（SHIKE_BACKUP_KEEP 可改）
 ├── frontend/
 │   ├── index.html + src/       # 工作台 SPA（Vue3 零构建，走 import map → vendor/）
+│   │                           # src/calendar.js = 月历格子纯逻辑（用 node 单测，见 test_schedule_import.py）
 │   ├── entry.html              # 题库录题页（单文件，Element Plus + KaTeX）—— 一次一道
 │   ├── batch.html              # 批量入库页（单文件）—— 一次切完整卷、并行识别、逐条审核
 │   └── app.css  vendor/        # 依赖**全部本地化**（Vue / Element Plus / KaTeX / marked / DOMPurify）
@@ -346,7 +349,21 @@ cd backend
 ./.venv/Scripts/python.exe test_entry_page.py      # 前端自检：入口页的 JS 语法 / 标签配对 / in-DOM 模板守卫（不需要服务）
 ./.venv/Scripts/python.exe test_batch_page.py      # 前端自检：批量页 + 侧栏导航（同上）
 ./.venv/Scripts/python.exe test_render_page.py     # 前端自检：两个页面 jsdom **真实挂载**（不连服务；没装 jsdom 就跳过）
+./.venv/Scripts/python.exe test_schedule_import.py # 课表 Excel 导入：解析 / 匹配查重 / 入库 / 模板 / 月历（临时库，不连服务、不发 HTTP）
 ```
+
+> `test_schedule_import.py` 起服务也不连 —— 它把临时库（`$TEMP/shike_schedule_scratch`）
+> 直接建表，然后**直接调用** `routers/lesson_import.py` 里的 `preview` / `commit`
+> 两个函数。所以它跑得快、不占端口、也不会因为「服务没起」而假失败。
+> 其中两处值得留着：
+> - **日历格子**（`frontend/src/calendar.js`）用 node 真跑一遍：首日偏移、大小月、
+>   闰年 2 月、跨年翻月。这块错了最难看出来 —— 网格整体错一格，月历看着「很正常」。
+> - **前端模板**用 `vendor/vue.global.prod.js` 的**真编译器**过一遍，抓 `compiler-30`
+>   （孤立的 `v-else-if`）这类错。脚本里还专门编译一份**故意写错**的模板要求它报错，
+>   以此证明「编译器真的在跑」，而不是被环境问题兜成永远通过。
+>   ⚠️ 这一处有个坑：Vue 的 compiler-dom 遇到属性值里的 `&`（比如 `a && b.length`）
+>   会去 `decodeEntities`，需要一个 `document` —— Node 里没有，报
+>   `ReferenceError: document is not defined`，**看起来像模板写错了，其实是环境问题**。
 
 > `test_vision.py` 加 `--real` 会渲染 `samples/2025真题/` 里的页面**真跑一次识别**
 > （需要服务在跑、且已配好 AI）。`samples/` 不入仓库，所以在别的机器上这一步会自动跳过。
@@ -729,12 +746,72 @@ png / jpg / jpeg / webp / bmp 可以直接上传，**当成 1 页的文档**：
 对应接口：`GET /api/documents/{id}/delete-impact`（纯读取，可反复调）、
 `DELETE /api/documents/{id}?with_questions=false`。
 
+### 课表：月历视图 + 从 Excel 批量排课
+
+「课表」页右上角切换两种视图：
+
+- **月历（默认）** —— 一整月一屏，一格一天。格子里列当天的课（时间 + 学生，按状态着色），
+  右上角标当天几节。点格子里的课＝编辑；点格子空白处的 `＋` ＝ 那天加一节课（日期已填好）。
+  上方 `‹ 2026 年 10 月 ›` 前后翻月。今天那一格描边高亮；课时费汇总两种视图都在。
+- **列表** —— 原来的按天分组，一路往下看。
+
+#### 从 Excel 导入（课表页 → 「导入 Excel」）
+
+排课表已经在 Excel 里（自己记的、机构发的），不必一节课一节课敲。
+点「导入 Excel」→ 可先点「下载导入模板（含格式说明）」→ 选文件 → **先预览** → 确认后入库。
+
+**只有三列是必填的**：
+
+| 列 | 必填 | 怎么写 | 留空时 |
+|---|---|---|---|
+| 日期 | ✅ | `2026-10-01` / `2026/10/1` / `2026年10月1日` / Excel 日期格式 / `10-01`（补当年） | — |
+| 开始时间 | ✅ | `19:00` / `19：00`（全角也认）/ `1900` / `19:00-20:30`（**顺便把时长算出来**） | — |
+| 学生 | ✅ | 系统里已有的学生姓名，**一个字都不能差** | — |
+| 时长（分钟） | | `90` / `90分钟` / `1.5小时` / `1小时30分` / `一小时` | 按 60 分钟 |
+| 本次内容 | | 如「三角函数图像变换」 | 空 |
+| 上课形式 | | `线下` / `线上`（也认 `面授` `网课`） | 线下 |
+| 地点 | | | 空 |
+| 单价 | | `300` / `¥300` / `300元` / `300/小时` | 取学生档案里的默认单价 |
+| 状态 | | `已排课` `已完成` `补课` `请假` `已取消` `已调课` | 已排课 |
+
+几条规则：
+
+- **表头名字要对得上，列的顺序随便换**；自己加的列（比如「备注」）会被忽略，
+  并在预览里告诉你忽略了哪几列。
+- 表头行上面可以有标题行（「10 月课表」这种），程序会自己往下找表头；中间的空行会被跳过。
+- 只认 `.xlsx`。老的 `.xls` 先在 Excel 里「另存为」成 `.xlsx`。
+- 一次最多 2000 行。
+
+#### 预览会替你查这四件事
+
+每一项都摊在预览表里，**确认之前不会写库**：
+
+1. **哪几行读不懂**（日期/时间/时长/单价/状态的写法不认识）—— 这些行不能导，
+   错误逐条列在该行后面，照着改 Excel 再导一次。
+2. **哪几行在表里就写重了** —— 同一个学生、同一个时间出现了两次
+   （多半是复制上一行时漏改了日期）。默认只留第一次，重复那行不勾。
+3. **哪几行和已排的课撞了** —— 库里已有同一学生、同一时间的课。默认不勾，确认要补排再手动勾。
+4. **哪几行定不出单价** —— 表里没写、学生档案里也没设默认课时费。
+   这些课导进去后金额是空的，**月底算课时费时不会计入**，预览里会标出来。
+
+学生姓名对不上时那几行默认不导。你可以先在「学生」里把人建好再回来导，
+或者勾「顺手把这几个学生还建到系统里」（**名字写错了也会建出一个新学生**，勾之前先扫一眼名字）。
+
+#### 三个实现上的取舍
+
+- **解析层不碰数据库**（`services/schedule_import.py` 里刻意不 import 任何 `app.*`）——
+  所以它能脱离服务单测；也是它「**永不抛异常**」的原因：脏数据变成一份
+  「这行有什么问题」的清单，而不是一个 500。
+- **不模糊匹配学生**。「张三」和「张三丰」都能匹配上「张三」的话，老师根本不会注意到课上错了人。
+  宁可如实报告「系统里没有这个学生」。
+- **入库复用 `lessons._apply_billing`**，不自己算钱。单价快照的规则只有一处，
+  否则「手动排课」与「Excel 导入」两条路的金额迟早会算出不一样的数。
+
 ## 接口一览（本批新增）
 
 | 方法 | 路径 | 作用 |
 |---|---|---|
-| GET | `/api/batch/options` | 题型 / 难度 / 置信度 / 标签限制 / 并发数 / 配图关键词表 |
-| GET | `/api/documents/{id}/region-image?spec=&zoom=` | **只读**预览某块切出来的样子（现渲染、不落盘，多段竖拼）。`spec` 形如 `1:40,90,550,300`，跨页用 `;` 连 |
+| GET | `/api/batch/options` | 题型 / 难度 / 置信度 / 标签限制 / 并发数 / 配图关键词表 || GET | `/api/documents/{id}/region-image?spec=&zoom=` | **只读**预览某块切出来的样子（现渲染、不落盘，多段竖拼）。`spec` 形如 `1:40,90,550,300`，跨页用 `;` 连 |
 | POST | `/api/documents/{id}/batch-crop` | 一次裁多块（含跨页竖拼），逐块容错 |
 | POST | `/api/batches/items/{id}/figure-crop` | 框出题干配图（多段竖拼；替换时回收旧图，顺手把 `needs_figure` 置真） |
 | POST | `/api/batches` | 建任务（`start=false` 只建不跑，测试用） |
@@ -744,6 +821,14 @@ png / jpg / jpeg / webp / bmp 可以直接上传，**当成 1 页的文档**：
 | PATCH | `/api/batches/items/{id}` | 审核时改字段（只改传上来的那些，枚举照校验）。`needs_figure` 是人工勾的那个；`figure_image=""` 撤掉配图并按引用计数回收 |
 | POST | `/api/batches/items/{id}/approve` `\|reject` `\|reset` | 通过入库 / 驳回 / 退回待审 |
 | POST | `/api/batches/{id}/rerun?only_failed=true` | 重跑（默认只重跑失败项） |
+
+课表 Excel 导入（三个）：
+
+| 方法 | 路径 | 作用 |
+|---|---|---|
+| GET | `/api/lessons/import/template` | 下载导入模板（示例行 + 独立的「填写说明」工作表，说明文字与解析层共用同一个列定义） |
+| POST | `/api/lessons/import/preview` | 上传 `.xlsx` → 解析 + 匹配学生 + 查重（**表内重复**与**与库重复**分开报）。**不写库** |
+| POST | `/api/lessons/import/commit` | 确认后写库。`create_students=true` 时顺手建缺失的学生（默认 false）；单价留空取学生默认单价并**快照**到这节课 |
 
 ## 已知限制（后续迭代）
 
@@ -766,3 +851,8 @@ png / jpg / jpeg / webp / bmp 可以直接上传，**当成 1 页的文档**：
 - 早期上传的旧文档没有保留原文件，页面分割会提示重新上传
 - docx 中表格与正文的先后顺序不保持（表格追加在末尾）
 - `.doc` 旧格式不支持，需另存为 `.docx`
+- **课表 Excel 导入只认 `.xlsx`**（老 `.xls` 得先另存），一次最多 2000 行；
+  「在表里就写重了」的那几行**只是默认不勾**，仍然可以手动勾上强行导入
+  （刻意不硬拦：有时确实要同一学生同一时间排两节，比如两节课连着上同一内容）
+- **月历不支持拖动改期**。改时间请点开那节课在弹窗里改 —— 月历上的课密度不高，
+  为拖拽引入一套几何换算（以及随之而来的一堆边界情况）不划算
