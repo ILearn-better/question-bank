@@ -24,6 +24,7 @@
 """
 import io
 import json
+import os
 import sys
 import traceback
 import urllib.error
@@ -33,7 +34,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from app import config                                   # noqa: E402  只为 CROPS_DIR
 
-BASE = "http://127.0.0.1:8000"
+# ⚠️ 默认打**本副本**的 8010，不是原项目的 8000 ——
+# 这个目录是实验副本，跑测试要验的是副本自己的代码；写死 8000 会去测原项目，
+# 副本里改坏了也照样全绿。用 SHIKE_BASE 可以临时指到别处。
+BASE = os.environ.get("SHIKE_BASE", "http://127.0.0.1:8010")
 
 # 假的 document_id：测试建的题不该挂在老师真实的卷子下面，
 # 否则从他的「按文档看题」里会冒出一堆测试题（test_render_prefer 的做法）

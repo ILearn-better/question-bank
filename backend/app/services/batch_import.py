@@ -244,21 +244,17 @@ def _clean_tags(v, knowledge_point: str) -> list[str]:
     return out
 
 
-def parse_fields(text: str) -> dict:
-    """把模型返回解析成结构化字段。
+def fields_from_obj(obj: dict, flags: list[str]) -> dict:
+    """把**已经解析成 dict** 的一条模型输出，整理成可入库的字段（枚举回落 + 标签清洗）。
 
-    **永不抛异常** —— 解析不出来也要给出一份可入库的默认值 + flags。
-    理由：一条脏结果不该让整批任务失败，更不该让它悄悄写进题库；
-    正确的做法是把它标成异常项放进待审列表，由人决定。
+    抽出来是给「AI 整页识别」复用的（见 services/batch_page.py）——
+    那边一次拿到的是**多道题**的对象数组，逐个走这里。
+    不复用的话就得把枚举回落、标签清洗这套逻辑再抄一份，
+    而抄一份就多一处「改了题型忘了同步」的地方 —— 那种不同步不报错，
+    只会让下拉里出现没有的值。
+
+    flags 由调用方给（bad_json / json_repaired 这类「源信息」），本函数只往里追加。
     """
-    flags: list[str] = []
-    obj, repaired = _loads(_extract_object(text) or "")
-    if obj is None:
-        flags.append("bad_json")
-        obj = {}
-    elif repaired:
-        flags.append("json_repaired")
-
     content = _as_str(obj.get("content"))
     if not content:
         flags.append("empty_stem")
@@ -299,6 +295,23 @@ def parse_fields(text: str) -> dict:
         "note": _as_str(obj.get("note")),
         "flags": flags,
     }
+
+
+def parse_fields(text: str) -> dict:
+    """把模型返回的**单题**文本解析成结构化字段（旧「块模式」走这里）。
+
+    **永不抛异常** —— 解析不出来也要给出一份可入库的默认值 + flags。
+    理由：一条脏结果不该让整批任务失败，更不该让它悄悄写进题库；
+    正确的做法是把它标成异常项放进待审列表，由人决定。
+    """
+    flags: list[str] = []
+    obj, repaired = _loads(_extract_object(text) or "")
+    if obj is None:
+        flags.append("bad_json")
+        obj = {}
+    elif repaired:
+        flags.append("json_repaired")
+    return fields_from_obj(obj, flags)
 
 
 # ---------------------------------------------------------------- 单张识别

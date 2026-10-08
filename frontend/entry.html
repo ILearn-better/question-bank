@@ -218,7 +218,7 @@
                style="width: 280px" @change="loadDoc">
       <el-option v-for="d in docs" :key="d.id" :value="d.id" :label="docLabel(d)"></el-option>
     </el-select>
-    <el-upload :show-file-list="false" accept=".pdf,.docx" :http-request="uploadFile">
+    <el-upload :show-file-list="false" accept=".pdf,.docx,.png,.jpg,.jpeg,.webp,.bmp" :http-request="uploadFile">
       <el-button type="primary">上传 PDF / Word</el-button>
     </el-upload>
   </div>
@@ -232,8 +232,9 @@
             <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
               <p class="panel-title" style="margin:0">📄 文档</p>
               <el-tag v-if="doc" size="small" type="info">{{ doc.filename }}</el-tag>
-              <el-tag v-if="isScanned" size="small" type="warning">扫描版</el-tag>
-              <el-radio-group v-if="isPdf && !isScanned" v-model="viewMode" size="small">
+              <el-tag v-if="isImg" size="small" type="warning">图片</el-tag>
+              <el-tag v-else-if="isScanned" size="small" type="warning">扫描版</el-tag>
+              <el-radio-group v-if="isPaged && !isScanned" v-model="viewMode" size="small">
                 <el-radio-button value="page">页面分割</el-radio-button>
                 <el-radio-button value="blocks">内容块</el-radio-button>
               </el-radio-group>
@@ -892,9 +893,20 @@ const app = createApp({
     };
   },
   computed: {
-    isPdf() { return this.doc && this.doc.filetype === '.pdf'; },
+    /** 这份文档**本身就有页面视图**（PDF / 图片），不用 Word 转换。
+     *  ⚠️ 不要写成 `filetype === '.pdf'` —— 图片(png/jpg…)被 pymupdf 打开就是
+     *  **单页文档**，走的是同一套页面渲染 / 框选 / 图形探测。
+     *  漏了图片，「给一张图片直接入库」那条路就没有页面视图可用。 */
+    isPaged() {
+      return !!this.doc && ['.pdf', '.png', '.jpg', '.jpeg', '.webp', '.bmp']
+        .indexOf(this.doc.filetype) >= 0;
+    },
+    isImg() {
+      return !!this.doc && ['.png', '.jpg', '.jpeg', '.webp', '.bmp']
+        .indexOf(this.doc.filetype) >= 0;
+    },
     isWord() { return this.doc && this.doc.filetype === '.docx'; },
-    isScanned() { return this.isPdf && !!this.doc.scanned; },
+    isScanned() { return this.isPaged && !!this.doc.scanned; },
     hasPreview() { return !!(this.doc && this.doc.preview && this.doc.preview.ready); },
     pageList() { return this.pv.count ? Array.from({ length: this.pv.count }, (_, i) => i + 1) : []; },
     pickedCount() { return (this.lineAnchor ? 1 : 0) + (this.lineFocus ? 1 : 0); },
@@ -951,6 +963,9 @@ const app = createApp({
       return res.json();
     },
     docLabel(d) {
+      if (['.png', '.jpg', '.jpeg', '.webp', '.bmp'].indexOf(d.filetype) >= 0) {
+        return d.filename + '（图片·1 页）';
+      }
       if (d.scanned) return d.filename + '（扫描版·截图）';
       if (d.filetype === '.docx') {
         return d.filename + (d.preview_ready ? '（' + d.preview_pages + ' 页）' : '（内容块 ' + d.block_count + '）');
@@ -973,7 +988,7 @@ const app = createApp({
       this.resetSel();
       this.loadQuestions();
       this.previewErr = null;
-      if (this.doc.filetype === '.pdf') {
+      if (this.isPaged) {
         this.viewMode = 'page';
         this.tool = this.doc.scanned ? 'crop' : 'divider';
         try {
@@ -1084,7 +1099,9 @@ const app = createApp({
         this.resetSel();
         this.loadQuestions();
         ElementPlus.ElMessage.success(
-          d.scanned ? '检测到扫描版 PDF，已进入截图模式'
+          d.scanned ? (['.png', '.jpg', '.jpeg', '.webp', '.bmp'].indexOf(d.filetype) >= 0
+                        ? '图片已作为 1 页导入，可直接用 AI 整页识别'
+                        : '检测到扫描版 PDF，已进入截图模式')
                     : (d.filetype === '.docx' ? '上传成功，正在生成页面图…' : '解析成功：' + d.block_count + ' 个内容块'));
         this.loadDoc(d.id);
       } catch (e) {

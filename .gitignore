@@ -5,6 +5,9 @@ backend/app.db
 *.db
 *.db-wal
 *.db-shm
+# 跑迁移前手动留的整库快照（形如 shike.db.before0023）。
+# 末尾不是 .db，上面三条挡不住 —— 别把这种备份提交进仓库。
+*.db.before*
 *.sqlite3
 
 # 运行时产物

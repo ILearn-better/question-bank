@@ -480,6 +480,25 @@ class BatchJobIn(BaseModel):
     start: bool = True
 
 
+class AiPageJobIn(BaseModel):
+    """AI 整页识别任务（2026-10-08 实验流程）。
+
+    与 BatchJobIn 唯一的差别是「要识别什么从哪来」：
+      块模式（BatchJobIn）：items 是**提交前就裁好**的题块图
+      整页模式：pages 是**页号**，页图在识别时由服务端从文档渲染出来
+
+    所以这里没有 items，只有 pages —— 而且**没有条目的概念**：
+    一页出几道题是模型说了算，条目在识别时才创建。
+    """
+
+    curriculum_id: Optional[int] = None
+    document_id: Optional[str] = None
+    doc_filename: Optional[str] = None
+    pages: List[int] = Field(default_factory=list)
+    # start=False 只建不跑（测试与「先建好回头再跑」用），与块模式一致。
+    start: bool = True
+
+
 class BatchItemPatch(BaseModel):
     """审核时改条目。**只改传上来的字段** —— 没传的保持原样。"""
 

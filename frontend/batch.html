@@ -229,7 +229,7 @@
                @change="loadDoc">
       <el-option v-for="d in docs" :key="d.id" :value="d.id" :label="d.filename"></el-option>
     </el-select>
-    <el-upload :show-file-list="false" accept=".pdf,.docx" :http-request="uploadFile">
+    <el-upload :show-file-list="false" accept=".pdf,.docx,.png,.jpg,.jpeg,.webp,.bmp" :http-request="uploadFile">
       <el-button>上传新卷子</el-button>
     </el-upload>
   </div>
@@ -238,14 +238,15 @@
     <div v-if="!doc" class="empty-block">先在上方选择或上传一份试卷</div>
 
     <el-row v-else :gutter="16">
-      <!-- ===================== 左：页面分割 ===================== -->
+      <!-- ===================== 左：卷面预览（整页识别的输入） ===================== -->
       <el-col :span="13">
         <el-card shadow="never">
           <template #header>
             <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
-              <p class="panel-title">✂️ 一次性分割</p>
+              <p class="panel-title">🤖 AI 整页识别（实验）</p>
               <el-tag size="small" type="info">{{ doc.filename }}</el-tag>
-              <el-tag v-if="doc.scanned" size="small" type="warning">扫描版</el-tag>
+              <el-tag v-if="isImg" size="small" type="warning">图片·1 页</el-tag>
+              <el-tag v-else-if="doc.scanned" size="small" type="warning">扫描版</el-tag>
               <div style="flex:1"></div>
               <el-radio-group v-model="tool" size="small">
                 <el-radio-button value="line">✂️ 画横线</el-radio-button>
@@ -254,7 +255,16 @@
             </div>
           </template>
 
+          <!-- 整页识别的主路径：不画线也能识别。这一段是给老师的「先看这里」。 -->
+          <div class="hint" style="margin-bottom:8px">
+            <b>整页识别不用画分界线</b>：右侧选好体系 → 点「AI 识别这 N 页」，
+            模型会自己把每页切成若干道题（并判断每题要不要配图）。<br>
+            左栏只是<b>卷面预览</b>（需要框选配图时会跳到这里看原页）。
+            下面这几个是<b>手动分割</b>的备用工具，走 AI 整页流程的话不用管它们。
+          </div>
+
           <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px">
+            <span class="muted-hint">手动分割：</span>
             <el-button size="small" @click="autoSegment()">自动识别题号铺线</el-button>
             <el-button size="small" type="danger" plain @click="clearDividers">清空分界线</el-button>
             <el-checkbox v-model="snapGaps" size="small">吸附到行间空隙</el-checkbox>
@@ -337,26 +347,59 @@
         <el-card shadow="never" style="margin-bottom:16px">
           <template #header>
             <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
-              <p class="panel-title">📦 提交</p>
+              <p class="panel-title">🤖 AI 整页识别</p>
               <div style="flex:1"></div>
               <el-select v-model="curriculumId" placeholder="整批体系" size="small" style="width:150px">
                 <el-option v-for="c in curricula" :key="c.id" :value="c.id" :label="c.name"></el-option>
               </el-select>
-              <span v-if="skippedCount" class="muted-hint">已排除 {{ skippedCount }} 块不提交</span>
-              <el-button size="small" type="primary" :loading="submitting"
-                         :disabled="!submitCount || !curriculumId" @click="submitAll">
-                识别这 {{ submitCount }} 块
-              </el-button>
             </div>
           </template>
           <div class="hint" style="margin-bottom:10px">
+            <b>整页直接交给 AI</b>，由它自己把每页切成若干道题（含「这题要不要配图」的判断）。
+            不用画分界线、也不用裁题块。识别结果在下面「待审」里逐条核对，
+            需要配图的题在卡片上<b>框选那一幅图</b>即可。<br>
             体系整批选一次（一份卷子一套体系）。<b>知识点由 AI 给出</b>，
             服务端再往该体系的知识树里匹配 —— 目前只有「国内高中数学」有知识树，
             其余体系匹配不上属正常，名字会原样保留。
           </div>
 
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+            <span class="muted-hint">识别范围</span>
+            <el-radio-group v-model="aiPageScope" size="small">
+              <el-radio-button value="all">全部 {{ pageList.length }} 页</el-radio-button>
+              <el-radio-button value="custom">指定页</el-radio-button>
+            </el-radio-group>
+            <el-select v-if="aiPageScope === 'custom'" v-model="aiPages" multiple collapse-tags
+                       size="small" style="min-width:190px" placeholder="选择要识别的页">
+              <el-option v-for="p in pageList" :key="p" :value="p" :label="'第 ' + p + ' 页'"></el-option>
+            </el-select>
+            <div style="flex:1"></div>
+            <el-button size="small" type="primary" :loading="submitting"
+                       :disabled="!aiPageCount || !curriculumId" @click="submitAiPages">
+              AI 识别这 {{ aiPageCount }} 页
+            </el-button>
+          </div>
+          <div class="hint" style="margin-top:6px">
+            每页一次请求（一次约 5–20 秒）· 一次最多 {{ maxPages }} 页
+          </div>
+
           <el-tabs v-model="tab">
-            <el-tab-pane :label="'题块 ' + blocks.length" name="blocks">
+            <el-tab-pane :label="'手动分割 ' + blocks.length" name="blocks">
+              <div class="hint" style="margin-bottom:8px">
+                这是<b>手动分割</b>备选路径（画分界线 → 裁题块 → 逐块识别）。
+                走 AI 整页识别不需要它 —— 直接点右上角的「AI 识别这 N 页」即可。
+                （留着它是因为 AI 偶尔会把某页切错，那时可以只对那一页手动重来。）
+              </div>
+              <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px">
+                <span class="muted-hint">
+                  已切 {{ blocks.length }} 块<template v-if="skippedCount">（{{ skippedCount }} 块不提交）</template>
+                </span>
+                <div style="flex:1"></div>
+                <el-button size="small" type="primary" :loading="submitting"
+                           :disabled="!submitCount || !curriculumId" @click="submitAll">
+                  按题块识别这 {{ submitCount }} 块
+                </el-button>
+              </div>
               <div v-if="!blocks.length" class="empty-block" style="padding:24px 0">
                 还没有题块 —— 在上面页面上画分界线或框选
               </div>
@@ -433,16 +476,23 @@
                   <el-progress :percentage="jobPct" :stroke-width="14" text-inside></el-progress>
                   <div class="hint" style="margin-top:4px">
                     正在并行识别 {{ currentJob.done }} / {{ currentJob.total }}
-                    （并发 {{ options.workers || 3 }}，每块约 2–5 秒）
+                    <template v-if="isAiPageJob">页</template><template v-else>块</template>
+                    （并发 {{ options.workers || 3 }}<template v-if="!isAiPageJob">，每块约 2–5 秒</template>）
                   </div>
                 </div>
                 <el-alert v-else-if="currentJob.error" :title="currentJob.error" type="error"
                           :closable="false" show-icon style="margin-bottom:10px"></el-alert>
                 <div v-else style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:10px">
                   <el-tag type="success" effect="plain">识别完成</el-tag>
-                  <span class="hint">成功 {{ currentJob.done }} 条，失败 {{ currentJob.failed }} 条</span>
+                  <span class="hint">
+                    <template v-if="isAiPageJob">
+                      成功 {{ currentJob.done }} 页（共切出 {{ items.length }} 道题），失败 {{ currentJob.failed }} 页
+                    </template>
+                    <template v-else>成功 {{ currentJob.done }} 条，失败 {{ currentJob.failed }} 条</template>
+                  </span>
                   <el-button v-if="currentJob.failed" size="small" plain @click="rerunFailed">
-                    重跑失败的 {{ currentJob.failed }} 条
+                    <template v-if="isAiPageJob">重跑失败的 {{ currentJob.failed }} 页</template>
+                    <template v-else>重跑失败的 {{ currentJob.failed }} 条</template>
                   </el-button>
                   <div style="flex:1"></div>
                   <!-- 手动同步：轮询在任务跑完/出错时就停了，之后服务端再变就看不到 -->
@@ -451,6 +501,12 @@
                   </el-button>
                   <el-button size="small" type="primary" plain :disabled="!pendingCount"
                              @click="approveAllPending">全部通过（{{ pendingCount }}）</el-button>
+                </div>
+
+                <div class="hint" style="margin-bottom:6px">
+                  <b>跨页的题</b>会被页界切成上下两半 —— 在下半段那张卡片上点「<b>并入上一题</b>」就接回去了；
+                  两半不相邻就先用卡片右上角的 <b>↑ ↓</b> 挪到一起。合并只动题干文本，
+                  题型 / 难度 / 知识点以上一条为准。
                 </div>
 
                 <div style="max-height: 62vh; overflow: auto; padding-right: 4px;">
@@ -470,12 +526,37 @@
                       <el-tag v-if="it.status === 'approved'" size="small" type="success">已入库</el-tag>
                       <el-tag v-if="it.status === 'rejected'" size="small" type="info">已驳回</el-tag>
                       <div style="flex:1"></div>
+                      <!-- ---------- 跨页题在这里收口 ----------
+                           整页识别**没有「人工分割」这一步**，一道跨页的题会被页界
+                           切成上下两半（上半在第 N 页末尾、下半在第 N+1 页开头），
+                           模型只能当成两道题分别给出。块模式可以在分割处把两段拖到一起，
+                           这里没有那个环节 —— 所以补上「移动 + 并入上一题」。
+                           上移 / 下移是给「两半不相邻」准备的（AI 偶尔把顺序切错）。 -->
+                      <template v-if="it.status === 'pending'">
+                        <el-button size="small" text :disabled="!canMove(it, -1)"
+                                   title="和上一条换位" @click="moveItem(it, -1)">↑</el-button>
+                        <el-button size="small" text :disabled="!canMove(it, 1)"
+                                   title="和下一条换位" @click="moveItem(it, 1)">↓</el-button>
+                        <el-button size="small" text type="primary" :disabled="!canMergeUp(it)"
+                                   title="把这条的题干接到上一题后面，并删掉这条"
+                                   @click="mergeUp(it)">并入上一题</el-button>
+                      </template>
                       <span class="hint">{{ it.doc_filename ? '第 ' + it.page_no + ' 页' : '' }}</span>
                     </div>
 
                     <div class="item-body">
                       <div class="item-img">
-                        <img :src="it.image" alt="原貌图" @click="zoom(it.image)">
+                        <img v-if="it.image" :src="it.image" alt="原貌图" @click="zoom(it.image)">
+                        <template v-else>
+                          <!-- 整页模式**没有题块原貌图**（题干文本模型直接给，不裁图）——
+                               给一张**来源页**的缩略图，让老师能对照「这道题在卷面哪儿」。
+                               走 pages/{pno}/image（页面视图本来就缓存了，不额外占盘）。 -->
+                          <img v-if="pageThumbOf(it)" :src="pageThumbOf(it)" alt="来源页"
+                               @click="zoom(pageThumbOf(it))">
+                          <div class="hint" style="margin-top:4px">
+                            整页识别 · 来自第 {{ it.page_no }} 页（无题块原貌图）
+                          </div>
+                        </template>
                         <div class="hint" style="margin-top:4px">出卷时按「{{ renderLabel() }}」呈现</div>
                       </div>
                       <div class="item-form">
@@ -549,11 +630,21 @@
                             <el-tag v-if="it.figure_note" size="small" type="info" effect="plain">
                               模型说：{{ it.figure_note }}
                             </el-tag>
+                            <!-- 自动配的图必须**看得出来是自动的** ——
+                                 否则它会被默认成「老师框过的」，没人核对就入库了。 -->
+                            <el-tag v-if="figureAuto(it) === 'snapped'" size="small"
+                                    type="success" effect="plain">
+                              AI 自动框的图（核对一眼即可）
+                            </el-tag>
+                            <el-tag v-else-if="figureAuto(it) === 'rough'" size="small"
+                                    type="warning" effect="plain">
+                              AI 估的图框，容易歪，建议核对
+                            </el-tag>
                             <div style="flex:1"></div>
                             <el-button size="small"
                                        :disabled="!it.needs_figure || it.status === 'approved'"
                                        @click="openFigurePick(it)">
-                              {{ it.figure_image ? '重新框选' : '框选配图' }}
+                              {{ it.figure_image ? '调整配图' : '框选配图' }}
                             </el-button>
                             <el-button v-if="it.figure_image" size="small" text type="danger"
                                        @click="clearFigure(it)">撤掉</el-button>
@@ -562,8 +653,14 @@
                           <img v-if="it.figure_image" :src="it.figure_image" class="fig-thumb"
                                alt="题干配图" @click="zoom(it.figure_image)">
                           <div v-else-if="it.needs_figure" class="hint" style="margin-top:6px">
-                            还没框图。点「框选配图」从原卷上把那一幅框出来 ——
-                            出卷走文本形态时原貌图整张不印，就靠这一张补上。
+                            <template v-if="figureLocateFailed(it)">
+                              AI 判断这题有图，但没能在这页上定位到它（图可能画在别的页，
+                              或者模型没给出位置）—— 点「框选配图」自己框一下。
+                            </template>
+                            <template v-else>
+                              还没框图。点「框选配图」从原卷上把那一幅框出来 ——
+                              出卷走文本形态时原貌图整张不印，就靠这一张补上。
+                            </template>
                           </div>
                         </div>
                       </div>
@@ -829,10 +926,25 @@ const app = createApp({
       // 框选配图弹窗。rects 是**已确认的段**（跨页时会有多段，服务端竖拼成一张），
       // draft 是正在拖的那个矩形。
       figPick: { show: false, item: null, page: 1, rects: [], draft: null, saving: false },
+      // ---- AI 整页识别（实验流程，2026-10-08）----
+      // 把**整页**交给模型，由它自己切成若干道题 —— 不画分界线、不裁题块。
+      // aiPageScope: 'all' = 全部页；'custom' = 只识别 aiPages 里挑中的页。
+      aiPageScope: 'all',
+      aiPages: [],
     };
   },
   computed: {
-    isPdf() { return this.doc && this.doc.filetype === '.pdf'; },
+    /** 图片(png/jpg…)被 pymupdf 打开就是**单页文档**，页面视图 / 渲染 / 框选 /
+     *  图形探测全都通用 —— 所以「本身带页面视图」要连图片一起算。
+     *  ⚠️ 别写回 `filetype === '.pdf'`：那样「上传一张图片直接入库」会没有页面视图。 */
+    isPaged() {
+      return !!this.doc && ['.pdf', '.png', '.jpg', '.jpeg', '.webp', '.bmp']
+        .indexOf(this.doc.filetype) >= 0;
+    },
+    isImg() {
+      return !!this.doc && ['.png', '.jpg', '.jpeg', '.webp', '.bmp']
+        .indexOf(this.doc.filetype) >= 0;
+    },
     pageList() { return this.pv.count ? Array.from({ length: this.pv.count }, (_, i) => i + 1) : []; },
     pendingCount() { return this.items.filter(i => i.status === 'pending').length; },
     loadedCount() { return Object.keys(this.loadedPages).length; },
@@ -858,6 +970,15 @@ const app = createApp({
       if (!j || !j.total) return 0;
       return Math.min(100, Math.round((j.done + j.failed) / j.total * 100));
     },
+    /** AI 整页识别这一轮要提交的页号（升序）。 */
+    aiPagePages() {
+      if (this.aiPageScope === 'custom') return this.aiPages.slice().sort((a, b) => a - b);
+      return this.pageList.slice();
+    },
+    aiPageCount() { return this.aiPagePages.length; },
+    /** 当前任务是不是整页模式 —— 进度单位（页 / 块）与文案都要分叉。 */
+    isAiPageJob() { return !!(this.currentJob && this.currentJob.ai_mode === 1); },
+    maxPages() { return this.options.max_pages || 30; },
   },
   mounted() { this.boot(); },
   beforeUnmount() { this.stopPoll(); this.teardownLazy(); },
@@ -1549,6 +1670,69 @@ const app = createApp({
       } finally { this.submitting = false; }
     },
 
+    /* ---------- AI 整页识别（实验流程） ---------- */
+    /** 整页识别：把选中的页**整体**交给模型，由它自己切成若干道题。
+     *
+     *  与 submitAll（块模式）的差别只有「发给服务端什么」：
+     *    块模式：先调 batch-crop 裁出题块图 → 提交 items（带图 URL）
+     *    整页模式：只给**页号** —— 页图由服务端从文档渲染（命中页面视图的磁盘缓存）
+     *  所以这里既没有裁图那一步，也**不产生题块原貌图**（题干文本模型直接给）。
+     *
+     *  ⚠️ 进度条上的 done / total 是**页数**而不是条目数 ——
+     *     一页出几道题是模型说了算，条目数要等识别完才知道。
+     */
+    async submitAiPages() {
+      if (!this.doc || !this.curriculumId) return;
+      const pages = this.aiPagePages;
+      if (!pages.length) {
+        ElementPlus.ElMessage.warning('没有选择要识别的页');
+        return;
+      }
+      if (pages.length > this.maxPages) {
+        ElementPlus.ElMessage.warning(
+          `一次最多 ${this.maxPages} 页，这次选了 ${pages.length} 页 —— 请分批提交`);
+        return;
+      }
+      const all = pages.length === this.pageList.length;
+      try {
+        await ElementPlus.ElMessageBox.confirm(
+          `把${all ? '全部 ' : ''}${pages.length} 页整页交给 AI 识别？\n`
+          + '每页一次请求，由模型自己把这一页切成若干道题（不用画分界线）。',
+          'AI 整页识别',
+          { type: 'info', confirmButtonText: '开始识别', cancelButtonText: '取消' });
+      } catch (e) { return; }
+
+      this.submitting = true;
+      try {
+        const job = await this.api('/api/batches/ai-pages', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            curriculum_id: this.curriculumId,
+            document_id: this.doc.id,
+            doc_filename: this.doc.filename,
+            pages, start: true,
+          }),
+        });
+        this.currentJob = job;
+        this.items = [];
+        this.edited = {};        // 新任务：旧任务的「动过」记账不带到这一批
+        this.tab = 'review';
+        ElementPlus.ElMessage.success(`已提交 ${pages.length} 页，正在识别…`);
+        await this.loadJobs();
+        this.startPoll(job.id);
+      } catch (e) {
+        ElementPlus.ElMessage.error(e.message);
+      } finally { this.submitting = false; }
+    },
+    /** 整页模式的条目没有题块原貌图 —— 用**来源页**现渲染一张给老师对照。
+     *  走 pages/{pno}/image（页面视图本来就有缓存），不是「区域渲染」那条路：
+     *  这里要看的是「整页」而不是「某个区域」。 */
+    pageThumbOf(it) {
+      if (!it || it.image || !it.document_id || !it.page_no) return '';
+      return `/api/documents/${it.document_id}/pages/${it.page_no}/image`;
+    },
+
     /* ---------- 轮询 ---------- */
     startPoll(jobId) {
       this.stopPoll();
@@ -1634,7 +1818,9 @@ const app = createApp({
     },
 
     /* ---------- 审核 ---------- */
-    async saveItem(it) {
+    /** 存一条的本地编辑。silent=true 时不弹「已保存」——合并/移动内部会连着存两条，
+     *  连弹两次「已保存」再去弹真正的结果，看着像出了三次事。 */
+    async saveItem(it, silent) {
       try {
         const r = await this.api('/api/batches/items/' + it.id, {
           method: 'PATCH',
@@ -1649,7 +1835,7 @@ const app = createApp({
         Object.assign(it, r);
         // 已落库 → 不再有「本地未保存的修改」，这几项重新跟随服务端
         delete this.edited[it.id];
-        ElementPlus.ElMessage.success('已保存');
+        if (!silent) ElementPlus.ElMessage.success('已保存');
         return true;
       } catch (e) {
         ElementPlus.ElMessage.error(e.message);
@@ -1693,6 +1879,61 @@ const app = createApp({
       try {
         const r = await this.api('/api/batches/items/' + it.id + '/reset', { method: 'POST' });
         Object.assign(it, r.item);
+      } catch (e) { ElementPlus.ElMessage.error(e.message); }
+    },
+
+    /* ---------- 待审列表里调整顺序 / 合并（跨页题收口） ----------
+       为什么放在待审而不是分割处：AI 整页识别**没有人工分割这一步**，
+       一道跨页的题被页界切成上下两半时，只能在待审列表里把两半接起来。
+       块模式的老路径（拖动合并）原样保留，两条路都在。 */
+
+    /** 相邻的那一条；step<0 是上一条。**必须也是待审**才认 ——
+     *  已入库 / 已驳回的条目不能跨过去，否则「还没审的那几条」在列表里会被劈成几段。 */
+    neighborOf(it, step) {
+      const i = this.items.findIndex(x => x.id === it.id);
+      if (i < 0) return null;
+      const j = i + step;
+      if (j < 0 || j >= this.items.length) return null;
+      const other = this.items[j];
+      return other.status === 'pending' ? other : null;
+    },
+    canMove(it, step) {
+      return it.status === 'pending' && !!this.neighborOf(it, step);
+    },
+    canMergeUp(it) {
+      return it.status === 'pending' && !!this.neighborOf(it, -1);
+    },
+    async moveItem(it, step) {
+      try {
+        const r = await this.api(
+          '/api/batches/items/' + it.id + '/move?direction=' + (step < 0 ? 'up' : 'down'),
+          { method: 'POST' });
+        this.applyItems(r.items, false);
+      } catch (e) { ElementPlus.ElMessage.error(e.message); }
+    },
+    async mergeUp(it) {
+      const prev = this.neighborOf(it, -1);
+      if (!prev) return;
+      const head = (prev.content || '').trim().slice(0, 60) || '(上一条题干还是空的)';
+      try {
+        await ElementPlus.ElMessageBox.confirm(
+          `把第 ${it.seq} 条的题干接到第 ${prev.seq} 条后面，并删掉第 ${it.seq} 条。\n\n` +
+          `并完之后第 ${prev.seq} 条是：\n「${head}…」\n\n` +
+          '只合并题干文本；题型 / 难度 / 知识点仍以上一条为准，合并后请再核对一遍。此操作不可撤销。',
+          '并入上一题', { type: 'warning', confirmButtonText: '合并', cancelButtonText: '取消' });
+      } catch (e) { return; }
+      // ⚠️ 必须先把**两条**的本地编辑都存了：合并发生在服务端，
+      //    没保存的改动不在服务端内容里，接完就被服务端的旧值盖掉了。
+      if (!(await this.saveItem(prev, true))) return;
+      if (!(await this.saveItem(it, true))) return;
+      try {
+        const r = await this.api('/api/batches/items/' + it.id + '/merge-up', { method: 'POST' });
+        // ⚠️ 清账再合并列表：applyItems 对「动过的字段」一律保留本地旧值，
+        //    不清的话服务端刚接好的新题干永远进不了文本框（老 bug 的同款坑）。
+        delete this.edited[prev.id];
+        delete this.edited[it.id];
+        this.applyItems(r.items, false);
+        ElementPlus.ElMessage.success(r.figure_moved ? '已并入上一题（配图也带过去了）' : '已并入上一题');
       } catch (e) { ElementPlus.ElMessage.error(e.message); }
     },
     async rerunFailed() {
@@ -1797,6 +2038,25 @@ const app = createApp({
       }
       return '';
     },
+    /** 这张配图是不是 AI 自动框的，以及可信到什么程度。返回 '' / 'snapped' / 'rough'。
+     *
+     *  为什么要分两档：数字版 PDF 上模型只负责「指出大概在哪」，边界由页面上的
+     *  图形几何定（`figure_snapped`）→ 基本可以直接用；
+     *  而扫描版没有几何可依据，框全是模型**估**的（`figure_rough`）→ 得认真看。
+     *  不分档的话，老师对两种情况的信任度会被统一成「要么都信要么都不信」。 */
+    figureAuto(it) {
+      const f = it.flags || [];
+      if (f.indexOf('figure_snapped') >= 0 || f.indexOf('figure_only_candidate') >= 0) {
+        return 'snapped';
+      }
+      if (f.indexOf('figure_rough') >= 0) return 'rough';
+      return '';
+    },
+    /** 模型说有图，但最终**没**产出图（没定位到 / 裁失败）→ 得让老师知道要自己框。 */
+    figureLocateFailed(it) {
+      const f = it.flags || [];
+      return f.indexOf('figure_box_missing') >= 0 || f.indexOf('figure_crop_failed') >= 0;
+    },
     async clearFigure(it) {
       try {
         await ElementPlus.ElMessageBox.confirm(
@@ -1821,7 +2081,21 @@ const app = createApp({
         return;
       }
       const page = Math.min(Math.max(1, it.page_no || 1), this.pv.count);
-      this.figPick = { show: true, item: it, page, rects: [], draft: null, saving: false };
+      // **预填已有框**（AI 自动框的 / 上次手框的）——
+      // 这是「自动配图」的价值一半所在：不对时只需拖一下边，而不是对着整页重画一遍。
+      // 单位换算与 figDown / figRectStyle 完全同源（都乘同一个 pg.width/height），
+      // 所以预填出来的框与鼠标拖出来的框落在同一处。
+      const rects = [];
+      const pg = this.pv.pages[page];
+      const box = it.figure_box;
+      if (box && box.length === 4 && pg && pg.width && pg.height) {
+        rects.push({
+          page,
+          x0: box[0] / 1000 * pg.width, y0: box[1] / 1000 * pg.height,
+          x1: box[2] / 1000 * pg.width, y1: box[3] / 1000 * pg.height,
+        });
+      }
+      this.figPick = { show: true, item: it, page, rects, draft: null, saving: false };
     },
     figPickTurn(d) {
       const p = this.figPick.page + d;
