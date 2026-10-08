@@ -912,6 +912,294 @@ def check_ordering_behavior(src: str) -> None:
         check("题块编排行为验证（node 无输出）", False, (r.stderr or "").strip()[:300])
 
 
+# ------------------------------------ ⑪ AI 整页识别（实验流程，2026-10-08）
+def check_ai_page_flow(src: str) -> None:
+    """整页识别的前后端接线：前端调新接口且**不裁图**；后端路由与模式标记都在。
+
+    锁这个是为了防「流程被顺手改回人工分割」——
+    最容易的误改是把 submitAiPages 改成先调 batch-crop，
+    那样整页模式就退化成块模式了，而且**跑起来不报错**：
+    只是把整页图当成「一道题」送去识别，结果全错、还照样入库。
+    """
+    sub = method_body(src, "submitAiPages")
+    check("抠到 submitAiPages 的真实方法体", bool(sub))
+    check("整页识别：前端调 /api/batches/ai-pages", "/api/batches/ai-pages" in sub)
+    check("整页识别：**不裁图**（方法体里没有 batch-crop）", "batch-crop" not in sub)
+    check("整页识别：带上页号与来源文档",
+          "pages, start: true" in sub and "document_id: this.doc.id" in sub)
+    check("整页识别：主按钮在模板里（AI 识别这 N 页）", "AI 识别这 {{ aiPageCount }} 页" in src)
+    check("整页识别：页数上限**取自服务端**（不在前端写死）",
+          "this.maxPages" in sub and "max_pages" in src)
+
+    # 状态与 UI 分叉
+    check("整页识别：状态 aiPageScope / aiPages", "aiPageScope:" in src and "aiPages:" in src)
+    check("整页识别：进度按 ai_mode 分叉（页 / 块）",
+          "isAiPageJob" in src and "currentJob.ai_mode === 1" in src)
+    check("整页识别：条目缩略图走**来源页**（pages/{pno}/image）",
+          "pages/${it.page_no}/image" in src)
+    check("整页识别：手动分割保留为回退路径（按题块提交的按钮还在）",
+          "按题块识别这 {{ submitCount }} 块" in src)
+
+    # 后端接线
+    r_ba = R_BATCHES.read_text(encoding="utf-8")
+    check("后端：有 POST /batches/ai-pages 路由", '@router.post("/batches/ai-pages")' in r_ba)
+    check("后端：任务详情带 ai_mode（前端靠它分叉文案）", '"ai_mode"' in r_ba)
+    check("后端：页数上限下发给前端", '"max_pages"' in r_ba)
+    check("后端：整页模式能重跑**失败的页**（按页号定位，不碰成功的题）",
+          "ai_mode == 1" in r_ba and "_launch_page" in r_ba)
+
+    svc = ROOT / "backend" / "app" / "services" / "batch_page.py"
+    check("后端：services/batch_page.py 存在", svc.exists())
+    if svc.exists():
+        s = svc.read_text(encoding="utf-8")
+        check("后端：解析有**截断抢救**（输出超长时救出前几道）", "_iter_json_objects" in s)
+        check("后端：区分「模型说没题」与「解析失败」", "_is_trusted_empty" in s)
+        check("后端：失败页**留痕**（不许静默消失）", "_write_page_error" in s)
+        check("后端：条目 seq 最终收口成 1..N", "_renumber" in s)
+        check("后端：整页模式**不裁原貌图**（image 留空）", 'image=""' in s)
+        check("后端：提示词要求「不属于题目的东西不要」",
+              "不属于题目的东西一律不要" in s)
+
+
+# ---------------------- ⑫ 待审列表里调整顺序 / 合并（跨页题收口，2026-10-08）
+def check_review_merge(src: str) -> None:
+    """跨页题在待审里收口：上移 / 下移 / 并入上一题。
+
+    为什么单独锁一段：AI 整页识别**没有「人工分割」这一步**，
+    一道跨页的题被页界切成上下两半，只能在待审列表里接回去。
+    这块最容易出的两类事故都是**静默**的：
+      ① 合并前没把两条的本地编辑存下来 —— 老师刚敲的字被服务端的旧值盖掉；
+      ② 合并后没清 `edited` 记账 —— 服务端刚接好的题干永远进不了文本框
+         （和 2026-10-08 那个老 bug 是同一个坑）。
+    两者看代码看不出来、跑起来也不报错，所以这里按**先后顺序**断言。
+    """
+    bts = R_BATCHES.read_text(encoding="utf-8")
+
+    def py_func(text: str, name: str) -> str:
+        """抠出一个后端函数的源码（到下一个顶层 def / 路由装饰器为止）。"""
+        m = re.search(rf"^def {name}\(.*?(?=^@router\.|^def |\Z)", text, re.S | re.M)
+        return m.group(0) if m else ""
+
+    # ---------------- 后端 ----------------
+    print("\n  -- 后端 --")
+    check("后端：有 /batches/items/{id}/move 路由",
+          '@router.post("/batches/items/{item_id}/move")' in bts)
+    check("后端：有 /batches/items/{id}/merge-up 路由",
+          '@router.post("/batches/items/{item_id}/merge-up")' in bts)
+
+    mv = py_func(bts, "move_item")
+    mg = py_func(bts, "merge_item_up")
+    jc = py_func(bts, "_join_content")
+    ro = py_func(bts, "_reorder")
+    check("后端：三个辅助函数都抠到了", all([mv, mg, jc, ro]))
+
+    check("移动：只让待审条目动（其余 409）", 'status != "pending"' in mv and "409" in mv)
+    check("移动：目标邻居也必须是待审（不能跨过已入库/已驳回）",
+          'other.status != "pending"' in mv)
+    check("移动：用 _reorder 重排编号", "_reorder(" in mv)
+    check("移动：返回整份列表（前端一次刷新到位）", '"items":' in mv)
+
+    check("重排：seq 赋值成 1..N", "it.seq = i" in ro)
+    check("拼接：两半之间用空行而不是单换行（Markdown 单换行会折成空格）",
+          r'f"{a}\n\n{b}"' in jc,
+          "找的是拼接那一行本身，不是注释里提过的字样")
+
+    check("合并：只让待审条目动（其余 409）", 'status != "pending"' in mg and "409" in mg)
+    check("合并：上一条也必须是待审", 'prev.status != "pending"' in mg)
+    check("合并：两条都有配图时 422 拒绝（绝不静默丢一张）",
+          "422" in mg and "都框了配图" in mg)
+    check("合并：配图能带走时迁移过去并置上 needs_figure",
+          "prev.figure_image = cur_fig" in mg and "prev.needs_figure = 1" in mg)
+    check("合并：本条独有的截图按引用计数回收（数完再删）",
+          "crops.purge(" in mg and "crops.referenced_crops(db)" in mg)
+    check("合并：删之前先 flush 让「迁移后的引用」进事务",
+          mg.find("db.flush()") != -1
+          and mg.find("db.flush()") < mg.find("db.delete(it)"),
+          "先删后数引用的话，刚迁移过去的那张图会被当成孤儿删掉")
+    check("合并：只动题干 —— 不碰题型 / 难度 / 标签（避免替老师做决定）",
+          not any(k in mg for k in ("prev.qtype", "prev.difficulty", "prev.tags")))
+    check("合并：返回已迁移配图 / 回收数 / 最新列表",
+          all(k in mg for k in ('"figure_moved"', '"crops_removed"', '"items"')))
+
+    # ---------------- 前端 ----------------
+    print("\n  -- 前端 --")
+    for name in ("neighborOf", "canMove", "canMergeUp", "moveItem", "mergeUp"):
+        check(f"前端：有 {name} 方法", bool(method_body(src, name)))
+
+    nb = method_body(src, "neighborOf")
+    check("前端：相邻判定要求对方也是待审（不能跨过已审核的）",
+          "other.status === 'pending'" in nb)
+    check("前端：上移/下移走 /move?direction=",
+          "/move?direction=" in method_body(src, "moveItem"))
+    check("前端：合并走 /merge-up", "/merge-up" in method_body(src, "mergeUp"))
+    check("前端：合并前有确认弹窗（不可撤销）",
+          "ElMessageBox.confirm" in method_body(src, "mergeUp"))
+
+    mgj = method_body(src, "mergeUp")
+    i_prev = mgj.find("saveItem(prev")
+    i_self = mgj.find("saveItem(it")
+    i_api = mgj.find("/merge-up")
+    i_clear = mgj.find("delete this.edited")
+    i_apply = mgj.find("applyItems(")
+    check("前端：合并前先存**两条**的本地编辑（否则刚敲的字会被盖掉）",
+          0 <= i_prev < i_self < i_api,
+          f"顺序 = saveItem(prev)@{i_prev} saveItem(it)@{i_self} api@{i_api}")
+    check("前端：清 edited 记账在 applyItems 之前（否则合并结果进不了文本框）",
+          0 <= i_clear < i_apply, f"clear@{i_clear} applyItems@{i_apply}")
+
+    check("前端：saveItem 支持静默（合并内部连存两条不弹两次「已保存」）",
+          "async saveItem(it, silent)" in src
+          and "if (!silent) ElementPlus.ElMessage.success('已保存')" in src)
+
+    head = re.search(r'<div class="item-head">([\s\S]*?)\n                    </div>', src)
+    head = head.group(1) if head else ""
+    check("前端：卡片头部有 ↑ / ↓ / 并入上一题 三个按钮",
+          ">↑</el-button>" in head and ">↓</el-button>" in head and "并入上一题</el-button>" in head)
+    check("前端：这三个按钮只对待审条目出现",
+          'v-if="it.status === \'pending\'"' in head)
+    check("前端：按钮的禁用态挂在 canMove / canMergeUp 上",
+          "canMove(it, -1)" in head and "canMove(it, 1)" in head and "canMergeUp(it)" in head)
+
+
+# ---------------------- ⑬ 配图自动裁切 + 图片直接上传（2026-10-08 第三轮）
+def check_auto_figure(src: str) -> None:
+    """配图**自动裁好**，老师只用审核；以及「一张图片直接入库」。
+
+    为什么单独锁一段：这一轮有两个变化是**跨层**的，单看任何一层都发现不了问题。
+
+      · 「模型指路 + 几何定框」这条链路横跨
+        batch_page（提示词/解析/吸附）→ adapters/pdf（候选区探测）→
+        documents.py（页面来源）。任何一环被改回「只用模型的框」，
+        表现是「能跑、接口全绿、只是图裁歪」——最难发现的那种。
+
+      · `batch_page.py` **不许 import pymupdf**：全项目只有 adapters/pdf.py 能引它
+        （AGPL 许可边界，见那个文件头部）。写这一轮时最顺手的一步就是
+        「import pymupdf 算个矩形交并比」——代码照样跑，边界却破了。
+
+      · 「图片当一页」靠的是**三个分支同时**认图片扩展名：
+        上传放行、_page_source、_preview_payload。只改前两个的话，
+        上传成功、列表里也有，但页面视图打不开 —— 前端那侧看起来像「白页」。
+    """
+    bp = (ROOT / "backend" / "app" / "services" / "batch_page.py").read_text(encoding="utf-8")
+    pdf = (ROOT / "backend" / "app" / "adapters" / "pdf.py").read_text(encoding="utf-8")
+    docs = R_DOCUMENTS.read_text(encoding="utf-8")
+    bts = R_BATCHES.read_text(encoding="utf-8")
+    entry = ENTRY.read_text(encoding="utf-8")
+
+    # ---------------- 后端：提示词 ----------------
+    print("\n  -- 后端：提示词与解析 --")
+    check("后端：提示词里要了 figure_box", '"figure_box"' in bp)
+    check("后端：提示词说明是**归一化 0~1000**（不说清就是让模型猜）",
+          "归一化坐标" in bp and "0 到 1000" in bp)
+    check("后端：提示词要求只框图形、不框题干文字",
+          "不要**把题干文字" in bp or "不要把题干文字" in bp)
+    check("后端：提示词里的字段数与实际列出的字段数**一致**（说九个却给十个会误导模型）",
+          "下面十个" in bp and "十个字段**必须全部出现**" in bp)
+    check("后端：四个 figure_* flag 名前后端一致（前端 figureAuto 认它们）",
+          "figure_snapped" in bp and "figure_rough" in bp
+          and "figure_box_missing" in bp and "figure_only_candidate" in bp)
+
+    # ---------------- 后端：几何边界 ----------------
+    print("\n  -- 后端：几何与许可边界 --")
+    check("后端：batch_page **不许 import pymupdf**（AGPL 边界，只许 adapters/pdf.py 引）",
+          not re.search(r"^\s*(import pymupdf|from pymupdf)", bp, re.M))
+    check("后端：pdf 适配层提供 page_size（归一化换算的唯一出处）",
+          "def page_size(" in pdf)
+    check("后端：pdf 适配层提供 figure_candidates", "def figure_candidates(" in pdf)
+    check("后端：候选区排掉表头斜线那类误报（长横竖线交叉＝表格）",
+          "def _inside_table_grid(" in pdf and "_inside_table_grid(b, h_rules, v_rules)" in pdf)
+    check("后端：候选区排掉整页扫描底图（否则扫描版会把整页当「图」）",
+          "_FIG_MAX_AREA_RATIO" in pdf)
+    check("后端：并簇用并查集（单趟合并会把一幅图切成两半）",
+          "parent" in pdf and "def _cluster_rects(" in pdf)
+    check("后端：吸附失败要能回退模型框，而不是直接不裁",
+          '"rough"' in bp and "figure_rough" in bp)
+    check("后端：裁图走 crop_region 落 CROPS_DIR（资产目录，靠引用计数回收）",
+          "crop_region(" in bp and "config.CROPS_DIR" in bp)
+    check("后端：裁图失败只打 flag，不让整页条目跟着失败",
+          "figure_crop_failed" in bp)
+    check("后端：提示词要求「true 就必须给框 或 说明为什么给不出」",
+          "必须同时给出 figure_box" in bp or "必须同时给出" in bp)
+    check("后端：提示词明确「只提到几何体名字不算有图」（实测那版把 4/5 道都判成有图）",
+          "正三棱柱" in bp and "给 false" in bp)
+    check("后端：「整页仅一处图形」的兜底由**页级**算（单条调用者看不到有几道题要图）",
+          "allow_only = (unboxed == 1 and len(cands) == 1)" in bp)
+    check("后端：默认不允许「替你挑图」（不给授权时绝不猜）",
+          "allow_only: bool = False" in bp)
+
+    wpi = re.search(r"^def _write_page_items\([\s\S]*?(?=^def )", bp, re.M).group(0)
+    check("后端：_write_page_items 收 src（没有源文件就裁不出来）",
+          "src: str | None = None" in wpi)
+    check("后端：几何信息每页只取一次（不是每题去开一遍 PDF）",
+          wpi.count("figure_candidates(") == 1)
+    check("后端：run_page_job 把 src 传下去",
+          "_write_page_items(job_id, doc_id, pno, items, src=src)" in bp)
+    check("后端：裁出图就把 needs_figure 置 1（与 figure-crop 接口同一口径）",
+          "needs = 1" in wpi)
+    check("后端：figure_box 落库（前端预填框要用）",
+          "figure_box=json.dumps(fig_box)" in wpi)
+
+    fc = re.search(r"^def crop_item_figure\([\s\S]*?(?=^@router\.|^def )", bts, re.M).group(0)
+    check("后端：手工框完也把框记下来（下次进来能预填）",
+          "it.figure_box = json.dumps(" in fc)
+    check("后端：跨页竖拼的图清掉框记录（一个矩形表示不了）",
+          "it.figure_box = None" in fc)
+    check("后端：_item_dict 下发 figure_box", '"figure_box"' in bts)
+
+    # ---------------- 后端：图片当一页 ----------------
+    print("\n  -- 后端：一张图片直接入库 --")
+    check("后端：上传放行图片扩展名",
+          "PAGE_IMAGE_EXTS" in docs and '".png"' in docs)
+    check("后端：三个分支共用 _is_paged（不许退回 filetype == '.pdf'）",
+          docs.count("_is_paged(") >= 4,
+          f"出现 {docs.count('_is_paged(')} 次")
+    check("后端：_page_source 认图片（否则页面视图打不开）",
+          "_is_paged(doc.filetype)" in docs)
+    check("后端：_preview_payload 认图片",
+          "is_pdf = _is_paged(doc.filetype)" in docs)
+    check("后端：图片按「无文字层」处理（走截图模式）",
+          "blocks = []" in docs and "scanned = 1" in docs)
+
+    # ---------------- 前端 ----------------
+    print("\n  -- 前端 --")
+    check("前端：上传框 accept 含图片扩展名",
+          ".png" in src and "accept=\".pdf,.docx,.png" in src)
+    check("前端：entry.html 的上传框也含图片",
+          "accept=\".pdf,.docx,.png" in entry)
+    for name in ("figureAuto", "figureLocateFailed", "openFigurePick"):
+        check(f"前端：有 {name} 方法", bool(method_body(src, name)))
+    fa = method_body(src, "figureAuto")
+    check("前端：自动配图分两档（几何定框 vs 模型估框）—— 混成一档会让可信度一刀切",
+          "figure_snapped" in fa and "figure_rough" in fa)
+    fl = method_body(src, "figureLocateFailed")
+    check("前端：没定位到 / 裁失败都要提示人工",
+          "figure_box_missing" in fl and "figure_crop_failed" in fl)
+
+    ofp = method_body(src, "openFigurePick")
+    check("前端：框选弹窗**预填**已有的框（拖一下边比重画一遍省事得多）",
+          "it.figure_box" in ofp and "rects.push" in ofp)
+    check("前端：预填用的换算与 figDown 同源（都乘 pg.width/height，否则预填的框会偏）",
+          "pg.width" in ofp and "pg.height" in ofp and "1000" in ofp)
+    check("前端：预填只在页几何拿得到时做（拿不到就空着，不能算错）",
+          "pg && pg.width && pg.height" in ofp)
+    # 预填与框选共用 pv.pages[pno] 的宽高 —— 那份数据来自「文字层」接口。
+    # 一旦有人把 lines 接口的返回精简成「只有行」，宽高就没了：
+    # 框选与预填会**静默失灵**（弹窗里画不出框、预填为空），接口全绿。
+    check("前端：pv.pages 存的是 lines 接口的**整份**返回（宽高就在里面）",
+          "pages[r.l.page] = r.l" in src)
+    check("后端：lines 接口必须带 width/height（前端框选几何都靠它）",
+          '"width": round(page.rect.width, 1)' in pdf
+          and '"height": round(page.rect.height, 1)' in pdf)
+
+    # 卡片上必须能看出「这张图是自动配的」—— 否则会被默认成老师框过的
+    check("前端：卡片上有「AI 自动框的图」提示",
+          "AI 自动框的图" in src and "AI 估的图框" in src)
+    check("前端：按钮文案改成「调整配图」（预填之后不再是「重新框」）",
+          "调整配图" in src)
+    check("前端：提示文案区分「AI 没定位到」与「还没框」",
+          "没能在这页上定位到它" in src)
+
+
 def main() -> int:
     src = BATCH.read_text(encoding="utf-8")
     clean = strip_noise(src)          # 标签配对要在去注释/去 script 的标记文本上数
@@ -1033,6 +1321,15 @@ def main() -> int:
 
     print("\n==== ⑩ 题块编排 + 待审同步（真实方法体在 node 里跑） ====")
     check_ordering_behavior(src)
+
+    print("\n==== ⑪ AI 整页识别（实验流程） ====")
+    check_ai_page_flow(src)
+
+    print("\n==== ⑫ 待审：上下移动 + 并入上一题（跨页题收口） ====")
+    check_review_merge(src)
+
+    print("\n==== ⑬ 配图自动裁切 + 图片直接上传 ====")
+    check_auto_figure(src)
 
     print("\n" + "=" * 60)
     if fails:

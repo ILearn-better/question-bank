@@ -40,6 +40,27 @@ router = APIRouter(prefix="/api", tags=["documents"])
 CROPS_DIR = str(config.CROPS_DIR)
 PREVIEW_ERROR_MAX = 600
 
+# 可以**直接当一页**用的图片格式。
+#
+# 为什么允许：用户 2026-10-08 的要求是「给一张图片，直接把图片和文本分割成可入库形式」——
+# 手上只有手机拍的/截屏的一道题时，不该先逼他去找工具转成 PDF。
+#
+# 为什么不用单独一条处理链：pymupdf 打开图片就是**单页文档**（做过验证：
+# 400x300 的 PNG 打开后 page_count=1、页面矩形按 96dpi 折算成 300x225 点）。
+# 于是页面视图、渲染、框选裁剪、图形候选探测这一整套**一行都不用改** ——
+# 只要让上面那几个「这是不是 PDF」的分支把图片也算进去。
+#
+# ⚠️ 页面坐标因此是「按 96dpi 折算的点」，不是 A4 的 595x842。
+#    凡是拿归一化比例换算的地方都必须用 page_size() 取真实尺寸，
+#    绝不能假定 A4（见 adapters/pdf.py 的 page_size 注释）。
+PAGE_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".bmp")
+
+
+def _is_paged(filetype: str | None) -> bool:
+    """这份文档是否**本身就带页面视图**（PDF / 图片，无需 Word 转换）。"""
+    return (filetype or "").lower() in (".pdf", *PAGE_IMAGE_EXTS)
+
+
 
 def _doc_or_404(db: Session, doc_id: str) -> Document:
     doc = db.get(Document, doc_id)
@@ -50,7 +71,7 @@ def _doc_or_404(db: Session, doc_id: str) -> Document:
 
 # ---------------------------------------------------------------- 路径解析
 def _source_file(db: Session, doc_id: str) -> Path:
-    """原始上传文件（.pdf 或 .docx），必须真实存在。"""
+    """原始上传文件（.pdf / .docx / 图片），必须真实存在。"""
     doc = _doc_or_404(db, doc_id)
     path = config.abs_from_data(doc.file_path)
     if path is None or not Path(path).exists():
@@ -75,10 +96,10 @@ def _clear_render_cache(doc_id: str) -> None:
 def ensure_preview(db: Session, doc: Document, force: bool = False) -> Path:
     """确保 Word 文档有可用的页面视图数据源，返回那份 PDF 的路径。
 
-    .pdf 文档直接返回原件（无需转换）。
+    .pdf 文档与**图片**直接返回原件（本身就是页面视图，无需转换）。
     .docx 文档在 preview_pdf 缺失或 force 时调用 Word 转换，并把结果入库。
     """
-    if (doc.filetype or "").lower() == ".pdf":
+    if _is_paged(doc.filetype):
         return _source_file(db, doc.id)
 
     out = _preview_pdf_path(doc)
@@ -112,7 +133,7 @@ def ensure_preview(db: Session, doc: Document, force: bool = False) -> Path:
 def _page_source(db: Session, doc_id: str, build: bool = True) -> Path:
     """页面视图（pages / image / lines / crop）统一走这里取数据源。"""
     doc = _doc_or_404(db, doc_id)
-    if (doc.filetype or "").lower() == ".pdf":
+    if _is_paged(doc.filetype):
         return _source_file(db, doc_id)
     if not build:
         out = _preview_pdf_path(doc)
@@ -124,7 +145,7 @@ def _page_source(db: Session, doc_id: str, build: bool = True) -> Path:
 
 def _preview_payload(db: Session, doc: Document) -> dict:
     """页面视图状态 —— 前端据此决定进页面视图还是回退内容块模式。"""
-    is_pdf = (doc.filetype or "").lower() == ".pdf"
+    is_pdf = _is_paged(doc.filetype)
     if is_pdf:
         return {"engine": "pdf", "ready": True, "pages": None, "error": None, "can_build": False}
 
@@ -147,8 +168,10 @@ async def upload_document(file: UploadFile = File(...), db: Session = Depends(ge
     ext = os.path.splitext(file.filename or "")[1].lower()
     if ext == ".doc":
         raise HTTPException(422, "暂不支持旧版 .doc，请在 Word 中另存为 .docx 后重新上传")
-    if ext not in (".pdf", ".docx"):
-        raise HTTPException(422, "仅支持 PDF 或 Word(.docx) 文件")
+    if ext not in (".pdf", ".docx", *PAGE_IMAGE_EXTS):
+        raise HTTPException(
+            422, "仅支持 PDF / Word(.docx) / 图片（png、jpg、jpeg、webp、bmp）文件"
+        )
 
     save_path = config.UPLOAD_DIR / f"{uuid.uuid4().hex}{ext}"
     with open(save_path, "wb") as f:
@@ -161,6 +184,13 @@ async def upload_document(file: UploadFile = File(...), db: Session = Depends(ge
             scanned = 0 if blocks else 1
             if scanned and pdf_adapter.page_count(str(save_path)) == 0:
                 raise HTTPException(422, "PDF 无有效页面，文件可能已损坏")
+        elif ext in PAGE_IMAGE_EXTS:
+            # 一张图片 = 一页。没有文字层，所以一定是「截图模式」，
+            # 这也正是图片的用法：整页喂给 AI 整页识别（见 services/batch_page.py）。
+            blocks = []
+            scanned = 1
+            if pdf_adapter.page_count(str(save_path)) == 0:
+                raise HTTPException(422, "图片读不出页面，文件可能已损坏或格式不支持")
         else:
             from doc_parser import parse_docx  # 延迟导入，避免包外依赖影响导入期
 
@@ -242,8 +272,8 @@ def build_preview(
 ):
     """生成（或重建）Word 的页面视图数据源。这是唯一会启动 Word 的接口。"""
     doc = _doc_or_404(db, doc_id)
-    if (doc.filetype or "").lower() == ".pdf":
-        return {"ok": True, "skipped": "PDF 无需转换", "preview": _preview_payload(db, doc)}
+    if _is_paged(doc.filetype):
+        return {"ok": True, "skipped": "PDF / 图片无需转换", "preview": _preview_payload(db, doc)}
     try:
         path = ensure_preview(db, doc, force=force)
     except HTTPException as e:

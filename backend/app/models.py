@@ -240,6 +240,14 @@ class BatchJob(Base):
     created_at: Mapped[str | None] = mapped_column(Text)
     finished_at: Mapped[str | None] = mapped_column(Text)
 
+    # ---- AI 整页识别模式（2026-10-08 实验，迁移 0023）----
+    # 0 = 旧的「人工分割 → 裁块 → 逐块识别」（默认，老任务读出来就是它）
+    # 1 = 「整页图 → 模型直接输出多道题 → 人工只补配图」，见 services/batch_page.py
+    ai_mode: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    # 整页模式下要识别的页号（JSON 数组，如 [1,2,3]）；块模式为 NULL
+    # （那时要识别什么在提交前就由题块定好了，不需要这里再记一份）。
+    pages: Mapped[str | None] = mapped_column(Text)
+
     items: Mapped[list["BatchItem"]] = relationship(
         back_populates="job", cascade="all, delete-orphan", order_by="BatchItem.seq"
     )
@@ -270,7 +278,14 @@ class BatchItem(Base):
     # AI 的原话另存在 figure_note 里，页面才能显示「模型说有图，你确认了没」。
     needs_figure: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     figure_note: Mapped[str | None] = mapped_column(Text)     # 模型对这张图的描述
-    figure_image: Mapped[str] = mapped_column(Text, default="", server_default="")  # 老师框选的配图
+    figure_image: Mapped[str] = mapped_column(Text, default="", server_default="")  # 配图
+    # 配图的实际框（JSON [x0,y0,x1,y1]，**归一化 0~1000**，原点是整页左上角）。
+    # 存在的意义有两个：
+    #   ① 老师要改这张图时，框选弹窗能**预填**这个框 —— 只需拖动一边微调，
+    #      而不是对着整页重新框一遍（自动配图的价值一大半在这里）；
+    #   ② 出问题时能看出「当时是按哪个框裁的」（模型估的 / 吸附到几何候选的）。
+    # 与 region 的区别：region 是**块模式**里那个题块的位置（点坐标），语义不同，故单独一列。
+    figure_box: Mapped[str | None] = mapped_column(Text)
 
     # ---- 模型给的那几列。列名与 questions 对齐，通过时直接搬过去 ----
     content: Mapped[str | None] = mapped_column(Text)

@@ -24,6 +24,7 @@
 """
 import io
 import json
+import os
 import sys
 import traceback
 import urllib.error
@@ -33,7 +34,15 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from app import config                                   # noqa: E402  只为 CROPS_DIR
 
-BASE = "http://127.0.0.1:8000"
+# 默认打哪个端口，**按检出目录名判定** —— 这个仓库曾经有一份实验副本
+# （目录名 `question-bank-ai`，端口 8010），副本里的测试必须验副本自己的代码。
+# 写死任一个端口都会出事：写死 8000 时副本里去测原项目（改坏了也照样全绿）；
+# 写死 8010 时主线里根本连不上。用 SHIKE_BASE 可以临时指到别处。
+BASE = os.environ.get(
+    "SHIKE_BASE",
+    "http://127.0.0.1:8010" if Path(__file__).resolve().parents[1].name == "question-bank-ai"
+    else "http://127.0.0.1:8000",
+)
 
 # 假的 document_id：测试建的题不该挂在老师真实的卷子下面，
 # 否则从他的「按文档看题」里会冒出一堆测试题（test_render_prefer 的做法）
