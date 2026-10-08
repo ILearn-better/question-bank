@@ -1,17 +1,15 @@
 # 专属题库工具
 
-> ## ⚠️ 这是实验副本，不是日常在用的那一份
+> ## 关于「AI 整页识别」这条路线
 >
-> 2026-10-08 从 `question-bank/`（原项目）**完整复制**而来，用来试验「**AI 整页识别**」这条新入库路线。
-> 原项目**保持不动**，日常教学照旧用它（端口 8000）。
+> 2026-10-08 起在实验副本 `question-bank-ai/` 里试的整条「AI 整页识别」流程，
+> **已合并回本仓库**（提交 `adb464e`，见下方专节）。现在这里就是唯一在维护的代码。
 >
-> - 本副本默认端口 **8010**（`启动拾课.bat` 已改），可以和原项目**同时开着**，互不干扰
-> - 两边各有独立的 `backend/shike.db`、`backend/data/`、`.venv/` —— 在副本里做实验不会动到真实题库
-> - ⚠️ 原项目的 `关闭拾课.bat` 是按「项目路径 + uvicorn」找进程的，路径匹配是**子串**匹配，
->   `question-bank` 能匹配上 `question-bank-ai` —— 所以**副本在跑的时候别去点原项目的关闭脚本**，
->   要关就点本目录的 `关闭拾课.bat`
->
-> 试下来的结论如果好，再把这套改动挑出来合并回原项目；不好，直接删掉这个目录即可。
+> - 默认端口仍是 **8000**（`启动拾课.bat` 没动）
+> - ⚠️ 旧副本目录若还留着，它的 `启动拾课.bat` 用的是 8010。注意本项目的 `关闭拾课.bat`
+>   是按「项目路径 + uvicorn」找进程、路径匹配是**子串**匹配 —— `question-bank` 能匹配上
+>   `question-bank-ai`，所以**副本在跑的时候别点本项目的关闭脚本**，要关就点那个目录里自己的。
+
 
 ## 实验内容：AI 整页识别（去掉人工分割）
 
@@ -96,7 +94,7 @@
 
 ### 怎么用
 
-1. 双击 `启动拾课.bat`（会在 http://127.0.0.1:8010/ 起来）
+1. 双击 `启动拾课.bat`（会在 http://127.0.0.1:8000/ 起来）
 2. 左边选文档（**或直接上传一张图片**，会自动当 1 页）→ 右栏「识别范围」选**全部页**或**指定页**（一次最多 30 页）
 3. 点 **「AI 识别这 N 页」** → 等它跑（每页一次请求，约 5–20 秒；多页并发 3）
 4. 在「待审」里逐条核对文本框内容；**配图已经自动裁好了**，只需看一眼对不对 ——
@@ -137,8 +135,9 @@ cd backend
 ./.venv/Scripts/python.exe test_batch_import.py         # 114 项：块模式一整条链，不调 AI
 ```
 
-⚠️ 带服务的测试默认打**本副本的 8010**（`SHIKE_BASE` 可覆盖），
-不要写死 8000 —— 那样会去测原项目，副本里改坏了也照样全绿。
+⚠️ 带服务的测试默认打**本仓库的 8000**（`SHIKE_BASE` 可覆盖）。
+端口是按**检出目录名**判定的：目录叫 `question-bank-ai`（旧实验副本）时它自己会切到 8010 ——
+免得同一份脚本在两个仓库里跑，指到对方身上去。
 
 #### 关于 `test_render_page.py`（三层防线里最慢也最狠的一层）
 
@@ -172,7 +171,7 @@ vendor 全加载不到而 `#app` 里只是未渲染的原始模板（1.8 万字�
   已录的题也能事后补答案
 - **批量入库** —— 整卷一次性画完分界线 → 并行送 AI 识图（题干 + 题型/难度/知识点/标签）
   → 待审列表逐条核对后通过入库。适合「一次录十套卷」而不是「一次录一道题」。
-  **另有实验路线「AI 整页识别」**（本副本新增，见下方专节）：不画分界线，整页交给 AI 自己切题
+  **另有路线「AI 整页识别」**（见下方专节）：不画分界线，整页交给 AI 自己切题
 - **题库与出卷** —— 多条件筛题（体系 / 知识点 / 标签 / 题型 / 难度 / 有无图）、组卷调序、导出 HTML / Word / PDF
 - **学生管理** —— 学生档案、能力维度与雷达图
 - **课表与课时费** —— 课时排期、课时费结算、家长反馈
@@ -356,12 +355,13 @@ cd backend
 >
 > | 测试 | 需要 |
 > |---|---|
-> | `test_paper_templates.py`、`test_render_prefer.py`、`test_doc_delete.py`、`test_batch_import.py`、`test_batch_merge.py`、`test_batch_page_ai_flow.py`、`test_visual.py`、`test_scanned.py` | **8010** 服务在跑 |
-> | `test_note_groups.py`、`test_note_questions.py`、`test_notes_transfer.py`、`test_doc_import.py`、`test_question_filters.py`、`test_supplements.py` | 8010 在跑 **+** 另起一个 **8001** 临时服务 |
+> | `test_paper_templates.py`、`test_render_prefer.py`、`test_doc_delete.py`、`test_batch_import.py`、`test_batch_merge.py`、`test_batch_page_ai_flow.py`、`test_visual.py`、`test_scanned.py` | **8000** 服务在跑 |
+> | `test_note_groups.py`、`test_note_questions.py`、`test_notes_transfer.py`、`test_doc_import.py`、`test_question_filters.py`、`test_supplements.py` | 8000 在跑 **+** 另起一个 **8001** 临时服务 |
 >
-> ⚠️ **本副本里一律是 8010，不是原项目的 8000**。测试默认打 8010
-> （`SHIKE_BASE` 可覆盖），别写死 8000 —— 那样会去测原项目，副本里改坏了也照样全绿。
-> 原项目那一份的 README 里这些数字仍是 8000。
+> ⚠️ `test_batch_import.py` / `test_batch_merge.py` 的端口**按检出目录名判定**：
+> 本仓库（`question-bank`）打 8000；旧实验副本（`question-bank-ai`）自动切 8010。
+> 不想靠目录名就用 `SHIKE_BASE` 显式指定。别把端口写死 —— 写死任一个都会出事：
+> 写死 8000 时副本里去测原项目（副本改坏了也照样全绿），写死 8010 时本仓库根本连不上。
 >
 > 8001 不另起会报 `no such table: notes`（不是代码 bug）。起法：
 > ```bash

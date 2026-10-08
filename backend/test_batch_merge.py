@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """待审列表里的「上移 / 下移 / 并入上一题」接口自检。
 
-跑法（服务得在跑；默认打实验副本 8010，可用 SHIKE_BASE 换）：
+跑法（服务得在跑；端口按检出目录名自动判定，可用 SHIKE_BASE 覆盖）：
     cd backend
     ./.venv/Scripts/python.exe test_batch_merge.py
 
@@ -29,7 +29,11 @@ sys.path.insert(0, str(BACKEND_DIR))
 
 from app import config                                   # noqa: E402  只为 CROPS_DIR
 
-BASE = os.environ.get("SHIKE_BASE", "http://127.0.0.1:8010")
+BASE = os.environ.get(
+    "SHIKE_BASE",
+    "http://127.0.0.1:8010" if BACKEND_DIR.parent.name == "question-bank-ai"
+    else "http://127.0.0.1:8000",
+)
 
 fails: list[str] = []
 state: dict = {"jobs": [], "files": []}
