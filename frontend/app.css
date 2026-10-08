@@ -549,3 +549,19 @@ body.notes-zen .notes-toc { max-height: none; }
 /* 导入预览的统计条 */
 .import-summary { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 10px; font-size: 13px; }
 
+/* ---------------- 出卷：题干的渲染结果 ----------------
+   题干是按 Markdown + KaTeX 渲染后由 JS 写 innerHTML 进来的（src/mathRender.js），
+   所以这些容器里不会有 Vue 插值 —— 别往里加 {{ }}。 */
+.q-rich { font-size: 14px; line-height: 1.75; overflow: hidden; word-break: break-word; }
+.q-rich > :first-child { margin-top: 0; }
+.q-rich > :last-child { margin-bottom: 0; }
+.q-rich p { margin: 0 0 6px; }
+.q-rich ul, .q-rich ol { margin: 4px 0 6px; padding-left: 22px; }
+.q-rich img { max-width: 100%; height: auto; }
+.q-rich .katex { font-size: 1.02em; }
+/* 块级公式太占高度，列表里压一压，免得一道题吃掉半屏 */
+.q-rich .katex-display { margin: 6px 0; }
+/* 长题干只露一截：老师是来挑题的，不是来通读的 */
+.lesson-row .q-rich { max-height: 132px; }
+.lesson-row .q-rich.q-rich-sm { max-height: 88px; }
+

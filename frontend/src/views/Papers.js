@@ -3,9 +3,11 @@
 // 为什么筛选用新的 /api/questions/search 而不是复用 GET /questions：
 // 后者是录题页正在用的、返回纯数组的旧接口；出卷要多条件 + 分页 + 「共 N 题」，
 // 诉求不同，硬改那个接口会把录题页一起弄坏。
-import { computed, onMounted, reactive, ref, watch } from 'vue';
+import { computed, nextTick, onMounted, reactive, ref, watch } from 'vue';
 import { curriculumApi, papersApi, paperTemplatesApi } from '../api.js';
 import { fail, loadCurricula, ok, state } from '../store.js';
+import { ensureLibs, renderRichEl } from '../mathRender.js';
+import { matchTags, tagQueryHint } from '../tagFilter.js';
 
 const QTYPES = ['选择题', '填空题', '解答题', '判断题', '证明题', '应用题', '图片题'];
 const DIFFS = ['基础', '中档', '拔高'];
@@ -139,10 +141,58 @@ export default {
       if (i >= 0) filter.tags.splice(i, 1); else filter.tags.push(t);
     }
 
+    /* ---------- 标签搜索（标签会越攒越多，光靠眼睛在这一排里找不现实） ----------
+     *
+     *  两种写法，**和常见直觉相反**（用户点名要的，别好心「修」回去）：
+     *    · 空格 = 任一命中：「对称 函数」→ 含对称的 ＋ 含函数的
+     *    · 竖线 = 同时包含：「对称|函数」→ 标签里两个词都有
+     *  语义与理由集中在 src/tagFilter.js（那边有 node 单测兜着）。 */
+    const tagQuery = ref('');
+    const shownTags = computed(() => matchTags(tagOptions.value, tagQuery.value));
+    const tagHint = computed(() => tagQueryHint(tagQuery.value));
+    /** 搜索把已选标签挡住了几个 —— 不提示的话老师会以为「我选的那几个没了」。 */
+    const hiddenPicked = computed(
+      () => filter.tags.filter((t) => !shownTags.value.some((o) => o.tag === t)).length,
+    );
+
     function resetFilter() {
       Object.assign(filter, { ...EMPTY_FILTER, tags: [] });
+      tagQuery.value = '';        // 重置就全清，别留下一个「看不见的过滤器」
       search();
     }
+
+    /* ---------- 题干渲染：老师要看的是真公式，不是 $…$ 原文 ----------
+     *
+     *  ⚠️ 为什么是「拿元素 ref 自己写 innerHTML」，而不是 `{{ q.content }}` 或 v-html：
+     *    KaTeX 的 auto-render 会把容器里的文本节点整个换掉，Vue 之后还往那个
+     *    已摘除的节点里写新内容 —— 界面会永远停在第一次渲染的那一版。
+     *    （笔记页在同一个坑里躺过，详见 src/mathRender.js 的注释。）
+     */
+    const richEls = new Map();          // 'row:<id>' / 'pick:<id>' → 容器元素
+    function setRichEl(key, el) {
+      if (el) richEls.set(key, el); else richEls.delete(key);
+    }
+    function paintRich() {
+      rows.value.forEach((q) => {
+        const el = richEls.get('row:' + q.id);
+        if (el) renderRichEl(el, q.content || '');
+      });
+      picked.value.forEach((q) => {
+        const el = richEls.get('pick:' + q.id);
+        if (el) renderRichEl(el, q.content || '');
+      });
+    }
+    let libsReady = false;
+    async function renderRich() {
+      if (!libsReady) {
+        paintRich();                     // 库还没到：先把原文铺出来，别留一屏空白
+        try { await ensureLibs(); libsReady = true; }
+        catch (e) { return; }            // 加载不上就一直显示原文，不挡着出卷
+      }
+      await nextTick();                  // 等 v-for 把新一页的容器挂上去
+      paintRich();
+    }
+    watch([rows, picked], () => { renderRich(); }, { flush: 'post' });
 
     const pickedIds = computed(() => picked.value.map((q) => q.id));
     const isPicked = (q) => pickedIds.value.includes(q.id);
@@ -216,12 +266,6 @@ export default {
       if (withAnswer) opts.show_analysis = true;      // 教师版默认带上解析（可再关）
     }
 
-    function brief(q) {
-      const t = (q.content || '').replace(/\s+/g, ' ').trim();
-      if (!t) return '（图片题）';
-      return t.length > 70 ? `${t.slice(0, 70)}…` : t;
-    }
-
     // 条件一改就重筛 —— 让老师每改一次都再点一下「筛选」太多余。
     watch(
       () => [filter.curriculum_id, filter.kp, filter.qtype, filter.difficulty,
@@ -247,8 +291,9 @@ export default {
       state, filter, rows, total, loading, kpGroups, picked, pickedIds,
       title, opts, QTYPES, DIFFS, pageNo, pageCount, tagOptions,
       templates, templateId, currentTemplate, renderModeHint,
+      tagQuery, shownTags, tagHint, hiddenPicked, setRichEl,
       search, resetFilter, add, addPage, remove, clearPicked, move,
-      isPicked, open, brief, prev, next, toggleTag, setVersion,
+      isPicked, open, prev, next, toggleTag, setVersion,
     };
   },
   template: `
@@ -307,15 +352,29 @@ export default {
           <div class="row" style="align-items:flex-start">
             <div class="field">
               <label>标签（多选 = 任一命中，括号里是题数）</label>
-              <div class="chips" style="max-height:80px;overflow:auto">
+              <input type="text" v-model="tagQuery"
+                     placeholder="搜标签：空格分隔 = 任一命中（对称 函数）；竖线分隔 = 同时包含（对称|函数）">
+              <div class="chips" style="max-height:150px;overflow:auto;margin-top:6px">
                 <span class="chip" :class="{ on: !filter.tags.length }" @click="filter.tags = []">不限</span>
-                <span class="chip" v-for="t in tagOptions" :key="t.tag"
+                <span class="chip" v-for="t in shownTags" :key="t.tag"
                       :class="{ on: filter.tags.includes(t.tag) }" @click="toggleTag(t.tag)">
                   {{ t.tag }} <span class="muted">{{ t.count }}</span>
                 </span>
                 <span v-if="!tagOptions.length" class="muted" style="font-size:12px">
                   还没有标签 —— 到录题页给题目打上标签，这里就会出现
                 </span>
+                <span v-else-if="!shownTags.length" class="muted" style="font-size:12px">
+                  没有匹配的标签
+                </span>
+              </div>
+              <p v-if="tagHint" class="muted" style="font-size:12px;margin:6px 0 0">
+                {{ tagHint }}<template v-if="hiddenPicked">；有 {{ hiddenPicked }} 个已选标签被搜索挡住了，见下面「已选」</template>
+              </p>
+              <!-- 已选单独列一行：搜索能把它藏起来，但**绝不能让人取消不掉** -->
+              <div v-if="filter.tags.length" class="chips" style="margin-top:6px">
+                <span class="muted" style="font-size:12px">已选：</span>
+                <span class="chip on" v-for="t in filter.tags" :key="'pk' + t"
+                      title="点一下取消这个标签" @click="toggleTag(t)">{{ t }} ✕</span>
               </div>
             </div>
           </div>
@@ -358,7 +417,11 @@ export default {
           <div v-if="!rows.length" class="empty">没有符合条件的题目</div>
           <div v-for="q in rows" :key="q.id" class="lesson-row">
             <div style="flex:1;min-width:0">
-              <div>{{ brief(q) }}</div>
+              <!-- 题干走渲染管线（见 setup 里 renderRich 的注释）：老师要看的是排好版的
+                   公式，不是 $…$ 原文。容器里**不能**再放 Vue 插值 —— KaTeX 会把
+                   文本节点换掉。 -->
+              <div v-if="q.content" class="q-rich" :ref="(el) => setRichEl('row:' + q.id, el)"></div>
+              <div v-else class="muted">（图片题，没有文本）</div>
               <div style="margin-top:5px;display:flex;gap:5px;flex-wrap:wrap">
                 <span class="tag blue">{{ q.qtype }}</span>
                 <span class="tag">{{ q.difficulty }}</span>
@@ -476,7 +539,10 @@ export default {
           <div v-if="!picked.length" class="empty">还没有选题</div>
           <div v-for="(q, i) in picked" :key="q.id" class="lesson-row">
             <span class="muted" style="width:20px;flex:none">{{ i + 1 }}</span>
-            <div style="flex:1;min-width:0">{{ brief(q) }}</div>
+            <div style="flex:1;min-width:0">
+              <div v-if="q.content" class="q-rich q-rich-sm" :ref="(el) => setRichEl('pick:' + q.id, el)"></div>
+              <div v-else class="muted">（图片题，没有文本）</div>
+            </div>
             <button class="btn sm ghost" :disabled="i === 0" @click="move(i, -1)">↑</button>
             <button class="btn sm ghost" :disabled="i === picked.length - 1" @click="move(i, 1)">↓</button>
             <button class="btn sm ghost" @click="remove(q.id)">✕</button>

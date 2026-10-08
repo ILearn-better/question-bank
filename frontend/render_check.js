@@ -271,6 +271,16 @@ async function checkBatch() {
   check('不再是未渲染的原始模板（无 {{ }} / v-else-if 字面量）',
     !/\{\{/.test(raw) && !/v-else-if=/.test(raw));
 
+  // —— 打开页面**不自动加载任何卷子**（用户点名要的：省掉每次打开的那一次加载）——
+  // ⚠️ 这条锁的是「新行为」，同时它也是这次改动的最大风险点：
+  //    卷面预览藏起来了，但**历史任务与待审必须照旧看得见**（它们不挂在当前卷子上）。
+  const raw0 = doc.querySelector('#app').innerHTML;
+  check('打开时没有自动打开任何文档（左栏卷面预览是空的）',
+    doc.querySelectorAll('.page-wrap').length === 0,
+    `page-wrap=${doc.querySelectorAll('.page-wrap').length}`);
+  check('没选卷子时给出落点提示', /先在上方选择或上传一份试卷/.test(raw0));
+  check('没选卷子也照样看得到「历史任务」', /历史任务/.test(raw0));
+
   // 进「待审」：点第一个历史任务卡片
   const card = doc.querySelector('.job-card');
   check('历史任务卡片渲染出来了', !!card);
@@ -321,6 +331,11 @@ async function checkEntry() {
 
   const raw = doc.querySelector('#app').innerHTML;
   check('不再是未渲染的原始模板', !/\{\{/.test(raw) && !/v-else-if=/.test(raw));
+
+  // 同上：打开时不自动加载上次那卷，停在下拉框的空状态
+  check('打开时没有自动打开任何文档（停在空状态）',
+    /上传一份 PDF 或 Word 试卷开始使用/.test(raw),
+    raw.slice(0, 200));
 
   // 图片当单页文档：上传要放行图片，「图片·1 页」那条分支要在
   const html = fs.readFileSync(path.join(ROOT, 'entry.html'), 'utf8');

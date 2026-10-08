@@ -214,7 +214,7 @@
       <el-radio-button :value="true">补答案</el-radio-button>
     </el-radio-group>
     <div style="flex:1"></div>
-    <el-select v-if="docs.length" v-model="currentDocId" placeholder="切换历史文档" size="default"
+    <el-select v-if="docs.length" v-model="currentDocId" placeholder="选择历史文档" size="default"
                style="width: 280px" @change="loadDoc">
       <el-option v-for="d in docs" :key="d.id" :value="d.id" :label="docLabel(d)"></el-option>
     </el-select>
@@ -972,12 +972,23 @@ const app = createApp({
       }
       return d.filename + '（' + d.block_count + ' 块）';
     },
-    async loadDocs() {
+    /** 拉文档列表。
+     *
+     *  ⚠️ **默认不自动打开任何一份**：以前这里是「没指定就挑第一份」，
+     *  于是每次点开这个页面都要先把上次那卷重新加载一遍（页面几何 + 自动铺线，
+     *  要等好几秒），而老师多数时候打开它就是要换一份新卷子。
+     *  现在停在下拉框的空状态，等老师自己选或上传 —— 一次都不多等。
+     *
+     *  唯一的例外是「刚删掉当前文档」：那时自动接上列表里的第一份更顺手，
+     *  调用处传 autoFirst=true（**别把这个开关又用到 mounted 上**）。
+     *
+     *  支持 ?doc=<id> 直达某份文档（可收藏，也能从工作台直接跳到某卷）—— 始终生效。
+     */
+    async loadDocs(autoFirst) {
       this.docs = await this.api('/api/documents');
-      // 支持 ?doc=<id> 直达某份文档（可收藏，也能从工作台直接跳到某卷）
       const want = new URLSearchParams(location.search).get('doc');
       const target = (want && this.docs.find(d => d.id === want)) ||
-                     (this.docs.length ? this.docs[0] : null);
+                     (autoFirst && this.docs.length ? this.docs[0] : null);
       if (target) {
         this.currentDocId = target.id;
         this.loadDoc(target.id);
@@ -1873,7 +1884,7 @@ const app = createApp({
       this.previewErr = null;
       this.resetSel();
       this.loadQuestions();
-      await this.loadDocs();     // 还有别的文档就自动打开第一份；一份都没了就留空
+      await this.loadDocs(true);  // 删完自动接上第一份（这里**刻意**要 autoFirst）；一份都没了就留空
     },
     diffTag(d) { return d === '基础' ? 'success' : d === '拔高' ? 'danger' : 'warning'; },
     exportJson() {
