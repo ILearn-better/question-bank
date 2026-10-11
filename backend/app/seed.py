@@ -12,7 +12,14 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from . import config
-from .models import Curriculum, FeedbackDocTemplate, FeedbackTemplate, Node, PaperTemplate
+from .models import (
+    Curriculum,
+    ExamAnalysisTemplate,
+    FeedbackDocTemplate,
+    FeedbackTemplate,
+    Node,
+    PaperTemplate,
+)
 
 # 用户当前实际教授的体系（2026-09-20 确认）
 DEFAULT_CURRICULA: list[dict] = [
@@ -438,6 +445,70 @@ def ensure_paper_templates(db: Session) -> int:
     return added
 
 
+# ---------------------------------------------------------------- 考情分析模板
+# 两套内置，覆盖两种不同**视角**（不是同一套的详略版）：
+#   · 五段·标准：从「考什么 → 卷子难不难 → 我讲了没讲过 → 他答成什么样 → 接下来怎么办」
+#     走一遍。这是老师跟家长复盘一次考试时最自然的叙述顺序。
+#   · 四段·错因导向：直接从**失分**切入（丢分分布 → 知识漏洞 → 习惯问题 → 针对性训练）。
+#     适合「分数已经知道了，现在只想搞清楚该补哪里」的场景。
+#
+# hint（提示语）都写给「写不下去时看一眼」用：只给标题不给提示，
+# 段落下面就是一片空白，人容易写两句就停。
+#
+# ⚠️ 内置模板只补不覆盖（同反馈模板/卷种样式）：已经存在同名模板就跳过，
+#    因为用户可能已经改过它的文案，覆盖等于把他的改动抹掉。
+BUILTIN_EXAM_ANALYSIS_TEMPLATES: list[dict] = [
+    {
+        "name": "考情分析（五段 · 标准）",
+        "sections": [
+            {"key": "scope", "label": "考察范围",
+             "hint": "这次考到哪些章节／知识点，大概各占多少分"},
+            {"key": "difficulty", "label": "试卷难易程度",
+             "hint": "整体偏难／适中／偏易；哪几道题是分水岭，基础题有没有守住"},
+            {"key": "taught", "label": "上课所讲内容",
+             "hint": "考到的内容里，课上讲过多少、讲到什么深度；哪些是他没接触过的"},
+            {"key": "performance", "label": "学生答题情况",
+             "hint": "分丢在哪儿：是知识点没掌握，还是审题／步骤／计算／时间分配的问题"},
+            {"key": "plan", "label": "后期计划安排",
+             "hint": "接下来先补什么、怎么补；下次课准备处理哪几块；要不要配练习"},
+        ],
+    },
+    {
+        "name": "考情分析（四段 · 错因导向）",
+        "sections": [
+            {"key": "loss", "label": "失分点分布",
+             "hint": "丢分集中在哪类题（选择／填空／解答，哪个章节），各丢了多少"},
+            {"key": "gaps", "label": "知识漏洞",
+             "hint": "哪些知识点明显没掌握、需要重新讲；列出具体条目，不要写「基础不牢」"},
+            {"key": "habits", "label": "习惯与方法问题",
+             "hint": "审题漏条件／步骤跳步／计算错／时间不够／不检查 —— 挑真正发生的写"},
+            {"key": "training", "label": "针对性训练安排",
+             "hint": "下次课与作业练什么、练多少、怎么检查有没有补上"},
+        ],
+    },
+]
+
+
+def ensure_exam_analysis_templates(db: Session) -> int:
+    """内置考情分析模板只补不覆盖（同上面几套模板的规矩）。"""
+    existing = {t.name for t in db.scalars(select(ExamAnalysisTemplate))}
+    added = 0
+    for i, spec in enumerate(BUILTIN_EXAM_ANALYSIS_TEMPLATES):
+        if spec["name"] in existing:
+            continue
+        db.add(ExamAnalysisTemplate(
+            owner_id=config.OWNER_ID,
+            name=spec["name"],
+            sections=json.dumps(spec["sections"], ensure_ascii=False),
+            is_builtin=1,
+            sort_order=i,
+        ))
+        added += 1
+    if added:
+        db.commit()
+    return added
+
+
 def seed_all(db: Session) -> dict:
     return {
         "curricula_added": ensure_curricula(db),
@@ -445,4 +516,5 @@ def seed_all(db: Session) -> dict:
         "templates_added": ensure_feedback_templates(db),
         "doc_templates_added": ensure_feedback_doc_templates(db),
         "paper_templates_added": ensure_paper_templates(db),
+        "exam_templates_added": ensure_exam_analysis_templates(db),
     }

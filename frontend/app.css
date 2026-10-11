@@ -582,3 +582,19 @@ body.notes-zen .notes-toc { max-height: none; }
 .lesson-row .q-rich { max-height: 132px; }
 .lesson-row .q-rich.q-rich-sm { max-height: 88px; }
 
+
+/* ---------------- 考试情况（学生详情页 + 记考试弹窗） ----------------
+   「试题与答题卡」的照片必须看得见缩略图才敢确认传对了 —— 沿用作业原件那套（.hw-thumb）。 */
+.exam-row { border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 10px 12px; }
+.exam-row + .exam-row { margin-top: 8px; }
+.exam-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.exam-head .spacer { flex: 1; }
+/* 分数是这一行里最该被一眼看到的东西 */
+.exam-head .exam-score { font-size: 16px; font-weight: 600; }
+.exam-file { display: flex; gap: 8px; align-items: center; margin-top: 8px; }
+.exam-thumb { display: block; height: 52px; max-width: 96px; object-fit: cover;
+              border: 1px solid var(--border); border-radius: var(--radius-sm); cursor: zoom-in; }
+/* 考情分析的一段：标题 + 提示语 + 正文输入框 */
+.exam-sec { margin-top: 10px; }
+.exam-sec .lb { font-size: 13px; color: var(--text-2); }
+.exam-sec textarea { margin-top: 4px; }

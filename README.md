@@ -185,7 +185,10 @@ vendor 全加载不到而 `#app` 里只是未渲染的原始模板（1.8 万字�
   同一篇笔记能出**教师版（含答案）/ 学生版（不含答案）**两版
 - **课后补充** —— 下课后把这次觉得该练的题与笔记挑进「今天这节课」，下节课一键打印学生版
 - **课前备课** —— 上课前给这节课写四段准备（教学目标 / 重点难点 / 教学流程 / 准备材料）、
-  挑这节课要用的题与笔记；写完可**一键存成笔记**，也能**从笔记库选取**一篇关联（双向联动）
+  挑这节课要用的题与笔记；还能**上传备课材料**（格式不限 —— 讲义、压缩包、录课视频都行，
+  电脑上做好的 `.lnk` 快捷方式也能直接传，原文件不复制、不占双份空间），
+  一律落到该节课的归档目录 `uploads/students/<学生>/<上课日期>/`；
+  写完可**一键存成笔记**，也能**从笔记库选取**一篇关联（双向联动）
 
 > 文档都在 `docs/`：
 >
@@ -355,6 +358,7 @@ cd backend
 ./.venv/Scripts/python.exe test_render_page.py     # 前端自检：两个页面 jsdom **真实挂载**（不连服务；没装 jsdom 就跳过）
 ./.venv/Scripts/python.exe test_schedule_import.py # 课表 Excel 导入：解析 / 匹配查重 / 入库 / 模板 / 月历（临时库，不连服务、不发 HTTP）
 ./.venv/Scripts/python.exe test_paper_ui.py        # 前端自检：题干渲染接线 / 标签多关键词搜索 / 打开不自动加载文档（纯静态 + node，不连服务）
+./.venv/Scripts/python.exe test_prep_files.py       # 备课材料上传：任意格式 / 只归档不抽文字 / 三份清单隔离 / 归档到「学生·日期」（临时库 + node，不连服务）
 ```
 
 > `test_paper_ui.py` 覆盖三块：
@@ -367,6 +371,15 @@ cd backend
 >   ⚠️ SPA 页（`index.html` 走 `<script type="module">`）**没法用 jsdom 真挂**
 >   —— jsdom 不执行 ES module。所以出卷页只到「模板能编译 + 接线正确」这一层，
 >   最后那一眼得靠人（对比：`batch.html` / `entry.html` 是零构建页面，能被 `render_check.js` 真挂一遍）。
+
+> `test_prep_files.py` 守的是「备课材料」这条路：它与「上课文件」共用 `lesson_files`
+> + `services/storage.py` 那套归档，只是 `role='prep'` —— **不限格式、刻意不抽文字**
+> （status 记 `archived`，而不是冒充「读出 0 字」）。三条最容易被改坏的前提：
+> - `.lnk` 快捷方式**必须**传得上来：前端 file input 不能设 `accept`（设了文件对话框
+>   就把 .lnk 藏起来），后端也不能拿「能抽出文字」的白名单卡它 —— 卡了就正好把需求挡在门外。
+> - 三份清单（`material` / `homework` / `prep`）**互相看不见**，否则备课材料会被
+>   AI 润色当成参考资料读进去。
+> - 归档目录的日期取**课时 `start_at`**，不是上传当天（不然「那天讲了什么」就散了）。
 
 > `test_schedule_import.py` 起服务也不连 —— 它把临时库（`$TEMP/shike_schedule_scratch`）
 > 直接建表，然后**直接调用** `routers/lesson_import.py` 里的 `preview` / `commit`
@@ -463,7 +476,10 @@ cd backend
   `shike.db-wal` 里没合并回主库，只拷主文件会拷走一份缺一块的数据
 - 数据库结构需要变更时，启动会自动备份到 `backend/data/backups/`，只保留最近 10 份
   （`SHIKE_BACKUP_KEEP` 可改）
-- 上传的原文件、页面渲染缓存、裁剪截图存在 `backend/data/uploads/`
+- 上传的原文件、页面渲染缓存、裁剪截图存在 `backend/data/uploads/`。
+  「上课文件 / 学生作业原件 / 备课材料」按 `uploads/students/<u<id>_姓名>/<上课日期>/`
+  归档 —— 按**上课日期**分而不是上传日期，回顾「那天讲了什么」时才找得到。
+  三类各是一份清单、互相看不见（备课材料只归档、不抽文字，不会被 AI 当参考资料读进去）
 - 知识点树在 `data/math-knowledge-tree.json`，接口为 `GET /api/tree`
 
 ## 使用流程

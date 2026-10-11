@@ -181,7 +181,8 @@ export const prepApi = {
 /** 上课文件（讲义 / 课件 / 试卷）：上传后由后端在本机抽文字，供 AI 润色当参考资料。
  *  ⚠️ 接的是纯文本接口，模型不收文件本身 —— 所以发出去的是**抽出来的文字**。 */
 export const lessonFilesApi = {
-  /** role: material（上课材料）/ homework（学生作业原件）—— 两份清单互相看不见。 */
+  /** role: material（上课材料）/ homework（学生作业原件）/ prep（备课材料）—— 三份清单互相看不见。
+   *  ⚠️ prep 只归档、**不抽文字**，且不限格式（老师电脑上做好的 .lnk 快捷方式走这一类）。 */
   list: (lessonId, role = 'material') =>
     api.get(`/api/lessons/${lessonId}/files`, { role }),
   upload: (lessonId, formData, role = 'material') =>
@@ -305,6 +306,39 @@ export const homeworkApi = {
   createDim: (body) => api.post('/api/homework-dims', body),
   updateDim: (id, body) => api.patch(`/api/homework-dims/${id}`, body),
   disableDim: (id) => api.del(`/api/homework-dims/${id}`),
+};
+
+/** 考试情况记录：**学生级**（不挂某节课）—— 考试日期和上课日期本来就不一定对得上。
+ *  日期可以是「2026-09-15」，也可以是「2026-09」「9 月中旬」这种不精确的说法。
+ *  试题 / 答题卡**先传暂存区，保存这次考试时才归档** —— 这样填表过程中
+ *  随便改日期/类型都不会牵动文件（归档目录名里带着日期和类型）。 */
+export const examsApi = {
+  list: (studentId) => api.get(`/api/students/${studentId}/exams`),
+  create: (body) => api.post('/api/exams', body),
+  /** 改：**没传的字段 = 不改**（想清空就显式传 null / 空串）。 */
+  update: (id, body) => api.patch(`/api/exams/${id}`, body),
+  /** 删这次考试 —— 连同它的试题/答题卡一起（那些是这次考试的专属材料）。 */
+  remove: (id) => api.del(`/api/exams/${id}`),
+
+  /** 附件进暂存区，返回 cache_key（保存时再搬进正式目录）。
+   *  role：paper（试题）/ sheet（答题卡）/ other（其他往来材料）。 */
+  upload: (formData, role = 'other') =>
+    api.upload('/api/exams/upload' + qs({ role }), formData),
+  /** 真删一份**还没保存**的暂存附件。
+   *  ⚠️ 只在界面上把它从列表里拿掉是没用的：文件不在数据库里，
+   *  任何按记录的清理都碰不到它，会一直躺在硬盘上。 */
+  removeCache: (cacheKey) => api.post('/api/exams/upload/remove', { cache_key: cacheKey }),
+
+  /** 已归档附件：删 / 改归类 / 取原件（inline=1 时图片就地显示）。 */
+  removeFile: (id) => api.del(`/api/exam-files/${id}`),
+  setFileRole: (id, role) => api.patch(`/api/exam-files/${id}`, { role }),
+  rawUrl: (id, inline) => `/api/exam-files/${id}/raw` + (inline ? '?inline=1' : ''),
+
+  /** 考情分析模板：一次分析该写哪几段（内置两套，可改不可删）。 */
+  templates: () => api.get('/api/exam-analysis-templates'),
+  createTemplate: (body) => api.post('/api/exam-analysis-templates', body),
+  updateTemplate: (id, body) => api.patch(`/api/exam-analysis-templates/${id}`, body),
+  removeTemplate: (id) => api.del(`/api/exam-analysis-templates/${id}`),
 };
 
 export const systemApi = {

@@ -524,3 +524,91 @@ class FigureCropIn(BaseModel):
 
     regions: List[BatchRegionIn]
     gap: int = 0
+
+
+# ============================================================ 考试情况记录
+class ExamFileIn(BaseModel):
+    """一份**已经传进暂存区**的附件（cache_key 由 POST /api/exams/upload 给）。
+
+    保存考试时服务端才把它从暂存区搬进正式归档目录并登记。
+    为什么要分两步：老师在填表时随时可能改日期/类型，而归档目录名是从这两样来的 ——
+    先落盘再登记的话，每改一次日期就得连人带文件搬一次家。
+    """
+
+    cache_key: str
+    role: Literal["paper", "sheet", "other"] = "other"
+    # 上传时的原名。暂存文件名已被安全洗字，带怪字符的名字会差一两个字符 ——
+    # 界面把它回传上来，库里 `name` 就还是老师当初选的那份文件的名字。
+    name: str = ""
+
+
+class ExamAnalysisIn(BaseModel):
+    """考情分析：选了哪套模板 + 各段写下的文字。
+
+    template_name 与 sections 里的 label 都**快照存下来** ——
+    模板日后被改名或删掉，这条记录也得显示得出来（与备课材料 title 快照同理）。
+    """
+
+    template_id: Optional[int] = None
+    template_name: str = ""
+    sections: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+class ExamIn(BaseModel):
+    """新建一次考试记录。
+
+    exam_date 是**自由文本**（'2026-09-15' / '2026-09' / '9 月中旬' 都合法），
+    date_key 由服务端解析，前端不用管。
+    score / full_score / grade 三者都可留空 —— 有的卷子只报等级，有的老师还没查到分。
+    ⚠️ 空值一律存 NULL，**绝不归一成 0**：用 0 顶替会把得分率和趋势一起带偏。
+    """
+
+    student_id: int
+    exam_date: str = ""
+    exam_type: str = ""
+    score: Optional[float] = None
+    full_score: Optional[float] = None
+    grade: str = ""
+    analysis: Optional[ExamAnalysisIn] = None
+    files: List[ExamFileIn] = Field(default_factory=list)
+
+
+class ExamPatch(BaseModel):
+    """改一次考试记录。
+
+    **没传的字段 = 不改**（与 PaperTemplateIn 同一套语义）。这条很重要：
+    只想改个成绩的调用，不该把考情分析整篇抹掉。
+    （想清空就显式传 null / 空串 —— 「传了」和「没传」是两件事。）
+    """
+
+    exam_date: Optional[str] = None
+    exam_type: Optional[str] = None
+    score: Optional[float] = None
+    full_score: Optional[float] = None
+    grade: Optional[str] = None
+    analysis: Optional[ExamAnalysisIn] = None
+    files: Optional[List[ExamFileIn]] = None
+
+
+class ExamCacheRemoveIn(BaseModel):
+    """删掉暂存区里一份**还没保存**的附件（相当于把「已选」撤回）。"""
+
+    cache_key: str
+
+
+class ExamFileRoleIn(BaseModel):
+    """改一份附件的归类（试题 / 答题卡 / 其他）—— 传错了不用删了重传。"""
+
+    role: Literal["paper", "sheet", "other"]
+
+
+class ExamAnalysisTemplateIn(BaseModel):
+    """考情分析模板。sections 形状见 services / models.ExamAnalysisTemplate。
+
+    sections 给 Optional 而不是默认空列表：**没传 = 不改这几段**，
+    这样「只改个模板名」不会把段落结构一起清空。
+    """
+
+    name: str = ""
+    sections: Optional[List[Dict[str, Any]]] = None
+    sort_order: int = 0

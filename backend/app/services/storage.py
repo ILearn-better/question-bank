@@ -155,6 +155,105 @@ def remove_student_dir(student) -> int:
     return n
 
 
+# ---------------------------------------------------------------- 考试资料
+# 布局：data/uploads/students/u1_李芹旭/exams/2026-09-15_月考/试题.pdf
+#
+# 为什么在 student 下**单独一层 exams/**，而不是并进 <上课日期> 文件夹：
+#   · 翻文件夹时要能一眼分清「这是上课材料」和「这是考试卷子」，动机完全不同；
+#   · 考试那天常常根本没排课，硬要塞进「上课日期」目录就得凭空造一个日期出来。
+def exam_dir_label(exam) -> str:
+    """考试归档目录名：`<日期>_<类型>`。
+
+    日期写的是老师自己填的**原文**（'2026-09'、'9月中旬' 都行，见 models.Exam），
+    两个都空时给个能看的兜底 —— 目录名空着比「未标日期_未标类型」更让人困惑。
+    """
+    d = safe_token(getattr(exam, "exam_date", ""), "未标日期")
+    t = safe_token(getattr(exam, "exam_type", ""), "未标类型")
+    return f"{d}_{t}"
+
+
+def exam_rel(student, exam) -> str:
+    """这次考试的归档目录（相对 UPLOAD_DIR，正斜杠）。"""
+    return f"students/{student_folder(student)}/exams/{exam_dir_label(exam)}"
+
+
+def exam_dir(student, exam) -> Path:
+    """拿到归档目录并确保存在。"""
+    d = config.UPLOAD_DIR / exam_rel(student, exam)
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def unique_dir_name(parent: Path, name: str, ignore: str | None = None) -> str:
+    """同名**目录**加 `_2`、`_3`。
+
+    同一个学生真可能有两场「2026-09_月考」（不同科目、或学校自己重复命名），
+    直接撞名会把两次考试的附件混进同一个文件夹。
+    ignore：把自己现有目录的名字排除掉 —— 改日期时算新目录名，
+    不排除自己就会一路变成「_2」「_3」，等于每改一次就搬一次家。
+    """
+    if ignore and name == ignore:
+        return name
+    try:
+        taken = {p.name for p in parent.iterdir() if p.is_dir()}
+    except OSError:
+        taken = set()
+    if name not in taken:
+        return name
+    i = 2                               # 从 _2 起（与文件同名规则 unique_name 一致）
+    while f"{name}_{i}" in taken:
+        i += 1
+    return f"{name}_{i}"
+
+
+def move_dir_contents(old: Path, new: Path) -> dict[str, str]:
+    """把 old 里的文件搬进 new（同名加 _2），返回 {旧文件名: 新文件名}；old 空了就收掉。
+
+    用于「老师改了考试的日期/类型」—— 归档目录得跟着改名。不搬的话，
+    之后再传的卷子会落到新目录，同一次考试的附件就散在两个文件夹里：
+    这种错误没有任何报错，只能靠人翻文件夹时发现「怎么少了一半」。
+    """
+    out: dict[str, str] = {}
+    if not old.is_dir() or old.resolve() == new.resolve():
+        return out
+    new.mkdir(parents=True, exist_ok=True)
+    for p in sorted(old.iterdir()):
+        if not p.is_file():
+            continue
+        dest_name = unique_name(new, p.name)
+        try:
+            shutil.move(str(p), str(new / dest_name))
+        except OSError:
+            continue                      # 单个文件搬不动不该让整次改名失败
+        out[p.name] = dest_name
+    prune_empty_dirs([old])
+    return out
+
+
+# 考试附件的暂存区别名（config.EXAM_CACHE_DIR 的名字）。
+# 单独取名字而不是再写一遍字面量：安全拼接（safe_cache_path）必须知道根在哪，
+# 而这个字符串一旦跟前端算出来的 key 前缀对不上，暂存文件就会永远搬不过去。
+EXAM_CACHE_NAME = config.EXAM_CACHE_DIR.name
+
+
+def safe_cache_path(key: str | None) -> Path | None:
+    """暂存区 key（形如 `ab12cd34ef56/试卷.pdf`）-> 磁盘路径；任何越界返回 None。
+
+    比 storage.safe_join 多一道闸：**路径必须真的落在 exams_cache/ 里面**。
+    否则一个构造出来的 key（比如 `students/u1_x/xxx`）就能借道删掉正式归档里的文件。
+    """
+    if not key:
+        return None
+    p = safe_join(f"{EXAM_CACHE_NAME}/{str(key).lstrip('/')}")
+    if p is None:
+        return None
+    try:
+        p.resolve().relative_to((config.UPLOAD_DIR / EXAM_CACHE_NAME).resolve())
+    except ValueError:
+        return None
+    return p
+
+
 def unique_name(directory: Path, filename: str) -> str:
     """同名文件加 `_2`、`_3` —— 一天里传两份「讲义.pdf」是完全正常的。"""
     name = Path(filename).name
@@ -264,10 +363,12 @@ def prune_empty_dirs(dirs, stop: Path | None = None) -> int:
     return removed
 
 
-def unlink_rels(rels: list[str]) -> int:
+def unlink_rels(rels: list[str], stop: Path | None = None) -> int:
     """删掉这些相对路径对应的文件，返回删掉几个。越界的路径直接忽略。
 
     顺手把因此空掉的目录也收掉（见 prune_empty_dirs）。
+    stop：收到哪一层就停手。考试附件传 `stop=<学生目录>` ——
+    删掉最后一个附件不该把老师自己也在用的学生文件夹整个铲掉。
     """
     n = 0
     parents = set()
@@ -282,7 +383,7 @@ def unlink_rels(rels: list[str]) -> int:
                 n += 1
         except OSError:
             pass
-    prune_empty_dirs(parents)
+    prune_empty_dirs(parents, stop=stop)
     return n
 
 
