@@ -13,7 +13,8 @@
   ⑦    模板
   ⑧⑨  匹配、查重、入库（临时库 + 直接调函数，一次 HTTP 都不发）
   ⑩⑪  前端守卫（Vue 真编译器校验模板；日历格子用 node 跑 calendar.js）
-  ⑫    一致性守卫（注册顺序、计费唯一出处、依赖声明、文档）
+  ⑫    计费（应收 vs 待上：缺单价的待上不许当 0）
+  ⑬    一致性守卫（注册顺序、计费唯一出处、依赖声明、文档）
 
 ⚠️ 临时库必须在 import app.db **之前**设好 —— engine 绑定在 import 时定死。
    这是本项目自包含测试的标准做法（见 test_batch_page_ai_flow.py）。
@@ -48,7 +49,13 @@ from app.models import Base, Lesson, Student        # noqa: E402
 from app.routers.lesson_import import (             # noqa: E402
     ImportCommitIn, ImportRowIn, MAX_UPLOAD, commit, preview,
 )
-from app.services import schedule_import as SI       # noqa: E402
+from app.routers.lessons import (                   # noqa: E402
+    _apply_billing, billing_monthly, patch_lesson,
+)
+from app.routers.students import create_student     # noqa: E402
+from app.schemas import LessonPatch, StudentIn      # noqa: E402
+from app.services import billing as BI              # noqa: E402
+from app.services import schedule_import as SI      # noqa: E402
 
 assert str(config.DB_PATH) == str(TMP / "schedule.db"), f"临时库没生效：{config.DB_PATH}"
 
@@ -561,9 +568,11 @@ def t_frontend() -> None:
     cal = FE / "src" / "calendar.js"
     sched = FE / "src" / "views" / "Schedule.js"
     dlg = FE / "src" / "components" / "ScheduleImportDialog.js"
+    sfd = FE / "src" / "components" / "StudentFormDialog.js"
+    stu = FE / "src" / "views" / "Students.js"
     api = FE / "src" / "api.js"
     css = FE / "app.css"
-    for p in (cal, sched, dlg, api, css):
+    for p in (cal, sched, dlg, sfd, stu, api, css):
         check(f"{p.relative_to(ROOT)} 存在", p.exists(), str(p))
 
     src = cal.read_text(encoding="utf-8")
@@ -587,15 +596,74 @@ def t_frontend() -> None:
     check("月历里用 grid 渲染格子", 'v-for="(c, i) in grid"' in src, "")
     check("点空格能排课（openCreate 带日期）", "openCreate(c.date)" in src, "")
     check("翻月用 shiftPeriod", "shiftPeriod(" in src, "")
+    check("顶部有「本月待上（未上课）」的课时费",
+          "本月待上（未上课）" in src and "pending_total_amount" in src, "")
+    check("课时费表有学生级「待上」列（金额 + 节数）",
+          "pending_amount" in src and "pending_lessons" in src, "")
+    check("★ 缺单价的待上必须给提示（不许静默当 0）",
+          "pending_no_rate" in src and "没填单价" in src, "")
+    check("文案写清口径：已上 = 到手的钱；待上上完会自动转过去",
+          "已经到手的钱" in src and "会自动转到" in src, "")
+
+    # ---- 月历：编辑 / 删除 / 拖动调课（2026-10-11）----
+    check("★ 单击课块延迟弹窗（双击的第一次 click 不能顺手把编辑弹窗打开）",
+          "CLICK_DELAY" in src and "setTimeout(() => { clickTimer = null; openEdit(ls); }" in src,
+          "")
+    check("★ 双击课块进入「调课模式」", "onItemDbl" in src and "dragMode.value = ls.id" in src, "")
+    check("★ 只有解锁后才 draggable（常驻 draggable 会把单击手抖当成拖动）",
+          ':draggable="dragMode === ls.id"' in src, "")
+    check("★ 放开只改日期、开始时间原样带过去（PATCH start_at 一处写库）",
+          "lessonsApi.update(ls.id, { start_at: `${day}T${ls.start_at.slice(11, 16)}` })" in src, "")
+    check("★ 拖回原地（同一天）不发请求", "ls.start_at.slice(0, 10) === day" in src, "")
+    check("★ Esc 能取消，且卸载时摘掉 keydown 监听（别泄漏）",
+          "onBeforeUnmount" in src and "removeEventListener('keydown'" in src, "")
+    check("★ 编辑弹窗里有「删除这节课」（月历里终于能删了）",
+          "删除这节课" in src and "remove(editing.lesson)" in src, "")
+    check("编辑弹窗里还能「标记完成」",
+          "标记完成" in src and "complete(editing.lesson)" in src, "")
+    check("格子接住 dragover / drop 且 prevent 掉浏览器默认行为",
+          '@dragover.prevent="onDragOver(c.date)"' in src
+          and '@drop.prevent="onDrop(c.date)"' in src, "")
+    check("调课时顶部有提示条（写清怎么放开、怎么取消）",
+          "cal-drag-tip" in src and "取消（Esc）" in src, "")
 
     src = dlg.read_text(encoding="utf-8")
     check("导入弹窗三步：pick/preview/done",
           all(f"step === '{s}'" in src for s in ("pick", "preview", "done")), "")
     check("有「下载导入模板」入口", "下载导入模板" in src, "")
-    check("有「顺手把这几个学生还建到系统里」开关", "顺手把这几个学生" in src, "")
+    # ---- 学生对不上 → 问一句 → 进创建流程（2026-10-11）----
+    check("★ 预览一出来就问「这些学生要现在建吗」（不是默默跳过那几行）",
+          "有学生系统里还没有，要现在建吗" in src and "ask.value = true" in src, "")
+    check("★「现在创建」走完整的学生档案表单（引入 StudentFormDialog + 传 preset-name）",
+          "from './StudentFormDialog.js'" in src and ":preset-name=" in src, "")
+    check("★ 建完用同一份文件重新核对（lastFile 留着 + refresh）",
+          "lastFile" in src and "async function refresh" in src, "")
+    check("★ 建完自动接着填下一个（queue 出队 → creating 换人）",
+          "queue.value = rest" in src and "creating.value = rest[0]" in src, "")
+    check("保留「直接建空档案」这条快路（旧行为没被砍掉）",
+          "直接建空档案" in src and "createBlankAll" in src, "")
+    check("对不上的提示块比黄字显眼（.import-unknown）",
+          'class="import-unknown"' in src, "")
     check("默认只勾 action=import 的行", "r.action === 'import'" in src, "")
     check("表内重复与库重复文案不同（dupText）", "dupText" in src and "表内写重了" in src, "")
     check("无单价的行有提示", "没有单价" in src, "")
+
+    # ---- 学生档案表单：只有一份（学生页与导入流程共用）----
+    stu_src = stu.read_text(encoding="utf-8")
+    check("★ Students.js 用共用的 StudentFormDialog", "StudentFormDialog" in stu_src, "")
+    check("★ Students.js 里不再自带那份表单（否则学生字段两处会漂移）",
+          'v-model="form.parent_contact"' not in stu_src
+          and "toggleCurriculum" not in stu_src, "")
+    sfd_src = sfd.read_text(encoding="utf-8")
+    check("StudentFormDialog 能预填姓名（presetName，导入时带过来的名字）",
+          "presetName" in sfd_src and "props.presetName" in sfd_src, "")
+    check("StudentFormDialog 保存后刷新全局学生列表（loadStudents(true)）",
+          "loadStudents(true)" in sfd_src, "")
+    check("StudentFormDialog 重名时给软提示（导入是按姓名对学生的）",
+          "已经有一个叫" in sfd_src, "")
+    # 表单字段必须覆盖后端 StudentIn 的每一个字段 —— 补档案少了字段就是白填
+    miss = [f for f in StudentIn.model_fields if f not in sfd_src]
+    check(f"StudentFormDialog 覆盖 StudentIn 的全部字段（缺：{miss or '无'}）", not miss, str(miss))
 
     src = api.read_text(encoding="utf-8")
     check("api.js 有 scheduleImportApi.templateUrl/preview/commit",
@@ -610,6 +678,13 @@ def t_frontend() -> None:
               re.search(rf"(?:^|[,{{]\s*){re.escape(cls)}\b", src, re.M) is not None, "")
     check("填位格 / 今天 有区分样式（.cal-cell.out / .cal-cell.today）",
           ".cal-cell.out" in src and ".cal-cell.today" in src, "")
+    check("app.css 有 .grid.cols-5（顶部 5 张卡片）", ".grid.cols-5" in src, "")
+    check("app.css 有 .import-unknown（导入时「学生对不上」的提示块）",
+          ".import-unknown" in src, "")
+    for cls in (".cal-item.armed", ".cal-item.dragging", ".cal-cell.drag-over", ".cal-drag-tip"):
+        check(f"app.css 有 {cls}（拖动调课的视觉反馈）", cls in src, "")
+    check("待上用橙色与「已上」区分（.v.pending / td.pending）",
+          ".v.pending" in src and "td.pending" in src, "")
 
     # ---- Vue 真编译器：抓 compiler-30（孤立的 v-else-if）这类模板错误 ----
     # ⚠️ 这里有两个坑，都踩过：
@@ -624,6 +699,15 @@ def t_frontend() -> None:
     if not node:
         print("  [SKIP] node 不在 PATH 上，跳过模板编译校验")
         return
+
+    # ---- JS 语法（setup 里的代码写错时，模板编译照样通过，页面却直接白屏）----
+    for path in (sched, dlg, sfd, stu):
+        tmp = TMP / (path.stem + "_chk.mjs")
+        shutil.copyfile(path, tmp)
+        rr = subprocess.run([node, "--check", str(tmp)], capture_output=True, text=True, timeout=60)
+        check(f"{path.name} 的 JS 语法（node --check）",
+              rr.returncode == 0, (rr.stderr or "").strip()[:160])
+
     vue = FE / "vendor" / "vue.global.prod.js"
     check("vendor/vue.global.prod.js 存在", vue.exists(), str(vue))
     if not vue.exists():
@@ -656,7 +740,7 @@ def t_frontend() -> None:
         encoding="utf-8")
 
     tpl_files = []
-    for path in (sched, dlg):
+    for path in (sched, dlg, sfd, stu):
         tpl = extract_template(path)
         check(f"{path.name} 能提取出 template（模板写成字符串常量）",
               bool(tpl) and tpl.rstrip().endswith(">"), (tpl or "")[-60:])
@@ -783,9 +867,216 @@ def t_calendar() -> None:
         check(f"node 侧 {n} 项里 0 失败", bad == "0", f"失败 {bad} 项")
 
 
-# ================================================================ ⑫ 一致性守卫
+# ================================================================ ⑫ 计费：应收 vs 待上
+def t_billing_pending() -> None:
+    section("⑫ 月度汇总：应收 / 待上（未上课）—— 缺单价的待上不许当 0 蒙过去")
+    db = SessionLocal()
+    P = "2099-07"                     # 专属月份，别和 seed 的那条课混在一起
+    try:
+        a = Student(owner_id=config.OWNER_ID, name="计费甲", hourly_rate=200.0,
+                    rate_unit="hour", status="active")
+        b = Student(owner_id=config.OWNER_ID, name="计费乙", hourly_rate=None,
+                    rate_unit="hour", status="active")
+        db.add_all([a, b])
+        db.commit()
+
+        def mk(sid: int, day: str, status: str, rate: float | None,
+               dur: int = 60, billable: int = 1):
+            """造一节课并**走真实计费规则**（_apply_billing 是金额的唯一出处）。"""
+            ls = Lesson(owner_id=config.OWNER_ID, student_id=sid, start_at=f"{P}-{day}T19:00",
+                        duration_min=dur, status=status, rate=rate, billable=billable,
+                        node_ids="[]")
+            _apply_billing(db, ls)
+            db.add(ls)
+            db.flush()
+            return ls
+
+        mk(a.id, "01", "done", 200.0)              # 已上 60min  → 200
+        mk(a.id, "02", "makeup", 200.0)            # 补课 60min  → 200
+        mk(a.id, "03", "scheduled", 200.0, 90)     # 待上 90min  → 300
+        mk(a.id, "04", "scheduled", 200.0)         # 待上 60min  → 200
+        mk(a.id, "05", "cancelled", 200.0)         # 取消 —— 两边都不算
+        mk(a.id, "06", "leave", 200.0)             # 请假 —— 两边都不算
+        mk(b.id, "07", "scheduled", None)          # 待上但**没单价** → amount = None
+        db.commit()
+
+        s = billing_monthly(P, db)
+
+        check("应收只含 done + makeup：200 + 200 = 400",
+              s["total_amount"] == 400.0, str(s["total_amount"]))
+        check("已上节数只数 done/makeup（2 节）", s["total_lessons"] == 2, str(s["total_lessons"]))
+        check("已上课时 60 + 60 = 120 分钟", s["total_minutes"] == 120, str(s["total_minutes"]))
+
+        check("★ 待上金额 = 300 + 200 = 500（scheduled 单独算，不并进应收）",
+              s["pending_total_amount"] == 500.0, str(s["pending_total_amount"]))
+        check("待上节数 = 3（甲 2 节 + 乙 1 节）",
+              s["pending_total_lessons"] == 3, str(s["pending_total_lessons"]))
+        check("待上课时 90 + 60 + 60 = 210 分钟",
+              s["pending_total_minutes"] == 210, str(s["pending_total_minutes"]))
+        check("★ 取消 / 请假两边都不计（那两节 200 一点没进来）",
+              s["total_amount"] == 400.0 and s["pending_total_amount"] == 500.0,
+              f"{s['total_amount']} / {s['pending_total_amount']}")
+        check("★ 没单价的待上进 pending_no_rate，不当 0 蒙过去",
+              s["pending_no_rate"] == 1, str(s["pending_no_rate"]))
+
+        row_a = [r for r in s["students"] if r["student_id"] == a.id][0]
+        row_b = [r for r in s["students"] if r["student_id"] == b.id][0]
+        check("甲：应收 400 / 待上 500",
+              row_a["amount"] == 400.0 and row_a["pending_amount"] == 500.0, str(row_a))
+        check("甲：待上 2 节 150 分钟",
+              row_a["pending_lessons"] == 2 and row_a["pending_minutes"] == 150, str(row_a))
+        check("甲：pending_no_rate = 0（他的课都有单价）", row_a["pending_no_rate"] == 0, str(row_a))
+        check("乙：应收 0；待上 1 节但金额算不出来（0），并报 pending_no_rate=1",
+              row_b["amount"] == 0.0 and row_b["pending_lessons"] == 1
+              and row_b["pending_amount"] == 0.0 and row_b["pending_no_rate"] == 1, str(row_b))
+
+        check("别的月份不受影响（2099-08 应为空）",
+              billing_monthly("2099-08", db)["students"] == [], "")
+
+        # 按次计价（rate_unit='session'）：金额与时长无关，也走同一条路。
+        # ⚠️ 单价快照是**上游**填的：lessons.py 先 resolve_rate(学生, 传进来的值)
+        #    再写进 Lesson.rate —— _apply_billing 只看 Lesson.rate，不认学生默认价。
+        #    这里照着真实路径走，别图省事直接塞 None，否则测的是另一条路。
+        c = Student(owner_id=config.OWNER_ID, name="计费丙", hourly_rate=380.0,
+                    rate_unit="session", status="active")
+        db.add(c)
+        db.commit()
+        mk(c.id, "09", "scheduled", BI.resolve_rate(c, None), dur=120)
+        db.commit()
+        s3 = billing_monthly(P, db)
+        row_c = [r for r in s3["students"] if r["student_id"] == c.id][0]
+        check("按次计价：待上 120 分钟也只算 380（与时长无关）",
+              row_c["pending_amount"] == 380.0, str(row_c))
+
+        # ---- 已知行为（本轮**刻意不改**，只钉住现状，免得哪天悄悄变了没人发现）----
+        # 已上的课如果没单价，amount 是 None → `or 0.0` 会让它**静默不进应收**。
+        # 待上那边已经用 pending_no_rate 把这个情况报出来了，已上这边还没有。
+        mk(b.id, "10", "done", None)
+        db.commit()
+        s4 = billing_monthly(P, db)
+        check("[已知行为] 已上但没单价的课：节数 +1、金额不动（静默漏算，待定）",
+              s4["total_lessons"] == 3 and s4["total_amount"] == 400.0,
+              f"lessons={s4['total_lessons']} amount={s4['total_amount']}")
+    finally:
+        db.close()
+
+
+# ================================================================ ⑬ 建学生 → 再导
+def t_create_student_then_import() -> None:
+    section("⑬ 学生对不上 → 建好档案 → 重新预览就能导（端到端）")
+    # 表里没写单价、学生也不存在：这行既「对不上学生」又「定不出单价」
+    data = mk_xlsx([HEAD, ["2026-10-12", "10:00", "小刚", 60, "第一次课", "线下", "", "", "scheduled"]])
+    db = SessionLocal()
+    try:
+        res1 = asyncio.run(preview(file=upload(data), db=db))
+        r0 = res1["rows"][0]
+        check("① 预览：小刚对不上 → action=no_student", r0["action"] == "no_student", str(r0["action"]))
+        check("① unknown_students = ['小刚']（前端就拿它去建）",
+              res1["unknown_students"] == ["小刚"], str(res1["unknown_students"]))
+        check("① counts.no_student = 1", res1["counts"]["no_student"] == 1, str(res1["counts"]))
+        check("① student_id 为空、也定不出单价", r0["student_id"] is None and r0["rate_effective"] is None,
+              f"{r0['student_id']} / {r0['rate_effective']}")
+
+        # 老师点「现在创建」→ 走学生档案（Students 页那张表单，含默认单价）
+        made = create_student(StudentIn(name="小刚", nickname="刚子", grade="中四",
+                                        hourly_rate=500.0, rate_unit="hour", status="active"), db)
+        check("② 学生档案建好了（姓名 + 默认单价）",
+              made["name"] == "小刚" and made["hourly_rate"] == 500.0, str(made))
+
+        # 前端 refresh()：拿同一份文件重新解析/匹配
+        res2 = asyncio.run(preview(file=upload(data), db=db))
+        r1 = res2["rows"][0]
+        check("★ ③ 重新预览：同一行变成「可导入」（不用回 Excel 改）",
+              r1["action"] == "import", str(r1["action"]))
+        check("★ ③ student_id 已填上（提交时直接用 id，不再靠名字猜）",
+              r1["student_id"] == made["id"], str((r1["student_id"], made["id"])))
+        check("③ 单价取到学生默认价 500",
+              r1["rate_effective"] == 500.0, str(r1["rate_effective"]))
+        check("③ 不再报「无单价」也不再有对不上的学生",
+              res2["counts"]["no_rate"] == 0 and res2["unknown_students"] == [],
+              f"{res2['counts']} / {res2['unknown_students']}")
+
+        rep = commit(ImportCommitIn(rows=[ImportRowIn(
+            row_no=r1["row_no"], date=r1["date"], time=r1["time"], student=r1["student"],
+            student_id=r1["student_id"], duration_min=r1["duration_min"], topic=r1["topic"],
+            mode=r1["mode"], location=r1["location"], rate=r1["rate"],
+            status=r1["status"])], create_students=False), db)
+        check("④ 提交后真的入库（0 跳过）", rep["created"] == 1 and rep["skipped"] == 0, str(rep))
+        lesson = db.scalar(select(Lesson).where(Lesson.start_at == "2026-10-12T10:00"))
+        check("④ 课时费算得出来：60 分钟 × 500 元/小时 = 500",
+              lesson is not None and lesson.amount == 500.0,
+              str(lesson.amount if lesson else None))
+        check("④ 这节课挂在刚建的学生名下",
+              lesson is not None and lesson.student_id == made["id"],
+              str((lesson.student_id, made["id"]) if lesson else None))
+
+        # 反例：名字写错（Excel 里是「小刚刚」）→ 建完学生也照样对不上，绝不放行
+        bad = mk_xlsx([HEAD, ["2026-10-13", "10:00", "小刚刚", 60, "", "", "", "", "scheduled"]])
+        res3 = asyncio.run(preview(file=upload(bad), db=db))
+        check("★ 名字写错（小刚刚）仍然对不上 → 不会被悄悄放行",
+              res3["rows"][0]["action"] == "no_student", str(res3["rows"][0]["action"]))
+
+        # 「直接建空档案」那条路（create_students=True）建出来的是没单价的空壳 ——
+        # 前端在询问框里把这个代价写明了，这里把后端行为钉住
+        rep2 = commit(ImportCommitIn(rows=[ImportRowIn(
+            row_no=200, date="2026-10-14", time="10:00", student="空档案甲",
+            student_id=None, duration_min=60, status="scheduled")], create_students=True), db)
+        check("⑤ 空档案：学生建出来了、课也导了", rep2["created"] == 1, str(rep2))
+        blank = db.scalar(select(Student).where(Student.name == "空档案甲"))
+        check("⑤ 空档案没有默认单价（所以那节课的金额是空的 —— 预览会报 no_rate）",
+              blank is not None and blank.hourly_rate is None, str(blank.hourly_rate if blank else None))
+        check("⑤ 空档案状态 active",
+              blank is not None and blank.status == "active", "")
+    finally:
+        db.close()
+
+
+# ================================================================ ⑭ 拖动调课
+def t_drag_move() -> None:
+    section("⑭ 拖动调课：只改日期、时间不变，钱跟着换月（PATCH 一个 start_at）")
+    db = SessionLocal()
+    try:
+        stu = Student(owner_id=config.OWNER_ID, name="调课甲", hourly_rate=400.0,
+                      rate_unit="hour", status="active")
+        db.add(stu)
+        db.commit()
+        ls = Lesson(owner_id=config.OWNER_ID, student_id=stu.id, start_at="2026-10-20T10:00",
+                    duration_min=60, status="scheduled", rate=400.0, billable=1, node_ids="[]")
+        _apply_billing(db, ls)
+        db.add(ls)
+        db.commit()
+
+        # 用「前后差」比，不依赖这个月库里恰好还有什么（t_commit 也往 2026-10 里放过课）
+        oct0 = billing_monthly("2026-10", db)["pending_total_amount"]
+        nov0 = billing_monthly("2026-11", db)["pending_total_amount"]
+        check("造好的这节 2026-10-20 已在 10 月待上里（+400）", oct0 >= 400.0, str(oct0))
+
+        # 同月内挪一天（拖动最常见的用法）
+        patch_lesson(ls.id, LessonPatch(start_at="2026-10-23T10:00"), db)
+        db.refresh(ls)
+        check("★ 时间部分原样保留（只有日期动了）", ls.start_at == "2026-10-23T10:00", ls.start_at)
+        check("★ 金额没被重算错（60 分钟 × 400/小时 = 400）", ls.amount == 400.0, str(ls.amount))
+        check("同月内挪动不改变 10 月待上总额",
+              billing_monthly("2026-10", db)["pending_total_amount"] == oct0, "")
+
+        # 跨月：拖到 11 月（月历的补位格子里也能放）
+        patch_lesson(ls.id, LessonPatch(start_at="2026-11-03T10:00"), db)
+        db.refresh(ls)
+        check("★ 拖到下个月：10 月少 400",
+              billing_monthly("2026-10", db)["pending_total_amount"] == oct0 - 400.0,
+              str(billing_monthly("2026-10", db)["pending_total_amount"]))
+        check("★ 11 月多 400",
+              billing_monthly("2026-11", db)["pending_total_amount"] == nov0 + 400.0,
+              str(billing_monthly("2026-11", db)["pending_total_amount"]))
+        check("调课不该顺手改状态（还是「已排课」）", ls.status == "scheduled", ls.status)
+        check("单价快照留住了 400（不回头读学生默认价）", ls.rate == 400.0, str(ls.rate))
+    finally:
+        db.close()
+
+
+# ================================================================ ⑮ 一致性守卫
 def t_consistency() -> None:
-    section("⑫ 一致性守卫（注册顺序 / 计费唯一出处 / 依赖 / 文档）")
+    section("⑮ 一致性守卫（注册顺序 / 计费唯一出处 / 依赖 / 文档）")
     main_src = (ROOT / "backend" / "main.py").read_text(encoding="utf-8")
     i_imp = main_src.find("lesson_import.router)")
     i_les = main_src.find("lessons.router)")
@@ -840,6 +1131,9 @@ def main() -> int:
     t_commit(sid_a, sid_b, res)
     t_frontend()
     t_calendar()
+    t_billing_pending()
+    t_create_student_then_import()
+    t_drag_move()
     t_consistency()
 
     print("\n" + "=" * 64)

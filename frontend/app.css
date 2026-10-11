@@ -91,8 +91,9 @@ a { color: var(--primary); text-decoration: none; }
 .grid.cols-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 .grid.cols-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .grid.cols-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.grid.cols-5 { grid-template-columns: repeat(5, minmax(0, 1fr)); }
 @media (max-width: 980px) {
-  .grid.cols-2, .grid.cols-3, .grid.cols-4 { grid-template-columns: 1fr; }
+  .grid.cols-2, .grid.cols-3, .grid.cols-4, .grid.cols-5 { grid-template-columns: 1fr; }
 }
 
 .empty { color: var(--text-3); font-size: 13px; padding: 26px 0; text-align: center; }
@@ -546,6 +547,24 @@ body.notes-zen .notes-toc { max-height: none; }
 .cal-item .t { font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; flex: none; }
 .cal-item .n { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
+/* ---------------- 月历：拖动调课 ----------------
+   双击某节课 → 进入「调课模式」：那条课亮起描边、光标变抓取，并且这时它才是 draggable
+   （常驻 draggable 的话，单击时手抖几像素就被当成拖动，编辑弹窗永远打不开）。
+   拖到哪一格，哪一格亮起来告诉你「能放这儿」。 */
+.cal-item { user-select: none; }
+.cal-item.armed { cursor: grab; outline: 2px solid currentColor; outline-offset: 1px; }
+.cal-item.dragging { opacity: .4; }
+.cal-cell.drag-ready:hover { border-style: dashed; border-color: var(--primary); }
+.cal-cell.drag-over {
+  border-color: var(--primary); background: var(--primary-weak);
+  box-shadow: inset 0 0 0 1px var(--primary);
+}
+.cal-drag-tip {
+  display: flex; align-items: center; flex-wrap: wrap; margin-bottom: 10px;
+  padding: 8px 10px; font-size: 13px; border-radius: 6px;
+  background: var(--primary-weak); color: var(--primary); border: 1px solid var(--primary);
+}
+
 /* 「加课」按钮平时藏起来（104px 的格子里常驻一个按钮太吵），hover 才现身 */
 .cal-add {
   position: absolute; right: 5px; bottom: 5px; width: 20px; height: 20px; padding: 0;
@@ -565,6 +584,15 @@ body.notes-zen .notes-toc { max-height: none; }
 
 /* 导入预览的统计条 */
 .import-summary { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 10px; font-size: 13px; }
+
+/* 课表导入：「这些学生系统里没有」的提示块。
+   要比 notes 那行黄色小字更显眼 —— 它是导入前唯一会漏掉一步就白导的地方
+   （行会被跳过，老师还得自己去学生页补档案再导一遍），所以给它卡片式的边 + 底色。 */
+.import-unknown {
+  margin: 10px 0; padding: 10px 12px; font-size: 13px;
+  background: var(--warning-weak, #fffaeb);
+  border: 1px solid var(--warning, #d97706); border-radius: 6px;
+}
 
 /* ---------------- 出卷：题干的渲染结果 ----------------
    题干是按 Markdown + KaTeX 渲染后由 JS 写 innerHTML 进来的（src/mathRender.js），
@@ -598,3 +626,8 @@ body.notes-zen .notes-toc { max-height: none; }
 .exam-sec { margin-top: 10px; }
 .exam-sec .lb { font-size: 13px; color: var(--text-2); }
 .exam-sec textarea { margin-top: 4px; }
+
+/* ---------------- 课表页：待上（未上课）的课时费 ----------------
+   橙色 = 钱还没到手，刻意跟「已上（应收）」的黑色区分开。 */
+.stat .v.pending { color: var(--warning); }
+table.tbl td.pending { color: var(--warning); font-weight: 600; }

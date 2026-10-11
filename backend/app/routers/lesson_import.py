@@ -178,7 +178,8 @@ async def preview(file: UploadFile = File(...), db: Session = Depends(get_db)):
     if unknown:
         result["notes"] = list(result.get("notes") or []) + [
             "这些学生系统里没有：" + "、".join(result["unknown_students"]) +
-            "。可以先在「学生」里建好再回来导，或导入时勾选「顺手建这几个学生」。"
+            "。导入前会问你要不要顺手建好 —— 可以进学生档案把资料填全（推荐，顺便填上默认单价），"
+            "也可以只落个名字之后补。名字是写错了的话，先回 Excel 改。"
         ]
     if no_rate:
         result["notes"] = list(result.get("notes") or []) + [
