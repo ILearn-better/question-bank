@@ -5,6 +5,12 @@
 接的是纯文本接口，扫描版 PDF / 纯图片课件注定读不了；
 这种情况静默跳过最糟 —— 老师会以为 AI 已经看过那份材料了。
 所以每个文件都留 status + reason，失败原因原样交给界面显示。
+
+三种角色（role），三份清单**互相看不见** —— 同一个归档目录，不同的用途：
+  · material  上课材料（讲义/课件/试卷）→ 抽文字，AI 润色时当参考
+  · homework  学生作业原件 → 抽文字/存图，命名走「学生_日期_序号」
+  · prep      备课材料（课前准备要用的东西）→ **只归档、不抽文字**，格式不限，
+              老师电脑上做好的 .lnk 快捷方式也放这一类（原文件不复制、不占双份空间）
 """
 from __future__ import annotations
 
@@ -30,6 +36,15 @@ MAX_BYTES = 30 * 1024 * 1024      # 30MB。课件/讲义足够，也避免把库
 # 允许「就地显示」的扩展名。只放图片：inline + HTML/SVG 等于开了个 XSS 口子。
 INLINE_OK_EXT = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
 
+# 见文件头：三种角色，各自一份清单。
+ROLES = ("material", "homework", "prep")
+
+
+def _role_or_422(role: str) -> str:
+    if role not in ROLES:
+        raise HTTPException(422, f"不认识的 role {role!r}（可选 {' / '.join(ROLES)}）")
+    return role
+
 
 def _lesson_or_404(db: Session, lid: int) -> Lesson:
     ls = db.get(Lesson, lid)
@@ -44,6 +59,7 @@ def _out(f: LessonFile) -> dict:
         "id": f.id,
         "lesson_id": f.lesson_id,
         "name": f.name,
+        "role": f.role,                 # material / homework / prep，界面上据此分块
         # 落盘时的文件名。作业是 `学生_日期_序号.ext`，和原名不同 ——
         # 界面显示它，老师在文件夹里看到的名字才和界面上是同一个。
         "stored_name": Path(f.stored).name if f.stored else "",
@@ -91,12 +107,18 @@ def collect_text(files: list[LessonFile], total_cap: int = 40000) -> tuple[str, 
 
 
 @router.get("/lessons/{lid}/files")
-def list_files(lid: int, role: str = Query("material", description="material / homework"),
+def list_files(lid: int,
+               role: str = Query("material", description="material / homework / prep"),
                db: Session = Depends(get_db)):
     """这节课的文件。**按 role 分开列**：写反馈时看的是「上课文件」（讲义/课件），
-    作业那条要看的是学生交上来的作业原件 —— 两份清单互相看不见，
-    否则老师会在反馈的文件列表里看到学生的作业照片。
+    作业那条要看的是学生交上来的作业原件，备课弹窗看的又是「备课材料」——
+    三份清单互相看不见，否则老师会在反馈的文件列表里看到学生的作业照片。
+
+    prep（备课材料）额外返回 `archive_only=True` + 空 accept：这类文件只归档、
+    不抽文字，所以既不限格式（.lnk 快捷方式要能传上来），界面也不该拿
+    「抽出 0 字」去吓人。
     """
+    _role_or_422(role)
     ls = _lesson_or_404(db, lid)
     rows = db.scalars(
         select(LessonFile)
@@ -104,10 +126,13 @@ def list_files(lid: int, role: str = Query("material", description="material / h
         .order_by(LessonFile.id)
     ).all()
     stu = db.get(Student, ls.student_id)
+    archive_only = role == "prep"
     return {
         "items": [_out(f) for f in rows],
-        "accept": file_text.ACCEPT,
-        "supported": file_text.SUPPORTED_NOTE,
+        "accept": file_text.ACCEPT_ANY if archive_only else file_text.ACCEPT,
+        "supported": (file_text.SUPPORTED_NOTE_ARCHIVE if archive_only
+                      else file_text.SUPPORTED_NOTE),
+        "archive_only": archive_only,
         # 归档目录（相对 UPLOAD_DIR），界面上显示出来，老师才知道文件去哪儿找
         "rel_dir": storage.dated_rel(stu, ls) if stu else "",
     }
@@ -115,7 +140,7 @@ def list_files(lid: int, role: str = Query("material", description="material / h
 
 @router.post("/lessons/{lid}/files")
 async def upload_file(lid: int, file: UploadFile = File(...),
-                      role: str = Query("material", description="material / homework"),
+                      role: str = Query("material", description="material / homework / prep"),
                       db: Session = Depends(get_db)):
     """上传并**当场抽文字**。
 
@@ -124,12 +149,19 @@ async def upload_file(lid: int, file: UploadFile = File(...),
 
     role 决定它属于哪一份清单：上课材料（讲义/课件）还是学生作业原件。
     作业复用同一条管线（归档、抽文字、失败原因、删除清理全一样），只是标签不同。
+
+    prep（备课材料）是例外中的例外：**格式不限、且刻意不抽文字**。
+    备课要用的东西什么样都有（压缩包、视频、思维导图），而老师电脑上做好的
+    `.lnk` 快捷方式是最该收进来的一类 —— 原文件几 GB，不该为了留个出处再复制一份。
+    这类文件在库里的 status 是 `archived`，如实表示「**没打算读**」，
+    而不是冒充「读出来 0 字」。
     """
-    if role not in ("material", "homework"):
-        raise HTTPException(422, f"不认识的 role {role!r}（可选 material / homework）")
+    _role_or_422(role)
     _lesson_or_404(db, lid)
     name = Path(file.filename or "未命名").name        # 只取文件名，防路径穿越
-    if file_text.kind_of(name) is None:
+    # material / homework 要送进 AI，读不出文字就没意义 → 仍卡白名单（.lnk 也会被挡）。
+    # prep 只归档，白名单在这里没有任何意义，反而会把快捷方式挡在门外。
+    if role != "prep" and file_text.kind_of(name) is None:
         raise HTTPException(422, f"暂不支持这种格式（{Path(name).suffix or '无扩展名'}）。"
                                  f"{file_text.SUPPORTED_NOTE}")
 
@@ -143,7 +175,8 @@ async def upload_file(lid: int, file: UploadFile = File(...),
     if stu is None:
         raise HTTPException(404, "这节课的学生不存在")
     # 归到「学生 / 上课日期」目录下，落盘文件名按 role 分两套（services/storage.py）：
-    #   · material（讲义/课件）：**保留原名** ——「（笔记）9.1特殊角的三角比.pdf」是老师有意取的名字。
+    #   · material / prep：**保留原名** ——「（笔记）9.1特殊角的三角比.pdf」是老师有意取的名字，
+    #     快捷方式更是必须留名：「三角函数课件.lnk」一眼就知道指向什么。
     #   · homework（作业原件）：`学生_日期_序号` —— 这类文件最常被单独拿出去，
     #     脱离目录还得能自证是谁的哪天的第几份；而截图/相册存下来的名字往往是一串哈希。
     # 不管哪套，库里 name 一律存**上传时的原名**，界面用它告诉老师「你选的是哪份」。
@@ -157,18 +190,24 @@ async def upload_file(lid: int, file: UploadFile = File(...),
     dest.write_bytes(data)
     stored_rel = storage.rel(dest)
 
+    kind = file_text.kind_of(name) or ""
+    if role == "prep":
+        kind = file_text.kind_for_archive(name)      # 任意扩展名都要有个能看的标签
     f = LessonFile(
         owner_id=config.OWNER_ID, lesson_id=lid, name=name, stored=stored_rel,
-        kind=file_text.kind_of(name) or "", size_bytes=len(data), role=role,
+        kind=kind, size_bytes=len(data), role=role,
     )
-    try:
-        r = file_text.extract(dest, name)
-        f.status, f.text, f.chars = "ok", r["text"], r["chars"]
-        f.truncated = 1 if r["truncated"] else 0
-        f.pages = r.get("pages")
-    except file_text.ExtractError as e:
-        # 文件留着（换解析器还能重试），但状态如实记为失败
-        f.status, f.reason = "failed", str(e)
+    if role == "prep":
+        f.status = "archived"           # 明确「只归档」，别让界面显示成「读出 0 字」
+    else:
+        try:
+            r = file_text.extract(dest, name)
+            f.status, f.text, f.chars = "ok", r["text"], r["chars"]
+            f.truncated = 1 if r["truncated"] else 0
+            f.pages = r.get("pages")
+        except file_text.ExtractError as e:
+            # 文件留着（换解析器还能重试），但状态如实记为失败
+            f.status, f.reason = "failed", str(e)
     db.add(f)
     db.commit()
     return _out(f)
@@ -239,6 +278,7 @@ def student_files(sid: int, db: Session = Depends(get_db)):
         for f in db.scalars(select(LessonFile).where(LessonFile.lesson_id.in_(ids)).order_by(LessonFile.id)).all():
             files.setdefault(f.lesson_id, []).append({
                 "type": "file", "id": f.id, "name": f.name,
+                "role": f.role,                       # material / homework / prep
                 "kind_cn": file_text.KIND_CN.get(f.kind, f.kind),
                 "size_bytes": f.size_bytes, "chars": f.chars,
                 "status": f.status, "reason": f.reason or "",

@@ -2,12 +2,14 @@
 // 设计目标：打开这个人的页面，从上到下就能看完他发生了什么，不用在多个页面之间跳。
 import { computed, onMounted, ref } from 'vue';
 import { useRoute } from 'vue-router';
-import { studentsApi, homeworkApi, supplementsApi, prepApi } from '../api.js';
+import { studentsApi, homeworkApi, supplementsApi, prepApi, examsApi } from '../api.js';
 import AbilityRadar from '../components/AbilityRadar.js';
 import FeedbackDialog from '../components/FeedbackDialog.js';
 import HomeworkDialog from '../components/HomeworkDialog.js';
 import SupplementDialog from '../components/SupplementDialog.js';
 import PrepDialog from '../components/PrepDialog.js';
+import ExamDialog from '../components/ExamDialog.js';
+import { filledSections, analysisPreview, analysisStats } from '../examAnalysis.js';
 import { fail, fmtBytes, hhmm, loadCurricula, money, ok, shortDate, STATUS_LABEL, STATUS_TAG } from '../store.js';
 
 /** 作业状态 -> 标签颜色。未交看红：家长沟通里这是必须提的事。 */
@@ -17,7 +19,7 @@ const SUP_TAG = { todo: 'orange', given: 'blue', returned: 'green' };
 
 export default {
   name: 'StudentDetail',
-  components: { AbilityRadar, FeedbackDialog, HomeworkDialog, SupplementDialog, PrepDialog },
+  components: { AbilityRadar, FeedbackDialog, HomeworkDialog, SupplementDialog, PrepDialog, ExamDialog },
   setup() {
     const route = useRoute();
     const id = Number(route.params.id);
@@ -40,6 +42,12 @@ export default {
     // 课前备课：这节课老师自己的准备（结构化四段 + 挑材料 + 关联笔记）
     const prepLesson = ref(null);
     const prepsByLesson = ref({});
+    // 考试情况：**学生级**记录，与上课记录并列 —— 考试日期和上课日期不一定对得上，
+    // 所以它不挂在任何一节课上（见 routers/exams.py 文件头）。
+    const exams = ref([]);
+    const examTypes = ref([]);
+    const examDialog = ref(null);      // { exam: 记录或 null }
+    const expandedExam = ref(0);       // 展开看详情的那条
 
     async function loadSupplements() {
       const map = {};
@@ -68,6 +76,17 @@ export default {
       prepsByLesson.value = map;
     }
 
+    async function loadExams() {
+      try {
+        const r = await examsApi.list(id);
+        exams.value = r.items || [];
+        // 常见类型 + 库里真用过的，一起喂给弹窗的 chips（录过「入学分班考」下次就能点）
+        examTypes.value = [...(r.used_types || []), ...(r.type_suggestions || [])];
+      } catch (e) {
+        exams.value = [];
+      }
+    }
+
     async function load() {
       loading.value = true;
       try {
@@ -77,6 +96,7 @@ export default {
         hwRadar.value = await homeworkApi.radar(id);
         await loadSupplements();
         await loadPreps();
+        await loadExams();
       } catch (e) {
         fail(e.message);
       } finally {
@@ -201,6 +221,41 @@ export default {
       await loadPreps();
     }
 
+    /** 「记一次考试」：**学生级**入口，不依赖某节课（考试日期和上课日期常常对不上）。 */
+    function openExam(e) {
+      examDialog.value = { exam: e || null };
+    }
+
+    async function onExamSaved() {
+      examDialog.value = null;
+      await loadExams();
+    }
+
+    function toggleExam(eid) {
+      expandedExam.value = expandedExam.value === eid ? 0 : eid;
+    }
+
+    async function removeExam(e) {
+      const what = [e.exam_type, e.exam_date].filter(Boolean).join(' · ') || '这次考试';
+      if (!window.confirm(`删掉「${what}」的记录？（试题/答题卡的归档文件也会一起删）`)) return;
+      try {
+        await examsApi.remove(e.id);
+        ok('考试记录已删掉');
+        await loadExams();
+      } catch (err) {
+        fail(err.message);
+      }
+    }
+
+    // ---- 考试行上的展示小工具（都是纯函数，模板里直接调）----
+    const examRawUrl = (fid, inline) => examsApi.rawUrl(fid, inline);
+    const isImg = (name) => /\.(png|jpe?g|gif|webp|bmp)$/i.test(String(name || ''));
+    const examHasScore = (e) => e.score !== null && e.score !== undefined;
+    /** 得分率只在「有成绩且有满分」时才算得出来 —— 算不出就什么都不显示，
+     *  拿成绩当分母凑个 100% 比空着更误导。 */
+    const scoreRatePct = (e) => (e.score_rate === null || e.score_rate === undefined)
+      ? '' : `${(e.score_rate * 100).toFixed(1)}%`;
+
     onMounted(async () => {
       await loadCurricula();
       await load();
@@ -214,6 +269,10 @@ export default {
       supplementLesson, supPending, supsByLesson, openSupplement, onSupplementSaved,
       setSupStatus, printSup, removeSup, printing, SUP_TAG,
       prepLesson, prepsByLesson, openPrep, onPrepSaved,
+      exams, examTypes, examDialog, expandedExam,
+      openExam, onExamSaved, toggleExam, removeExam,
+      examRawUrl, isImg, examHasScore, scoreRatePct,
+      filledSections, analysisPreview, analysisStats,
     };
   },
   template: `
@@ -342,6 +401,80 @@ export default {
         </div>
       </div>
 
+      <!-- 考试情况：**学生级**记录，与上课记录并列（考试日期和上课日期不一定对得上，
+           所以不挂在某节课上）。成绩、等级、试题/答题卡、考情分析都在这里。 -->
+      <div class="card">
+        <h2>
+          考试情况
+          <span v-if="exams.length" class="small muted" style="font-weight:400">（共 {{ exams.length }} 次）</span>
+          <div class="spacer"></div>
+          <button class="btn sm primary" @click="openExam(null)">＋ 记一次考试</button>
+        </h2>
+        <div v-if="!exams.length" class="empty">
+          还没有考试记录
+          <div class="small" style="margin-top:6px">
+            记一次考试：日期（可以只写大概）、类型、成绩，传上试题与答题卡，再按模板写考情分析
+          </div>
+        </div>
+        <div v-else>
+          <div v-for="e in exams" :key="e.id" class="exam-row">
+            <div class="exam-head">
+              <span v-if="e.exam_type" class="tag blue">{{ e.exam_type }}</span>
+              <span class="small muted">{{ e.exam_date || '未填日期' }}</span>
+              <span v-if="examHasScore(e)" class="exam-score">
+                {{ e.score }}<span v-if="e.full_score" class="muted small"> / {{ e.full_score }}</span>
+              </span>
+              <span v-if="e.grade" class="tag">{{ e.grade }}</span>
+              <span v-if="scoreRatePct(e)" class="tag green">{{ scoreRatePct(e) }}</span>
+              <span class="small muted">附件 {{ e.files.length }} 份</span>
+              <div class="spacer"></div>
+              <button class="btn ghost sm" @click="toggleExam(e.id)">
+                {{ expandedExam === e.id ? '收起' : '展开' }}
+              </button>
+              <button class="btn ghost sm" @click="openExam(e)">改</button>
+              <button class="btn ghost sm" style="color:var(--danger)" @click="removeExam(e)">删</button>
+            </div>
+
+            <!-- 收起时露一句分析的开头，省得每次都要点开才知道写了什么 -->
+            <div v-if="expandedExam !== e.id && analysisPreview(e.analysis)"
+                 class="small muted" style="margin-top:4px">
+              {{ analysisPreview(e.analysis) }}
+            </div>
+
+            <div v-if="expandedExam === e.id" style="margin-top:8px">
+              <div class="small muted">
+                考情分析：写了 {{ analysisStats(e.analysis).filled }} / {{ analysisStats(e.analysis).total }} 段
+                <template v-if="e.analysis.template_name"> · 模板「{{ e.analysis.template_name }}」</template>
+              </div>
+              <template v-if="filledSections(e.analysis).length">
+                <div v-for="(s, i) in filledSections(e.analysis)" :key="s.key || i" class="exam-sec">
+                  <b class="lb">{{ s.label || '（未命名段）' }}</b>
+                  <div class="small" style="white-space:pre-wrap">{{ s.text }}</div>
+                </div>
+              </template>
+              <div v-else class="small muted" style="margin-top:4px">还没写内容</div>
+
+              <!-- 试题与答题卡：图片给缩略图，点开原图；其它类型点名字下载 -->
+              <div v-if="e.files.length" style="margin-top:10px">
+                <div v-for="f in e.files" :key="f.id" class="exam-file">
+                  <a v-if="isImg(f.name)" :href="examRawUrl(f.id, true)" target="_blank" rel="noopener"
+                     style="flex:none" title="点开看原图">
+                    <img :src="examRawUrl(f.id, true)" alt="" class="exam-thumb">
+                  </a>
+                  <span v-else class="tag" style="flex:none">{{ f.kind_cn }}</span>
+                  <span class="tag" style="flex:none">{{ f.role_label }}</span>
+                  <div style="flex:1;min-width:0">
+                    <a :href="examRawUrl(f.id)" target="_blank" rel="noopener">{{ f.stored_name || f.name }}</a>
+                    <span class="small muted"> · {{ fmtBytes(f.size_bytes) }}</span>
+                  </div>
+                </div>
+              </div>
+              <div v-if="e.dir_rel" class="small muted" style="margin-top:6px">归档位置：{{ e.dir_rel }}</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
       <div class="card" v-if="supPending.count"
            style="border-color:var(--warning); background:var(--panel-2)">
         <b>有 {{ supPending.count }} 批课后补充还没给</b>
@@ -449,5 +582,8 @@ export default {
                       @close="supplementLesson = null" @saved="onSupplementSaved" />
     <PrepDialog v-if="prepLesson" :lesson="prepLesson"
                 @close="prepLesson = null" @saved="onPrepSaved" />
+    <ExamDialog v-if="examDialog" :exam="examDialog.exam" :student="stu"
+                :folder="folder ? folder.folder : ''" :type-options="examTypes"
+                @close="examDialog = null" @saved="onExamSaved" />
   </div>`,
 };

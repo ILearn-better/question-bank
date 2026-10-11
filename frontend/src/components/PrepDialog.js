@@ -1,16 +1,18 @@
 // 课前备课 —— 老师上课前做的准备，与「写反馈 / 交作业 / 课后补充」并列的第四样。
 //
-// 三块内容（对应需求的三句话）：
+// 四块内容（对应需求）：
 //   ① 结构化四段：教学目标 / 重点难点 / 教学流程 / 准备材料。
 //   ② 挑材料：这节课要用的题 / 笔记（交互复用课后补充那套：搜索 + 勾选 + 已选 chips）。
-//   ③ 与笔记库双向联动：
+//   ③ 备课材料**文件**：任意格式（含电脑上做好的 .lnk 快捷方式），只归档不抽文字，
+//      落在「学生 / 上课日期」文件夹里（role='prep'，与上课文件两份清单互不相见）。
+//   ④ 与笔记库双向联动：
 //       · 「从笔记库选取」→ 关联一篇已有笔记（note_id 指向它）；
 //       · 「存成笔记」→ 把四段 + 材料拼成 Markdown 写进笔记库（先保存备课，再调后端）。
 //
 // 一节一条：备课一节课备一次，改了就是改这一份（不像课后补充能存好几批）。
 import { computed, ref, watch } from 'vue';
-import { notesApi, papersApi, prepApi } from '../api.js';
-import { fail, ok } from '../store.js';
+import { lessonFilesApi, notesApi, papersApi, prepApi } from '../api.js';
+import { fail, fmtBytes, ok } from '../store.js';
 import Modal from './Modal.js';
 
 // 四段的键与中文名（保存时 keyPoints -> key_points 由服务端字段名对一下）。
@@ -46,6 +48,64 @@ export default {
     const noteKeyword = ref('');
     const noteRows = ref([]);
     const noteLoading = ref(false);
+    // ---- 备课材料（文件 / 快捷方式；只归档，不抽文字）----
+    const files = ref([]);
+    const uploadingFile = ref(false);
+    const upIndex = ref(0);
+    const upTotal = ref(0);
+    const fileNote = ref('');
+    const archiveDir = ref('');
+    const fileEl = ref(null);
+
+    async function loadFiles() {
+      try {
+        const r = await lessonFilesApi.list(props.lesson.id, 'prep');
+        files.value = r.items || [];
+        archiveDir.value = r.rel_dir || '';
+      } catch (e) { /* 拿不到不影响写备课 */ }
+    }
+
+    function pickFile() { fileEl.value && fileEl.value.click(); }
+
+    /** 原件地址（点名字就能下载/查看那份文件）。 */
+    const rawUrl = (id) => lessonFilesApi.rawUrl(id);
+
+    /** 一次可以选多份，逐份上传：一份失败不该把其余的也拦下来。 */
+    async function onFilePicked(e) {
+      const picked = Array.from(e.target.files || []);
+      e.target.value = '';            // 同一批文件连传两次也要能再次触发 change
+      if (!picked.length) return;
+      uploadingFile.value = true;
+      fileNote.value = '';
+      upTotal.value = picked.length;
+      let bad = 0;
+      for (let i = 0; i < picked.length; i++) {
+        upIndex.value = i + 1;
+        const fd = new FormData();
+        fd.append('file', picked[i], picked[i].name);
+        try {
+          const r = await lessonFilesApi.upload(props.lesson.id, fd, 'prep');
+          files.value = [...files.value, r];
+        } catch (err) {
+          bad += 1;
+          fileNote.value = `「${picked[i].name}」没传上去：${err.message}`;
+        }
+      }
+      uploadingFile.value = false;
+      upTotal.value = 0;
+      if (!bad) ok(`已归档 ${picked.length} 份备课材料`);
+    }
+
+    async function removeFile(f) {
+      if (!window.confirm(`把「${f.name}」从归档里删掉？磁盘上那份文件也会一起删。`)) return;
+      try {
+        await lessonFilesApi.remove(f.id);
+        files.value = files.value.filter((x) => x.id !== f.id);
+      } catch (e) {
+        fail(e.message);
+      }
+    }
+
     // ---- 状态 ----
     const saving = ref(false);
     const savingNote = ref(false);
@@ -201,6 +261,7 @@ export default {
     papersApi.knowledgePoints().then((t) => { kps.value = (t.items || []).map((x) => x.kp); }).catch(() => {});
     search();
     load();
+    loadFiles();
 
     return {
       FIELDS, form, tab, keyword, tag, kp, rows, total, loading, tags, kps,
@@ -208,6 +269,8 @@ export default {
       noteId, noteTitle, pickingNote, noteKeyword, noteRows, noteLoading,
       searchNotes, toggleNotePick, pickNote, save, saveAsNote,
       saving, savingNote, loaded,
+      files, uploadingFile, upIndex, upTotal, fileNote, archiveDir, fileEl,
+      pickFile, onFilePicked, removeFile, fmtBytes, rawUrl,
     };
   },
   template: `
@@ -268,6 +331,43 @@ export default {
                 :title="p.title" @click="toggle(p.kind, p.ref_id, p.title)">
             {{ p.kind === 'question' ? '题' : '笔记' }}·{{ (p.title || '').slice(0, 16) }} ✕
           </span>
+        </div>
+      </div>
+
+      <!-- 备课材料：格式不限（电脑上做好的 .lnk 快捷方式也能直接传），
+           只归档到「学生 / 上课日期」文件夹里，不在本机抽文字、不送给 AI。 -->
+      <div class="field" style="margin-top:12px">
+        <label>
+          备课材料
+          <span class="muted small">
+            （这节课要用的文件；格式不限 —— 快捷方式 .lnk 直接传上来即可，
+             落到磁盘后在资源管理器里双击就能打开它指向的原文件）
+          </span>
+        </label>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <button class="btn sm" :disabled="uploadingFile" @click="pickFile">
+            {{ uploadingFile ? '上传中…' : '＋ 添加文件 / 快捷方式' }}
+          </button>
+          <!-- 刻意不设 accept：一旦设了白名单，文件对话框就会把 .lnk 藏起来 -->
+          <input ref="fileEl" type="file" multiple style="display:none" @change="onFilePicked">
+          <span v-if="uploadingFile" class="small muted">正在传第 {{ upIndex }} / {{ upTotal }} 份…</span>
+          <span v-else-if="files.length" class="small muted">共 {{ files.length }} 份</span>
+        </div>
+
+        <div v-for="f in files" :key="f.id"
+             style="display:flex;gap:8px;align-items:flex-start;margin-top:8px">
+          <span class="tag" style="flex:none">{{ f.kind_cn }}</span>
+          <div style="flex:1;min-width:0">
+            <a :href="rawUrl(f.id)" :title="f.name" style="word-break:break-all">{{ f.name }}</a>
+            <span class="small muted"> · {{ fmtBytes(f.size_bytes) }}</span>
+            <div class="small muted">只归档，不读文字 · 存盘名：{{ f.stored_name }}</div>
+          </div>
+          <button class="btn ghost sm" style="flex:none;color:var(--danger)" @click="removeFile(f)">删除</button>
+        </div>
+
+        <div v-if="fileNote" class="small" style="color:var(--danger);margin-top:6px">{{ fileNote }}</div>
+        <div v-if="archiveDir" class="small muted" style="margin-top:6px">
+          归档位置：<span class="mono">uploads/{{ archiveDir }}</span>（按「学生 / 上课日期」存放）
         </div>
       </div>
 

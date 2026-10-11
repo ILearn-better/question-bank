@@ -54,11 +54,19 @@ KINDS = {
     ".heif": "image",
 }
 IMAGE_KINDS = {"image"}
+
+# 只归档、**不抽文字**的类别 —— 备课材料（role=prep）用。
+# .lnk / .url 是「快捷方式本身」：里面没有正文可读，也不需要读 ——
+# 老师把电脑上做好的快捷方式传上来，落在「学生/上课日期」那一格里，
+# 以后在资源管理器里双击就能打开原文件（原文件不动、不复制、不占双份空间）。
+ARCHIVE_KINDS = {".lnk": "link", ".url": "url"}
+
 # 送给前端的可读说明
 KIND_CN = {
     "pdf": "PDF", "word": "Word", "word-legacy": "Word（旧格式）", "rtf": "RTF",
     "ppt": "PPT", "ppt-legacy": "PPT（旧格式）", "text": "文本", "image": "图片",
     "html": "网页",
+    "link": "快捷方式", "url": "网址快捷方式",
 }
 _DOC_EXTS = sorted(k for k, v in KINDS.items() if v not in IMAGE_KINDS)
 # 上课材料（讲义/课件）用这个：不加图片，免得把「拍照的习题」当讲义收进去
@@ -66,6 +74,15 @@ ACCEPT = ",".join(_DOC_EXTS)
 ACCEPT_WITH_IMAGES = ",".join(sorted(KINDS))       # 作业原件用这个：图文都收
 SUPPORTED_NOTE = "支持 PDF / Word(.docx) / PPT(.pptx) / 文本 / 网页(.html)；老式 .doc / .ppt / .rtf 需要本机装有 Word"
 SUPPORTED_NOTE_ANY = SUPPORTED_NOTE + "；图片（照片/截图）也可以，但只存档、不抽文字"
+
+# 备课材料（role=prep）：**不限格式** —— 备课要用的东西什么样都有（压缩包、视频、
+# 思维导图、还有老师自己做的快捷方式），而这些本来就不抽文字，没必要卡白名单。
+# 空串表示「不设 accept」：浏览器文件对话框会显示所有文件，.lnk 才选得到。
+ACCEPT_ANY = ""
+SUPPORTED_NOTE_ARCHIVE = (
+    "格式不限，任何文件都能传（快捷方式 .lnk / 网址快捷方式 .url、压缩包、视频、图片……）；"
+    "备课材料只归档到文件夹，不提取文字"
+)
 
 W_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 A_NS = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
@@ -77,6 +94,20 @@ class ExtractError(RuntimeError):
 
 def kind_of(filename: str) -> str | None:
     return KINDS.get(Path(filename or "").suffix.lower())
+
+
+def kind_for_archive(filename: str) -> str:
+    """备课材料的类别：能读出文字的沿用原类别，快捷方式给 link / url，
+    其余按扩展名大写显示（ZIP / MP4 …）。**永不为空** ——
+    界面上总得有个东西告诉老师「这是份什么文件」，空着的标签等于没有信息。
+    """
+    k = kind_of(filename)
+    if k:
+        return k
+    ext = Path(filename or "").suffix.lower()
+    if ext in ARCHIVE_KINDS:
+        return ARCHIVE_KINDS[ext]
+    return (ext.lstrip(".") or "file").upper()[:12]
 
 
 def _clip(text: str) -> tuple[str, bool]:

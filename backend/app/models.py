@@ -729,6 +729,132 @@ class LessonFile(Base):
 
 
 # ============================================================
+# M2 扩展：考试情况记录（**学生级**，不挂靠某节课）
+# ============================================================
+class Exam(Base):
+    """一次考试的情况记录 —— 与「上课记录」并列，但**不挂在课上**。
+
+    为什么不挂某节课：考试日期和上课日期本来就不一定对得上。
+    月考是一次独立发生的事，老师想记的是「他这次考得怎么样」，
+    不是「哪节课讲评了这份卷子」。挂在课上等于逼他先去找一节课，
+    而这个前提往往根本不成立（那天可能压根没排课）。
+
+    exam_date 为什么是**自由文本**而不是日期列：
+      老师经常只记得「9 月中旬那次月考」「上学期期末」，精确到日既做不到、
+      也没必要。所以原样存他写的字。date_key 是**尽力解析**出来的排序键
+      （'2026-09-15' / '2026-09' / 空），只用来排序 —— 界面上显示的永远是原文。
+
+    score / full_score 分开存：
+      只写「85」看不出是 85/100 还是 85/150，有了满分才能算得分率、才能跨考试比较。
+      两个都可以为空（有的卷子只报等级），**空就是空，绝不用 0 顶替** ——
+      用 0 记会把趋势和平均值一起带偏，看起来像考砸了。
+
+    analysis 存 JSON 快照：
+      {"template_id": 3, "template_name": "考情分析（五段）",
+       "sections": [{"key": "scope", "label": "考察范围", "text": "…"}, …]}
+      段名（label）一起快照，是为了模板日后被改名/删掉之后，这条老记录仍然显示得出来
+      —— 与备课材料的 title 快照同一个道理：记录要能自解释。
+
+    dir_rel：这次考试的归档目录（相对 UPLOAD_DIR）。
+      **第一次落文件时才确定** —— 没传过附件的考试不该在磁盘上留空目录。
+      老师后来改了日期/类型，目录会跟着改名（routers/exams.py 里搬迁），
+      所以它必须存在库里，不能每次由日期现推。
+    """
+
+    __tablename__ = "exams"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    owner_id: Mapped[int] = mapped_column(Integer, nullable=False, default=OWNER_ID, server_default=str(OWNER_ID))
+    student_id: Mapped[int] = mapped_column(
+        ForeignKey("students.id", ondelete="CASCADE"), nullable=False
+    )
+    exam_date: Mapped[str] = mapped_column(Text, default="", server_default="")
+    date_key: Mapped[str] = mapped_column(String, default="", server_default="")
+    exam_type: Mapped[str] = mapped_column(String, default="", server_default="")
+    score: Mapped[float | None] = mapped_column(REAL)
+    full_score: Mapped[float | None] = mapped_column(REAL)
+    grade: Mapped[str] = mapped_column(String, default="", server_default="")
+    analysis: Mapped[str] = mapped_column(Text, default="{}", server_default="{}")
+    dir_rel: Mapped[str] = mapped_column(Text, default="", server_default="")
+    created_at: Mapped[str] = mapped_column(Text, default=_now, server_default=NOW)
+    updated_at: Mapped[str] = mapped_column(Text, default=_now, server_default=NOW)
+
+    files: Mapped[list["ExamFile"]] = relationship(
+        back_populates="exam", cascade="all, delete-orphan"
+    )
+
+    __table_args__ = (Index("idx_exams_student", "student_id", "date_key"),)
+
+
+class ExamFile(Base):
+    """一次考试的试题 / 答题卡 / 其他往来材料 —— **只归档，不抽文字**。
+
+    为什么不复用 lesson_files：那张表的 lesson_id 是 NOT NULL、指向某一节课，
+    而考试本来就不挂在课上。硬塞进去只有两条路 —— 把 lesson_id 改成可空
+    （动既有表，风险大），或者凭空造一节课（往库里塞假数据）。两条都不该走。
+    所以独立一张表，形状只保留归档那部分（name / stored / kind / size_bytes）。
+
+    为什么**刻意不抽文字**：试题和答题卡是拿来存档备查的 ——
+    老师要的是「那次月考的卷子在这儿」，不是让 AI 读它。
+    何况真读也多半是扫描件，抽出来是一片乱码，比不读更容易误导。
+    所以状态一律 'archived'，如实表示「**没打算读**」，
+    而不是冒充 'ok' + 0 字（那会被界面显示成「读出 0 字」，像出故障）。
+
+    role：paper（试题）/ sheet（答题卡）/ other（其他）。
+      前两个直接对应需求里的「试题与答题卡情况」—— 这两样老师是想分开找的
+      （要卷子还是要他那张答题卡，动机完全不同）。
+    """
+
+    __tablename__ = "exam_files"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    owner_id: Mapped[int] = mapped_column(Integer, nullable=False, default=OWNER_ID, server_default=str(OWNER_ID))
+    exam_id: Mapped[int] = mapped_column(
+        ForeignKey("exams.id", ondelete="CASCADE"), nullable=False
+    )
+    name: Mapped[str] = mapped_column(String, nullable=False)         # 上传时的原名
+    stored: Mapped[str] = mapped_column(Text, default="", server_default="")
+    role: Mapped[str] = mapped_column(String, default="other", server_default="other")
+    kind: Mapped[str] = mapped_column(String, default="", server_default="")
+    size_bytes: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    status: Mapped[str] = mapped_column(String, default="archived", server_default="archived")
+    reason: Mapped[str] = mapped_column(Text, default="", server_default="")
+    created_at: Mapped[str] = mapped_column(Text, default=_now, server_default=NOW)
+
+    exam: Mapped["Exam"] = relationship(back_populates="files")
+
+    __table_args__ = (Index("idx_exam_files_exam", "exam_id", "role"),)
+
+
+class ExamAnalysisTemplate(Base):
+    """考情分析模板 —— 一次分析该写**哪几段**。
+
+    为什么是「分段」而不是一整篇范文：
+      老师要的是骨架（考察范围 / 试卷难易程度 / 上课所讲内容 / 学生答题情况 /
+      后期计划），每段自己写。给一整篇范文，他得先把整篇删干净再重写，反而更费事。
+      sections 存 [{"key": "scope", "label": "考察范围", "hint": "这次考到哪些章节…"}, …]
+      hint 是**提示语**：不写提示，段落标题下面就是一片空白，人容易写两句就停了。
+
+    为什么存数据库而不是写死在代码里：
+      不同学科、不同考试的分析角度差很多（周考盯近三周的内容覆盖，
+      期中要看整册的漏洞分布），写死等于逼所有人用同一套。
+    is_builtin：内置的允许改文案但不允许删 —— 删了下次启动种子又会建回来，反而迷惑。
+    """
+
+    __tablename__ = "exam_analysis_templates"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    owner_id: Mapped[int] = mapped_column(Integer, nullable=False, default=OWNER_ID, server_default=str(OWNER_ID))
+    name: Mapped[str] = mapped_column(String, nullable=False)
+    sections: Mapped[str] = mapped_column(Text, default="[]", server_default="[]")
+    is_builtin: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    sort_order: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    created_at: Mapped[str] = mapped_column(Text, default=_now, server_default=NOW)
+
+    __table_args__ = (Index("idx_exam_templates_owner", "owner_id", "sort_order"),)
+
+
+# ============================================================
 # M4 笔记（Markdown 正文 + 一层板书笔画）
 # ============================================================
 class NoteFolder(Base):

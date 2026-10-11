@@ -33,6 +33,11 @@ NOTES_DIR = UPLOAD_DIR / "notes"        # 笔记里插入的图片
 # 反馈配图与上课文件都归到这里 —— 图片名也是「学生_日期」，脱离目录还能自证身份。
 # （原先那个扁平的 uploads/feedback 目录已废弃：所有图片现在都走归档布局。）
 STUDENTS_DIR = UPLOAD_DIR / "students"
+# 考试附件的暂存区：老师选好卷子/答题卡就立刻落盘，但**保存这次考试时才搬进归档目录**。
+# 这样做是为了「日期/类型随便改」—— 先落地再登记的话，目录名会在保存前就定死，
+# 老师改一次日期就得连人带文件搬一次。暂存区只按随机 token 分目录，与考试内容无关。
+# （超过 48 小时没被保存的暂存目录由 routers/exams.py 在下次上传时顺手清掉。）
+EXAM_CACHE_DIR = UPLOAD_DIR / "exams_cache"
 EXPORT_DIR = DATA_DIR / "exports"
 BACKUP_DIR = DATA_DIR / "backups"
 
@@ -55,7 +60,7 @@ AUTO_MIGRATE = os.getenv("SHIKE_AUTO_MIGRATE", "1") != "0"
 
 def ensure_dirs() -> None:
     for d in (DATA_DIR, UPLOAD_DIR, PAGES_CACHE, CROPS_DIR, CONVERTED_DIR, EXPORT_DIR,
-              BACKUP_DIR, NOTES_DIR, STUDENTS_DIR):
+              BACKUP_DIR, NOTES_DIR, STUDENTS_DIR, EXAM_CACHE_DIR):
         d.mkdir(parents=True, exist_ok=True)
 
 
