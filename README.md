@@ -185,8 +185,9 @@ vendor 全加载不到而 `#app` 里只是未渲染的原始模板（1.8 万字�
   同一篇笔记能出**教师版（含答案）/ 学生版（不含答案）**两版
 - **课后补充** —— 下课后把这次觉得该练的题与笔记挑进「今天这节课」，下节课一键打印学生版
 - **课前备课** —— 上课前给这节课写四段准备（教学目标 / 重点难点 / 教学流程 / 准备材料）、
-  挑这节课要用的题与笔记；还能**上传备课材料**（格式不限 —— 讲义、压缩包、录课视频都行，
-  电脑上做好的 `.lnk` 快捷方式也能直接传，原文件不复制、不占双份空间），
+  挑这节课要用的题与笔记（**「题库挑题」里的题干按渲染后的样子显示** —— 真公式而不是
+  `$…$` 原文，鼠标移上去会自动展开看全）；还能**上传备课材料**（格式不限 —— 讲义、压缩包、
+  录课视频都行，电脑上做好的 `.lnk` 快捷方式也能直接传，原文件不复制、不占双份空间），
   一律落到该节课的归档目录 `uploads/students/<学生>/<上课日期>/`；
   写完可**一键存成笔记**，也能**从笔记库选取**一篇关联（双向联动）
 
@@ -358,7 +359,7 @@ cd backend
 ./.venv/Scripts/python.exe test_render_page.py     # 前端自检：两个页面 jsdom **真实挂载**（不连服务；没装 jsdom 就跳过）
 ./.venv/Scripts/python.exe test_schedule_import.py # 课表 Excel 导入：解析 / 匹配查重 / 入库 / 模板 / 月历（临时库，不连服务、不发 HTTP）
 ./.venv/Scripts/python.exe test_paper_ui.py        # 前端自检：题干渲染接线 / 标签多关键词搜索 / 打开不自动加载文档（纯静态 + node，不连服务）
-./.venv/Scripts/python.exe test_prep_files.py       # 备课材料上传：任意格式 / 只归档不抽文字 / 三份清单隔离 / 归档到「学生·日期」（临时库 + node，不连服务）
+./.venv/Scripts/python.exe test_prep_files.py       # 备课材料上传 + 挑题题干渲染：任意格式 / 只归档不抽文字 / 三份清单隔离 / 归档到「学生·日期」（临时库 + node，不连服务）
 ```
 
 > `test_paper_ui.py` 覆盖三块：
@@ -368,9 +369,12 @@ cd backend
 > - **`renderRichEl` 的接线**：用 node 跑真实模块、把三个库 stub 掉，精确看它「喂给 marked 的
 >   是不是归一化之后的文本」「写的是 innerHTML 还是 textContent」。
 > - **标签搜索的语义**（`frontend/src/tagFilter.js`）：空格 = 任一命中、竖线 = 同时包含。
->   ⚠️ SPA 页（`index.html` 走 `<script type="module">`）**没法用 jsdom 真挂**
+>   ⚠️ SPA 页（`index.html` 走 `<script type="module">`）**没法整页用 jsdom 真挂**
 >   —— jsdom 不执行 ES module。所以出卷页只到「模板能编译 + 接线正确」这一层，
 >   最后那一眼得靠人（对比：`batch.html` / `entry.html` 是零构建页面，能被 `render_check.js` 真挂一遍）。
+>   **但单个组件可以挂**：`test_prep_files.py` 会用 `frontend/prep_mount_check.js`
+>   把 `PrepDialog.js` 原样复制到临时目录、依赖换桩、vendor 手动喂进 jsdom，
+>   真挂一遍后数 `.katex` —— 静态断言只能说「源码写了渲染」，证明不了「挂载后公式真出来了」。
 
 > `test_prep_files.py` 守的是「备课材料」这条路：它与「上课文件」共用 `lesson_files`
 > + `services/storage.py` 那套归档，只是 `role='prep'` —— **不限格式、刻意不抽文字**
@@ -380,6 +384,9 @@ cd backend
 > - 三份清单（`material` / `homework` / `prep`）**互相看不见**，否则备课材料会被
 >   AI 润色当成参考资料读进去。
 > - 归档目录的日期取**课时 `start_at`**，不是上传当天（不然「那天讲了什么」就散了）。
+> - 「题库挑题」的题干走**渲染管线**（`src/mathRender.js`，与出卷页同一套），
+>   鼠标移上去自动展开 —— 列表里只露一截（`.q-clamp` 折叠 + `:hover` 放开）。
+>   ⚠️ 渲染容器里**不能**再有 Vue 插值：KaTeX 的 auto-render 会把文本节点整个换掉。
 
 > `test_schedule_import.py` 起服务也不连 —— 它把临时库（`$TEMP/shike_schedule_scratch`）
 > 直接建表，然后**直接调用** `routers/lesson_import.py` 里的 `preview` / `commit`

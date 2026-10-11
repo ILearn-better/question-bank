@@ -3,6 +3,8 @@
 // 四块内容（对应需求）：
 //   ① 结构化四段：教学目标 / 重点难点 / 教学流程 / 准备材料。
 //   ② 挑材料：这节课要用的题 / 笔记（交互复用课后补充那套：搜索 + 勾选 + 已选 chips）。
+//      题干按**渲染后**的样子显示（真公式，不是 $…$ 原文），鼠标移上去自动展开看全 ——
+//      挑题时老师要能读到整道题，不能只看见一行截断的纯文本。
 //   ③ 备课材料**文件**：任意格式（含电脑上做好的 .lnk 快捷方式），只归档不抽文字，
 //      落在「学生 / 上课日期」文件夹里（role='prep'，与上课文件两份清单互不相见）。
 //   ④ 与笔记库双向联动：
@@ -10,8 +12,9 @@
 //       · 「存成笔记」→ 把四段 + 材料拼成 Markdown 写进笔记库（先保存备课，再调后端）。
 //
 // 一节一条：备课一节课备一次，改了就是改这一份（不像课后补充能存好几批）。
-import { computed, ref, watch } from 'vue';
+import { computed, nextTick, ref, watch } from 'vue';
 import { lessonFilesApi, notesApi, papersApi, prepApi } from '../api.js';
+import { ensureLibs, renderRichEl } from '../mathRender.js';
 import { fail, fmtBytes, ok } from '../store.js';
 import Modal from './Modal.js';
 
@@ -164,6 +167,36 @@ export default {
       timer = setTimeout(search, 300);
     });
 
+    /* ---------- 题库挑题的题干：按真公式渲染（管线唯一出处 src/mathRender.js）----------
+     *
+     *  为什么是「拿元素 ref 自己写 innerHTML」，而不是 `{{ r.content }}` / v-html：
+     *    KaTeX 的 auto-render 会把容器里的文本节点整个换掉，Vue 之后还往那个已摘除的
+     *    节点里写新内容 —— 界面会永远停在第一次渲染的那一版。容器里**不能**有插值。
+     *    （出卷页 / 笔记页踩过同一个坑，见 Papers.js 里同名注释。）
+     */
+    const richEls = new Map();          // 'q:<id>' → 题干容器元素
+    function setRichEl(key, el) {
+      if (el) richEls.set(key, el); else richEls.delete(key);
+    }
+    function paintRich() {
+      rows.value.forEach((r) => {
+        const el = richEls.get('q:' + r.id);
+        if (el) renderRichEl(el, r.content || '');
+      });
+    }
+    let libsReady = false;
+    async function renderRich() {
+      if (!libsReady) {
+        paintRich();                     // 库还没到：先把原文铺出来，别留一屏空白
+        try { await ensureLibs(); libsReady = true; }
+        catch (e) { return; }            // 加载不上就一直显示原文，不挡着备课
+      }
+      await nextTick();                  // 等 v-for 把这一批容器挂上去
+      paintRich();
+    }
+    // 只在「题库挑题」页签下渲染：笔记页签那批行里根本没有 q-rich 容器
+    watch([rows, tab], () => { if (tab.value === 'question') renderRich(); }, { flush: 'post' });
+
     // ---- 笔记联动 ----
     async function searchNotes() {
       noteLoading.value = true;
@@ -265,7 +298,7 @@ export default {
 
     return {
       FIELDS, form, tab, keyword, tag, kp, rows, total, loading, tags, kps,
-      picked, pickedList, pickedCount, isPicked, toggle, brief, search,
+      picked, pickedList, pickedCount, isPicked, toggle, brief, search, setRichEl,
       noteId, noteTitle, pickingNote, noteKeyword, noteRows, noteLoading,
       searchNotes, toggleNotePick, pickNote, save, saveAsNote,
       saving, savingNote, loaded,
@@ -304,16 +337,34 @@ export default {
         </template>
       </div>
 
+      <p class="small muted" style="margin:0 0 6px" v-if="tab === 'question'">
+        题干按渲染后的样子显示；<b>鼠标移上去自动展开</b>看全（列表里只露一截）。
+      </p>
+
       <div class="pick-list">
         <div v-if="loading" class="empty">查询中…</div>
         <template v-else-if="rows.length">
-          <div v-for="r in rows" :key="r.id" class="pick-row">
+          <!-- key 带页签前缀：题库 id 与笔记 id 可能撞号，切页签时必须重建 DOM，
+               否则函数 ref 会把新行挂到旧元素上，渲染结果串行。 -->
+          <div v-for="r in rows" :key="tab + ':' + r.id" class="pick-row"
+               :class="{ 'pick-row-top': tab === 'question' }">
             <div style="flex:1;min-width:0">
-              <div>{{ tab === 'question' ? brief(r) : r.title }}</div>
-              <div class="small muted" v-if="tab === 'note' && r.path">{{ r.path }}</div>
-              <div class="small muted" v-else-if="tab === 'question' && (r.knowledge_points || []).length">
-                {{ r.knowledge_points.join(' / ') }}
-              </div>
+              <template v-if="tab === 'question'">
+                <!-- 题干走渲染管线（见 setup 里 renderRich 的注释）：老师要看的是排好版的
+                     公式，不是 $…$ 原文。容器里**不能**再放 Vue 插值 —— KaTeX 会把文本节点换掉。 -->
+                <div class="q-clamp">
+                  <div v-if="r.content" class="q-rich" :ref="(el) => setRichEl('q:' + r.id, el)"></div>
+                  <div v-else class="muted small">（图片题，没有文本）</div>
+                </div>
+                <div class="small muted" style="margin-top:5px"
+                     v-if="(r.knowledge_points || []).length">
+                  {{ r.knowledge_points.join(' / ') }}
+                </div>
+              </template>
+              <template v-else>
+                <div>{{ r.title }}</div>
+                <div class="small muted" v-if="r.path">{{ r.path }}</div>
+              </template>
             </div>
             <button class="btn sm" :class="{ primary: !isPicked(tab, r.id) }"
                     @click="toggle(tab, r.id, tab === 'question' ? brief(r) : r.title)">
