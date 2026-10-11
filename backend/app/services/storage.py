@@ -337,13 +337,18 @@ def prune_empty_dirs(dirs, stop: Path | None = None) -> int:
 
     只删**空**目录，所以不可能碰到数据 —— 老师删掉一份文件后，如果那一格空了，
     留一个空壳只会让人以为「这里本来有东西」。往上走到 stop（默认 STUDENTS_DIR）为止。
+
+    ⚠️ stop 与 cur 必须先化成**同一种形式**再比：safe_join() 返回的是 resolve() 过的路径，
+    而 STUDENTS_DIR 可能带着 Windows 的 8.3 短名（TEMP 常长这样：C:/Users/ZHOULI~1/...）。
+    不统一的话 cur.relative_to(stop) 会抛 ValueError，于是**空目录一个都收不掉** ——
+    症状是删除后留一堆空壳目录，且只在短名路径下复现（2026-10-11 在测试里踩到）。
     """
-    stop = (stop or config.STUDENTS_DIR)
+    stop = Path(stop or config.STUDENTS_DIR).resolve()
     removed = 0
     seen = set()
     for d in dirs or []:
         try:
-            cur = Path(d)
+            cur = Path(d).resolve()
         except TypeError:
             continue
         while cur and cur not in seen:
