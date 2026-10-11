@@ -1,26 +1,21 @@
 // 学生列表。核心是「一眼看到谁的反馈欠着」——待写反馈数直接列出来。
-import { computed, onMounted, reactive, ref } from 'vue';
+//
+// 新增 / 编辑用的是共用的 StudentFormDialog（课表导入那边补学生档案也走同一份），
+// 这样学生字段只有一处定义 —— 见 components/StudentFormDialog.js 的文件头。
+import { computed, onMounted, ref } from 'vue';
 import { studentsApi } from '../api.js';
-import Modal from '../components/Modal.js';
+import StudentFormDialog from '../components/StudentFormDialog.js';
 import { fail, loadCurricula, loadStudents, money, ok, state } from '../store.js';
-
-const EMPTY = {
-  name: '', nickname: '', grade: '', school: '', contact: '', parent_contact: '',
-  hourly_rate: null, rate_unit: 'hour', status: 'active', started_at: '', ended_at: '',
-  remark: '', curriculum_ids: [], primary_curriculum_id: null,
-};
 
 export default {
   name: 'Students',
-  components: { Modal },
+  components: { StudentFormDialog },
   setup() {
     const rows = ref([]);
     const loading = ref(true);
     const filter = ref('active');
     const keyword = ref('');
-    const editing = ref(null);
-    const form = reactive({ ...EMPTY });
-    const saving = ref(false);
+    const editing = ref(null);        // { mode: 'create' | 'edit', student } | null
 
     async function load() {
       loading.value = true;
@@ -44,53 +39,16 @@ export default {
     });
 
     function openCreate() {
-      Object.assign(form, EMPTY, { curriculum_ids: [] });
-      editing.value = { mode: 'create' };
+      editing.value = { mode: 'create', student: null };
     }
 
     function openEdit(s) {
-      Object.assign(form, EMPTY, {
-        name: s.name, nickname: s.nickname || '', grade: s.grade || '', school: s.school || '',
-        contact: s.contact || '', parent_contact: s.parent_contact || '',
-        hourly_rate: s.hourly_rate, rate_unit: s.rate_unit || 'hour', status: s.status,
-        started_at: s.started_at || '', ended_at: s.ended_at || '', remark: s.remark || '',
-        curriculum_ids: [...(s.curriculum_ids || [])],
-        primary_curriculum_id: null,
-      });
-      editing.value = { mode: 'edit', id: s.id };
+      editing.value = { mode: 'edit', student: s };
     }
 
-    function toggleCurriculum(id) {
-      const i = form.curriculum_ids.indexOf(id);
-      if (i >= 0) form.curriculum_ids.splice(i, 1);
-      else form.curriculum_ids.push(id);
-      if (!form.curriculum_ids.includes(form.primary_curriculum_id)) {
-        form.primary_curriculum_id = form.curriculum_ids[0] ?? null;
-      }
-    }
-
-    async function save() {
-      if (!form.name.trim()) {
-        fail('学生姓名不能为空');
-        return;
-      }
-      saving.value = true;
-      try {
-        const payload = { ...form, hourly_rate: form.hourly_rate === '' ? null : form.hourly_rate };
-        if (editing.value.mode === 'create') {
-          await studentsApi.create(payload);
-          ok('学生已添加');
-        } else {
-          await studentsApi.update(editing.value.id, payload);
-          ok('已保存');
-        }
-        editing.value = null;
-        await load();
-      } catch (e) {
-        fail(e.message);
-      } finally {
-        saving.value = false;
-      }
+    async function onSaved() {
+      editing.value = null;
+      await load();
     }
 
     async function remove(s) {
@@ -110,8 +68,8 @@ export default {
     });
 
     return {
-      rows, visible, loading, filter, keyword, editing, form, saving, state,
-      openCreate, openEdit, toggleCurriculum, save, remove, money,
+      rows, visible, loading, filter, keyword, editing, state,
+      openCreate, openEdit, onSaved, remove, money,
     };
   },
   template: `
@@ -180,87 +138,7 @@ export default {
       </table>
     </div>
 
-    <Modal v-if="editing" :title="editing.mode === 'create' ? '添加学生' : '编辑学生'" @close="editing = null">
-      <div class="row">
-        <div class="field">
-          <label>姓名 *</label>
-          <input type="text" v-model="form.name" placeholder="真实姓名或代号">
-        </div>
-        <div class="field">
-          <label>昵称 / 备注名</label>
-          <input type="text" v-model="form.nickname" placeholder="选填">
-        </div>
-      </div>
-      <div class="row">
-        <div class="field">
-          <label>年级</label>
-          <input type="text" v-model="form.grade" placeholder="中四 / Year 11 / 高一">
-        </div>
-        <div class="field">
-          <label>学校</label>
-          <input type="text" v-model="form.school">
-        </div>
-      </div>
-
-      <div class="field">
-        <label>所学体系（可多选 —— 一个学生可以同时学 DSE 和国内课程）</label>
-        <div class="chips">
-          <span v-for="c in state.curricula" :key="c.id" class="chip"
-                :class="{on: form.curriculum_ids.includes(c.id)}"
-                @click="toggleCurriculum(c.id)">{{ c.name }}</span>
-        </div>
-      </div>
-
-      <div class="row">
-        <div class="field">
-          <label>默认单价</label>
-          <input type="number" v-model.number="form.hourly_rate" placeholder="如 500">
-        </div>
-        <div class="field">
-          <label>计价方式</label>
-          <select v-model="form.rate_unit">
-            <option value="hour">按小时</option>
-            <option value="session">按次（与时长无关）</option>
-          </select>
-        </div>
-        <div class="field">
-          <label>状态</label>
-          <select v-model="form.status">
-            <option value="active">在读</option>
-            <option value="paused">暂停</option>
-            <option value="ended">已结课</option>
-          </select>
-        </div>
-      </div>
-      <div class="row">
-        <div class="field">
-          <label>开始日期</label>
-          <input type="date" v-model="form.started_at">
-        </div>
-        <div class="field">
-          <label>结束日期</label>
-          <input type="date" v-model="form.ended_at">
-        </div>
-        <div class="field">
-          <label>联系方式</label>
-          <input type="text" v-model="form.contact">
-        </div>
-      </div>
-      <div class="field">
-        <label>家长联系方式（导出报告时默认脱敏，不会出现在发给家长的页面上）</label>
-        <input type="text" v-model="form.parent_contact">
-      </div>
-      <div class="field">
-        <label>备注</label>
-        <textarea rows="2" v-model="form.remark" placeholder="基础情况、性格、家长诉求…"></textarea>
-      </div>
-
-      <template #foot>
-        <button class="btn" @click="editing = null">取消</button>
-        <button class="btn primary" :disabled="saving" @click="save">
-          {{ saving ? '保存中…' : '保存' }}
-        </button>
-      </template>
-    </Modal>
+    <StudentFormDialog v-if="editing" :student="editing.student"
+                       @close="editing = null" @saved="onSaved" />
   </div>`,
 };

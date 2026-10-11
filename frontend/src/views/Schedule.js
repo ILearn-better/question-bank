@@ -5,7 +5,13 @@
 //             排课/调课这类「按天想事」的操作都在这里做。
 //   · 列表 —— 原来的按天分组，顺着一行行往下看。适合核对某一周的细节。
 // 两份视图读同一份 lessons 数据，切换不重新请求。
-import { computed, onMounted, reactive, ref, watch } from 'vue';
+//
+// 月历上的交互（2026-10-11 加拖动调课）：
+//   单击一条课 → 编辑弹窗（改日期/时间/状态、标记完成、**删除**）
+//   双击一条课 → 进入「调课模式」，再按住它拖到目标日期，放开即改日期（Esc 取消）
+// 为什么调课要「双击解锁」再做拖动：块一旦常驻 draggable，单击时手抖几像素就会被
+// 浏览器当成拖动，弹窗永远打不开。双击解锁后单击绝对可靠。
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue';
 import { lessonsApi } from '../api.js';
 import { lessonsByDate, monthGrid, shiftPeriod, WEEK_HEADS } from '../calendar.js';
 import Modal from '../components/Modal.js';
@@ -14,6 +20,9 @@ import {
   currentPeriod, fail, hhmm, loadCurricula, loadStudents, money, ok,
   shortDate, state, STATUS_LABEL, STATUS_TAG, todayISO,
 } from '../store.js';
+
+// 单击要等这么久才弹窗：双击的第一次 click 会先到，不能让它顺手把弹窗打开
+const CLICK_DELAY = 200;
 
 function emptyLesson() {
   return {
@@ -106,7 +115,79 @@ export default {
         rate: ls.rate,
         topic: ls.topic || '',
       });
-      editing.value = { mode: 'edit', id: ls.id };
+      editing.value = { mode: 'edit', id: ls.id, lesson: ls };
+    }
+
+    // ---------------- 拖动调课（月历） ----------------
+    const dragId = ref(0);                 // 正在被拖的那节课
+    const dragMode = ref(0);               // 双击解锁的调课模式（= 课 id）
+    const dragOver = ref('');              // 悬停到哪一天（高亮目标格）
+    let clickTimer = null;
+
+    const dragLesson = computed(() => lessons.value.find((x) => x.id === dragMode.value) || null);
+    const dragText = computed(() => (dragLesson.value
+      ? `${dragLesson.value.student_name} ${hhmm(dragLesson.value.start_at)}` : ''));
+
+    function onItemClick(ls) {
+      if (dragMode.value) return;          // 调课模式里单击不做别的
+      clearTimeout(clickTimer);
+      clickTimer = setTimeout(() => { clickTimer = null; openEdit(ls); }, CLICK_DELAY);
+    }
+
+    function onItemDbl(ls) {
+      clearTimeout(clickTimer);            // 别让双击顺带弹出编辑窗
+      clickTimer = null;
+      dragMode.value = ls.id;
+      ok(`调课模式：按住「${ls.student_name} ${hhmm(ls.start_at)}」拖到目标日期，放开即可（Esc 取消）`);
+    }
+
+    function cancelDrag() {
+      dragMode.value = 0;
+      dragId.value = 0;
+      dragOver.value = '';
+    }
+
+    function onDragStart(ls, e) {
+      if (dragMode.value !== ls.id) return;   // 没解锁就按住拖 → 不拖（避免误触）
+      dragId.value = ls.id;
+      if (e.dataTransfer) {
+        e.dataTransfer.effectAllowed = 'move';
+        e.dataTransfer.setData('text/plain', String(ls.id));   // Firefox 不设就不拖
+      }
+    }
+
+    function onDragEnd() {
+      dragId.value = 0;
+      dragOver.value = '';
+    }
+
+    function onDragOver(day) {
+      if (dragId.value && day) dragOver.value = day;
+    }
+
+    function onDragLeave(day) {
+      if (dragOver.value === day) dragOver.value = '';
+    }
+
+    /** 放开：只改日期，开始时间不变。真正写库就这一处（PATCH start_at）。 */
+    async function onDrop(day) {
+      const ls = lessons.value.find((x) => x.id === dragId.value);
+      cancelDrag();
+      if (!ls || !day || ls.start_at.slice(0, 10) === day) return;   // 原地放下，什么都不做
+      try {
+        await lessonsApi.update(ls.id, { start_at: `${day}T${ls.start_at.slice(11, 16)}` });
+        ok(`已把「${ls.student_name}」调到 ${day}`);
+        await load();
+      } catch (e) {
+        fail(e.message);
+      }
+    }
+
+    function onKey(e) {
+      if (e.key === 'Escape' && dragMode.value) {
+        cancelDrag();
+        ok('已取消调课');
+      }
     }
 
     async function save() {
@@ -148,6 +229,7 @@ export default {
       try {
         await lessonsApi.complete(ls.id);
         ok('已标记完成');
+        editing.value = null;               // 从弹窗里点的 → 顺手关掉
         await load();
       } catch (e) {
         fail(e.message);
@@ -157,10 +239,13 @@ export default {
     }
 
     async function remove(ls) {
-      if (!confirm(`删除 ${ls.student_name} ${ls.start_at.replace('T', ' ')} 的这节课？`)) return;
+      if (!ls) return;
+      if (!confirm(`删除 ${ls.student_name} ${String(ls.start_at).replace('T', ' ')} 的这节课？`)) return;
       try {
         await lessonsApi.remove(ls.id);
         ok('已删除');
+        editing.value = null;
+        cancelDrag();
         await load();
       } catch (e) {
         fail(e.message);
@@ -188,12 +273,16 @@ export default {
       await loadStudents();
       await load();
     });
+    onMounted(() => window.addEventListener('keydown', onKey));
+    onBeforeUnmount(() => window.removeEventListener('keydown', onKey));
 
     return {
       period, lessons, monthly, loading, grouped, editing, form, saving, busy, state,
       view, importing, grid, byDay, WEEK_HEADS,
       openCreate, openEdit, save, complete, remove, onStudentChange, shift, goToday, onImported,
       hhmm, money, shortDate, todayISO, STATUS_LABEL, STATUS_TAG,
+      dragId, dragMode, dragOver, dragText, onItemClick, onItemDbl, cancelDrag,
+      onDragStart, onDragEnd, onDragOver, onDragLeave, onDrop,
     };
   },
   template: `
@@ -218,10 +307,16 @@ export default {
       <button class="btn primary" @click="openCreate()">＋ 排课</button>
     </div>
 
-    <div class="grid cols-4">
+    <div class="grid cols-5">
       <div class="card stat"><div class="v">{{ monthly ? monthly.total_lessons : '—' }}</div><div class="k">本月已上节数</div></div>
       <div class="card stat"><div class="v">{{ monthly ? (monthly.total_minutes / 60).toFixed(1) : '—' }}</div><div class="k">本月课时（小时）</div></div>
-      <div class="card stat"><div class="v">{{ money(monthly ? monthly.total_amount : null) }}</div><div class="k">本月应收</div></div>
+      <div class="card stat"><div class="v">{{ money(monthly ? monthly.total_amount : null) }}</div><div class="k">本月应收（已上）</div></div>
+      <div class="card stat">
+        <div class="v" :class="{ pending: monthly && monthly.pending_total_amount }">
+          {{ money(monthly ? monthly.pending_total_amount : null) }}
+        </div>
+        <div class="k">本月待上（未上课）{{ monthly ? ' · ' + monthly.pending_total_lessons + ' 节' : '' }}</div>
+      </div>
       <div class="card stat"><div class="v">{{ monthly ? monthly.students.length : '—' }}</div><div class="k">涉及学生</div></div>
     </div>
 
@@ -230,6 +325,10 @@ export default {
 
         <!-- ============ 月历 ============ -->
         <div v-if="view === 'calendar'" class="card">
+          <div v-if="dragMode" class="cal-drag-tip">
+            调课中：按住「{{ dragText }}」拖到目标日期，放开即完成。
+            <button class="btn ghost sm" style="margin-left:6px" @click="cancelDrag()">取消（Esc）</button>
+          </div>
           <div v-if="loading" class="empty">加载中…</div>
           <template v-else>
             <div class="cal-head">
@@ -237,7 +336,11 @@ export default {
             </div>
             <div class="cal-grid">
               <div v-for="(c, i) in grid" :key="i" class="cal-cell"
-                   :class="{ out: c.out, today: c.date === todayISO() }">
+                   :class="{ out: c.out, today: c.date === todayISO(),
+                             'drag-ready': !!dragMode, 'drag-over': c.date && dragOver === c.date }"
+                   @dragover.prevent="onDragOver(c.date)"
+                   @dragleave="onDragLeave(c.date)"
+                   @drop.prevent="onDrop(c.date)">
                 <template v-if="c.date">
                   <div class="cal-day">
                     <span>{{ c.day }}</span>
@@ -245,9 +348,14 @@ export default {
                   </div>
                   <div class="cal-items">
                     <div v-for="ls in (byDay.get(c.date) || [])" :key="ls.id"
-                         class="cal-item" :class="STATUS_TAG[ls.status] || 'plain'"
-                         :title="ls.student_name + ' ' + hhmm(ls.start_at) + ' ' + ls.duration_min + '分钟' + (ls.topic ? ' · ' + ls.topic : '')"
-                         @click="openEdit(ls)">
+                         class="cal-item" :class="[STATUS_TAG[ls.status] || 'plain',
+                                                   { dragging: dragId === ls.id, armed: dragMode === ls.id }]"
+                         :title="ls.student_name + ' ' + hhmm(ls.start_at) + ' ' + ls.duration_min + '分钟' + (ls.topic ? ' · ' + ls.topic : '') + '（单击编辑，双击后可拖动调课）'"
+                         :draggable="dragMode === ls.id"
+                         @click="onItemClick(ls)"
+                         @dblclick="onItemDbl(ls)"
+                         @dragstart="onDragStart(ls, $event)"
+                         @dragend="onDragEnd">
                       <span class="t">{{ hhmm(ls.start_at) }}</span>
                       <span class="n">{{ ls.student_name }}</span>
                     </div>
@@ -257,7 +365,8 @@ export default {
               </div>
             </div>
             <div class="small muted" style="margin-top:10px">
-              点日历上的课就能直接改（改完、标记完成都在弹窗里）；
+              <b>单击</b>某节课 → 打开弹窗改（编辑、标记完成、删除都在里面）；
+              <b>双击</b>某节课 → 进入调课模式，把它拖到目标日期放开，就能改到那天（时间不变，Esc 取消）。
               鼠标移到某天格子上，右下角会出现 ＋ 可以加课。
             </div>
           </template>
@@ -307,24 +416,45 @@ export default {
       <div>
         <div class="card">
           <h2>本月课时费</h2>
-          <div v-if="!monthly || !monthly.students.length" class="empty">暂无已完成的课时</div>
+          <div v-if="!monthly || !monthly.students.length" class="empty">本月还没有课时记录</div>
           <table v-else class="tbl">
+            <thead>
+              <tr>
+                <th>学生</th>
+                <th style="text-align:right">已上（应收）</th>
+                <th style="text-align:right">待上（未上课）</th>
+              </tr>
+            </thead>
             <tbody>
               <tr v-for="r in monthly.students" :key="r.student_id">
                 <td>
                   <router-link :to="'/students/' + r.student_id">{{ r.student_name }}</router-link>
-                  <div class="small muted">{{ r.lesson_count }} 节 · {{ (r.billable_minutes / 60).toFixed(1) }} 小时</div>
+                  <div class="small muted">
+                    已上 {{ r.lesson_count }} 节 · {{ (r.billable_minutes / 60).toFixed(1) }} 小时
+                    <template v-if="r.pending_lessons">
+                      　待上 {{ r.pending_lessons }} 节 · {{ (r.pending_minutes / 60).toFixed(1) }} 小时
+                    </template>
+                  </div>
                 </td>
                 <td style="text-align:right; white-space:nowrap">{{ money(r.amount) }}</td>
+                <td style="text-align:right; white-space:nowrap"
+                    :class="r.pending_amount ? 'pending' : 'muted'">
+                  {{ r.pending_lessons ? money(r.pending_amount) : '—' }}
+                </td>
               </tr>
               <tr>
                 <td style="text-align:right; color:var(--text-2)">合计</td>
                 <td style="text-align:right; font-weight:600">{{ money(monthly.total_amount) }}</td>
+                <td style="text-align:right; font-weight:600" class="pending">{{ money(monthly.pending_total_amount) }}</td>
               </tr>
             </tbody>
           </table>
+          <div v-if="monthly && monthly.pending_no_rate" class="small" style="margin-top:8px; color:var(--warning)">
+            ⚠️ 有 {{ monthly.pending_no_rate }} 节待上的课没填单价，金额没算进去 —— 补上单价后才会显示。
+          </div>
           <div class="small muted" style="margin-top:10px">
-            只统计「已完成」和「补课」；请假、取消不计费但会留痕。
+            <b>已上</b>＝已完成/补课，已经到手的钱；<b>待上</b>＝本月已排好、还没上的课，
+            按排课时的单价预估，上完课会自动转到「已上」。请假、取消不计费但会留痕。
           </div>
         </div>
       </div>
@@ -400,6 +530,12 @@ export default {
       </div>
 
       <template #foot>
+        <button v-if="editing.mode === 'edit'" class="btn ghost" style="color:var(--danger)"
+                @click="remove(editing.lesson)">删除这节课</button>
+        <button v-if="editing.mode === 'edit' && editing.lesson && editing.lesson.status === 'scheduled'"
+                class="btn" :disabled="busy === editing.lesson.id"
+                @click="complete(editing.lesson)">标记完成</button>
+        <div class="spacer"></div>
         <button class="btn" @click="editing = null">取消</button>
         <button class="btn primary" :disabled="saving" @click="save">{{ saving ? '保存中…' : '保存' }}</button>
       </template>
