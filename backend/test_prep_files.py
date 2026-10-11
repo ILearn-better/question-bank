@@ -433,6 +433,35 @@ def t_frontend() -> None:
     check("用的类都是项目已有的（.tag / .btn / .chip），没引新 UI 库",
           all(c in src for c in ("class=\"tag\"", "class=\"btn", "class=\"chip")), "")
 
+    # ---- 题库挑题的题干：渲染成真公式 + 鼠标悬停展开（2026-10-11）----
+    check("引了渲染管线 mathRender（不自己写 marked / katex 调用）",
+          "from '../mathRender.js'" in src and "renderRichEl" in src and "ensureLibs" in src, "")
+    check("题库行的题干改成渲染容器（q-rich + setRichEl），不再直接插值 brief(r)",
+          'class="q-rich"' in src and "setRichEl('q:'" in src
+          and "{{ tab === 'question' ? brief(r) : r.title }}" not in src, "")
+    # KaTeX 的 auto-render 会把容器里的文本节点整个换掉 —— 容器里绝不能有插值
+    check("渲染容器是空 div（里面有插值就会被 KaTeX 换掉，界面卡在第一版）",
+          re.search(r'class="q-rich"\s+:ref="[^"]*"></div>', src) is not None,
+          str(re.search(r'class="q-rich"[^>]*>[^<]*', src)))
+    check("重渲染用 flush:'post'（等 v-for 把容器挂上去）", "flush: 'post'" in src, "")
+    check("只在题库页签下渲染（笔记页签的行里没有 q-rich 容器）",
+          "if (tab.value === 'question') renderRich()" in src, "")
+    check("列表 key 带页签前缀（题库 id 与笔记 id 撞号时 DOM 不会串行）",
+          "tab + ':' + r.id" in src, "")
+    check("还留着 brief（已选 chips 的 title 仍要纯文本）",
+          "brief(r)" in src, "")
+
+    css = (FE / "app.css").read_text(encoding="utf-8")
+    check("列表里题干默认只露一截（.pick-row .q-clamp 有 max-height）",
+          re.search(r"\.pick-row \.q-clamp\s*\{[^}]*max-height", css) is not None, "")
+    check("★ 鼠标移上去自动展开（.pick-row:hover .q-clamp → max-height:none）",
+          re.search(r"\.pick-row:hover \.q-clamp\s*\{\s*max-height:\s*none", css) is not None,
+          str(re.search(r"\.pick-row:hover[^{]*\{[^}]*", css)))
+    check("折起来时底部渐隐，提示「下面还有」",
+          ".q-clamp::after" in css and "linear-gradient" in css, "")
+    check("题干是多行块，按钮顶对齐（.pick-row-top）",
+          ".pick-row.pick-row-top" in css, "")
+
     api_src = api.read_text(encoding="utf-8")
     check("api.js 注释写明了 prep 是「只归档不抽文字」",
           "prep" in api_src and "不抽文字" in api_src, "")
@@ -469,6 +498,22 @@ def t_frontend() -> None:
     check("node 侧输出完整（进程没中途挂掉）",
           "SELFTEST_GOOD" in out and "TPL " in out, out.strip()[-200:])
 
+    # ---- 真挂载：把 PrepDialog 挂一遍，数渲染痕迹 ----
+    # 静态断言只能证明「源码里写了 setRichEl」，证明不了**挂载后容器真的被填上 KaTeX**。
+    mount = ROOT / "frontend" / "prep_mount_check.js"
+    check("frontend/prep_mount_check.js 存在（SPA 组件的真挂载检查）",
+          mount.exists(), str(mount))
+    if mount.exists():
+        rr = subprocess.run([node, str(mount)], capture_output=True, text=True,
+                            encoding="utf-8", errors="replace", timeout=240)
+        mout = (rr.stdout or "") + (rr.stderr or "")
+        if "SKIP" in mout and "jsdom" in mout:
+            print("  [SKIP] 没找到 jsdom，跳过真挂载检查")
+        else:
+            check("★ 真挂载：公式渲染出 .katex / 悬停容器在 / 切页签不串行",
+                  rr.returncode == 0,
+                  (mout.strip().splitlines() or [""])[-1])
+
 
 # ================================================================ ⑧ 一致性
 def t_consistency() -> None:
@@ -496,6 +541,9 @@ def t_consistency() -> None:
           "备课材料" in readme, "")
     check("README 写明了归档布局按「学生 / 上课日期」",
           "上课日期" in readme, "")
+    prep = (ROOT / "frontend" / "src" / "components" / "PrepDialog.js").read_text(encoding="utf-8")
+    check("备课挑题的渲染只走 mathRender（别处升级管线时才不会漏掉这一份）",
+          "renderMathInElement" not in prep and "window.marked" not in prep, "")
 
 
 # ================================================================ main

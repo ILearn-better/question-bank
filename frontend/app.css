@@ -477,6 +477,19 @@ body.notes-zen .notes-toc { max-height: none; }
 .pick-row { display: flex; align-items: center; gap: 8px; padding: 6px 6px;
             border-bottom: 1px solid var(--border); }
 .pick-row:last-child { border-bottom: none; }
+/* 备课「题库挑题」：题干按渲染后的真公式显示（容器见 PrepDialog 里的 q-rich）。
+   列表里只露一截省地方，鼠标移上去自动展开看全 —— 挑题时得能读到整道题。 */
+.pick-row .q-clamp { position: relative; max-height: 92px; overflow: hidden; }
+.pick-row:hover .q-clamp { max-height: none; }
+/* 折起来时底部渐隐，提示「下面还有」；展开了就不用再盖 */
+.pick-row .q-clamp::after {
+  content: ''; position: absolute; left: 0; right: 0; bottom: 0; height: 24px;
+  background: linear-gradient(to bottom, transparent, var(--panel));
+  pointer-events: none;
+}
+.pick-row:hover .q-clamp::after { display: none; }
+/* 题干是多行块：按钮对齐到顶部，别被 align-items:center 拉到中间去 */
+.pick-row.pick-row-top { align-items: flex-start; }
 
 /* 学生详情页里那一行「课后补充」：一批一条，状态用颜色区分 */
 .sup-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 6px; }
