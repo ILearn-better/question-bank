@@ -1,22 +1,26 @@
 # -*- coding: utf-8 -*-
-"""出卷页细节优化 —— 题干按公式渲染 + 标签多关键词搜索；外加录题/批量页
-「打开不自动加载上次文档」。
+"""出卷页细节优化 —— 题干按公式渲染 + 标签多关键词搜索 + **图片题显示原貌图**；
+外加录题/批量页「打开不自动加载上次文档」。
 
 为什么不起服务
 ------------------------------------------------
-这一轮改的全是**前端**：渲染管线的唯一出处、Papers.js 怎么接线、标签搜索的
-纯逻辑。所以这里只做三件事，一件都不用 uvicorn：
+这一轮改的全是**前端**：渲染管线的唯一出处、Papers.js 怎么接线、形态判定的纯逻辑。
+所以这里只做这几件事，一件都不用 uvicorn：
 
   ① 静态守卫 —— 谁该引用谁、唯一出处有没有守住、顺序坑有没有被改回去
   ② Vue**真编译器**校验 Papers.js 的模板（抓 compiler-30 这类错误）
-  ③ node 直接跑 tagFilter.js 的纯逻辑（OR / AND 两种写法的语义）
+  ③ node 直接跑 tagFilter.js / questionForm.js 的纯逻辑
+  ④ **真挂载**（⑫）：用 jsdom 把 Papers.js 挂起来数渲染痕迹 ——
+     图片题到底有没有显示出那张原貌图，静态断言是证明不了的
+  ⑤ 形态判定**与后端逐条对照**（⑪）：同一张题目表喂两边，结果必须一样
 
-⚠️ 为什么不能像 batch/entry 那样用 jsdom 真挂一遍：SPA 的入口是
-   `<script type="module" src="/src/main.js">` + importmap，**jsdom 不执行 ES module**。
-   所以 Papers.js 只能到「模板能编译 + 接线正确」这一层，最后那一眼得靠人。
+⚠️ 整页仍然挂不了：SPA 的入口是 `<script type="module" src="/src/main.js">` + importmap，
+   **jsdom 不执行 ES module**。⑫ 走的是「只挂这一个视图」的路子
+   （临时目录搭骨架 + 依赖换桩 + vendor 喂进 window），见 frontend/papers_mount_check.js。
 """
 from __future__ import annotations
 
+import json
 import re
 import shutil
 import subprocess
@@ -68,6 +72,20 @@ def extract_template(path: Path) -> str | None:
     if j < 0:
         return None
     return src[i + len(key):j]
+
+
+def code_only(src: str) -> str:
+    """去掉注释，只留代码。
+    反面断言（「不许出现 document」「这句占位已删除」）必须看代码 ——
+    否则**注释里解释这个坑**的那句话会把断言弄红（踩过：自己写的注释把自己绊倒）。"""
+    no_block = re.sub(r"/\*.*?\*/", "", src, flags=re.S)
+    no_line = re.sub(r"(?m)^\s*//.*$", "", no_block)
+    return no_line
+
+
+def no_html_comments(tpl: str) -> str:
+    """模板里同样是这个理：HTML 注释里提到旧文案不算「还留着旧文案」。"""
+    return re.sub(r"<!--.*?-->", "", tpl, flags=re.S)
 
 
 # ================================================================ ① 渲染管线唯一出处
@@ -130,30 +148,51 @@ def t_notes() -> None:
 
 # ================================================================ ③ 题干渲染接线
 def t_papers_render() -> None:
-    section("③ Papers.js：题库结果改渲染后的题干")
+    section("③ Papers.js：题库结果按「会印成什么」显示（文本渲染 / 图片题显示原貌图）")
     pp = FE / "src" / "views" / "Papers.js"
     src = read(pp)
 
     check("Papers.js 从 ../mathRender.js 引入 ensureLibs / renderRichEl",
           "from '../mathRender.js'" in src and "ensureLibs" in src and "renderRichEl" in src, "")
+    check("形态判定从 ../questionForm.js 引入（不在这页里另写一套）",
+          "from '../questionForm.js'" in src and "chooseForm" in src and "stemImage" in src, "")
 
     tpl = extract_template(pp) or ""
     check("题库结果用 .q-rich 容器 + setRichEl('row:'+id) 接元素",
           'class="q-rich"' in tpl and "setRichEl('row:' + q.id, el)" in tpl, "")
     check("已选列表同样渲染（同一页里两处不能一处公式一处原文）",
           "setRichEl('pick:' + q.id, el)" in tpl, "")
-    check("空题干不给渲染容器（渲染空串没意义）",
-          tpl.count('v-if="q.content"') >= 2, str(tpl.count('v-if="q.content"')))
+
+    # ★ 这一条就是本次需求：没识别出文本的题，列表里要显示那张原貌图
+    check("★ 两种形态各走各的分支（formOf(q) 判 text / image）",
+          "formOf(q) === 'text'" in tpl and "formOf(q) === 'image'" in tpl, "")
+    check("★ 不再写死 `v-if=\"q.content\"`（那正是「图片题只剩一句占位」的根源）",
+          'v-if="q.content"' not in tpl, "")
+    check("★ 图片题渲染 <img class=\"q-thumb\">，src 取 stemImage(q)",
+          'class="q-thumb"' in tpl and "stemImage(q)" in tpl, "")
+    check("★ 「（图片题，没有文本）」这句占位已删除（注释里提到旧文案不算）",
+          "（图片题，没有文本）" not in no_html_comments(tpl), "")
+    check("缩略图点开能看原图（a.q-thumb-link → 新标签页）",
+          "q-thumb-link" in tpl and 'target="_blank"' in tpl, "")
+    check("缩略图懒加载（一页 20 道题，别一进来就全量拉图）",
+          'loading="lazy"' in tpl, "")
+    check("图片旁边写清「为什么显示成图」（imageNote）",
+          "imageNote(q" in tpl, "")
+    check("★ 文字和图都没有的题，挑题时就点出来（NO_STEM_NOTE：出卷会印成空白）",
+          "NO_STEM_NOTE" in tpl, "")
+    check("已选那列的图小一号（q-thumb-sm）", "q-thumb-sm" in tpl, "")
     check("纯文本摘要 brief 已移除（它正是被替换掉的那个）",
           "function brief" not in src and "brief(q)" not in tpl, "")
 
     # 渲染容器里**不能**有 Vue 插值：KaTeX 会把那些文本节点换掉
-    m = re.search(r'<div v-if="q\.content" class="q-rich[^"]*"[^>]*>(.*?)</div>', tpl, re.S)
+    m = re.search(r'<div class="q-rich[^"]*"[^>]*>(.*?)</div>', tpl, re.S)
     check("渲染容器里没有 Vue 插值（会被 KaTeX 顶掉）",
           bool(m) and "{{" not in (m.group(1) or ""), (m.group(1) or "")[:60])
 
     check("每次列表变化后重渲染（否则翻页/加题后新容器是空的）",
-          re.search(r"watch\(\s*\[rows,\s*picked\]", src) is not None, "")
+          re.search(r"watch\(\s*\[rows,\s*picked", src) is not None, "")
+    check("★ 切「题目呈现」也要重渲染（rows/picked 一行没变，容器却换了一批）",
+          "() => opts.render_mode" in src, "")
     check("重渲染等 nextTick（等 v-for 把新容器挂上）",
           "await nextTick();" in src and "paintRich();" in src, "")
     check("库没加载上时先铺原文（别留一屏空白）", "!libsReady" in src and "libsReady = true" in src, "")
@@ -374,7 +413,8 @@ def t_tag_filter() -> None:
         return
     text = read(src)
     check("tagFilter.js 不碰 DOM / 不 import 任何东西（纯逻辑才好单测）",
-          "document" not in text and not re.search(r"^\s*import\s", text, re.M), "")
+          "document" not in code_only(text)
+          and not re.search(r"^\s*import\s", code_only(text), re.M), "")
 
     d = TMP / "tag"
     d.mkdir(parents=True, exist_ok=True)
@@ -615,6 +655,171 @@ def t_real_katex() -> None:
         check(f"node 侧 {n} 项里 0 失败", bad == "0", f"失败 {bad} 项")
 
 
+# ================================================================ ⑪ 形态判定：纯逻辑 + 与后端一致
+# ⚠️ 这张表是**同一份题目**喂给两边的：前端 chooseForm(q, override) 与后端
+#    paper_export._choose_form(text, image, pref, override)。两边结果必须逐条相同 ——
+#    不然「列表里看着是文本、印出来是图」（或更糟：印出一道空白题）。
+#    列：content / image / render_prefer / 出卷的整卷覆盖（题目呈现）
+FORM_MATRIX: list[tuple] = [
+    ("题干", "/api/crops/a.png", "auto", "auto"),      # 文本优先
+    ("", "/api/crops/a.png", "auto", "auto"),          # ★ 图片题：没文本 → 显示图
+    ("   ", "/api/crops/a.png", "auto", "auto"),       # 全空白 = 没文本
+    ("题干", "/api/crops/a.png", "text", "auto"),      # 单题偏好：文本
+    ("题干", "/api/crops/a.png", "image", "auto"),     # 单题偏好：图
+    ("题干", "", "image", "auto"),                     # ★ 想用图但没图 → 退回文本
+    ("", "", "image", "auto"),                         # 两样都没有 → none
+    ("", "", "auto", "auto"),
+    ("题干", "", "auto", "auto"),
+    ("题干", "/api/crops/a.png", "auto", "image"),     # ★ 整卷覆盖压过单题偏好
+    ("", "/api/crops/a.png", "auto", "image"),
+    ("题干", "", "auto", "image"),                     # 整卷要图但这题没图 → 退回文本
+    ("题干", "/api/crops/a.png", "auto", "text"),
+    ("", "/api/crops/a.png", "auto", "text"),          # ★ 整卷要文本但没文本 → 退回图
+    ("题干", "/api/crops/a.png", "拼错的值", "auto"),   # 认不出的偏好 = auto
+    ("题干", "/api/crops/a.png", "auto", "拼错的值"),   # 认不出的覆盖 = 落到单题偏好
+    (None, "/api/crops/a.png", None, None),            # 老数据 / 老前端：字段可能是空
+]
+
+FORM_JS = r"""
+import { chooseForm, stemImage, imageNote, NO_STEM_NOTE } from './questionform.mjs';
+import { readFileSync } from 'node:fs';
+let pass = 0, fail = 0;
+function check(name, ok, extra) {
+  if (ok) { pass++; console.log('  [OK ] ' + name); }
+  else { fail++; console.log('  [FAIL] ' + name + (extra !== undefined ? '   <- ' + extra : '')); }
+}
+const q = (content, image, pref) => ({ content, image, render_prefer: pref });
+
+check('★ 有文本 + 有图 + auto → 文本（识别过的文本比截图清楚，还能搜）',
+      chooseForm(q('题干', '/x.png', 'auto'), 'auto') === 'text',
+      chooseForm(q('题干', '/x.png', 'auto'), 'auto'));
+check('★ 只有图（没识别出文本）→ image —— 这次需求的核心',
+      chooseForm(q('', '/x.png', 'auto'), 'auto') === 'image',
+      chooseForm(q('', '/x.png', 'auto'), 'auto'));
+check('只有文本 → text', chooseForm(q('题干', '', 'auto'), 'auto') === 'text', '');
+check('两样都没有 → none（卷子上会是空白，挑题时就该拦）',
+      chooseForm(q('', '', 'auto'), 'auto') === 'none', '');
+check('纯空白文本不算有文本', chooseForm(q('   \n ', '/x.png', 'auto'), 'auto') === 'image', '');
+check('单题偏好 image + 有图 → image', chooseForm(q('题干', '/x.png', 'image'), 'auto') === 'image', '');
+check('★ 想用图但没图 → 自动退回文本（绝不印空白题）',
+      chooseForm(q('题干', '', 'image'), 'auto') === 'text',
+      chooseForm(q('题干', '', 'image'), 'auto'));
+check('★ 整卷「全部用图片」压过单题偏好',
+      chooseForm(q('题干', '/x.png', 'text'), 'image') === 'image', '');
+check('★ 整卷「全部用文本」，没文本的题退回印图',
+      chooseForm(q('', '/x.png', 'auto'), 'text') === 'image',
+      chooseForm(q('', '/x.png', 'auto'), 'text'));
+check('认不出的偏好当 auto（与后端 `pref or "auto"` 一致）',
+      chooseForm(q('题干', '/x.png', '拼错'), 'auto') === 'text', '');
+check('认不出的整卷覆盖 → 落到单题偏好',
+      chooseForm(q('题干', '/x.png', 'image'), '拼错') === 'image', '');
+check('题目对象是 null 也不炸（返回 none）', chooseForm(null, 'auto') === 'none', '');
+check('老数据 content 是 null 也当没文本', chooseForm(q(null, '/x.png', 'auto'), 'auto') === 'image', '');
+check('stemImage 取 image 那一列', stemImage(q('', '/x.png', 'auto')) === '/x.png', '');
+check('没有图返回空串（别给 <img> 塞空 src，那会去请求当前页）',
+      stemImage(q('题干', '', 'auto')) === '' && stemImage(null) === '', '');
+check('图片题的说明写的是「没有识别出文字」',
+      imageNote(q('', '/x.png', 'auto'), 'auto').includes('没有识别出文字'), '');
+check('整卷覆盖成图时，说明里点出是「全部用图片」',
+      imageNote(q('题干', '/x.png', 'auto'), 'image').includes('全部用图片'), '');
+check('空题提示写清了后果（出卷会印成空白）', NO_STEM_NOTE.includes('空白'), NO_STEM_NOTE);
+
+// ---- 与后端逐条对照（对照表由 Python 侧写好传进来） ----
+const matrix = JSON.parse(readFileSync(process.argv[2], 'utf8'));
+const out = matrix.map(([c, i, p, o]) => chooseForm(q(c, i, p), o));
+console.log('__FORM__ ' + JSON.stringify(out));
+console.log(`__FORM_DONE__ ${pass + fail} ${fail}`);
+"""
+
+
+def t_form_choice() -> None:
+    section("⑪ 形态判定：纯逻辑 + 与后端印卷规则逐条对照")
+    node = node_bin()
+    if not node:
+        print("  [SKIP] node 不在 PATH 上")
+        return
+    src = FE / "src" / "questionForm.js"
+    check("frontend/src/questionForm.js 存在（形态判定的唯一出处）", src.exists(), str(src))
+    if not src.exists():
+        return
+    text = read(src)
+    check("不 import 任何东西、不碰 document（纯逻辑才好单测）",
+          "document" not in code_only(text)
+          and not re.search(r"^\s*import\s", code_only(text), re.M), "")
+    check("注释里点明它是后端 _choose_form 的镜像（改一边要想另一边）",
+          "_choose_form" in text and "paper_export" in text, "")
+
+    d = TMP / "form"
+    d.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(src, d / "questionform.mjs")
+    (d / "matrix.json").write_text(json.dumps(FORM_MATRIX, ensure_ascii=False), encoding="utf-8")
+    (d / "run.mjs").write_text(FORM_JS, encoding="utf-8")
+    r = subprocess.run([node, str(d / "run.mjs"), str(d / "matrix.json")],
+                       capture_output=True, text=True, encoding="utf-8",
+                       errors="replace", timeout=60)
+    out = (r.stdout or "") + (r.stderr or "")
+    for line in out.splitlines():
+        if "[OK ]" in line or "[FAIL]" in line:
+            m = re.match(r"\s*\[(OK |FAIL)\]\s*(.+?)(?:\s+<- (.*))?$", line)
+            if m:
+                check(m.group(2).strip(), m.group(1) == "OK ", m.group(3) or "")
+    tail = [l for l in out.splitlines() if l.startswith("__FORM_DONE__")]
+    check("node 侧断言全部跑完（进程没中途挂掉）", len(tail) == 1, out.strip()[-200:])
+    if tail:
+        n, bad = tail[0].split()[1:3]
+        check(f"node 侧 {n} 项里 0 失败", bad == "0", f"失败 {bad} 项")
+
+    js_out = [l for l in out.splitlines() if l.startswith("__FORM__ ")]
+    check("node 侧回传了对照表结果", len(js_out) == 1, out.strip()[-200:])
+    if len(js_out) != 1:
+        return
+    got = json.loads(js_out[0][len("__FORM__ "):])
+    check("对照表两侧条数一致", len(got) == len(FORM_MATRIX), f"{len(got)} vs {len(FORM_MATRIX)}")
+
+    # 后端那一份（引 pymupdf，缺依赖就跳过对照，别把这条弄成假通过）
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from app.services.paper_export import _choose_form as be_form   # noqa: E402
+    except Exception as e:                                              # pragma: no cover
+        print(f"  [SKIP] 后端 paper_export 引不进来（多半缺 pymupdf）：{e}")
+        return
+    for (content, image, pref, override), js_pick in zip(FORM_MATRIX, got):
+        want = be_form(content, image, pref, override)
+        label = (f"文本={'有' if (content or '').strip() else '无'}"
+                 f" / 图={'有' if image else '无'}"
+                 f" / 偏好={pref or 'auto'} / 整卷={override or 'auto'}"
+                 f" → {want}")
+        check(f"★ 前后端形态一致：{label}", js_pick == want, f"前端 {js_pick} / 后端 {want}")
+
+
+# ================================================================ ⑫ 出卷页真挂载
+def t_mount_check() -> None:
+    section("⑫ 出卷页真挂载（jsdom 挂 Papers.js，数图片/公式的渲染痕迹）")
+    node = node_bin()
+    if not node:
+        print("  [SKIP] node 不在 PATH 上")
+        return
+    mount = FE / "papers_mount_check.js"
+    check("frontend/papers_mount_check.js 存在（SPA 视图的真挂载检查）",
+          mount.exists(), str(mount))
+    if not mount.exists():
+        return
+    r = subprocess.run([node, str(mount)], capture_output=True, text=True,
+                       encoding="utf-8", errors="replace", timeout=240)
+    out = (r.stdout or "") + (r.stderr or "")
+    if "SKIP" in out and "jsdom" in out:
+        print("  [SKIP] 没找到 jsdom，跳过真挂载检查")
+        return
+    # 逐条搬过来 —— 里面有「图片题真的显示出原貌图」这种静态断言证明不了的判据
+    for line in out.splitlines():
+        if "[OK ]" in line or "[FAIL]" in line:
+            m = re.match(r"\s*\[(OK |FAIL)\]\s*(.+?):?\s*$", line)
+            if m:
+                check(m.group(2).strip(), m.group(1) == "OK ", "")
+    check("★ 真挂载：图片题显示原貌图 / 切呈现方式跟着变 / 已选列也有图",
+          r.returncode == 0, (out.strip().splitlines() or [""])[-1])
+
+
 # ================================================================ main
 def main() -> int:
     print("出卷页细节优化 · 自包含检查（不起服务、不碰真库）")
@@ -628,6 +833,8 @@ def main() -> int:
     t_tag_filter()
     t_math_render()
     t_real_katex()
+    t_form_choice()
+    t_mount_check()
     print(f"\n共 {total} 项，失败 {len(fails)} 项")
     if fails:
         print("失败项：")

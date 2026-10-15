@@ -606,6 +606,18 @@ body.notes-zen .notes-toc { max-height: none; }
 .lesson-row .q-rich { max-height: 132px; }
 .lesson-row .q-rich.q-rich-sm { max-height: 88px; }
 
+/* ---------------- 挑题时的「题目原貌图」 ----------------
+   只有图片的题（没识别出文本）—— 出卷挑题、备课挑题两处都显示它。
+   以前那里只有一句「（图片题，没有文本）」，老师认不出是哪道题，只能盲挑。
+   高度封顶（.q-thumb-sm 更矮）让一屏能多看几道；要看清就点开原图（.q-thumb-link）。 */
+.q-thumb-link { display: inline-block; cursor: zoom-in; }
+.q-thumb {
+  display: block; max-width: 100%; max-height: 200px; height: auto; width: auto;
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+}
+/* 已选那一列本来就矮，图也跟着小一号 */
+.q-thumb-sm { max-height: 72px; }
+
 
 /* ---------------- 考试情况（学生详情页 + 记考试弹窗） ----------------
    「试题与答题卡」的照片必须看得见缩略图才敢确认传对了 —— 沿用作业原件那套（.hw-thumb）。 */
@@ -627,3 +639,45 @@ body.notes-zen .notes-toc { max-height: none; }
    橙色 = 钱还没到手，刻意跟「已上（应收）」的黑色区分开。 */
 .stat .v.pending { color: var(--warning); }
 table.tbl td.pending { color: var(--warning); font-weight: 600; }
+
+/* ---------------- 整体规划（学生详情页的一个区块 + 看/改弹窗） ----------------
+   列表里一条规划只给「名字 + 一行摘要」：整份规划动辄几千字，铺在列表里这一页
+   就没法往下翻了。点开才渲染正文（见 routers/plans.py 设计⑤）。 */
+.plan-row { display: flex; gap: 8px; align-items: center;
+            border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 10px 12px; }
+.plan-row + .plan-row { margin-top: 8px; }
+/* 整块可点 = 点开看排版好的正文（按钮在右边，不抢这一块的点击） */
+.plan-main { flex: 1; min-width: 0; cursor: pointer; }
+.plan-main:hover .plan-name { color: var(--primary); }
+.plan-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.plan-name { font-size: 14px; }
+/* 摘要压成一行：它是「这条规划讲什么」的线索，不是正文 */
+.plan-preview { font-size: 13px; color: var(--text-2); overflow: hidden;
+                text-overflow: ellipsis; white-space: nowrap; margin-top: 3px; }
+
+/* 「看」那一面渲染出来的正文。容器由 JS 写 innerHTML（KaTeX 要求），
+   所以排版规则全落在这里 —— 与 .q-rich 同一套行距，但**不设高度上限**：
+   这里是专门点开来看的，限高就等于把内容藏起来。 */
+.plan-rich { font-size: 14px; line-height: 1.8; word-break: break-word;
+             max-height: 62vh; overflow: auto; }
+.plan-rich > :first-child { margin-top: 0; }
+.plan-rich p { margin: 0 0 8px; }
+.plan-rich h1, .plan-rich h2, .plan-rich h3 { margin: 14px 0 6px; line-height: 1.35; }
+.plan-rich h1 { font-size: 19px; }
+.plan-rich h2 { font-size: 17px; }
+.plan-rich h3 { font-size: 15px; }
+.plan-rich ul, .plan-rich ol { margin: 4px 0 8px; padding-left: 24px; }
+.plan-rich li { margin: 2px 0; }
+.plan-rich table { border-collapse: collapse; margin: 8px 0; }
+.plan-rich th, .plan-rich td { border: 1px solid var(--border); padding: 4px 8px; font-size: 13px; }
+.plan-rich blockquote { margin: 8px 0; padding: 2px 0 2px 10px;
+                        border-left: 3px solid var(--border); color: var(--text-2); }
+.plan-rich img { max-width: 100%; height: auto; }
+.plan-rich code { background: var(--panel-2); padding: 1px 4px; border-radius: 3px; font-size: 13px; }
+.plan-rich pre { background: var(--panel-2); padding: 8px 10px; border-radius: var(--radius-sm); overflow: auto; }
+.plan-rich .katex { font-size: 1.02em; }
+.plan-rich .katex-display { margin: 8px 0; overflow-x: auto; }
+.plan-title { font-size: 17px; font-weight: 600; margin-bottom: 2px; }
+/* 正文输入框：等宽字体，让 Markdown 的标记和缩进看得清（写表格时尤其） */
+.plan-editor { font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+               font-size: 13px; line-height: 1.7; }

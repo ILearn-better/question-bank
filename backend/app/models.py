@@ -855,6 +855,92 @@ class ExamAnalysisTemplate(Base):
 
 
 # ============================================================
+# M2 扩展：整体规划（**学生级**，一份可长可短的文档）
+# ============================================================
+class StudentPlan(Base):
+    """这个学生的「整体规划」—— 一份文档，**学生级、不挂课**。
+
+    需求原话（用户 2026-10-16）：
+    「学生信息界面添加一下整体规划……要能够新建规划,删除规划,查看规划,修改规划。
+      我会将文本或者文本文件放到规划,我点开某个规划要能够查看渲染好的文件,
+      常见的 markdown、word 这些。（每个规划点开才能详细查看）」
+
+    为什么正文是 **Markdown 文本**而不是「挂一个文件」：
+      老师说「放文本**或者**文本文件」—— 两种情况都存在。若正文只是个文件路径，
+      那「直接打字写规划」这条路就没有地方存了（总不能再造一个小文件）。
+      所以**正文以 Markdown 存库**，Word/PDF/Markdown 文件在上传时**转成 Markdown
+      灌进正文**（转换器复用 services/doc_to_note，那是「给人看」的那一套，
+      标题、列表、表格都保留）。原件同时归档到学生文件夹（PlanFile），
+      原件才是「一定没丢的那部分」。
+
+    为什么每条规划**点开才看见正文**（列表只给标题 + 摘要）：
+      整体规划是一份正经文档，动辄几千字。全铺在列表里，学生页会被一条规划撑满，
+      往下翻找考试情况、上课记录就很难受。摘要是纯文本预览（剥掉 Markdown 标记），
+      不渲染 —— 列表里渲染几十个 KaTeX 块会明显卡。
+
+    dir_rel：这条规划的归档目录（相对 UPLOAD_DIR），**第一次落文件时才确定**。
+      没传过文件的规划不该在磁盘上留空目录。改了标题 → 目录跟着改名
+      （routers/plans.py 里搬迁），所以必须存在库里，不能每次由标题现推。
+    """
+
+    __tablename__ = "student_plans"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    owner_id: Mapped[int] = mapped_column(Integer, nullable=False, default=OWNER_ID, server_default=str(OWNER_ID))
+    student_id: Mapped[int] = mapped_column(
+        ForeignKey("students.id", ondelete="CASCADE"), nullable=False
+    )
+    title: Mapped[str] = mapped_column(String, nullable=False)
+    content: Mapped[str] = mapped_column(Text, default="", server_default="")
+    dir_rel: Mapped[str] = mapped_column(Text, default="", server_default="")
+    created_at: Mapped[str] = mapped_column(Text, default=_now, server_default=NOW)
+    updated_at: Mapped[str] = mapped_column(Text, default=_now, server_default=NOW)
+
+    files: Mapped[list["PlanFile"]] = relationship(
+        back_populates="plan", cascade="all, delete-orphan"
+    )
+
+    __table_args__ = (Index("idx_student_plans_student", "student_id", "updated_at"),)
+
+
+class PlanFile(Base):
+    """一条规划带上的**原件**（Word / PDF / Markdown / 图片…）—— 归档备查，不重复抽文字。
+
+    为什么正文已经转成 Markdown 了还要留原件：
+      转换一定有失真（Word 里的公式只留文字形式、版面还原不了，见 doc_to_note 的说明）。
+      正文是「能读的那部分」，原件是「一定没丢的那部分」—— 与笔记导入文档同一个道理。
+      老师想对照原文时，点一下就能下载。
+
+    为什么不复用 exam_files：那张表的 exam_id 是 NOT NULL、指向一次考试。
+      规划不挂在考试上，硬塞要么改既有表约束，要么造一条假考试记录 —— 两条都不该走。
+
+    kind 用 file_text.kind_for_archive（**永不为空**）：界面上总得有个东西说明
+    「这是份什么文件」，空标签等于没有信息。
+    """
+
+    __tablename__ = "plan_files"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    owner_id: Mapped[int] = mapped_column(Integer, nullable=False, default=OWNER_ID, server_default=str(OWNER_ID))
+    plan_id: Mapped[int] = mapped_column(
+        ForeignKey("student_plans.id", ondelete="CASCADE"), nullable=False
+    )
+    name: Mapped[str] = mapped_column(String, nullable=False)          # 上传时的原名
+    stored: Mapped[str] = mapped_column(Text, default="", server_default="")
+    kind: Mapped[str] = mapped_column(String, default="", server_default="")
+    size_bytes: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    # 这份文件有没有被转成正文（0/1）。界面上要能说清「这份只是存着，没转出文字」——
+    # 不说的话，老师会以为转换悄悄失败了。
+    converted: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    note: Mapped[str] = mapped_column(Text, default="", server_default="")
+    created_at: Mapped[str] = mapped_column(Text, default=_now, server_default=NOW)
+
+    plan: Mapped["StudentPlan"] = relationship(back_populates="files")
+
+    __table_args__ = (Index("idx_plan_files_plan", "plan_id", "id"),)
+
+
+# ============================================================
 # M4 笔记（Markdown 正文 + 一层板书笔画）
 # ============================================================
 class NoteFolder(Base):

@@ -8,6 +8,7 @@ import { curriculumApi, papersApi, paperTemplatesApi } from '../api.js';
 import { fail, loadCurricula, ok, state } from '../store.js';
 import { ensureLibs, renderRichEl } from '../mathRender.js';
 import { matchTags, tagQueryHint } from '../tagFilter.js';
+import { chooseForm, imageNote, stemImage, NO_STEM_NOTE } from '../questionForm.js';
 
 const QTYPES = ['选择题', '填空题', '解答题', '判断题', '证明题', '应用题', '图片题'];
 const DIFFS = ['基础', '中档', '拔高'];
@@ -192,7 +193,18 @@ export default {
       await nextTick();                  // 等 v-for 把新一页的容器挂上去
       paintRich();
     }
-    watch([rows, picked], () => { renderRich(); }, { flush: 'post' });
+    // ⚠️ 监视里必须带上 render_mode：切「题目呈现」时 rows / picked **一行都没变**，
+    //    但行里的容器换了一批（文本 ↔ 图），不重渲染就会看着是空的。
+    watch([rows, picked, () => opts.render_mode], () => { renderRich(); }, { flush: 'post' });
+
+    /* ---------- 列表里的题目按「会印成什么」显示 ----------
+     *
+     *  以前写死 `v-if="q.content"`：没识别出文本的题在列表里只剩一句「（图片题，没有文本）」，
+     *  老师认不出是哪道题，只能盲挑。现在走 src/questionForm.js 的判定 ——
+     *  与后端印卷规则逐条一致（该文本就渲染文本，该图就显示原貌图），
+     *  顺带把「卷子上会是空白」的题（文字和图都没有）在挑题时就点出来。
+     */
+    const formOf = (q) => chooseForm(q, opts.render_mode);
 
     const pickedIds = computed(() => picked.value.map((q) => q.id));
     const isPicked = (q) => pickedIds.value.includes(q.id);
@@ -292,6 +304,7 @@ export default {
       title, opts, QTYPES, DIFFS, pageNo, pageCount, tagOptions,
       templates, templateId, currentTemplate, renderModeHint,
       tagQuery, shownTags, tagHint, hiddenPicked, setRichEl,
+      formOf, stemImage, imageNote, NO_STEM_NOTE,
       search, resetFilter, add, addPage, remove, clearPicked, move,
       isPicked, open, prev, next, toggleTag, setVersion,
     };
@@ -419,9 +432,21 @@ export default {
             <div style="flex:1;min-width:0">
               <!-- 题干走渲染管线（见 setup 里 renderRich 的注释）：老师要看的是排好版的
                    公式，不是 $…$ 原文。容器里**不能**再放 Vue 插值 —— KaTeX 会把
-                   文本节点换掉。 -->
-              <div v-if="q.content" class="q-rich" :ref="(el) => setRichEl('row:' + q.id, el)"></div>
-              <div v-else class="muted">（图片题，没有文本）</div>
+                   文本节点换掉。
+                   展示哪种形态由 questionForm.chooseForm 定（= 后端印卷的同一条规则）：
+                   没识别出文本的题在这里显示**原貌图**，不再是「（图片题，没有文本）」。 -->
+              <template v-if="formOf(q) === 'text'">
+                <div class="q-rich" :ref="(el) => setRichEl('row:' + q.id, el)"></div>
+              </template>
+              <template v-else-if="formOf(q) === 'image'">
+                <a class="q-thumb-link" :href="stemImage(q)" target="_blank" rel="noopener"
+                   title="点开看原图">
+                  <img class="q-thumb" :src="stemImage(q)" alt="题目原貌图"
+                       loading="lazy" decoding="async">
+                </a>
+                <div class="small muted" style="margin-top:4px">{{ imageNote(q, opts.render_mode) }}</div>
+              </template>
+              <div v-else class="muted small">{{ NO_STEM_NOTE }}</div>
               <div style="margin-top:5px;display:flex;gap:5px;flex-wrap:wrap">
                 <span class="tag blue">{{ q.qtype }}</span>
                 <span class="tag">{{ q.difficulty }}</span>
@@ -540,8 +565,15 @@ export default {
           <div v-for="(q, i) in picked" :key="q.id" class="lesson-row">
             <span class="muted" style="width:20px;flex:none">{{ i + 1 }}</span>
             <div style="flex:1;min-width:0">
-              <div v-if="q.content" class="q-rich q-rich-sm" :ref="(el) => setRichEl('pick:' + q.id, el)"></div>
-              <div v-else class="muted">（图片题，没有文本）</div>
+              <template v-if="formOf(q) === 'text'">
+                <div class="q-rich q-rich-sm" :ref="(el) => setRichEl('pick:' + q.id, el)"></div>
+              </template>
+              <a v-else-if="formOf(q) === 'image'" class="q-thumb-link"
+                 :href="stemImage(q)" target="_blank" rel="noopener" title="点开看原图">
+                <img class="q-thumb q-thumb-sm" :src="stemImage(q)" alt="题目原貌图"
+                     loading="lazy" decoding="async">
+              </a>
+              <div v-else class="muted small">{{ NO_STEM_NOTE }}</div>
             </div>
             <button class="btn sm ghost" :disabled="i === 0" @click="move(i, -1)">↑</button>
             <button class="btn sm ghost" :disabled="i === picked.length - 1" @click="move(i, 1)">↓</button>

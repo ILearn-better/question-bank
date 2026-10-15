@@ -28,7 +28,7 @@ from sqlalchemy.orm import Session
 from .. import config
 from ..adapters import notes_math, office
 from ..db import get_db
-from ..models import Note, NoteFolder, Question
+from ..models import Note, NoteFolder, Question, StudentPlan
 from ..schemas import NoteIn, NotePatch, QuestionBlockIn
 from ..services import file_text, images, note_questions, notes_export
 from . import note_folders, notes_transfer
@@ -89,9 +89,19 @@ def _note_or_404(db: Session, nid: str) -> Note:
 
 
 def _used_images(db: Session) -> set[str]:
-    """所有笔记引用到的配图文件名（引用计数的依据）。"""
+    """所有笔记引用到的配图文件名（引用计数的依据）。
+
+    ⚠️ **整体规划的正文也要算进来**（`student_plans.content`）。
+    带图的 Word 导入规划时，图是由 `doc_to_note._save_asset` 落到**笔记资源目录**的，
+    正文引用成 `/api/notes/files/<name>` —— 与笔记同一批文件、同一个名字形态。
+    不把规划算进引用计数，就会出现这种事故：某篇笔记刚好不再引用那张图（或整篇被删），
+    回收逻辑把文件删掉，而规划里那张图变成破图 —— **完全没有任何报错**，
+    只能靠人翻到那条规划时才看见。
+    """
     used: set[str] = set()
     for (content,) in db.execute(select(Note.content)).all():
+        used |= set(_IMG_RE.findall(content or ""))
+    for (content,) in db.execute(select(StudentPlan.content)).all():
         used |= set(_IMG_RE.findall(content or ""))
     return used
 

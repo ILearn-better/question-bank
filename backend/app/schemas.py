@@ -612,3 +612,53 @@ class ExamAnalysisTemplateIn(BaseModel):
     name: str = ""
     sections: Optional[List[Dict[str, Any]]] = None
     sort_order: int = 0
+
+
+# ============================================================ 整体规划（学生级）
+class PlanFileIn(BaseModel):
+    """一份**已经传进暂存区**的原件（cache_key 由 POST /api/plans/upload 给）。
+
+    保存这条规划时服务端才把它从暂存区搬进正式归档目录并登记。
+    为什么要分两步：归档目录名是从**规划标题**来的，而标题随时会改 ——
+    先落盘再登记的话，每改一次标题就得连人带文件搬一次家。
+    """
+
+    cache_key: str
+    # 上传时的原名。暂存文件名已被安全洗字，带怪字符的名字会差一两个字符 ——
+    # 界面把它回传上来，库里 `name` 就还是老师当初选的那份文件的名字。
+    name: str = ""
+    # 这份文件有没有被转成正文（上传时后端已经转过一次，结果以它为准）。
+    converted: bool = False
+    # 没转成功的原因（界面要照实说，不能让老师以为转换悄悄成功了）。
+    note: str = ""
+
+
+class PlanIn(BaseModel):
+    """新建一条规划。title 与 content 至少要有一个有内容 ——
+    两样都空的「规划」在列表里就是一个没有标题的空条，点开也是空白。"""
+
+    student_id: int
+    title: str = ""
+    content: str = ""
+    files: List[PlanFileIn] = Field(default_factory=list)
+
+
+class PlanPatch(BaseModel):
+    """改一条规划。**没传的字段 = 不改**（与 ExamPatch / PaperTemplateIn 同一套语义）：
+    只想改标题的调用，不该把整篇正文抹掉。
+    （想清空就显式传空串 —— 「传了」和「没传」是两件事。）
+
+    ⚠️ files 是**增量**（只搬这次新传的），不是整份清单：
+    这样「改个错别字」不会把已归档的原件重新搬一遍、也不会误删。
+    要删某一份走 DELETE /api/plan-files/{fid}。
+    """
+
+    title: Optional[str] = None
+    content: Optional[str] = None
+    files: Optional[List[PlanFileIn]] = None
+
+
+class PlanCacheRemoveIn(BaseModel):
+    """删掉暂存区里一份**还没保存**的原件（相当于把「已选」撤回）。"""
+
+    cache_key: str

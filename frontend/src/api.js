@@ -341,6 +341,29 @@ export const examsApi = {
   removeTemplate: (id) => api.del(`/api/exam-analysis-templates/${id}`),
 };
 
+/** 整体规划（学生级）：正文是 Markdown，点开某条才取完整正文（列表只给摘要）。 */
+export const plansApi = {
+  list: (studentId) => api.get(`/api/students/${studentId}/plans`),
+  /** 单条详情：带完整正文 + 原件清单 —— 「每个规划点开才能详细查看」。 */
+  get: (id) => api.get(`/api/plans/${id}`),
+  create: (body) => api.post('/api/plans', body),
+  /** 改：**没传的字段 = 不改**；files 是增量（只提交这次新传的）。 */
+  update: (id, body) => api.patch(`/api/plans/${id}`, body),
+  /** 删这条规划 —— 连同它的原件一起。 */
+  remove: (id) => api.del(`/api/plans/${id}`),
+
+  /** 原件进暂存区，顺手返回转好的 Markdown（前端决定填进正文还是追加）。
+   *  ⚠️ 返回的 markdown 可能是空串 —— 那表示「这份转不出正文」（扫描件 / 图片 / 压缩包…），
+   *  此时 note 里写着原因，原件照样归档，界面要照实说。 */
+  upload: (formData) => api.upload('/api/plans/upload', formData),
+  /** 真删一份**还没保存**的暂存原件（只在界面上拿掉是没用的，文件会一直留着）。 */
+  removeCache: (cacheKey) => api.post('/api/plans/upload/remove', { cache_key: cacheKey }),
+
+  /** 已归档原件：删 / 取回（一律下载 —— Word/PDF 就地打开多半是白屏或乱码）。 */
+  removeFile: (id) => api.del(`/api/plan-files/${id}`),
+  rawUrl: (id) => `/api/plan-files/${id}/raw`,
+};
+
 export const systemApi = {
   info: () => api.get('/api/system/info'),
   backup: () => api.post('/api/system/backup'),
