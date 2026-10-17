@@ -308,11 +308,16 @@ def t_paths() -> None:
 
     r = upload("正文.md", "# 标题\n正文".encode("utf-8"))
     got = PL._cache_path(r["cache_key"])
+    # ⚠️ 用 is_relative_to 而不是字符串 startswith：Windows 上环境变量里的路径可能带
+    # 8.3 短名（C:/Users/ZHOULI~1/...），而 _cache_path 返回的是 resolve() 过的长名 ——
+    # 字符串前缀比会假失败（2026-10-18 踩到），路径层面判断才对两种写法都稳。
+    got_p = Path(got).resolve() if got else None
     check("正常 key 能解析到暂存区里那个文件",
-          got is not None and str(got).startswith(str(config.PLAN_CACHE_DIR)), str(got))
+          got_p is not None and got_p.is_relative_to(config.PLAN_CACHE_DIR.resolve()), str(got))
     check("★ 解析出来的是**规划**暂存区，不是考试那个（两个区不能互相看见）",
-          str(got).startswith(str(config.PLAN_CACHE_DIR))
-          and not str(got).startswith(str(config.EXAM_CACHE_DIR)), str(got))
+          got_p is not None
+          and got_p.is_relative_to(config.PLAN_CACHE_DIR.resolve())
+          and not got_p.is_relative_to(config.EXAM_CACHE_DIR.resolve()), str(got))
     PL.remove_plan_cache(PlanCacheRemoveIn(cache_key=r["cache_key"]))
     check("撤回后暂存文件真的没了", not got.exists(), str(got))
 
