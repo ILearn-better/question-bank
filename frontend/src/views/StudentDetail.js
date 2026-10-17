@@ -1,8 +1,8 @@
 // 学生详情 —— 「学生情况记录」的核心视图。
 // 设计目标：打开这个人的页面，从上到下就能看完他发生了什么，不用在多个页面之间跳。
 import { computed, onMounted, ref } from 'vue';
-import { useRoute } from 'vue-router';
-import { studentsApi, homeworkApi, supplementsApi, prepApi, examsApi, plansApi } from '../api.js';
+import { useRoute, useRouter } from 'vue-router';
+import { studentsApi, homeworkApi, supplementsApi, prepApi, examsApi, plansApi, gradeApi } from '../api.js';
 import AbilityRadar from '../components/AbilityRadar.js';
 import FeedbackDialog from '../components/FeedbackDialog.js';
 import HomeworkDialog from '../components/HomeworkDialog.js';
@@ -23,6 +23,7 @@ export default {
   components: { AbilityRadar, FeedbackDialog, HomeworkDialog, SupplementDialog, PrepDialog, ExamDialog, PlanDialog },
   setup() {
     const route = useRoute();
+    const router = useRouter();
     const id = Number(route.params.id);
     const stu = ref(null);
     const timeline = ref([]);
@@ -220,6 +221,22 @@ export default {
       await load();
     }
 
+    /** 「保存并批改」：作业在弹窗里已经存好了，这里只负责建批改任务、跳到批改台。
+     *  建任务失败就停在当前页报错 —— 不要把老师丢到一个空白的批改页。 */
+    async function onGrade({ lessonId, fileIds }) {
+      try {
+        const g = await gradeApi.create({
+          lesson_id: lessonId,
+          file_ids: fileIds || [],
+          answer_mode: 'ai',
+        });
+        homeworkLesson.value = null;
+        router.push('/grade/' + g.id);
+      } catch (e) {
+        fail(e.message);
+      }
+    }
+
     /** 「课前备课」：与反馈/作业/课后补充并列的入口，同一节课、同一个位置。 */
     function openPrep(item) {
       prepLesson.value = {
@@ -306,7 +323,7 @@ export default {
       stu, timeline, loading, feedbackLesson, pendingCount, abilityDims, hasAbility,
       openFeedback, onSaved, load, hhmm, money, shortDate, STATUS_LABEL, STATUS_TAG,
       folder, openingFolder, openFolder, fmtBytes,
-      hwRadar, homeworkLesson, openHomework, onHomeworkSaved, HW_TAG,
+      hwRadar, homeworkLesson, openHomework, onHomeworkSaved, HW_TAG, onGrade,
       supplementLesson, supPending, supsByLesson, openSupplement, onSupplementSaved,
       setSupStatus, printSup, removeSup, printing, SUP_TAG,
       prepLesson, prepsByLesson, openPrep, onPrepSaved,
@@ -655,7 +672,8 @@ export default {
     <FeedbackDialog v-if="feedbackLesson" :lesson="feedbackLesson"
                     @close="feedbackLesson = null" @saved="onSaved" />
     <HomeworkDialog v-if="homeworkLesson" :lesson="homeworkLesson"
-                    @close="homeworkLesson = null" @saved="onHomeworkSaved" />
+                    @close="homeworkLesson = null" @saved="onHomeworkSaved"
+                    @grade="onGrade" />
     <SupplementDialog v-if="supplementLesson" :lesson="supplementLesson"
                       @close="supplementLesson = null" @saved="onSupplementSaved" />
     <PrepDialog v-if="prepLesson" :lesson="prepLesson"

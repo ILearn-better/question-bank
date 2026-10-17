@@ -662,3 +662,101 @@ class PlanCacheRemoveIn(BaseModel):
     """删掉暂存区里一份**还没保存**的原件（相当于把「已选」撤回）。"""
 
     cache_key: str
+
+
+# ============================================================ 作业批改（0027）
+class GradeIn(BaseModel):
+    """建一次批改任务。
+
+    提交件走 `file_ids`（`lesson_files.id`）—— 学生交的照片/PDF 已经在「交作业」那一步
+    上传归档过了，这里只引用，不重传一份一样的。
+
+    答案的三种来源就对应 `answer_mode`：
+      · `ai`     —— 不用老师给，模型自己解题（会标 reference_unverified，老师能展开看它的解法）
+      · `key`    —— 老师给答案：`answer_text` 粘文字，或 `answer_file_ids` 给照片/Word
+      · `rubric` —— 老师给分步评分细则：`rubric_text`（每步多少分、扣分条件）
+    """
+
+    lesson_id: int
+    curriculum_id: Optional[int] = None
+    file_ids: List[int] = Field(default_factory=list)
+    answer_mode: Literal["ai", "key", "rubric"] = "key"
+    answer_text: str = ""
+    rubric_text: str = ""
+    answer_file_ids: List[int] = Field(default_factory=list)
+
+
+class GradeSetupPatch(BaseModel):
+    """开批**之前**改「判定依据」（A1：答案由老师提供，不是模型自己编）。
+
+    为什么单独开一个接口而不是重建任务：页图、提交件、归档目录都已就位，
+    重建等于把刚选好的东西丢掉。但也**只允许在没批出结果之前改** ——
+    已经批完再换依据，等于拿旧判定冒充新标准，那必须走「重新批改」（会清空结果）。
+
+    字段是 Optional 且 `None = 不改`（同其它 Patch 的语义）；传空串 = 清空。
+    """
+
+    answer_mode: Optional[Literal["ai", "key", "rubric"]] = None
+    answer_text: Optional[str] = None
+    rubric_text: Optional[str] = None
+
+
+class GradeItemPatch(BaseModel):
+    """老师改一道题的结果。**没传的字段 = 不改**（同 ExamPatch / PlanPatch 的语义）。
+
+    ⚠️ 改 `student_answer`（老师发现识别错了，把 3 改成 8）会**清掉这一题的判定、
+    把 transcription_version +1** —— 旧判定引用的原文已经不存在了，留着就是
+    「引用了一句不存在的话」。服务层负责这件事，前端只要传新文本。
+    """
+
+    verdict: Optional[Literal["correct", "partial", "wrong", "blank", "ungradable"]] = None
+    score: Optional[float] = None
+    qtype: Optional[str] = None
+    kp_name: Optional[str] = None
+    error_reason: Optional[str] = None
+    student_answer: Optional[str] = None
+    tags: Optional[List[str]] = None
+    status: Optional[Literal["pending", "approved", "rejected"]] = None
+
+
+class GradeMarkIn(BaseModel):
+    """一条标注。坐标是**按页归一化的 0~1000**，前端 viewBox 直接吃。
+
+    `ink` 是老师手写的笔迹（红笔圈、划线、写「重做」）：点列走 `points`，
+    `geo` 只放包围盒（橡皮命中、列表统计要用），别指望它精确。
+    """
+
+    page_no: int = 1
+    kind: Literal["box", "ellipse", "check", "cross", "arrow", "text", "ink"] = "box"
+    geo: List[float] = Field(default_factory=list)      # [x0, y0, x1, y1]
+    points: List[float] = Field(default_factory=list)   # 手绘折线 [x,y,x,y,…]
+    text: str = ""
+    color: str = ""
+    item_id: Optional[str] = None
+
+
+class GradeMarkPatch(BaseModel):
+    """拖 / 改 / 改颜色。同样「没传 = 不改」。"""
+
+    geo: Optional[List[float]] = None
+    points: Optional[List[float]] = None
+    text: Optional[str] = None
+    color: Optional[str] = None
+    kind: Optional[Literal["box", "ellipse", "check", "cross", "arrow", "text", "ink"]] = None
+
+
+class GradeToBankIn(BaseModel):
+    """把一道错题挂到题库已有题上（B1 已定：**不自动建题**）。
+
+    `question_id` 必填 —— 找不到对应题时前端引导老师去「录入新题」，
+    走的是题库既有的新增接口，不在这里偷偷造一道。
+    """
+
+    question_id: str
+    tags: List[str] = Field(default_factory=list)
+
+
+class GradeConfirmIn(BaseModel):
+    """老师确认整份批改。确认之后，统计口径（掌握度 / 家长稿）才会读它。"""
+
+    note: str = ""

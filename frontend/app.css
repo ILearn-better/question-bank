@@ -681,3 +681,215 @@ table.tbl td.pending { color: var(--warning); font-weight: 600; }
 /* 正文输入框：等宽字体，让 Markdown 的标记和缩进看得清（写表格时尤其） */
 .plan-editor { font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
                font-size: 13px; line-height: 1.7; }
+
+/* ---------------- 作业批改台（/grade/:id） ----------------
+   左边页图 + 标注层，右边逐题卡。判定的颜色是这一屏的信息主色：
+   对=绿、部分对=橙、错=红、空白=灰、判不了=紫（**不是**灰 —— 灰会被读成「没判」，
+   而判不了是一个有原因的一等状态，见 models.HomeworkGradeItem 注释 1）。 */
+.grade-top { padding: 12px 16px; }
+.grade-top-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+/* 顶部那句人话：常驻，不折叠。AI 不给分这条边界要说在最显眼的地方。 */
+.grade-tip { margin-top: 8px; font-size: 12px; color: var(--text-2);
+             border-left: 3px solid var(--primary); padding: 2px 0 2px 8px; }
+
+/* 「还没开始 / 正在跑」的补充说明。比 .grade-tip 弱一档，但必须看得见 —— 
+   这两句是防「以为在跑、其实没动」的唯一提示。 */
+.grade-hint { margin-top: 6px; font-size: 12px; color: var(--text-2);
+              background: var(--panel-2); border-radius: 6px; padding: 4px 8px; }
+
+.grade-status { display: inline-block; padding: 1px 9px; border-radius: 999px;
+                font-size: 11px; font-weight: 600; border: 1px solid var(--border);
+                background: var(--panel-2); color: var(--text-2); }
+.grade-status.s-running { background: var(--primary-weak); color: var(--primary); border-color: #c7d7fe; }
+.grade-status.s-reviewing { background: var(--warning-weak); color: var(--warning); border-color: #fedf89; }
+.grade-status.s-done { background: var(--success-weak); color: var(--success); border-color: #bbf7d0; }
+.grade-status.s-partial, .grade-status.s-failed { background: var(--danger-weak); color: var(--danger); border-color: #fecaca; }
+
+.grade-wrap { display: grid; grid-template-columns: minmax(0, 1fr) minmax(420px, 560px);
+              gap: 14px; align-items: start; margin-top: 14px; }
+/* 左栏跟着滚：一页图很高，逐题卡又长，不吸顶的话往下翻两屏就看不见卷面了。
+   ⚠️ 高度只在左栏内部滚，**不要**给图片设 max-height —— 标注层是按容器等比铺的，
+   给图片单独限高会让标注和卷面对不上。 */
+.grade-left { position: sticky; top: 12px; max-height: calc(100vh - 24px); overflow: auto; }
+.grade-pagebar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
+.grade-pagebar .spacer { flex: 1; }
+.grade-page { position: relative; line-height: 0; border-radius: var(--radius-sm); overflow: hidden;
+              background: var(--panel-2); border: 1px solid var(--border); }
+.grade-page-img { display: block; width: 100%; height: auto; }
+.grade-page-miss { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+                   line-height: 1.6; color: var(--text-3); text-align: center; padding: 20px; }
+/* 标注层：绝对铺满图片，SVG 用 0~1000 的归一化坐标（preserveAspectRatio="none"）。
+   根节点不吃鼠标 —— 没标注的地方要能穿透到图片上。 */
+.gmark-layer { position: absolute; inset: 0; pointer-events: none; }
+.gmark-svg { display: block; width: 100%; height: 100%; }
+.gmark { pointer-events: auto; cursor: pointer; }
+.gmark-hit { fill: transparent; }
+.gmark .shape { stroke-width: 2.2; vector-effect: non-scaling-stroke; }
+/* AI 给的框只准到「哪一带」（实测偏高约 1/8 页）→ 虚线就是在说「这个框是估的」 */
+.gmark.rough .shape { stroke-dasharray: 7 5; opacity: .9; }
+.gmark:hover .gmark-hit { fill: rgba(37, 99, 235, .06); }
+.gmark.sel .shape { stroke-width: 3.4; stroke-dasharray: none; }
+.gmark.sel .gmark-hit { fill: rgba(37, 99, 235, .1); }
+/* 可拖的标注（框类）给「抓手」光标 —— 用户得先知道这东西能拖，否则永远发现不了 */
+.gmark.mv { cursor: grab; }
+.gmark.mv.drag { cursor: grabbing; }
+/* 文字标注走 HTML：SVG 的 <text> 在非等比 viewBox 里会被横向压扁 */
+.gmark-label { position: absolute; transform: translate(0, -100%); max-width: 46%;
+               pointer-events: auto; cursor: grab; font-size: 11px; line-height: 1.4;
+               padding: 0 5px; border: 1px solid currentColor; border-radius: 4px;
+               background: rgba(255, 255, 255, .92); white-space: nowrap;
+               overflow: hidden; text-overflow: ellipsis;
+               /* 拖动时别让浏览器顺手选中文字 / 触发滚动，否则一按就变成框选 */
+               user-select: none; touch-action: none; }
+.gmark-label.sel { font-weight: 600; box-shadow: 0 0 0 2px var(--primary-weak); }
+.gmark-label.drag { cursor: grabbing; box-shadow: 0 3px 12px rgba(0, 0, 0, .2); z-index: 3; }
+
+.grade-right { min-width: 0; }
+.grade-side-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+                   padding-bottom: 8px; border-bottom: 1px solid var(--border); margin-bottom: 10px; }
+.grade-side-head .spacer { flex: 1; }
+
+.g-item { border: 1px solid var(--border); border-radius: var(--radius-sm);
+          padding: 10px 12px; background: var(--panel); }
+.g-item + .g-item { margin-top: 10px; }
+/* 选中态 = 从标注点过来落在这里的那一题。只用边框和一圈淡色，不闪动画。 */
+.g-item.sel { border-color: var(--primary); box-shadow: 0 0 0 3px var(--primary-weak); }
+.g-head { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.g-head .spacer { flex: 1; }
+.g-no { font-size: 14px; }
+
+.g-verdict { display: inline-block; padding: 1px 9px; border-radius: 999px;
+             font-size: 11px; font-weight: 600; border: 1px solid transparent; }
+.g-verdict.v-correct { background: var(--success-weak); color: var(--success); border-color: #bbf7d0; }
+.g-verdict.v-partial { background: var(--warning-weak); color: var(--warning); border-color: #fedf89; }
+.g-verdict.v-wrong { background: var(--danger-weak); color: var(--danger); border-color: #fecaca; }
+.g-verdict.v-blank { background: var(--panel-2); color: var(--text-2); border-color: var(--border); }
+.g-verdict.v-ungradable { background: #f5f3ff; color: #6d28d9; border-color: #ddd6fe; }
+
+.g-sec { margin-top: 8px; }
+.g-lb { font-size: 11px; color: var(--text-3); }
+/* 题干 / 学生作答 / 参考答案：容器由 JS 写 innerHTML（KaTeX 要求空容器），
+   所以排版规则落在这里，与 .q-rich / .plan-rich 同一套行距。 */
+.g-rich { font-size: 13.5px; line-height: 1.75; word-break: break-word; }
+.g-rich > :first-child { margin-top: 0; }
+.g-rich > :last-child { margin-bottom: 0; }
+.g-rich p { margin: 0 0 6px; }
+.g-rich ul, .g-rich ol { margin: 4px 0 6px; padding-left: 22px; }
+.g-rich img { max-width: 100%; height: auto; }
+.g-rich code { background: var(--panel-2); padding: 1px 4px; border-radius: 3px; font-size: 12px; }
+.g-rich .katex { font-size: 1.02em; }
+.g-rich .katex-display { margin: 6px 0; overflow-x: auto; }
+/* 参考答案只是对照用的，压一压，别抢学生作答的位置 */
+.g-rich-sm { color: var(--text-2); max-height: 120px; overflow: auto; }
+
+/* 判不了必须把原因写在脸上 */
+.g-ungradable { margin-top: 6px; padding: 6px 8px; font-size: 12px; color: #6d28d9;
+                background: #f5f3ff; border-left: 3px solid #a78bfa; border-radius: 4px; }
+
+.g-line { font-size: 13px; }
+.g-line b { font-size: 11px; color: var(--text-3); font-weight: 500; margin-right: 6px; }
+.g-basis { font-size: 12.5px; color: var(--text-2); margin-top: 2px; white-space: pre-wrap; }
+.g-meta { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+
+.g-verdicts { display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+              margin-top: 10px; padding-top: 8px; border-top: 1px dashed var(--border); }
+.g-vbtn { border: 1px solid var(--border-strong); background: var(--panel); color: var(--text-2);
+          border-radius: 999px; padding: 2px 10px; font-size: 12px; cursor: pointer;
+          font-family: inherit; }
+.g-vbtn:hover { border-color: currentColor; }
+.g-vbtn.ok { color: var(--success); border-color: #bbf7d0; }
+.g-vbtn.part { color: var(--warning); border-color: #fedf89; }
+.g-vbtn.bad { color: var(--danger); border-color: #fecaca; }
+.g-vbtn.blank { color: var(--text-2); }
+.g-vbtn.na { color: #6d28d9; border-color: #ddd6fe; }
+.g-vbtn.on { color: #fff; border-color: transparent; font-weight: 600; }
+.g-vbtn.ok.on { background: var(--success); }
+.g-vbtn.part.on { background: var(--warning); }
+.g-vbtn.bad.on { background: var(--danger); }
+.g-vbtn.blank.on { background: var(--text-3); }
+.g-vbtn.na.on { background: #7c3aed; }
+
+.g-foot { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+.g-foot .spacer { flex: 1; }
+.g-check { display: inline-flex; align-items: center; gap: 5px; font-size: 12px;
+           color: var(--text-2); cursor: pointer; }
+.g-check input { width: auto; }
+
+.g-bank { margin-top: 8px; padding: 8px 10px; background: var(--panel-2);
+          border: 1px dashed var(--border-strong); border-radius: var(--radius-sm); }
+
+@media (max-width: 1180px) {
+  .grade-wrap { grid-template-columns: 1fr; }
+  .grade-left { position: static; max-height: none; overflow: visible; }
+}
+
+/* 判定依据（A1：答案由老师给）。开批前可改，开批后锁住 —— 锁住这件事要在界面上说清楚，
+   不然老师会以为是按钮坏了。 */
+.grade-setup { margin-bottom: 12px; }
+.grade-setup-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.grade-setup-modes { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+.grade-setup-modes label {
+  display: inline-flex; align-items: center; gap: 5px; cursor: pointer;
+  padding: 4px 10px; border: 1px solid var(--border); border-radius: 999px; font-size: 13px;
+}
+.grade-setup-modes label.on { border-color: var(--primary); color: var(--primary); background: var(--panel-2); }
+.grade-setup-modes input { margin: 0; }
+.grade-setup textarea { width: 100%; }
+
+/* ==================== 手写批改（画 / 擦 / 文字框 / √× / 导出） ==================== */
+.grade-tools { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin: 2px 0 8px; }
+.g-tool {
+  border: 1px solid var(--border); background: var(--panel, #fff); color: var(--text-2);
+  border-radius: 7px; padding: 4px 10px; font-size: 12.5px; line-height: 1.5; cursor: pointer;
+}
+.g-tool:hover { border-color: var(--primary); color: var(--primary); }
+.g-tool.on { background: var(--primary); border-color: var(--primary); color: #fff; }
+.g-tool.g-mark { min-width: 30px; padding: 2px 8px; font-size: 15px; font-weight: 700; }
+.g-sep { width: 1px; height: 18px; background: var(--border); margin: 0 2px; }
+.g-color {
+  width: 18px; height: 18px; padding: 0; border: 2px solid var(--panel, #fff);
+  border-radius: 50%; box-shadow: 0 0 0 1px var(--border-strong); cursor: pointer;
+}
+.g-color.on { box-shadow: 0 0 0 2px var(--primary); }
+.grade-toolhint { margin: -2px 0 8px; }
+
+/* ⚠️ 画/擦/放标记时整层接事件；同时让**已有标注**失去指针 ——
+   否则笔一落就被某条标注吃掉（<g> 默认 pointer-events:auto），画不出线。 */
+.gmark-layer.mode-ink, .gmark-layer.mode-erase,
+.gmark-layer.mode-text, .gmark-layer.mode-check, .gmark-layer.mode-cross {
+  pointer-events: auto; touch-action: none;
+}
+.gmark-layer.mode-ink { cursor: crosshair; }
+.gmark-layer.mode-erase { cursor: cell; }
+.gmark-layer.mode-text { cursor: text; }
+.gmark-layer.mode-check, .gmark-layer.mode-cross { cursor: copy; }
+.gmark-layer.mode-ink .gmark, .gmark-layer.mode-erase .gmark,
+.gmark-layer.mode-text .gmark, .gmark-layer.mode-check .gmark,
+.gmark-layer.mode-cross .gmark,
+.gmark-layer.mode-ink .gmark-label, .gmark-layer.mode-erase .gmark-label,
+.gmark-layer.mode-text .gmark-label, .gmark-layer.mode-check .gmark-label,
+.gmark-layer.mode-cross .gmark-label { pointer-events: none; }
+
+/* 老师笔迹：比 AI 的框更活泼一点（粗、圆头、圆角），一眼能分出「这是我画的」 */
+.gmark .shape.ink { stroke-width: 3; }
+.gmark-draft {
+  stroke-width: 3; stroke-linecap: round; stroke-linejoin: round; opacity: .85;
+  pointer-events: none;
+}
+
+/* 文字框浮层（零构建，不引第三方弹窗） */
+.g-textmask {
+  position: fixed; inset: 0; z-index: 80; background: rgba(15, 23, 42, .35);
+  display: flex; align-items: flex-start; justify-content: center; padding-top: 16vh;
+}
+.g-textbox {
+  width: min(460px, 92vw); padding: 14px; background: var(--panel, #fff);
+  border-radius: 10px; box-shadow: 0 18px 50px rgba(0, 0, 0, .22);
+}
+.g-textbox-head { margin-bottom: 8px; font-weight: 600; }
+.g-textbox textarea {
+  width: 100%; box-sizing: border-box; padding: 8px; resize: vertical;
+  font: inherit; border: 1px solid var(--border); border-radius: 8px;
+}
+.g-textbox textarea:focus { outline: none; border-color: var(--primary); }
+.g-textbox-foot { display: flex; align-items: center; gap: 8px; margin-top: 10px; }

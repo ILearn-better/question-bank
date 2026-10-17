@@ -35,6 +35,7 @@ from app.routers import (                                   # noqa: E402
     exams,
     feedbacks,
     homeworks,
+    homework_grades,
     lesson_files,
     lesson_import,
     lessons,
@@ -175,6 +176,7 @@ app.include_router(lessons.router)
 app.include_router(feedbacks.router)
 app.include_router(lesson_files.router)
 app.include_router(homeworks.router)
+app.include_router(homework_grades.router)
 app.include_router(supplements.router)
 app.include_router(preps.router)
 app.include_router(curriculum.router)
