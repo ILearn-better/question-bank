@@ -38,6 +38,10 @@ STUDENTS_DIR = UPLOAD_DIR / "students"
 # 老师改一次日期就得连人带文件搬一次。暂存区只按随机 token 分目录，与考试内容无关。
 # （超过 48 小时没被保存的暂存目录由 routers/exams.py 在下次上传时顺手清掉。）
 EXAM_CACHE_DIR = UPLOAD_DIR / "exams_cache"
+# 整体规划上传原件的暂存区。与考试附件同一个道理：老师选好文件就立刻落盘，
+# 但**保存这条规划时才搬进归档目录** —— 规划换标题不该牵动文件
+# （归档目录名就是从标题来的）。超 48 小时没保存的暂存目录由 routers/plans.py 顺手清。
+PLAN_CACHE_DIR = UPLOAD_DIR / "plans_cache"
 EXPORT_DIR = DATA_DIR / "exports"
 BACKUP_DIR = DATA_DIR / "backups"
 
@@ -60,7 +64,7 @@ AUTO_MIGRATE = os.getenv("SHIKE_AUTO_MIGRATE", "1") != "0"
 
 def ensure_dirs() -> None:
     for d in (DATA_DIR, UPLOAD_DIR, PAGES_CACHE, CROPS_DIR, CONVERTED_DIR, EXPORT_DIR,
-              BACKUP_DIR, NOTES_DIR, STUDENTS_DIR, EXAM_CACHE_DIR):
+              BACKUP_DIR, NOTES_DIR, STUDENTS_DIR, EXAM_CACHE_DIR, PLAN_CACHE_DIR):
         d.mkdir(parents=True, exist_ok=True)
 
 

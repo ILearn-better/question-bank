@@ -1,14 +1,15 @@
 // 学生详情 —— 「学生情况记录」的核心视图。
 // 设计目标：打开这个人的页面，从上到下就能看完他发生了什么，不用在多个页面之间跳。
 import { computed, onMounted, ref } from 'vue';
-import { useRoute } from 'vue-router';
-import { studentsApi, homeworkApi, supplementsApi, prepApi, examsApi } from '../api.js';
+import { useRoute, useRouter } from 'vue-router';
+import { studentsApi, homeworkApi, supplementsApi, prepApi, examsApi, plansApi, gradeApi } from '../api.js';
 import AbilityRadar from '../components/AbilityRadar.js';
 import FeedbackDialog from '../components/FeedbackDialog.js';
 import HomeworkDialog from '../components/HomeworkDialog.js';
 import SupplementDialog from '../components/SupplementDialog.js';
 import PrepDialog from '../components/PrepDialog.js';
 import ExamDialog from '../components/ExamDialog.js';
+import PlanDialog from '../components/PlanDialog.js';
 import { filledSections, analysisPreview, analysisStats } from '../examAnalysis.js';
 import { fail, fmtBytes, hhmm, loadCurricula, money, ok, shortDate, STATUS_LABEL, STATUS_TAG } from '../store.js';
 
@@ -19,9 +20,10 @@ const SUP_TAG = { todo: 'orange', given: 'blue', returned: 'green' };
 
 export default {
   name: 'StudentDetail',
-  components: { AbilityRadar, FeedbackDialog, HomeworkDialog, SupplementDialog, PrepDialog, ExamDialog },
+  components: { AbilityRadar, FeedbackDialog, HomeworkDialog, SupplementDialog, PrepDialog, ExamDialog, PlanDialog },
   setup() {
     const route = useRoute();
+    const router = useRouter();
     const id = Number(route.params.id);
     const stu = ref(null);
     const timeline = ref([]);
@@ -48,6 +50,10 @@ export default {
     const examTypes = ref([]);
     const examDialog = ref(null);      // { exam: 记录或 null }
     const expandedExam = ref(0);       // 展开看详情的那条
+    // 整体规划：**学生级**的文档（可新建/查看/改/删），放在「考试情况」上方。
+    // 列表只拿标题 + 摘要，点开某条才去取完整正文（list 不带正文，见 routers/plans.py 设计⑤）。
+    const plans = ref([]);
+    const planDialog = ref(null);      // { plan: 简要对象或 null, startEdit: bool }
 
     async function loadSupplements() {
       const map = {};
@@ -87,6 +93,15 @@ export default {
       }
     }
 
+    async function loadPlans() {
+      try {
+        const r = await plansApi.list(id);
+        plans.value = r.items || [];
+      } catch (e) {
+        plans.value = [];
+      }
+    }
+
     async function load() {
       loading.value = true;
       try {
@@ -97,6 +112,7 @@ export default {
         await loadSupplements();
         await loadPreps();
         await loadExams();
+        await loadPlans();
       } catch (e) {
         fail(e.message);
       } finally {
@@ -205,6 +221,22 @@ export default {
       await load();
     }
 
+    /** 「保存并批改」：作业在弹窗里已经存好了，这里只负责建批改任务、跳到批改台。
+     *  建任务失败就停在当前页报错 —— 不要把老师丢到一个空白的批改页。 */
+    async function onGrade({ lessonId, fileIds }) {
+      try {
+        const g = await gradeApi.create({
+          lesson_id: lessonId,
+          file_ids: fileIds || [],
+          answer_mode: 'ai',
+        });
+        homeworkLesson.value = null;
+        router.push('/grade/' + g.id);
+      } catch (e) {
+        fail(e.message);
+      }
+    }
+
     /** 「课前备课」：与反馈/作业/课后补充并列的入口，同一节课、同一个位置。 */
     function openPrep(item) {
       prepLesson.value = {
@@ -247,6 +279,32 @@ export default {
       }
     }
 
+    // ---- 整体规划：点开一条 = 看排版好的正文；「改」直接进编辑态 ----
+    function openPlan(p) {
+      planDialog.value = { plan: p || null, startEdit: !p };
+    }
+
+    function editPlan(p) {
+      planDialog.value = { plan: p, startEdit: true };
+    }
+
+    async function onPlanSaved() {
+      planDialog.value = null;
+      await loadPlans();
+    }
+
+    async function removePlan(p) {
+      const what = p.title || '这条规划';
+      if (!window.confirm(`删掉「${what}」？（原件也会一起删）`)) return;
+      try {
+        await plansApi.remove(p.id);
+        ok('规划已删掉');
+        await loadPlans();
+      } catch (err) {
+        fail(err.message);
+      }
+    }
+
     // ---- 考试行上的展示小工具（都是纯函数，模板里直接调）----
     const examRawUrl = (fid, inline) => examsApi.rawUrl(fid, inline);
     const isImg = (name) => /\.(png|jpe?g|gif|webp|bmp)$/i.test(String(name || ''));
@@ -265,13 +323,14 @@ export default {
       stu, timeline, loading, feedbackLesson, pendingCount, abilityDims, hasAbility,
       openFeedback, onSaved, load, hhmm, money, shortDate, STATUS_LABEL, STATUS_TAG,
       folder, openingFolder, openFolder, fmtBytes,
-      hwRadar, homeworkLesson, openHomework, onHomeworkSaved, HW_TAG,
+      hwRadar, homeworkLesson, openHomework, onHomeworkSaved, HW_TAG, onGrade,
       supplementLesson, supPending, supsByLesson, openSupplement, onSupplementSaved,
       setSupStatus, printSup, removeSup, printing, SUP_TAG,
       prepLesson, prepsByLesson, openPrep, onPrepSaved,
       exams, examTypes, examDialog, expandedExam,
       openExam, onExamSaved, toggleExam, removeExam,
       examRawUrl, isImg, examHasScore, scoreRatePct,
+      plans, planDialog, openPlan, editPlan, onPlanSaved, removePlan,
       filledSections, analysisPreview, analysisStats,
     };
   },
@@ -397,6 +456,42 @@ export default {
                 </tr>
               </tbody>
             </table>
+          </div>
+        </div>
+      </div>
+
+      <!-- 整体规划：**学生级**的一份文档（正文本体存库，可打字、也可由 Word/Markdown
+           文件转成）。列表只给标题 + 摘要，**点开某条才渲染正文** ——
+           一条几千字的规划铺在列表里，这一页就没法往下翻了（见 routers/plans.py 设计⑤）。 -->
+      <div class="card">
+        <h2>
+          整体规划
+          <span v-if="plans.length" class="small muted" style="font-weight:400">（共 {{ plans.length }} 条）</span>
+          <div class="spacer"></div>
+          <button class="btn sm primary" @click="openPlan(null)">＋ 新建规划</button>
+        </h2>
+        <div v-if="!plans.length" class="empty">
+          还没有规划
+          <div class="small" style="margin-top:6px">
+            新建一条，直接打字写；也可以传一份 Word / Markdown 文件，自动转成正文
+          </div>
+        </div>
+        <div v-else>
+          <div v-for="p in plans" :key="p.id" class="plan-row">
+            <div class="plan-main" @click="openPlan(p)" title="点开看排版好的正文">
+              <div class="plan-head">
+                <b class="plan-name">{{ p.title || '（未命名规划）' }}</b>
+                <span v-if="!p.has_content" class="tag orange">还没有正文</span>
+                <span v-if="p.file_count" class="tag">{{ p.file_count }} 份原件</span>
+                <span class="small muted">{{ (p.updated_at || '').slice(0, 10) }}</span>
+              </div>
+              <div v-if="p.preview" class="plan-preview">{{ p.preview }}</div>
+              <div v-else class="small muted">（点开写点内容）</div>
+            </div>
+            <div class="spacer"></div>
+            <button class="btn ghost sm" @click="openPlan(p)">查看</button>
+            <button class="btn ghost sm" @click="editPlan(p)">改</button>
+            <button class="btn ghost sm" style="color:var(--danger)" @click="removePlan(p)">删</button>
           </div>
         </div>
       </div>
@@ -577,7 +672,8 @@ export default {
     <FeedbackDialog v-if="feedbackLesson" :lesson="feedbackLesson"
                     @close="feedbackLesson = null" @saved="onSaved" />
     <HomeworkDialog v-if="homeworkLesson" :lesson="homeworkLesson"
-                    @close="homeworkLesson = null" @saved="onHomeworkSaved" />
+                    @close="homeworkLesson = null" @saved="onHomeworkSaved"
+                    @grade="onGrade" />
     <SupplementDialog v-if="supplementLesson" :lesson="supplementLesson"
                       @close="supplementLesson = null" @saved="onSupplementSaved" />
     <PrepDialog v-if="prepLesson" :lesson="prepLesson"
@@ -585,5 +681,8 @@ export default {
     <ExamDialog v-if="examDialog" :exam="examDialog.exam" :student="stu"
                 :folder="folder ? folder.folder : ''" :type-options="examTypes"
                 @close="examDialog = null" @saved="onExamSaved" />
+    <PlanDialog v-if="planDialog" :plan="planDialog.plan" :student="stu"
+                :folder="folder ? folder.folder : ''" :start-edit="planDialog.startEdit"
+                @close="planDialog = null" @saved="onPlanSaved" />
   </div>`,
 };

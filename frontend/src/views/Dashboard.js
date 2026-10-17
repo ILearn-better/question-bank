@@ -1,7 +1,8 @@
 // 今日工作台 —— 打开系统第一眼要看到的东西。
 // 只回答四个问题：今天有哪几节课？哪些课还没写反馈？本月收了多少？有多少在读学生？
 import { onMounted, ref } from 'vue';
-import { dashboardApi, lessonsApi } from '../api.js';
+import { useRouter } from 'vue-router';
+import { dashboardApi, lessonsApi, gradeApi } from '../api.js';
 import FeedbackDialog from '../components/FeedbackDialog.js';
 import HomeworkDialog from '../components/HomeworkDialog.js';
 import {
@@ -12,6 +13,7 @@ export default {
   name: 'Dashboard',
   components: { FeedbackDialog, HomeworkDialog },
   setup() {
+    const router = useRouter();
     const data = ref(null);
     const monthly = ref(null);
     const period = ref(currentPeriod());
@@ -63,10 +65,25 @@ export default {
       load();
     }
 
+    /** 「保存并批改」：作业在弹窗里存好之后，建一条批改任务并跳到批改台。 */
+    async function onGrade({ lessonId, fileIds }) {
+      try {
+        const g = await gradeApi.create({
+          lesson_id: lessonId,
+          file_ids: fileIds || [],
+          answer_mode: 'ai',
+        });
+        homeworkLesson.value = null;
+        router.push('/grade/' + g.id);
+      } catch (e) {
+        fail(e.message);
+      }
+    }
+
     onMounted(load);
     return {
       data, monthly, period, loading, busy, feedbackLesson, homeworkLesson,
-      load, complete, reloadMonthly, onFeedbackSaved, onHomeworkSaved,
+      load, complete, reloadMonthly, onFeedbackSaved, onHomeworkSaved, onGrade,
       hhmm, money, shortDate, STATUS_LABEL, STATUS_TAG,
     };
   },
@@ -203,6 +220,7 @@ export default {
     <FeedbackDialog v-if="feedbackLesson" :lesson="feedbackLesson"
                     @close="feedbackLesson = null" @saved="onFeedbackSaved" />
     <HomeworkDialog v-if="homeworkLesson" :lesson="homeworkLesson"
-                    @close="homeworkLesson = null" @saved="onHomeworkSaved" />
+                    @close="homeworkLesson = null" @saved="onHomeworkSaved"
+                    @grade="onGrade" />
   </div>`,
 };

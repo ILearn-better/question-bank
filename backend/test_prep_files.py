@@ -433,7 +433,7 @@ def t_frontend() -> None:
     check("用的类都是项目已有的（.tag / .btn / .chip），没引新 UI 库",
           all(c in src for c in ("class=\"tag\"", "class=\"btn", "class=\"chip")), "")
 
-    # ---- 题库挑题的题干：渲染成真公式 + 鼠标悬停展开（2026-10-11）----
+    # ---- 题库挑题的题干：渲染成真公式 + 鼠标悬停展开 + **图片题显示原貌图**（2026-10-11）----
     check("引了渲染管线 mathRender（不自己写 marked / katex 调用）",
           "from '../mathRender.js'" in src and "renderRichEl" in src and "ensureLibs" in src, "")
     check("题库行的题干改成渲染容器（q-rich + setRichEl），不再直接插值 brief(r)",
@@ -451,6 +451,18 @@ def t_frontend() -> None:
     check("还留着 brief（已选 chips 的 title 仍要纯文本）",
           "brief(r)" in src, "")
 
+    # ★ 图片题：没有文本的题在列表里显示那张原貌图，不再是「（图片题，没有文本）」
+    check("★ 形态判定走 questionForm（与出卷页同一份，不在这页里另写一套）",
+          "from '../questionForm.js'" in src and "chooseForm" in src, "")
+    check("★ 图片题渲染 <img class=\"q-thumb\">，src 取 stemImage(r)",
+          'class="q-thumb"' in src and "stemImage(r)" in src, "")
+    check("★ 「（图片题，没有文本）」这句占位已删除（注释里提到旧文案不算）",
+          "（图片题，没有文本）" not in re.sub(
+              r"<!--.*?-->", "", extract_template(dlg) or "", flags=re.S), "")
+    check("图片旁边写清「为什么显示成图」（imageNote）", "imageNote(r" in src, "")
+    check("缩略图点开能看原图", "q-thumb-link" in src and 'target="_blank"' in src, "")
+    check("缩略图懒加载（一次 50 条结果，别一进来就全量拉图）", 'loading="lazy"' in src, "")
+
     css = (FE / "app.css").read_text(encoding="utf-8")
     check("列表里题干默认只露一截（.pick-row .q-clamp 有 max-height）",
           re.search(r"\.pick-row \.q-clamp\s*\{[^}]*max-height", css) is not None, "")
@@ -461,6 +473,9 @@ def t_frontend() -> None:
           ".q-clamp::after" in css and "linear-gradient" in css, "")
     check("题干是多行块，按钮顶对齐（.pick-row-top）",
           ".pick-row.pick-row-top" in css, "")
+    check("挑题列表里的题目原貌图有样式（.q-thumb / .q-thumb-sm）",
+          re.search(r"^\.q-thumb\b", css, re.M) is not None
+          and re.search(r"^\.q-thumb-sm\b", css, re.M) is not None, "")
 
     api_src = api.read_text(encoding="utf-8")
     check("api.js 注释写明了 prep 是「只归档不抽文字」",
@@ -544,6 +559,9 @@ def t_consistency() -> None:
     prep = (ROOT / "frontend" / "src" / "components" / "PrepDialog.js").read_text(encoding="utf-8")
     check("备课挑题的渲染只走 mathRender（别处升级管线时才不会漏掉这一份）",
           "renderMathInElement" not in prep and "window.marked" not in prep, "")
+    check("形态判定只有一份（src/questionForm.js）：备课与出卷不再各写一套",
+          "from '../questionForm.js'" in prep
+          and not re.search(r"function\s+chooseForm", prep), "")
 
 
 # ================================================================ main

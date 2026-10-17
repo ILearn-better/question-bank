@@ -855,6 +855,92 @@ class ExamAnalysisTemplate(Base):
 
 
 # ============================================================
+# M2 扩展：整体规划（**学生级**，一份可长可短的文档）
+# ============================================================
+class StudentPlan(Base):
+    """这个学生的「整体规划」—— 一份文档，**学生级、不挂课**。
+
+    需求原话（用户 2026-10-16）：
+    「学生信息界面添加一下整体规划……要能够新建规划,删除规划,查看规划,修改规划。
+      我会将文本或者文本文件放到规划,我点开某个规划要能够查看渲染好的文件,
+      常见的 markdown、word 这些。（每个规划点开才能详细查看）」
+
+    为什么正文是 **Markdown 文本**而不是「挂一个文件」：
+      老师说「放文本**或者**文本文件」—— 两种情况都存在。若正文只是个文件路径，
+      那「直接打字写规划」这条路就没有地方存了（总不能再造一个小文件）。
+      所以**正文以 Markdown 存库**，Word/PDF/Markdown 文件在上传时**转成 Markdown
+      灌进正文**（转换器复用 services/doc_to_note，那是「给人看」的那一套，
+      标题、列表、表格都保留）。原件同时归档到学生文件夹（PlanFile），
+      原件才是「一定没丢的那部分」。
+
+    为什么每条规划**点开才看见正文**（列表只给标题 + 摘要）：
+      整体规划是一份正经文档，动辄几千字。全铺在列表里，学生页会被一条规划撑满，
+      往下翻找考试情况、上课记录就很难受。摘要是纯文本预览（剥掉 Markdown 标记），
+      不渲染 —— 列表里渲染几十个 KaTeX 块会明显卡。
+
+    dir_rel：这条规划的归档目录（相对 UPLOAD_DIR），**第一次落文件时才确定**。
+      没传过文件的规划不该在磁盘上留空目录。改了标题 → 目录跟着改名
+      （routers/plans.py 里搬迁），所以必须存在库里，不能每次由标题现推。
+    """
+
+    __tablename__ = "student_plans"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    owner_id: Mapped[int] = mapped_column(Integer, nullable=False, default=OWNER_ID, server_default=str(OWNER_ID))
+    student_id: Mapped[int] = mapped_column(
+        ForeignKey("students.id", ondelete="CASCADE"), nullable=False
+    )
+    title: Mapped[str] = mapped_column(String, nullable=False)
+    content: Mapped[str] = mapped_column(Text, default="", server_default="")
+    dir_rel: Mapped[str] = mapped_column(Text, default="", server_default="")
+    created_at: Mapped[str] = mapped_column(Text, default=_now, server_default=NOW)
+    updated_at: Mapped[str] = mapped_column(Text, default=_now, server_default=NOW)
+
+    files: Mapped[list["PlanFile"]] = relationship(
+        back_populates="plan", cascade="all, delete-orphan"
+    )
+
+    __table_args__ = (Index("idx_student_plans_student", "student_id", "updated_at"),)
+
+
+class PlanFile(Base):
+    """一条规划带上的**原件**（Word / PDF / Markdown / 图片…）—— 归档备查，不重复抽文字。
+
+    为什么正文已经转成 Markdown 了还要留原件：
+      转换一定有失真（Word 里的公式只留文字形式、版面还原不了，见 doc_to_note 的说明）。
+      正文是「能读的那部分」，原件是「一定没丢的那部分」—— 与笔记导入文档同一个道理。
+      老师想对照原文时，点一下就能下载。
+
+    为什么不复用 exam_files：那张表的 exam_id 是 NOT NULL、指向一次考试。
+      规划不挂在考试上，硬塞要么改既有表约束，要么造一条假考试记录 —— 两条都不该走。
+
+    kind 用 file_text.kind_for_archive（**永不为空**）：界面上总得有个东西说明
+    「这是份什么文件」，空标签等于没有信息。
+    """
+
+    __tablename__ = "plan_files"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    owner_id: Mapped[int] = mapped_column(Integer, nullable=False, default=OWNER_ID, server_default=str(OWNER_ID))
+    plan_id: Mapped[int] = mapped_column(
+        ForeignKey("student_plans.id", ondelete="CASCADE"), nullable=False
+    )
+    name: Mapped[str] = mapped_column(String, nullable=False)          # 上传时的原名
+    stored: Mapped[str] = mapped_column(Text, default="", server_default="")
+    kind: Mapped[str] = mapped_column(String, default="", server_default="")
+    size_bytes: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    # 这份文件有没有被转成正文（0/1）。界面上要能说清「这份只是存着，没转出文字」——
+    # 不说的话，老师会以为转换悄悄失败了。
+    converted: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    note: Mapped[str] = mapped_column(Text, default="", server_default="")
+    created_at: Mapped[str] = mapped_column(Text, default=_now, server_default=NOW)
+
+    plan: Mapped["StudentPlan"] = relationship(back_populates="files")
+
+    __table_args__ = (Index("idx_plan_files_plan", "plan_id", "id"),)
+
+
+# ============================================================
 # M4 笔记（Markdown 正文 + 一层板书笔画）
 # ============================================================
 class NoteFolder(Base):
@@ -1046,3 +1132,196 @@ class AiSetting(Base):
     api_key: Mapped[str] = mapped_column(Text, default="", server_default="")
     timeout: Mapped[int] = mapped_column(Integer, default=60, server_default="60")
     updated_at: Mapped[str] = mapped_column(Text, default=_now, server_default=NOW)
+
+
+# ============================================================
+# M5 作业批改（迁移 0027）
+# ============================================================
+class HomeworkGrade(Base):
+    """一次「AI 批改」任务：一条记录 = 一份作业（可能多页、多份文件）。
+
+    ⚠️ **为什么不在 `homeworks` 上加字段**：`homeworks` 有
+    `UniqueConstraint("lesson_id")` —— **一节课只能有一条**。批改若也唯一，
+    老师重批一次就 IntegrityError，而重批是常态（换了答案、改了细则、换了模型）。
+    所以这里只挂一个**可空** FK：批改可以「先批了、再补记交没交」，
+    `homeworks` 行不存在也能开批改。
+
+    ⚠️ **为什么不复用 `batch_jobs` / `batch_items`**：那两张表的语义是
+    「题库入库的待审中间态」，唯一出口是 `questions`。批改的产物同时落在两处
+    （题库错题 + 作业记录），硬塞进去会让「题库入库」这条线莫名其妙多出一堆状态。
+    只借它的**轮询形状**（total/done/failed + daemon 线程），不借表。
+
+    ⚠️ **status 与「AI 不许给作业打分」那条边界的关系**（见 docs/学生作业上传与评分方案.md §6）：
+    这张表里的东西是「逐题对错」—— 客观、有标准答案可核对；
+    那 5 个**主观维度分**仍然只有老师能打，存在 `homework_scores` 里，两边不混。
+    只有老师点过「确认」、status 到 done 之后，统计口径（掌握度 / 家长稿）才会读这里。
+    """
+
+    __tablename__ = "homework_grades"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    owner_id: Mapped[int] = mapped_column(Integer, nullable=False, default=OWNER_ID, server_default=str(OWNER_ID))
+    student_id: Mapped[int] = mapped_column(
+        ForeignKey("students.id", ondelete="CASCADE"), nullable=False
+    )
+    lesson_id: Mapped[int] = mapped_column(
+        ForeignKey("lessons.id", ondelete="CASCADE"), nullable=False
+    )
+    # 可空 + SET NULL：作业记录被撤销时，批改结果本身不该跟着消失（那是另一份工作成果）
+    homework_id: Mapped[int | None] = mapped_column(ForeignKey("homeworks.id", ondelete="SET NULL"))
+    curriculum_id: Mapped[int | None] = mapped_column(ForeignKey("curricula.id"))
+
+    # queued → running → reviewing → done；出错是 partial（部分题失败）/ failed（整份没起来）
+    status: Mapped[str] = mapped_column(String, default="queued", server_default="queued")
+    # ai = 模型自己解题后判断；key = 老师给的答案；rubric = 老师给的分步评分细则
+    answer_mode: Mapped[str] = mapped_column(String, default="key", server_default="key")
+
+    # ⚠️ total 是**页数**，不是题目数 —— 同 batch_jobs 踩过的坑：
+    #    混着用，进度条会出现「done 3 / total 3」而列表里 11 条。
+    total: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    done: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    failed: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+
+    # 总分 / 满分**可空**：一期只判对错不给分。给 0 会让「没判」和「零分」混成一个东西。
+    score: Mapped[float | None] = mapped_column(REAL)
+    full_score: Mapped[float | None] = mapped_column(REAL)
+
+    error: Mapped[str] = mapped_column(Text, default="", server_default="")
+    dir_rel: Mapped[str] = mapped_column(Text, default="", server_default="")
+    created_at: Mapped[str] = mapped_column(Text, default=_now, server_default=NOW)
+    finished_at: Mapped[str | None] = mapped_column(Text)
+    reviewed_at: Mapped[str | None] = mapped_column(Text)     # 老师点「确认」的时间
+
+    files: Mapped[list["HomeworkGradeFile"]] = relationship(
+        back_populates="grade", cascade="all, delete-orphan"
+    )
+
+    __table_args__ = (
+        # 一节课可以有多条（重批），所以**不加 unique**
+        Index("idx_hwgrades_lesson", "lesson_id", "id"),
+        Index("idx_hwgrades_student", "student_id", "id"),
+    )
+
+
+class HomeworkGradeFile(Base):
+    """批改用到的文件：学生交的（submission）、老师的答案（answer）、评分细则（rubric）。
+
+    提交件**直接引用 `lesson_files` 那一行**（`lesson_file_id`），不复制：
+    同一张照片在磁盘上只有一份，"作业"区块和批改页看到的是同一份原件，
+    删一边不会让另一边变成空壳。
+
+    答案 / 细则一期不走独立归档：文字直接粘在 `HomeworkGrade` 的前置输入里，
+    文件则借用 `lesson_files(role='homework')` 上传 —— 刻意**不给 lesson_files 加第四个 role**，
+    那会让「三份清单互相看不见」这条既有断言（test_prep_files.py）跟着变。
+    """
+
+    __tablename__ = "homework_grade_files"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    owner_id: Mapped[int] = mapped_column(Integer, nullable=False, default=OWNER_ID, server_default=str(OWNER_ID))
+    grade_id: Mapped[int] = mapped_column(
+        ForeignKey("homework_grades.id", ondelete="CASCADE"), nullable=False
+    )
+    lesson_file_id: Mapped[int | None] = mapped_column(
+        ForeignKey("lesson_files.id", ondelete="SET NULL")
+    )
+    name: Mapped[str] = mapped_column(String, nullable=False)
+    stored: Mapped[str] = mapped_column(Text, default="", server_default="")   # 仅 answer/rubric 自落盘时用
+    role: Mapped[str] = mapped_column(String, default="submission", server_default="submission")
+    kind: Mapped[str] = mapped_column(String, default="", server_default="")
+    size_bytes: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    pages: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    created_at: Mapped[str] = mapped_column(Text, default=_now, server_default=NOW)
+
+    grade: Mapped["HomeworkGrade"] = relationship(back_populates="files")
+
+    __table_args__ = (Index("idx_hwgrade_files_grade", "grade_id", "role"),)
+
+
+class HomeworkGradeItem(Base):
+    """一道题的批改结果 —— **AI 初稿，老师核对后才算数**（看 status）。
+
+    三条设计要点（都是踩过或调研出来的）：
+
+    1. `ungradable` 是**一等 verdict**，不是错误分支（识别不清 / 图题 / 超纲 / 没作答）。
+       一旦允许它落进 `wrong`，系统就开始冤枉人了。
+    2. `evidence_quote` 由 `raw` 里的 `student_steps` 逐字撑腰 ——
+       服务层要**在代码里校验它是学生原文的子串**，对不上就把这条扣分作废、整题转人工。
+       光在提示词里写「必须引用原文」是拦不住编造的。
+    3. `transcription_version` 是为了「老师把识别错的 3 改成 8」这件事：
+       改完转写文本后，旧的 evidence_quote 已经不存在了，必须让这一题的判定作废重跑 ——
+       否则导出时会出现「引用了一句不存在的话」。**这是数据模型决策，越晚加越贵。**
+    """
+
+    __tablename__ = "homework_grade_items"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    owner_id: Mapped[int] = mapped_column(Integer, nullable=False, default=OWNER_ID, server_default=str(OWNER_ID))
+    grade_id: Mapped[int] = mapped_column(
+        ForeignKey("homework_grades.id", ondelete="CASCADE"), nullable=False
+    )
+    seq: Mapped[int] = mapped_column(Integer, default=0, server_default="0")        # 卷面顺序
+    page_no: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    q_no: Mapped[str] = mapped_column(String, default="", server_default="")        # 卷面题号（"3" / "三.2"）
+    qtype: Mapped[str | None] = mapped_column(String)                                # taxonomy.QTYPES
+    stem: Mapped[str] = mapped_column(Text, default="", server_default="")
+    student_answer: Mapped[str] = mapped_column(Text, default="", server_default="")
+    correct_answer: Mapped[str] = mapped_column(Text, default="", server_default="")
+
+    verdict: Mapped[str] = mapped_column(String, default="ungradable", server_default="ungradable")
+    # correct / partial / wrong / blank / ungradable
+    score: Mapped[float | None] = mapped_column(REAL)
+    full_score: Mapped[float | None] = mapped_column(REAL)
+    basis: Mapped[str] = mapped_column(Text, default="", server_default="")         # 判定依据（人话）
+    confidence: Mapped[str] = mapped_column(String, default="low", server_default="low")
+    kp_name: Mapped[str] = mapped_column(Text, default="", server_default="")
+    node_id: Mapped[int | None] = mapped_column(ForeignKey("nodes.id"))
+    tags: Mapped[str] = mapped_column(Text, default="[]", server_default="[]")      # 错题标签
+    error_reason: Mapped[str] = mapped_column(Text, default="", server_default="")
+    flags: Mapped[str] = mapped_column(Text, default="[]", server_default="[]")     # transcription_conflict / insufficient_evidence …
+    raw: Mapped[str] = mapped_column(Text, default="{}", server_default="{}")       # 模型原始输出（供复核与重放）
+    transcription_version: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+
+    status: Mapped[str] = mapped_column(String, default="pending", server_default="pending")
+    question_id: Mapped[str | None] = mapped_column(ForeignKey("questions.id", ondelete="SET NULL"))
+    reviewed_at: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[str] = mapped_column(Text, default=_now, server_default=NOW)
+
+    __table_args__ = (Index("idx_hwgrade_items_grade", "grade_id", "seq"),)
+
+
+class HomeworkGradeMark(Base):
+    """原件上的一条标注（对错号 / 圈出步骤 / 文字框）。老师复核时可以拖、可以删。
+
+    ⚠️ 坐标一律 **0~1000 的整数**，按页归一化 —— 与 `batch_items.figure_box` 完全同制，
+    前端 `viewBox="0 0 1000 1000"` 直接吃，零换算。
+    **不存 PDF 点坐标**：图片是 96dpi 折点、Word 转出的 PDF 又是另一套页面尺寸，
+    两套坐标混在一列里，迟早会画到纸外。
+
+    `created_by` 区分 AI 猜的与老师放的：模型给的框只可信到「哪一带」
+    （实测偏高约 1/8 页），所以界面默认允许拖动，拖动后归属改成 teacher。
+    """
+
+    __tablename__ = "homework_grade_marks"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    owner_id: Mapped[int] = mapped_column(Integer, nullable=False, default=OWNER_ID, server_default=str(OWNER_ID))
+    grade_id: Mapped[int] = mapped_column(
+        ForeignKey("homework_grades.id", ondelete="CASCADE"), nullable=False
+    )
+    # 可空：可以是整页的批注（比如页脚写一句「书写要工整」），不挂在某道题上
+    item_id: Mapped[str | None] = mapped_column(
+        ForeignKey("homework_grade_items.id", ondelete="CASCADE")
+    )
+    page_no: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    kind: Mapped[str] = mapped_column(String, default="box", server_default="box")
+    # box / ellipse / check / cross / arrow / text
+    geo: Mapped[str] = mapped_column(Text, default="[]", server_default="[]")       # [x0,y0,x1,y1]，0~1000
+    points: Mapped[str] = mapped_column(Text, default="[]", server_default="[]")    # 手绘折线，0~1000
+    text: Mapped[str] = mapped_column(Text, default="", server_default="")
+    color: Mapped[str] = mapped_column(String, default="", server_default="")
+    created_by: Mapped[str] = mapped_column(String, default="ai", server_default="ai")
+    flags: Mapped[str] = mapped_column(Text, default="[]", server_default="[]")     # mark_rough …
+    created_at: Mapped[str] = mapped_column(Text, default=_now, server_default=NOW)
+
+    __table_args__ = (Index("idx_hwgrade_marks_grade", "grade_id", "page_no"),)

@@ -184,6 +184,18 @@ def exam_dir(student, exam) -> Path:
     return d
 
 
+# 整体规划的归档目录：`students/<学生>/plans/<规划标题>/`。
+# 为什么不按日期分：规划本来就是一整段时间的事（「暑期冲刺」「初三全年」），
+# 硬塞一个日期只会让老师先想「这算哪天的？」—— 考试那边按日期是因为
+# **考试那天的卷子就是那天的**，规划没有这个性质。
+def plan_dir_label(plan) -> str:
+    """规划归档目录名：老师自己写的标题（洗过字）。
+
+    标题空着时给个能看的兜底 —— 目录名空着比「未命名规划」更让人困惑。
+    """
+    return safe_token(getattr(plan, "title", ""), "未命名规划")
+
+
 def unique_dir_name(parent: Path, name: str, ignore: str | None = None) -> str:
     """同名**目录**加 `_2`、`_3`。
 
@@ -234,21 +246,28 @@ def move_dir_contents(old: Path, new: Path) -> dict[str, str]:
 # 单独取名字而不是再写一遍字面量：安全拼接（safe_cache_path）必须知道根在哪，
 # 而这个字符串一旦跟前端算出来的 key 前缀对不上，暂存文件就会永远搬不过去。
 EXAM_CACHE_NAME = config.EXAM_CACHE_DIR.name
+# 整体规划原件的暂存区（同上一套规矩，只是根目录不同）。
+PLAN_CACHE_NAME = config.PLAN_CACHE_DIR.name
 
 
-def safe_cache_path(key: str | None) -> Path | None:
+def safe_cache_path(key: str | None, cache_dir: Path | None = None) -> Path | None:
     """暂存区 key（形如 `ab12cd34ef56/试卷.pdf`）-> 磁盘路径；任何越界返回 None。
 
-    比 storage.safe_join 多一道闸：**路径必须真的落在 exams_cache/ 里面**。
+    比 storage.safe_join 多一道闸：**路径必须真的落在指定的暂存目录里面**
+    （默认 exams_cache/，规划原件传 PLAN_CACHE_NAME 那份）。
     否则一个构造出来的 key（比如 `students/u1_x/xxx`）就能借道删掉正式归档里的文件。
+
+    ⚠️ cache_dir 是**可信来源**（只能传 config 里的常量），绝不接受请求参数 ——
+    它是这道闸的根：根一旦可控，整个校验就形同虚设。
     """
     if not key:
         return None
-    p = safe_join(f"{EXAM_CACHE_NAME}/{str(key).lstrip('/')}")
+    root = cache_dir if cache_dir is not None else config.EXAM_CACHE_DIR
+    p = safe_join(f"{root.name}/{str(key).lstrip('/')}")
     if p is None:
         return None
     try:
-        p.resolve().relative_to((config.UPLOAD_DIR / EXAM_CACHE_NAME).resolve())
+        p.resolve().relative_to(root.resolve())
     except ValueError:
         return None
     return p

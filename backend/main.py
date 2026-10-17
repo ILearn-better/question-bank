@@ -35,6 +35,7 @@ from app.routers import (                                   # noqa: E402
     exams,
     feedbacks,
     homeworks,
+    homework_grades,
     lesson_files,
     lesson_import,
     lessons,
@@ -42,6 +43,7 @@ from app.routers import (                                   # noqa: E402
     notes,
     notes_transfer,
     papers,
+    plans,
     preps,
     questions,
     students,
@@ -165,6 +167,8 @@ app.include_router(ai.router)
 app.include_router(students.router)
 # 考试情况记录（学生级）：/api/students/{sid}/exams、/api/exams/...、/api/exam-files/...
 app.include_router(exams.router)
+# 整体规划（学生级）：/api/students/{sid}/plans、/api/plans/...、/api/plan-files/...
+app.include_router(plans.router)
 # 课表 Excel 导入。**必须在 lessons 之前**：它是 /api/lessons/import/...，
 # 虽然当前与 /api/lessons/{lid}/... 不撞，但先注册具体的总是更稳。
 app.include_router(lesson_import.router)
@@ -172,6 +176,7 @@ app.include_router(lessons.router)
 app.include_router(feedbacks.router)
 app.include_router(lesson_files.router)
 app.include_router(homeworks.router)
+app.include_router(homework_grades.router)
 app.include_router(supplements.router)
 app.include_router(preps.router)
 app.include_router(curriculum.router)

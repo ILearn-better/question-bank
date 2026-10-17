@@ -28,7 +28,7 @@ export default {
   name: 'HomeworkDialog',
   components: { Modal },
   props: { lesson: { type: Object, required: true } },
-  emits: ['close', 'saved'],
+  emits: ['close', 'saved', 'grade'],
   setup(props, { emit }) {
     const dims = ref([]);
     const loading = ref(true);
@@ -178,7 +178,18 @@ export default {
       }
     }
 
-    async function save() {
+    /** 保存这次作业。
+     *
+     *  `gradeAfter = true` 是「保存并批改」：**先照常保存**，存成功才把
+     *  `{lessonId, fileIds}` 交给父组件去建批改任务、跳批改页 —— 保存失败就停在原地，
+     *  不能出现「批改页里是一份没记上的作业」。
+     *  这条路径**不发 saved**：父组件收到 grade 就跳走了，再发 saved 会让弹窗先关一次。
+     */
+    async function save(gradeAfter = false) {
+      if (gradeAfter && !files.value.length) {
+        warn('先上传作业原件再批改 —— 批改是对着照片判的');
+        return;
+      }
       saving.value = true;
       try {
         const payload = {
@@ -195,6 +206,14 @@ export default {
         }
         ok('作业已记录');
         existing.value = r;
+        if (gradeAfter) {
+          emit('grade', {
+            lessonId: props.lesson.id,
+            // 只要已经落盘的那几份（暂存的没有 id，批改读不到）
+            fileIds: files.value.map((f) => f.id).filter(Boolean),
+          });
+          return;
+        }
         emit('saved');
       } catch (e) {
         fail(e.message);
@@ -318,8 +337,13 @@ export default {
       <button v-if="existing" class="btn ghost" style="color:var(--danger)"
               :disabled="busy || saving" @click="clearRecord">撤销记录</button>
       <button class="btn" @click="$emit('close')">取消</button>
-      <button class="btn primary" :disabled="saving || loading" @click="save">
+      <!-- 注意必须写 save()：写成 @click="save" 会把 MouseEvent 当成 gradeAfter 传进去 -->
+      <button class="btn primary" :disabled="saving || loading" @click="save()">
         {{ saving ? '保存中…' : '保存' }}
+      </button>
+      <button class="btn" :disabled="saving || loading" @click="save(true)"
+              title="先保存这次作业，再跳到批改台让 AI 判对错">
+        {{ saving ? '保存中…' : '保存并批改' }}
       </button>
     </template>
   </Modal>

@@ -50,6 +50,14 @@ const routes = [
     component: () => import('./views/Settings.js'),
     meta: { title: '设置' },
   },
+  {
+    // 批改台是独立视图，不塞进「交作业」弹窗：弹窗宽版上限 860px，
+    // 放不下「左页图 + 右逐题卡」，而且批改要能刷新恢复、能深链。
+    path: '/grade/:id',
+    name: 'grade',
+    component: () => import('./views/HomeworkGrade.js'),
+    meta: { title: '作业批改' },
+  },
   { path: '/:pathMatch(.*)*', redirect: '/' },
 ];
 

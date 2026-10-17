@@ -5,6 +5,7 @@
 //   ② 挑材料：这节课要用的题 / 笔记（交互复用课后补充那套：搜索 + 勾选 + 已选 chips）。
 //      题干按**渲染后**的样子显示（真公式，不是 $…$ 原文），鼠标移上去自动展开看全 ——
 //      挑题时老师要能读到整道题，不能只看见一行截断的纯文本。
+//      没识别出文本的**图片题显示原貌图**（形态判定见 src/questionForm.js，与出卷印卷同一条规则）。
 //   ③ 备课材料**文件**：任意格式（含电脑上做好的 .lnk 快捷方式），只归档不抽文字，
 //      落在「学生 / 上课日期」文件夹里（role='prep'，与上课文件两份清单互不相见）。
 //   ④ 与笔记库双向联动：
@@ -15,6 +16,7 @@
 import { computed, nextTick, ref, watch } from 'vue';
 import { lessonFilesApi, notesApi, papersApi, prepApi } from '../api.js';
 import { ensureLibs, renderRichEl } from '../mathRender.js';
+import { chooseForm, imageNote, stemImage, NO_STEM_NOTE } from '../questionForm.js';
 import { fail, fmtBytes, ok } from '../store.js';
 import Modal from './Modal.js';
 
@@ -197,6 +199,15 @@ export default {
     // 只在「题库挑题」页签下渲染：笔记页签那批行里根本没有 q-rich 容器
     watch([rows, tab], () => { if (tab.value === 'question') renderRich(); }, { flush: 'post' });
 
+    /* ---------- 只显示「原貌图」的那类题 ----------
+     *
+     *  以前这里写死 `v-if="r.content"`：没识别出文本的题只剩一句「（图片题，没有文本）」——
+     *  备课挑题时老师认不出是哪道题，跟出卷挑题是同一个毛病。
+     *  形态判定集中在 src/questionForm.js（与后端印卷 `_choose_form` 逐条一致），
+     *  备课没有整卷覆盖，走每题自己的偏好（override 传 'auto'）。
+     */
+    const formOf = (q) => chooseForm(q, 'auto');
+
     // ---- 笔记联动 ----
     async function searchNotes() {
       noteLoading.value = true;
@@ -299,6 +310,7 @@ export default {
     return {
       FIELDS, form, tab, keyword, tag, kp, rows, total, loading, tags, kps,
       picked, pickedList, pickedCount, isPicked, toggle, brief, search, setRichEl,
+      formOf, stemImage, imageNote, NO_STEM_NOTE,
       noteId, noteTitle, pickingNote, noteKeyword, noteRows, noteLoading,
       searchNotes, toggleNotePick, pickNote, save, saveAsNote,
       saving, savingNote, loaded,
@@ -351,13 +363,24 @@ export default {
             <div style="flex:1;min-width:0">
               <template v-if="tab === 'question'">
                 <!-- 题干走渲染管线（见 setup 里 renderRich 的注释）：老师要看的是排好版的
-                     公式，不是 $…$ 原文。容器里**不能**再放 Vue 插值 —— KaTeX 会把文本节点换掉。 -->
+                     公式，不是 $…$ 原文。容器里**不能**再放 Vue 插值 —— KaTeX 会把文本节点换掉。
+                     没有文字的题显示**原貌图**（形态判定见 src/questionForm.js）。 -->
                 <div class="q-clamp">
-                  <div v-if="r.content" class="q-rich" :ref="(el) => setRichEl('q:' + r.id, el)"></div>
-                  <div v-else class="muted small">（图片题，没有文本）</div>
+                  <template v-if="formOf(r) === 'text'">
+                    <div class="q-rich" :ref="(el) => setRichEl('q:' + r.id, el)"></div>
+                  </template>
+                  <a v-else-if="formOf(r) === 'image'" class="q-thumb-link"
+                     :href="stemImage(r)" target="_blank" rel="noopener" title="点开看原图">
+                    <img class="q-thumb" :src="stemImage(r)" alt="题目原貌图"
+                         loading="lazy" decoding="async">
+                  </a>
+                  <div v-else class="small muted">{{ NO_STEM_NOTE }}</div>
+                </div>
+                <div class="small muted" style="margin-top:5px" v-if="formOf(r) === 'image'">
+                  {{ imageNote(r, 'auto') }}
                 </div>
                 <div class="small muted" style="margin-top:5px"
-                     v-if="(r.knowledge_points || []).length">
+                     v-else-if="(r.knowledge_points || []).length">
                   {{ r.knowledge_points.join(' / ') }}
                 </div>
               </template>

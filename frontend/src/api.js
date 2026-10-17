@@ -341,6 +341,65 @@ export const examsApi = {
   removeTemplate: (id) => api.del(`/api/exam-analysis-templates/${id}`),
 };
 
+/** 整体规划（学生级）：正文是 Markdown，点开某条才取完整正文（列表只给摘要）。 */
+export const plansApi = {
+  list: (studentId) => api.get(`/api/students/${studentId}/plans`),
+  /** 单条详情：带完整正文 + 原件清单 —— 「每个规划点开才能详细查看」。 */
+  get: (id) => api.get(`/api/plans/${id}`),
+  create: (body) => api.post('/api/plans', body),
+  /** 改：**没传的字段 = 不改**；files 是增量（只提交这次新传的）。 */
+  update: (id, body) => api.patch(`/api/plans/${id}`, body),
+  /** 删这条规划 —— 连同它的原件一起。 */
+  remove: (id) => api.del(`/api/plans/${id}`),
+
+  /** 原件进暂存区，顺手返回转好的 Markdown（前端决定填进正文还是追加）。
+   *  ⚠️ 返回的 markdown 可能是空串 —— 那表示「这份转不出正文」（扫描件 / 图片 / 压缩包…），
+   *  此时 note 里写着原因，原件照样归档，界面要照实说。 */
+  upload: (formData) => api.upload('/api/plans/upload', formData),
+  /** 真删一份**还没保存**的暂存原件（只在界面上拿掉是没用的，文件会一直留着）。 */
+  removeCache: (cacheKey) => api.post('/api/plans/upload/remove', { cache_key: cacheKey }),
+
+  /** 已归档原件：删 / 取回（一律下载 —— Word/PDF 就地打开多半是白屏或乱码）。 */
+  removeFile: (id) => api.del(`/api/plan-files/${id}`),
+  rawUrl: (id) => `/api/plan-files/${id}/raw`,
+};
+
+/** AI 批改作业：一份作业一条任务，逐题出「对 / 部分对 / 错 / 空白 / 判不了」初稿，
+ *  老师核对（或改判定）之后才算数（见 docs/AI批改作业-实现计划.md）。
+ *  ⚠️ 坐标一律是**按页归一化 0~1000 的整数**，前端 viewBox="0 0 1000 1000" 直接吃，不做换算。 */
+export const gradeApi = {
+  create: (body) => api.post('/api/homework-grades', body),
+  /** 某节课的批改记录（只给进度，不带 items —— 详情要按 gid 单独取）。 */
+  list: (lessonId) => api.get('/api/homework-grades', { lesson_id: lessonId }),
+  get: (gid) => api.get(`/api/homework-grades/${gid}`),
+  /** 开批**之前**改判定依据（AI 自己解 / 老师给的答案 / 评分细则）。
+   *  ⚠️ 已经批出结果的不能再改，只能「重新批改」—— 否则旧判定是按旧依据批的。 */
+  patchSetup: (gid, body) => api.patch(`/api/homework-grades/${gid}`, body),
+  /** 开始/重跑。**幂等**：已经在跑时返回当前进度，不会重复开一个任务。 */
+  run: (gid) => api.post(`/api/homework-grades/${gid}/run`),
+  /** 整份确认（此后才进统计口径）。note 可以留空。 */
+  confirm: (gid, note) => api.post(`/api/homework-grades/${gid}/confirm`, { note }),
+
+  /** 页图 PNG，直接当 img.src 用。 */
+  pageUrl: (gid, pno) => `/api/homework-grades/${gid}/page/${pno}`,
+  /** 导出**带批改痕迹的副本**：fmt=pdf 整份多页、fmt=png 单页。原件不动。 */
+  exportUrl: (gid, fmt = 'pdf', page = 1) =>
+    `/api/homework-grades/${gid}/export?fmt=${encodeURIComponent(fmt)}&page=${Number(page) || 1}`,
+
+  /** 改一题的判定 / 学生作答 / 错因 / 考点 / 核对状态。
+   *  ⚠️ 改 student_answer 会**作废这一题的判定并重跑**（旧的 evidence 引用已经不存在了）。 */
+  patchItem: (iid, body) => api.patch(`/api/grade-items/${iid}`, body),
+  /** 只重批这一题（不牵动整份）。 */
+  rerunItem: (iid) => api.post(`/api/grade-items/${iid}/rerun`),
+  /** 错题回存题库：不自动建题，question_id 由老师指定，tags 是追加的标签。 */
+  toBank: (iid, body) => api.post(`/api/grade-items/${iid}/to-bank`, body),
+
+  /** 原件上的标注：新增 / 改 / 删。 */
+  addMark: (gid, body) => api.post(`/api/homework-grades/${gid}/marks`, body),
+  patchMark: (mid, body) => api.patch(`/api/grade-marks/${mid}`, body),
+  removeMark: (mid) => api.del(`/api/grade-marks/${mid}`),
+};
+
 export const systemApi = {
   info: () => api.get('/api/system/info'),
   backup: () => api.post('/api/system/backup'),

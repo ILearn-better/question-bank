@@ -26,7 +26,7 @@
  *   · 每道有文本的题，`.q-rich` 里必须出现 `.katex`（= 公式真渲染了）
  *   · `.q-rich` 的 textContent 里**不能再有 `$…$` 原文**（渲染成功的反向证据）
  *   · 悬停展开的折叠容器 `.q-clamp` 每行一个（CSS 的展开规则由静态断言守）
- *   · 没有文本的题走「（图片题，没有文本）」分支，不会渲染出空壳
+ *   · 没有文本的题显示**原貌图**（`.q-thumb` 的 src 指到那张图），不是空壳
  *   · 点「加入」后 chips 里是 **brief 的纯文本**（不能把渲染后的 HTML 塞进 title）
  *
  * 找不到 jsdom 就 **SKIP 并退出 0**：它只是开发期加固，不该把回归弄红。
@@ -61,15 +61,16 @@ function loadJsdom() {
 /* ====================== 桩：形状取自真实接口响应（不猜结构） ====================== */
 
 const API_STUB = `
-const row = (id, content, kps) => ({
-  id, content, qtype: '解答题', difficulty: '中档', tags: [],
+const row = (id, content, kps, image) => ({
+  id, content, image: image || '', qtype: '解答题', difficulty: '中档', tags: [],
   knowledge_points: kps || [], answer: 'x=1',
 });
 export const papersApi = {
   search: async () => ({ items: [
     row('q1', '解方程：$x^2 - 5x + 6 = 0$。', ['一元二次方程']),
     row('q2', '已知 $\\\\frac{a}{b} = \\\\frac{2}{3}$，求 $a + b$ 的值。', ['分式']),
-    row('q3', '', []),                       // 图片题：没有文本，走另一条分支
+    // 图片题：没有文本、只有原貌截图 —— 列表里必须显示这张图
+    row('q3', '', [], '/api/crops/pic.png'),
   ], total: 3 }),
   tags: async () => ({ items: [{ tag: '一元二次方程', count: 2 }] }),
   knowledgePoints: async () => ({ items: [{ kp: '一元二次方程', count: 2 }] }),
@@ -162,6 +163,8 @@ async function main() {
     fs.copyFileSync(path.join(ROOT, 'src', 'components', 'PrepDialog.js'),
       path.join(comps, 'PrepDialog.js'));
     fs.copyFileSync(path.join(ROOT, 'src', 'mathRender.js'), path.join(tmp, 'src', 'mathRender.js'));
+    // 形态判定（文本 / 图）也走真代码，不桩掉 —— 图片题能不能显示就靠它
+    fs.copyFileSync(path.join(ROOT, 'src', 'questionForm.js'), path.join(tmp, 'src', 'questionForm.js'));
     fs.writeFileSync(path.join(tmp, 'src', 'api.js'), API_STUB);
     fs.writeFileSync(path.join(tmp, 'src', 'store.js'), STORE_STUB);
     fs.writeFileSync(path.join(comps, 'Modal.js'), MODAL_STUB);
@@ -220,9 +223,21 @@ async function main() {
     checkTrue('渲染出的题干确实有内容（不是空 div）',
       texts.every((t) => t.trim().length > 0), texts.map((t) => t.length).join('/'));
 
-    const pic = D.querySelectorAll('.pick-row .q-clamp .muted');
-    checkTrue('图片题走「没有文本」分支', pic.length === 1 && pic[0].textContent.includes('图片题'),
-      pic.length ? pic[0].textContent.trim() : '没找到');
+    // ★ 图片题：列表里必须真的出现那张原貌图（以前这里只有一句「（图片题，没有文本）」）
+    const thumbs = D.querySelectorAll('.pick-row .q-thumb');
+    check('★ 图片题显示了原貌图（1 张缩略图）', thumbs.length, 1);
+    if (thumbs.length) {
+      checkTrue('缩略图的 src 指向那道题的 image',
+        String(thumbs[0].getAttribute('src') || '').includes('pic.png'),
+        String(thumbs[0].getAttribute('src')));
+      checkTrue('图片外面套了「点开看原图」的链接',
+        !!thumbs[0].closest('a.q-thumb-link'));
+    }
+    checkTrue('图片题不再只剩「没有文本」那句占位',
+      !D.querySelector('#app').innerHTML.includes('（图片题，没有文本）'));
+    const notes = Array.from(D.querySelectorAll('.pick-row .small.muted')).map((el) => el.textContent);
+    checkTrue('图旁边写清了「为什么显示成图」',
+      notes.some((t) => t.includes('图片题')), notes.join(' | '));
 
     // ---- 5. 勾选后 chips 是纯文本 title（别把渲染后的 HTML 塞进去） ----
     // ⚠️ 两个页签本身就是 `.chip.on`，取值时必须剔掉 —— 否则数出来永远多一个。
