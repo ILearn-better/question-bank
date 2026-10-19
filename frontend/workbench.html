@@ -1,0 +1,1308 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>拾课 · 批改工作台</title>
+<!--
+  批改工作台（路线 B）——**整个文件处理链路照抄批量录题页**（frontend/batch.html）。
+
+  为什么单独一个页面而不是改造现有批改页（路线 A）：
+    用户 2026-10-19 原话「直接用录题代码」「当前页面设计太难用了」。
+    录题那套好用的地方不在功能，在**信息组织**：
+      · 一份卷子**所有页竖排在一个滚动框里**（不是一次只看一页、来回翻）
+      · 左边看卷面画线，右边块卡片逐块处理，**两边一直同时在场**
+      · 每块一张缩略图（切歪了当场看见）
+      · 块可以拖拽排序 / ↑↓ / 并入上一块 / 不提交
+    路线 A 是在原页面上加旋钮，布局没变，所以用户觉得「还是难用」。
+  两条路线并存一个分支，用户对比之后再删旧的。
+
+  ★ 与录题页的两处**刻意不同**（照抄会出 bug，不是偏好问题）：
+    1. **分割线「全切」**：录题页「第一条线以上当卷头跳过」，批改不行 ——
+       学生可能从页顶就开始写第 1 题，丢掉就是丢掉一整题。
+       多出来的页眉段在右栏标成「建议不判」，老师一眼就能点掉。
+    2. **末段到「结束线」为止**（而不是「末线以下不成块」）：
+       最后一题常常一直写到页底，而页底还有页脚 / 页码 / 条形码。
+       给一个每页的结束线（默认页底），拖到 96% 就把页脚排除在块之外。
+
+  ⚠️ 坐标一律 **0~1000 按页归一化整数**（与 markGeom / 后端 regions 同制）。
+     录题页用的是 PDF 点（pt）—— 因为它要按 pt 裁原 PDF。批改这边后端收的是
+     归一化坐标，所以这里不取页面 pt 尺寸，盒子高度靠 aspect-ratio 顶住。
+
+  ⚠️ 这是零构建的 in-DOM 模板：
+     · 自定义组件**绝不能写自闭合** `<el-tag />` —— 浏览器解析器忽略斜杠，
+       把它当开标签，后面的兄弟节点会被吞成子节点（整块消失）。
+     · 这里**没有**模板字符串反引号问题（模板是 body 里的真 DOM），
+       但下面那段内联脚本里的字符串引号要自己数清楚。
+-->
+<link rel="stylesheet" href="/vendor/element-plus/index.css">
+<link rel="stylesheet" href="/vendor/katex/katex.min.css">
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #f0f2f5; font-family: "PingFang SC", "Microsoft YaHei", sans-serif; }
+  .topbar {
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+    background: #fff; padding: 12px 24px; box-shadow: 0 1px 4px rgba(0,0,0,.08);
+    position: sticky; top: 0; z-index: 10;
+  }
+  .topbar h1 { font-size: 17px; margin: 0; color: #303133; }
+  .topbar .sub { color: #909399; font-size: 12px; }
+  .main { max-width: 1600px; margin: 16px auto; padding: 0 16px; }
+  .panel-title { font-size: 14px; font-weight: 600; color: #303133; margin: 0; }
+  .hint { color: #909399; font-size: 12px; line-height: 1.8; }
+  .back-link { font-size: 13px; color: #409eff; text-decoration: none; }
+  .empty-block { color: #c0c4cc; text-align: center; padding: 40px 0; font-size: 13px; }
+  .pick-bar {
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+    background: #ecf5ff; border: 1px solid #d9ecff; border-radius: 6px;
+    padding: 6px 10px; margin-bottom: 10px; font-size: 12.5px; color: #303133;
+  }
+  .pick-bar b { color: #409eff; }
+  .muted-hint { color: #909399; font-size: 12px; }
+
+  /* ===== 页面分割（与录题页同一套视觉） ===== */
+  .page-wrap { margin-bottom: 20px; }
+  .page-no-label { font-size: 12px; color: #909399; margin-bottom: 6px;
+                   display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .page-box {
+    position: relative; user-select: none; -webkit-user-select: none;
+    border: 1px solid #e4e7ed; border-radius: 4px; overflow: hidden;
+    background: #fff; line-height: 0; min-height: 120px;
+    /* A4 竖版占位：图还没取回来时线就在正确的位置上，不会等图到了才跳一下。
+       照片/横版会有一点偏差，可接受 —— 换来的是一打开就能开始画线。 */
+    aspect-ratio: 210 / 297;
+  }
+  .page-box img {
+    position: absolute; inset: 0; width: 100%; height: 100%;
+    display: block; pointer-events: none; object-fit: contain;
+  }
+  .page-ph {
+    position: absolute; inset: 0; display: flex; align-items: center;
+    justify-content: center; color: #c0c4cc; font-size: 13px; line-height: 1;
+  }
+  .page-box.tool-line { cursor: crosshair; }
+  .page-box.tool-rect { cursor: crosshair; }
+  .divider {
+    position: absolute; left: 0; right: 0; height: 0; z-index: 5;
+    border-top: 2px dashed #f56c6c; cursor: ns-resize;
+  }
+  .divider .dv-y {
+    position: absolute; right: 4px; top: -20px; padding: 2px 6px;
+    border-radius: 3px; background: #f56c6c; color: #fff;
+    font-size: 11px; line-height: 1.4; white-space: nowrap;
+  }
+  .divider .dv-x {
+    position: absolute; left: 2px; top: -11px; width: 22px; height: 22px;
+    border-radius: 50%; background: #f56c6c; color: #fff; font-size: 14px;
+    display: flex; align-items: center; justify-content: center; cursor: pointer;
+    line-height: 1; box-shadow: 0 0 0 2px #fff;
+  }
+  .divider .dv-x:hover { background: #c45656; transform: scale(1.12); }
+  /* 题块色带。奇偶交替上色，一眼能数出「这一页切了几块」。 */
+  .blk-band { position: absolute; left: 0; right: 0; pointer-events: none; z-index: 2; }
+  .blk-band.odd { background: rgba(64, 158, 255, .10); }
+  .blk-band.even { background: rgba(230, 162, 60, .12); }
+  .blk-band.bad { background: rgba(245, 108, 108, .16); box-shadow: inset 0 0 0 2px #f56c6c; }
+  .blk-tag {
+    position: absolute; left: 4px; top: 2px; font-size: 11px; line-height: 1;
+    padding: 3px 7px; border-radius: 10px; background: #409eff; color: #fff; opacity: .9;
+  }
+  .blk-band.even .blk-tag { background: #e6a23c; }
+  .blk-band.bad .blk-tag { background: #f56c6c; }
+  /* 跨页题的第二段起：灰底虚线框，表示它和上一段是同一道题 */
+  .blk-band.cont { box-shadow: inset 0 0 0 2px #909399; background: rgba(144,147,153,.14); }
+  /* 结束线以下：刻意不进任何块（页脚 / 页码），用斜纹提醒「这一截不送 AI」 */
+  .tail-hint {
+    position: absolute; left: 0; right: 0; z-index: 3; pointer-events: none;
+    border: 1px dashed #c0c4cc; background: repeating-linear-gradient(
+      45deg, rgba(144,147,153,.06), rgba(144,147,153,.06) 6px,
+      rgba(144,147,153,.14) 6px, rgba(144,147,153,.14) 12px);
+    color: #909399; font-size: 11px; display: flex; align-items: center;
+    justify-content: center; text-align: center;
+  }
+  .rect-rect {
+    position: absolute; z-index: 6; border: 2px solid #00a870; background: rgba(0, 168, 112, .12);
+    pointer-events: none;
+  }
+  .crop-rect {
+    position: absolute; z-index: 7; border: 2px dashed #409eff; background: rgba(64, 158, 255, .10);
+    pointer-events: none;
+  }
+  /* 整页不判的页：卷面上压一层灰，别让它看起来还在送 AI */
+  .page-box.page-off { opacity: .55; }
+  .page-box.page-off::after {
+    content: '本页不判'; position: absolute; right: 8px; top: 8px; z-index: 8;
+    background: #909399; color: #fff; font-size: 12px; line-height: 1;
+    padding: 5px 9px; border-radius: 10px;
+  }
+
+  /* ===== 右栏：题块卡片 / 批改卡片 ===== */
+  .blk-card {
+    display: flex; gap: 10px; align-items: flex-start;
+    background: #fff; border: 1px solid #e4e7ed; border-radius: 6px;
+    padding: 8px 10px; margin-bottom: 8px; font-size: 13px;
+  }
+  .blk-card.bad { border-color: #fbc4c4; background: #fef0f0; }
+  /* 标了「不判」的块：整张淡掉 + 序号变灰，一眼与要送的块区分开 */
+  .blk-card.skipped { opacity: .62; border-style: dashed; background: #fafafa; }
+  .blk-card.skipped .blk-no { background: #dcdfe6; color: #909399; }
+  .blk-card.skipped .blk-thumb { filter: grayscale(1); }
+  .blk-band.off { background: transparent !important; box-shadow: inset 0 0 0 2px #dcdfe6; }
+  /* 拖拽排序：拖住 ⋮⋮ 换位。dragging = 手上那块，drag-over = 要落到哪一格 */
+  .blk-card.dragging { opacity: .45; }
+  .blk-card.drag-over { border-color: #409eff; box-shadow: 0 -3px 0 0 #409eff inset; }
+  .drag-handle { cursor: grab; color: #c0c4cc; font-size: 13px; letter-spacing: -2px;
+                 user-select: none; padding: 0 2px; }
+  .drag-handle:active { cursor: grabbing; }
+  .blk-no {
+    flex: none; width: 30px; text-align: center; font-size: 12px; font-weight: 700;
+    color: #409eff; background: #ecf5ff; border-radius: 4px; padding: 2px 0;
+  }
+  .blk-body { flex: 1; min-width: 0; }
+  .blk-meta { color: #909399; font-size: 12px; line-height: 1.7; }
+  .blk-thumb {
+    max-width: 100%; max-height: 120px; display: block; margin-top: 4px;
+    border: 1px solid #ebeef5; border-radius: 3px; cursor: zoom-in; background: #fafafa;
+  }
+
+  /* ===== 批改结果卡片 ===== */
+  .g-card {
+    background: #fff; border: 1px solid #e4e7ed; border-radius: 8px;
+    margin-bottom: 12px; overflow: hidden;
+  }
+  .g-card.sel { border-color: #409eff; box-shadow: 0 0 0 2px rgba(64,158,255,.12); }
+  .g-card.ungradable { border-color: #e9e9eb; }
+  .g-head {
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+    padding: 8px 12px; background: #fafafa; border-bottom: 1px solid #ebeef5;
+  }
+  .g-body { padding: 10px 12px; }
+  .g-lb { font-size: 12px; color: #909399; margin-bottom: 3px; }
+  .g-rich { font-size: 13.5px; line-height: 1.85; color: #303133; word-break: break-word; }
+  .g-rich p { margin: 0 0 4px; }
+  .g-rich p:last-child { margin-bottom: 0; }
+  .g-verdict { font-size: 12px; font-weight: 700; padding: 2px 8px; border-radius: 10px; }
+  .g-verdict.v-correct { background: #f0f9eb; color: #67c23a; }
+  .g-verdict.v-partial { background: #fdf6ec; color: #e6a23c; }
+  .g-verdict.v-wrong { background: #fef0f0; color: #f56c6c; }
+  .g-verdict.v-ungradable { background: #f4f4f5; color: #909399; }
+  .g-un { margin-top: 6px; padding: 6px 8px; border-radius: 6px; font-size: 12px;
+          background: #f4f4f5; color: #606266; }
+  .g-note { margin-top: 6px; padding: 5px 8px; border-radius: 6px; font-size: 12px;
+            background: #fff7ed; border: 1px solid #fdba74; color: #9a3412; }
+  .g-vbtns { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+  .g-vbtn { font-size: 12px; padding: 3px 10px; border-radius: 12px; cursor: pointer;
+            border: 1px solid #dcdfe6; background: #fff; color: #606266; }
+  .g-vbtn.on { border-color: #409eff; background: #ecf5ff; color: #409eff; font-weight: 700; }
+</style>
+</head>
+<body>
+<div id="app">
+  <!-- ===================== 顶栏 ===================== -->
+  <div class="topbar">
+    <h1>批改工作台</h1>
+    <span class="sub">拾课 · 照批量录题那一套</span>
+    <a class="back-link" :href="backUrl">← 旧版批改台</a>
+    <a class="back-link" href="/">回到工作台</a>
+    <div style="flex:1"></div>
+    <el-select v-if="grades.length" v-model="gid" placeholder="选择一份作业" style="width: 300px"
+               filterable @change="loadGrade">
+      <el-option v-for="x in grades" :key="x.id" :value="x.id"
+                 :label="optLabel(x)"></el-option>
+    </el-select>
+    <span v-if="!grades.length" class="muted-hint">还没有批改记录 —— 先在课时里点「AI 批改作业」</span>
+  </div>
+
+  <div class="main">
+    <el-row :gutter="16">
+      <!-- ===================== 左：卷面（多页竖排，滚动到哪载入哪） ===================== -->
+      <el-col :span="13">
+        <el-card v-if="!g" shadow="never">
+          <div class="empty-block">
+            先在上方选择一份作业<br>
+            <span style="font-size:12px">（批改记录是在课时详情里点「AI 批改作业」建出来的）</span>
+          </div>
+        </el-card>
+        <el-card v-else shadow="never">
+          <template #header>
+            <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+              <p class="panel-title">📄 卷面</p>
+              <el-tag size="small" type="info">{{ gradeTag }}</el-tag>
+              <el-tag v-if="g.files && g.files.length > 1" size="small" type="warning">
+                {{ g.files.length }} 个文件
+              </el-tag>
+              <div style="flex:1"></div>
+              <el-radio-group v-model="tool" size="small">
+                <el-radio-button value="line">✂️ 画横线</el-radio-button>
+                <el-radio-button value="rect">📷 框选</el-radio-button>
+                <el-radio-button value="view">👁 只看</el-radio-button>
+              </el-radio-group>
+            </div>
+          </template>
+
+          <div class="pick-bar">
+            <template v-if="tool === 'line'">
+              <span>在<b>每道题上方</b>点一下放一条起始线 —— <b>相邻两线之间</b>就是一道题，
+                第一条线以上也算一段（学生可能从页顶就开始写，所以<b>不丢卷头</b>）。</span>
+              <span class="muted-hint">删线点线上的 <b>×</b>，拖线可以微调。</span>
+            </template>
+            <template v-else-if="tool === 'rect'">
+              <span>在页面上<b>拖拽矩形</b>框住一道题 —— 双栏排版、图形题、或者只想框住某一小段时用。</span>
+              <span class="muted-hint">框住的地方若与某条线切出的段重叠，那个段就不再单独成块。</span>
+            </template>
+            <template v-else>
+              <span>只看不画。想改分割就切到<b>画横线</b>或<b>框选</b>。</span>
+            </template>
+          </div>
+
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px">
+            <span class="muted-hint">
+              已切 {{ blocks.length }} 题<template v-if="skippedCount">（{{ skippedCount }} 题不判）</template>
+            </span>
+            <el-tag v-if="unsplitPageCount" size="small" type="warning" effect="plain">
+              {{ unsplitPageCount }} 页整页未分割
+            </el-tag>
+            <div style="flex:1"></div>
+            <span class="muted-hint">共 {{ pageList.length }} 页 · 已载入 {{ loadedCount }} 页</span>
+          </div>
+
+          <div ref="scrollBox" style="max-height: 70vh; overflow: auto; padding-right: 4px;">
+            <div v-for="pno in pageList" :key="pno" class="page-wrap" :data-page="pno">
+              <div class="page-no-label">
+                <span>第 {{ pno }} 页 · {{ bandsOf(pno).length }} 块</span>
+                <el-button v-if="pageSkipped(pno)" size="small" text type="primary"
+                           @click="togglePageSkip(pno)">恢复本页</el-button>
+                <el-button v-else size="small" text type="info"
+                           @click="togglePageSkip(pno)">本页不判</el-button>
+                <span class="muted-hint">末段底边 {{ endOf(pno) / 10 }}%</span>
+                <el-button size="small" text @click="setEndOf(pno, 960)"
+                           title="页脚 / 页码通常在底部 4% 内">截掉页脚</el-button>
+                <el-button v-if="endOf(pno) < 1000" size="small" text
+                           @click="setEndOf(pno, 1000)">到页底</el-button>
+              </div>
+              <div class="page-box" :id="'pg' + pno"
+                   :class="['tool-' + tool, { 'page-off': pageSkipped(pno) }]"
+                   @pointerdown="onPageDown(pno, $event)">
+                <img v-if="loadedPages[pno]" :src="pageImg(pno)" alt="" draggable="false">
+                <div v-else class="page-ph">第 {{ pno }} 页</div>
+                <!-- 题块色带（线之间 / 结束线以上）。奇偶交替上色，一眼数得清切了几块 -->
+                <div v-for="(b, bi) in bandsView(pno)" :key="'b' + bi"
+                     class="blk-band" :class="[b.parity, { cont: b.cont, bad: b.tooThin, off: b.skipped }]"
+                     :style="bandStyle(b)">
+                  <span class="blk-tag">{{ b.seqLabel }}</span>
+                </div>
+                <!-- 结束线以下：刻意不进块（页脚 / 页码 / 条形码） -->
+                <div v-if="tailBand(pno)" class="tail-hint" :style="bandStyle(tailBand(pno))">
+                  以下不进任何块 · 不送 AI
+                </div>
+                <!-- 框选出来的块 -->
+                <div v-for="(r, ri) in rectsOf(pno)" :key="'r' + ri" class="rect-rect"
+                     :style="rectStyle(r.box)"></div>
+                <!-- 分割线 -->
+                <div v-for="(dy, di) in (dividers[pno] || [])" :key="'d' + di"
+                     class="divider" :style="{ top: unitPct(dy) }"
+                     @pointerdown.stop="startDragDivider(pno, di, $event)">
+                  <span v-if="dragTip && dragTip.pno === pno && dragTip.di === di" class="dv-y">
+                    {{ clampUnit(dragTip.y) }}
+                  </span>
+                  <span class="dv-x" title="删掉这条线（它下面那段会与上一段合并）"
+                        @pointerdown.stop.prevent @click.stop="removeDivider(pno, di)">×</span>
+                </div>
+                <div v-if="draft && draft.page === pno" class="crop-rect"
+                     :style="rectStyle(draftBox)"></div>
+              </div>
+            </div>
+          </div>
+        </el-card>
+      </el-col>
+
+      <!-- ===================== 右：题块 / 批改 ===================== -->
+      <el-col :span="11">
+        <el-card shadow="never" style="margin-bottom:16px">
+          <template #header>
+            <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+              <p class="panel-title">🤖 AI 批改</p>
+              <el-tag v-if="g" size="small" :type="statusType(g.status)">{{ statusLabel(g.status) }}</el-tag>
+              <div style="flex:1"></div>
+              <el-button v-if="g" size="small" type="primary" :loading="submitting"
+                         :disabled="running" @click="runGrade">
+                {{ g.done && g.status !== 'queued' ? '重新批改' : '开始批改' }}
+              </el-button>
+            </div>
+          </template>
+
+          <div v-if="!g" class="hint" style="margin:0">
+            还没选作业。左边的「待批改」和历史记录<b>不依赖</b>当前选择，随时能回看。
+          </div>
+          <template v-else>
+            <!-- 进度条：与批量录题同一套观感 -->
+            <div v-if="running" style="margin-bottom:10px">
+              <el-progress :percentage="jobPct" :stroke-width="14" text-inside></el-progress>
+              <div class="hint" style="margin-top:4px">
+                正在批改 {{ g.done }} / {{ g.total }} 页 · 一页约 2~3 分钟（逐题裁切逐题判）
+              </div>
+            </div>
+            <el-alert v-else-if="g.error" :title="g.error" type="error"
+                      :closable="false" show-icon style="margin-bottom:10px"></el-alert>
+            <div v-else-if="g.status === 'reviewing'" class="hint" style="margin-bottom:8px">
+              <el-tag type="success" effect="plain" size="small">批完了</el-tag>
+              共 {{ g.total }} 页 · {{ items.length }} 题 —— 逐条核一遍，改完点右边「确认」
+            </div>
+
+            <el-tabs v-model="tab">
+              <el-tab-pane :label="'分割 ' + blocks.length" name="blocks">
+                <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px">
+                  <span class="muted-hint">
+                    已切 {{ blocks.length }} 题<template v-if="skippedCount">（{{ skippedCount }} 题不判）</template>
+                  </span>
+                  <div style="flex:1"></div>
+                  <el-button size="small" :disabled="!dirty" @click="saveRegions"
+                             :loading="busy === 'regions'">
+                    {{ dirty ? '保存分割' : '已保存' }}
+                  </el-button>
+                </div>
+                <div class="hint" style="margin-bottom:8px">
+                  右边这张列表就是<b>最终要送去批改的东西</b>：一行 = 一道题，缩略图就是
+                  裁出来的那一块。<b>切歪了当场就看得见</b>，不用等模型判完才发现。<br>
+                  卷头 / 结构说明段（「四、解答题…共 77 分」）点「<b>不判</b>」——
+                  框会留着，随时能恢复。跨页题在下半段那行点「<b>并入上一题</b>」。
+                </div>
+                <div v-if="!blocks.length" class="empty-block" style="padding:24px 0">
+                  还没有题块 —— 在左边卷面上画横线或框选
+                </div>
+                <!-- 每张卡片可拖拽排序（原生 HTML5 DnD，零依赖），另配 ↑/↓ 兜底 -->
+                <div v-for="(b, i) in blocks" :key="b.id" class="blk-card"
+                     :class="{ bad: b.tooThin || b.error, skipped: b.skipped, dragging: dragFrom === i, 'drag-over': dragOver === i && dragFrom !== i }"
+                     draggable="true"
+                     @dragstart="dragStart(i, $event)"
+                     @dragover.prevent="onDragOver(i)"
+                     @drop.prevent="dropOn(i)"
+                     @dragend="dragEnd()">
+                  <div class="blk-no">{{ i + 1 }}</div>
+                  <div class="blk-body">
+                    <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+                      <span class="drag-handle" title="拖住这里换位，顺序就是最终题目顺序">⋮⋮</span>
+                      <el-tag size="small" effect="plain" :type="b.source === 'rect' ? 'success' : 'primary'">
+                        {{ b.source === 'rect' ? '框选' : '横线' }}
+                      </el-tag>
+                      <el-tag v-if="b.skipped" size="small" type="info" effect="plain">不判</el-tag>
+                      <span class="blk-meta">
+                        第 {{ b.startPage }} 页
+                        <template v-if="b.regions.length > 1">
+                          ＋跨到第 {{ b.endPage }} 页 · 合 {{ b.regions.length }} 段
+                        </template>
+                        · 约 {{ b.pct }}% 版面
+                      </span>
+                      <div style="flex:1"></div>
+                      <el-button size="small" text :type="b.skipped ? 'warning' : 'info'"
+                                 :title="b.skipped ? '恢复：这块会重新送去批改' : '这块不送 AI（卷头、结构说明段）—— 框还留着'"
+                                 @click="toggleSkip(i)">{{ b.skipped ? '恢复' : '不判' }}</el-button>
+                      <el-button size="small" text :disabled="i === 0"
+                                 title="上移" @click="shiftBlock(i, -1)">↑</el-button>
+                      <el-button size="small" text :disabled="i === blocks.length - 1"
+                                 title="下移" @click="shiftBlock(i, 1)">↓</el-button>
+                      <el-button v-if="i > 0" size="small" text type="primary"
+                                 @click="mergePrev(i)">并入上一题</el-button>
+                      <el-button size="small" text type="danger" @click="removeBlock(i)">✕</el-button>
+                    </div>
+                    <div v-if="b.tooThin" class="blk-meta" style="color:#e6a23c">
+                      这一块太薄（可能只是页脚或空白），建议删掉 —— 后端也会拒收
+                    </div>
+                    <div v-if="b.skipped" class="blk-meta" style="color:#909399">
+                      已标「不判」—— 批改时跳过它，不调模型（点「恢复」可改）
+                    </div>
+                    <!-- 块的即时预览：这是「两条线之间到底切成了什么」的唯一凭据。
+                         走 /region-image（服务端现裁、不落盘），改一下坐标 URL 就变。
+                         ⚠️ draggable="false"：否则从缩略图上起手会拖成「拖图片」而不是拖这张卡 -->
+                    <img v-if="b.thumb" :src="b.thumb" class="blk-thumb" draggable="false"
+                         loading="lazy" alt="这一块切出来的样子" @click="zoom(b.thumb)">
+                  </div>
+                </div>
+                <div v-if="dirty" class="hint" style="color:#e6a23c">
+                  ⚠️ 分割改过还没保存 —— 不保存的话批改用的是旧分割
+                </div>
+              </el-tab-pane>
+
+              <el-tab-pane :label="'批改 ' + items.length" name="review">
+                <div v-if="!items.length" class="empty-block" style="padding:24px 0">
+                  点右上角「开始批改」，跑完这里会一题一题列出来
+                </div>
+                <div v-else style="max-height: 64vh; overflow: auto; padding-right: 4px;">
+                  <div v-for="it in items" :key="'it' + it.id" class="g-card"
+                       :class="{ sel: selItem === it.id, ungradable: it.verdict === 'ungradable' }"
+                       @click="selItem = it.id; gotoItem(it)">
+                    <div class="g-head">
+                      <b style="font-size:13px">{{ it.q_no || ('第 ' + it.seq + ' 题') }}</b>
+                      <el-tag v-if="it.qtype" size="small" effect="plain">{{ it.qtype }}</el-tag>
+                      <span class="g-verdict" :class="'v-' + (it.verdict || 'ungradable')">
+                        {{ verdictLabel(it.verdict) }}
+                      </span>
+                      <el-tag v-for="f in (it.flags || [])" :key="'f' + it.id + f"
+                              size="small" type="warning" effect="plain">{{ flagLabel(f) }}</el-tag>
+                      <div style="flex:1"></div>
+                      <el-button size="small" text @click.stop="gotoPage(it.page_no)">
+                        第 {{ it.page_no }} 页
+                      </el-button>
+                    </div>
+                    <div class="g-body">
+                      <!-- 模型说「这块不像一道题」—— 只提示，绝不自动跳过 -->
+                      <div v-if="oddKind(it)" class="g-note">
+                        {{ oddKind(it) }}：模型认为这一块不是题目本体，判出来多半是噪音
+                        —— 到「分割」页签把这一行点「不判」即可（框会留着）。
+                      </div>
+                      <div class="g-lb">题干</div>
+                      <div class="g-rich" :ref="el => setRich(el, 'stem' + it.id)"></div>
+                      <div class="g-lb" style="margin-top:8px">学生作答</div>
+                      <div class="g-rich" :ref="el => setRich(el, 'ans' + it.id)"></div>
+                      <div v-if="it.verdict === 'ungradable'" class="g-un">
+                        判不了的原因：{{ it.error_reason || '识别不清 / 图题 / 没作答' }}
+                      </div>
+                      <template v-if="it.basis || it.error_reason">
+                        <div class="g-lb" style="margin-top:8px">依据</div>
+                        <div class="g-rich" style="font-size:12.5px;color:#606266">{{ it.basis }}</div>
+                      </template>
+                      <!-- 模型报的「底部有问题」：老师自己看不出末段被切掉了一角 -->
+                      <div v-if="it.tail_note" class="g-note">
+                        这一块的底部：{{ it.tail_note }}
+                        —— 到左边把这一页的「末段底边」往上收一点，或者翻页看下面还有没有内容。
+                      </div>
+                      <div class="g-vbtns">
+                        <span class="muted-hint">判定</span>
+                        <button v-for="v in VERDICTS" :key="'v' + it.id + v.value" type="button"
+                                class="g-vbtn" :class="{ on: it.verdict === v.value }"
+                                @click.stop="setVerdict(it, v.value)">{{ v.label }}</button>
+                        <div style="flex:1"></div>
+                        <el-button size="small" text @click.stop="rerunItem(it)">单独重批</el-button>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </el-tab-pane>
+            </el-tabs>
+          </template>
+        </el-card>
+      </el-col>
+    </el-row>
+  </div>
+</div>
+
+<script src="/vendor/vue.global.prod.js"></script>
+<script src="/vendor/element-plus/index.full.min.js"></script>
+<script src="/vendor/marked.min.js"></script>
+<script src="/vendor/purify.min.js"></script>
+<script src="/vendor/katex/katex.min.js"></script>
+<script src="/vendor/katex/auto-render.min.js"></script>
+<script>
+const { createApp } = Vue;
+
+/** 一个块的最小高度（0~1000 制）。**与后端 grade_store.REGION_MIN_SIDE 同值**：
+ *  比这更薄的段裁出来只是一条糊字，送模型等于花钱买一句「读不清」，后端还会直接 422。
+ *  前端先挡一层，老师就不用为一次手抖看一个红色报错。 */
+const MIN_GAP = 20;
+
+/** 一个框被算作「整页宽」的容差（8 ≈ 纸面 0.8%）。框选很难恰好贴着左右页边。 */
+const FULL_TOL = 8;
+
+/** 框盖住一个段多少，才认为「这块已经被框管了」。0.5 的理由见 gradeLines.js。 */
+const COVER = 0.5;
+
+const VERDICTS = [
+  { value: 'correct', label: '对' },
+  { value: 'partial', label: '半对' },
+  { value: 'wrong', label: '错' },
+  { value: 'ungradable', label: '判不了' },
+];
+const VERDICT_LABEL = { correct: '对', partial: '半对', wrong: '错', ungradable: '判不了' };
+const FLAG_LABEL = {
+  low_confidence: '把握低', blurry: '字迹糊', region_empty: '框里没题',
+  region_multi: '框里多题', figure: '有图',
+};
+const BLOCK_KIND_LABEL = {
+  header: '卷头 / 页眉', section: '段落标题', footer: '页脚 / 页码',
+  blank: '空白', other: '其它（不像题目本体）',
+};
+
+const num = (v, d = 0) => { const n = Number(v); return Number.isFinite(n) ? n : d; };
+const clampUnit = (v) => Math.min(1000, Math.max(0, num(v)));
+const bodyText = (s) => String(s === null || s === undefined ? '' : s);
+
+const app = createApp({
+  data() {
+    return {
+      grades: [], gid: null, g: null,
+      // 分割
+      tool: 'line',
+      loadedPages: {},
+      dividers: {},            // { 页号: [y…] }，y 是 0~1000
+      ends: {},                // { 页号: endY }，缺省 1000
+      rects: [],               // [{ n, page, box:[x0,y0,x1,y1] }]，n 是稳定序号
+      _rectSeq: 0,
+      draft: null,             // 正在拖的框 { page, x0, y0, x1, y1 }
+      skips: {},               // { 页号: true } 整页不判
+      skipKeys: {},            // { 段key: true } 这块不判
+      groups: [],              // [[段key…]…] **编排表**：外层顺序 = 题目顺序
+      dragging: null,          // 框选拖拽的中间态（指针）
+      dragTip: null,           // 拖分割线时的读数 { pno, di, y }
+      dragFrom: null, dragOver: null,
+      dirty: false,
+      busy: '', submitting: false,
+      // 批改
+      tab: 'blocks',
+      selItem: null,
+      VERDICTS,
+      _poll: null,
+      // DOM 元素不参与响应式：markRaw 一下，否则每次 setRich 都触发一轮 patch
+      _rich: Vue.markRaw(new Map()),
+    };
+  },
+  computed: {
+    /** 回旧版批改台的地址。旧版是 SPA 里的路由 `/grade/:id`（entry.html），
+     *  所以这里必须拼进去当前 gid —— 写死一个列表页地址是不存在的路由。 */
+    backUrl() {
+      return this.gid ? '/entry.html#/grade/' + this.gid : '/entry.html';
+    },
+    pageList() {
+      const n = this.g ? num(this.g.total) : 0;
+      return n > 0 ? Array.from({ length: n }, (_, i) => i + 1) : [];
+    },
+    loadedCount() { return Object.keys(this.loadedPages).length; },
+    items() { return (this.g && this.g.items) || []; },
+    blocks() { return this.buildBlocks(); },
+    skippedCount() { return this.blocks.filter((b) => b.skipped).length; },
+    /** 还没画线、也没框选过的页 —— 它们会「整页作为一块」。多页卷子上这个数字要显眼。 */
+    unsplitPageCount() {
+      if (this.pageList.length <= 1) return 0;
+      let n = 0;
+      this.pageList.forEach((pno) => {
+        if (this.pageSkipped(pno)) return;
+        if ((this.dividers[pno] || []).length) return;
+        if (this.rects.some((r) => r.page === pno)) return;
+        n += 1;
+      });
+      return n;
+    },
+    /** ⚠️ 「在跑」不能只看 status==='running'：刚点开始那一瞬服务端还是 queued。
+     *  这是本项目踩过两次的坑（表现是「点了没反应」）。 */
+    running() {
+      if (!this.g) return false;
+      return this.g.status === 'running' || this.g.status === 'queued';
+    },
+    jobPct() {
+      const g = this.g;
+      if (!g || !g.total) return 0;
+      return Math.min(100, Math.round((num(g.done) + num(g.failed)) / g.total * 100));
+    },
+    gradeTag() {
+      const g = this.g;
+      if (!g) return '';
+      const st = this.statusLabel(g.status);
+      return '#' + g.id + ' · ' + st + (g.total ? ' · ' + g.total + ' 页' : '');
+    },
+    draftBox() {
+      const d = this.draft;
+      if (!d) return [0, 0, 0, 0];
+      return [Math.min(d.x0, d.x1), Math.min(d.y0, d.y1),
+        Math.max(d.x0, d.x1), Math.max(d.y0, d.y1)];
+    },
+  },
+  watch: {
+    // 卡片是在 `tab === 'review'` 里渲染的 —— 切过去那一下 ref 才存在，得重画一遍。
+    tab(v) { if (v === 'review') this.$nextTick(() => this.paintAll()); },
+    // 轮询把 results 刷新后，题干/作答的文本可能变了（比如单题重批）
+    items() { this.$nextTick(() => this.paintAll()); },
+  },
+  mounted() { this.boot(); },
+  beforeUnmount() { this.stopPoll(); this.teardownLazy(); },
+  methods: {
+    /* ============================ 基础 ============================ */
+    async api(url, opt) {
+      const res = await fetch(url, opt);
+      if (!res.ok) {
+        let msg = '请求失败 ' + res.status;
+        try { msg = (await res.json()).detail || msg; } catch (e) { /* 非 JSON 就算了 */ }
+        throw new Error(msg);
+      }
+      return res.json();
+    },
+    optLabel(x) {
+      const t = String(x.created_at || '').slice(0, 16).replace('T', ' ');
+      return '#' + x.id + ' · ' + this.statusLabel(x.status) + ' · ' +
+        (x.total || 0) + ' 页 · ' + t;
+    },
+    statusLabel(s) {
+      return ({ queued: '排队中', running: '批改中', reviewing: '待复核',
+        done: '已确认', failed: '失败', partial: '部分失败' })[s] || s || '';
+    },
+    statusType(s) {
+      return ({ queued: 'info', running: 'warning', reviewing: 'success',
+        done: 'success', failed: 'danger', partial: 'warning' })[s] || 'info';
+    },
+    verdictLabel(v) { return VERDICT_LABEL[v] || '判不了'; },
+    flagLabel(f) { return FLAG_LABEL[f] || '需留意'; },
+    oddKind(it) {
+      const k = bodyText(it && it.block_kind).trim();
+      return k && k !== 'question' ? (BLOCK_KIND_LABEL[k] || BLOCK_KIND_LABEL.other) : '';
+    },
+    zoom(url) { if (url) window.open(url, '_blank'); },
+    clampUnit(v) { return Math.round(clampUnit(v)); },
+    unitPct(y) { return (clampUnit(y) / 10) + '%'; },
+
+    /* ============================ 载入 ============================ */
+    async boot() {
+      try {
+        this.grades = await this.api('/api/homework-grades');
+        const want = Number(new URLSearchParams(location.search).get('gid') || 0);
+        const target = want ? this.grades.find((x) => x.id === want) : null;
+        // ⚠️ 刻意不自动打开第一条：几十页的作业一加载就是一次渲染 + 一批页图请求，
+        //    停在「选择一份作业」的空状态（与 batch/entry 页同一个约定）。
+        if (target) { this.gid = target.id; await this.loadGrade(target.id); }
+      } catch (e) { ElementPlus.ElMessage.error(e.message); }
+    },
+    async loadGrade(id) {
+      if (!id) return;
+      // ⚠️ 先把上一份的状态清干净再加载。留着旧的 dividers/rects 会与新 total 错配：
+      //    色带算在已不存在的页上、缩略图拼出不存在的页号 → 一片破图。
+      this.stopPoll();
+      this.g = null;
+      this.loadedPages = {};
+      this.dividers = {};
+      this.ends = {};
+      this.rects = [];
+      this._rectSeq = 0;
+      this.draft = null;
+      this.skips = {};
+      this.skipKeys = {};
+      this.groups = [];
+      this.dragFrom = null;
+      this.dirty = false;
+      this.selItem = null;
+      this.teardownLazy();
+      try {
+        const d = await this.api('/api/homework-grades/' + id);
+        this.applyDetail(d);
+      } catch (e) {
+        ElementPlus.ElMessage.error({ message: '打不开这份作业：' + e.message, duration: 6000 });
+        return;
+      }
+      if (this.running) this.startPoll();
+      history.replaceState(null, '', '?gid=' + id);
+      this.$nextTick(() => this.setupLazy());
+    },
+    /** 把服务端的详情摊进「分割草稿」。**刷新页也不丢已保存的分割**就靠这一步。 */
+    applyDetail(d) {
+      this.g = d;
+      this.syncRegions();
+      this.$nextTick(() => { this.paintAll(); this.$nextTick(() => this.paintAll()); });
+    },
+    /** 从 detail.regions 反推 dividers / rects / ends / groups / skipKeys。
+     *
+     *  为什么不额外存一份「线」：整页宽的段**只可能来自分割线**（手拖一个框几乎不可能
+     *  同时压在 0 和 1000 上），所以线能从段反推出来 —— 同一个事实只有一个出处。 */
+    syncRegions() {
+      const regions = (this.g && this.g.regions) || [];
+      const dividers = {};
+      const ends = {};
+      const rects = [];
+      const groups = [];
+      const skipKeys = {};
+      let rn = 0;
+      const bySeq = new Map();
+      regions.forEach((r) => {
+        const p = num(r.page_no, 1);
+        const box = (r.box || []).slice();
+        const seq = num(r.seq, 0);
+        if (!bySeq.has(seq)) bySeq.set(seq, []);
+        let key;
+        if (this.isFullWidth(box)) {
+          key = 'L' + p + '_' + Math.round(clampUnit(box[1]));
+          (dividers[p] = dividers[p] || []).push(Math.round(clampUnit(box[1])));
+          ends[p] = Math.max(num(ends[p], 0), Math.round(clampUnit(box[3])));
+        } else {
+          rn += 1;
+          key = 'R' + rn;
+          rects.push({ n: rn, page: p, box });
+        }
+        bySeq.get(seq).push({ key, page: p, box });
+        if (r.skipped) skipKeys[key] = true;
+      });
+      // 线要去重、排序；`0` 不是线（它已经是页顶了）
+      Object.keys(dividers).forEach((p) => {
+        const ys = Array.from(new Set(dividers[p].map((y) => Math.round(clampUnit(y)))))
+          .filter((y) => y > 0 && y < 1000).sort((a, b) => a - b);
+        if (ys.length) dividers[p] = ys; else delete dividers[p];
+      });
+      // groups 按 seq 升序；块内按「先页、再上边」排（跨页题的上下半段）
+      Array.from(bySeq.keys()).sort((a, b) => a - b).forEach((seq) => {
+        const segs = bySeq.get(seq).slice().sort(
+          (a, b) => a.page - b.page || num(a.box[1]) - num(b.box[1]));
+        groups.push(segs.map((s) => s.key));
+      });
+      this._rectSeq = rn;
+      this.rects = rects;
+      this.dividers = dividers;
+      this.ends = ends;
+      this.groups = groups;
+      this.skipKeys = skipKeys;
+      this.skips = {};
+      ((this.g && this.g.skipped_pages) || []).forEach((p) => { this.skips[num(p, 1)] = true; });
+      this.dirty = false;
+    },
+    pageImg(pno) { return '/api/homework-grades/' + this.gid + '/page/' + pno; },
+
+    /* ============================ 懒加载 ============================ */
+    /** 只加载视口附近的页 —— 一份几十页的作业全量加载会解码出几百 MB 位图。
+     *  与批量录题页同一个做法（那边 46 页实测会卡死）。 */
+    setupLazy() {
+      this.teardownLazy();
+      if (typeof IntersectionObserver === 'undefined') {   // jsdom 之类没有就直接全load
+        this.pageList.forEach((p) => { this.loadedPages[p] = true; });
+        return;
+      }
+      this._io = new IntersectionObserver((rows) => {
+        rows.forEach((r) => {
+          if (!r.isIntersecting) return;
+          const pno = num(r.target.getAttribute('data-page'), 0);
+          if (pno) this.loadedPages[pno] = true;
+        });
+      }, { root: this.$refs.scrollBox || null, rootMargin: '600px 0px' });
+      const box = this.$refs.scrollBox;
+      if (!box) return;
+      Array.from(box.querySelectorAll('.page-wrap')).forEach((el) => this._io.observe(el));
+      // 首屏那几页先给上，别等观察器触发
+      this.pageList.slice(0, 3).forEach((p) => { this.loadedPages[p] = true; });
+    },
+    teardownLazy() { if (this._io) { this._io.disconnect(); this._io = null; } },
+
+    /* ============================ 分割：几何 ============================ */
+    isFullWidth(box) {
+      if (!Array.isArray(box) || box.length < 4) return false;
+      const x0 = clampUnit(box[0]); const x1 = clampUnit(box[2]);
+      return x0 <= FULL_TOL && x1 >= 1000 - FULL_TOL;
+    },
+    endOf(pno) { return Math.round(clampUnit(num(this.ends[pno], 1000))) || 1000; },
+    /** 这一页由线切出来的段（0~endY 全切，**第一条线以上也算**）。
+     *
+     *  ⚠️ **没有线就一条段都不生成**，哪怕这一页有框、哪怕一段都没有。
+     *     `edges = [0, end]` 按「全切」语义会返回整页那一段 —— 那在「一页一刀没画」
+     *     时看起来是对的，但会把「整页」当成一道题混进块列表：老师明明已经用框
+     *     框住了其中一题，列表里却还多出一个覆盖整页的幽灵段（题数 +1，还给那个
+     *     幽灵占了一个题号）。路线 A 那边就是被这条咬过（挂载检查抓到的），
+     *     所以这里一上来就写死：**线是段的唯一来源，没线就没段**。
+     *     没画线也没框的页 = 0 块 → 后端按老口径整页判一次（与 A 一致）。 */
+    bandsOf(pno) {
+      if (!(this.dividers[pno] || []).length) return [];
+      const end = this.endOf(pno);
+      const ys = Array.from(new Set((this.dividers[pno] || [])
+        .map((y) => Math.round(clampUnit(y))).filter((y) => y > 0 && y < end)))
+        .sort((a, b) => a - b);
+      const edges = [0].concat(ys).concat([end]);
+      const out = [];
+      for (let i = 0; i + 1 < edges.length; i += 1) {
+        const y0 = edges[i]; const y1 = edges[i + 1];
+        if (y1 - y0 < MIN_GAP) continue;          // 太薄的带丢掉，不吃后端 422
+        out.push({ key: 'L' + pno + '_' + y0, page: pno, box: [0, y0, 1000, y1],
+          y0, y1, src: 'line', tooThin: (y1 - y0) < MIN_GAP * 2 });
+      }
+      return out;
+    },
+    rectsOf(pno) { return this.rects.filter((r) => r.page === pno); },
+    /** 这一页所有可成块的段 = 线切带（被框盖住的不再生成）+ 框选段。**框优先**：
+     *  老师先画线切好、再单独框住其中一题时，那一带不该再单独成块（否则同一题出现两次）。 */
+    segsOf(pno) {
+      const boxes = this.rectsOf(pno);
+      const bands = this.bandsOf(pno).filter((b) => !boxes.some((r) =>
+        this.coverRatio(b.box, r.box) >= COVER));
+      return bands.concat(boxes.map((r) => ({
+        key: r.key || ('R' + r.n), page: pno, box: r.box, src: 'rect', tooThin: false,
+      })));
+    },
+    coverRatio(inner, outer) {
+      const i = this.norm(inner); const o = this.norm(outer);
+      if (!i || !o) return 0;
+      const area = (i[2] - i[0]) * (i[3] - i[1]);
+      if (area <= 0) return 0;
+      const w = Math.min(i[2], o[2]) - Math.max(i[0], o[0]);
+      const h = Math.min(i[3], o[3]) - Math.max(i[1], o[1]);
+      return (w > 0 && h > 0 ? w * h : 0) / area;
+    },
+    norm(box) {
+      if (!Array.isArray(box) || box.length < 4) return null;
+      const x0 = clampUnit(Math.min(num(box[0]), num(box[2])));
+      const x1 = clampUnit(Math.max(num(box[0]), num(box[2])));
+      const y0 = clampUnit(Math.min(num(box[1]), num(box[3])));
+      const y1 = clampUnit(Math.max(num(box[1]), num(box[3])));
+      return [Math.round(x0), Math.round(y0), Math.round(x1), Math.round(y1)];
+    },
+    segByKey(key) {
+      const m = /^L(\d+)_/.exec(key);
+      if (m) {
+        const pno = num(m[1], 1);
+        return this.segsOf(pno).find((s) => s.key === key) || null;
+      }
+      const r = this.rects.find((x) => ('R' + x.n) === key);
+      return r ? { key, page: r.page, box: r.box, src: 'rect' } : null;
+    },
+
+    /* ============================ 分割：编排 → 块 ============================ */
+    /** groups 是**源头**（老师意图），blocks 是渲染产物。每次渲染重建，别反过来。 */
+    buildBlocks() {
+      const out = [];
+      const seen = new Set();
+      this.groups.forEach((keys) => {
+        const segs = (keys || []).map((k) => this.segByKey(k)).filter(Boolean)
+          .sort((a, b) => a.page - b.page || num(a.box[1]) - num(b.box[1]));
+        if (!segs.length) return;                 // 线被删了/页被跳了 → 这一段不存在了
+        segs.forEach((s) => seen.add(s.key));
+        const first = segs[0];
+        const last = segs[segs.length - 1];
+        const pct = Math.round(segs.reduce((n, s) => n +
+          (num(s.box[3]) - num(s.box[1])) / 10, 0));
+        out.push({
+          id: segs.map((s) => s.key).join('|'),
+          segKeys: segs.map((s) => s.key),
+          regions: segs,
+          source: first.src,
+          startPage: first.page,
+          endPage: last.page,
+          pct,
+          tooThin: segs.every((s) => !!s.tooThin) && segs.length === 1,
+          skipped: segs.every((s) => !!this.skipKeys[s.key]),
+          thumb: this.thumbOf(segs),
+        });
+      });
+      // 还没编进 groups 的段（刚画的线 / 刚框的）追加到最后 —— 否则「画了线但列表里没有」
+      const rest = [];
+      this.pageList.forEach((pno) => {
+        this.segsOf(pno).forEach((s) => { if (!seen.has(s.key)) rest.push(s); });
+      });
+      rest.forEach((s) => {
+        out.push({
+          id: s.key, segKeys: [s.key], regions: [s], source: s.src,
+          startPage: s.page, endPage: s.page,
+          pct: Math.round((num(s.box[3]) - num(s.box[1])) / 10),
+          tooThin: !!s.tooThin, skipped: !!this.skipKeys[s.key],
+          thumb: this.thumbOf([s]),
+        });
+      });
+      return out;
+    },
+    /** 这一块切出来什么样（现裁、不落盘）。spec 是前后端唯一的契约：
+     *  `页号:x0,y0,x1,y1`，多段用 `;` 连（后端按它裁图 + 跨页竖拼）。 */
+    thumbOf(segs) {
+      if (!segs || !segs.length || !this.gid) return '';
+      const spec = segs.map((s) => s.page + ':' + (s.box || []).join(',')).join(';');
+      return '/api/homework-grades/' + this.gid + '/region-image?spec=' + encodeURIComponent(spec);
+    },
+    /** 色带渲染：序号用「块」的号（不是段号），跨页第二段起标 cont。 */
+    bandsView(pno) {
+      const blocks = this.blocks;
+      const seqOf = new Map();
+      blocks.forEach((b, i) => b.segKeys.forEach((k) => seqOf.set(k, i + 1)));
+      const firstOf = new Map();
+      blocks.forEach((b) => firstOf.set(b.regions[0].page + '|' + b.regions[0].box[1], true));
+      return this.segsOf(pno).filter((s) => s.src === 'line').map((s, i) => {
+        const n = seqOf.get(s.key) || 0;
+        const isFirst = !!firstOf.get(s.page + '|' + s.box[1]);
+        return {
+          y0: s.box[1], y1: s.box[3],
+          parity: n % 2 ? 'odd' : 'even',
+          cont: !isFirst,
+          tooThin: !!s.tooThin,
+          skipped: !!this.skipKeys[s.key],
+          seqLabel: n ? ('第 ' + n + ' 题') : '—',
+        };
+      });
+    },
+    bandStyle(b) {
+      const y0 = clampUnit(b.y0); const y1 = clampUnit(b.y1);
+      return { top: (y0 / 10) + '%', height: ((y1 - y0) / 10) + '%' };
+    },
+    rectStyle(box) {
+      const b = this.norm(box) || [0, 0, 0, 0];
+      return {
+        left: (b[0] / 10) + '%', top: (b[1] / 10) + '%',
+        width: ((b[2] - b[0]) / 10) + '%', height: ((b[3] - b[1]) / 10) + '%',
+      };
+    },
+    /** 结束线以下那一截（页脚带）。默认没有。 */
+    tailBand(pno) {
+      const end = this.endOf(pno);
+      if (end >= 1000) return null;
+      return { y0: end, y1: 1000 };
+    },
+
+    /* ============================ 分割：交互 ============================ */
+    /** 页面上按下：横线模式 = 加一条线；框选模式 = 开始拖一个框。 */
+    onPageDown(pno, ev) {
+      if (this.tool === 'view') return;
+      const box = ev.currentTarget.getBoundingClientRect();
+      if (!box.width || !box.height) return;
+      const rel = (e) => ({
+        x: clampUnit((e.clientX - box.left) / box.width * 1000),
+        y: clampUnit((e.clientY - box.top) / box.height * 1000),
+      });
+      const p = rel(ev);
+      if (this.tool === 'line') {
+        this.addDivider(pno, p.y);
+        return;
+      }
+      // 框选：拖出来才成块（点一下不算，避免误触）
+      this.draft = { page: pno, x0: p.x, y0: p.y, x1: p.x, y1: p.y };
+      const move = (e) => {
+        const q = rel(e);
+        if (this.draft) { this.draft.x1 = q.x; this.draft.y1 = q.y; }
+      };
+      const up = () => {
+        window.removeEventListener('pointermove', move);
+        window.removeEventListener('pointerup', up);
+        const d = this.draft;
+        this.draft = null;
+        if (!d) return;
+        const b = this.norm([d.x0, d.y0, d.x1, d.y1]);
+        if (!b || b[2] - b[0] < MIN_GAP || b[3] - b[1] < MIN_GAP) {
+          ElementPlus.ElMessage.warning('框太小了 —— 至少要 ' + MIN_GAP + ' 见方（后端会拒收）');
+          return;
+        }
+        this.addRect(pno, b);
+      };
+      window.addEventListener('pointermove', move);
+      window.addEventListener('pointerup', up);
+    },
+    addDivider(pno, y) {
+      const v = Math.round(clampUnit(y));
+      if (v <= 0 || v >= this.endOf(pno)) {
+        ElementPlus.ElMessage.warning('这条线落在页边或结束线以下 —— 切不出东西');
+        return;
+      }
+      const cur = (this.dividers[pno] || []).slice();
+      if (cur.some((l) => Math.abs(l - v) < MIN_GAP)) {
+        ElementPlus.ElMessage.warning('离已有的线太近了 —— 那样切出来的题太薄，模型读不出内容');
+        return;
+      }
+      cur.push(v); cur.sort((a, b) => a - b);
+      this.dividers = Object.assign({}, this.dividers, { [pno]: cur });
+      this.markDirty();
+    },
+    removeDivider(pno, di) {
+      const cur = (this.dividers[pno] || []).slice();
+      cur.splice(di, 1);
+      const next = Object.assign({}, this.dividers);
+      if (cur.length) next[pno] = cur; else delete next[pno];
+      this.dividers = next;
+      this.markDirty();
+    },
+    startDragDivider(pno, di, ev) {
+      const boxEl = document.getElementById('pg' + pno);
+      if (!boxEl) return;
+      const rect = boxEl.getBoundingClientRect();
+      if (!rect.height) return;
+      this.dragTip = { pno, di, y: (this.dividers[pno] || [])[di] };
+      const move = (e) => {
+        const y = Math.round(clampUnit((e.clientY - rect.top) / rect.height * 1000));
+        this.dragTip = { pno, di, y };
+      };
+      const up = () => {
+        window.removeEventListener('pointermove', move);
+        window.removeEventListener('pointerup', up);
+        const t = this.dragTip;
+        this.dragTip = null;
+        if (!t) return;
+        const cur = (this.dividers[pno] || []).slice();
+        const others = cur.filter((_, i) => i !== di);
+        if (t.y <= 0 || t.y >= this.endOf(pno) || others.some((l) => Math.abs(l - t.y) < MIN_GAP)) {
+          ElementPlus.ElMessage.warning('这个位置放不下 —— 太靠页边或离别的线太近');
+          return;                                  // 放不下就保持原位，不留一条无效的线
+        }
+        cur[di] = t.y;
+        cur.sort((a, b) => a - b);
+        this.dividers = Object.assign({}, this.dividers, { [pno]: cur });
+        this.markDirty();
+      };
+      window.addEventListener('pointermove', move);
+      window.addEventListener('pointerup', up);
+    },
+    addRect(pno, box) {
+      this._rectSeq += 1;
+      this.rects = this.rects.concat([{ n: this._rectSeq, page: pno, box }]);
+      this.markDirty();
+    },
+    setEndOf(pno, y) {
+      const v = Math.round(clampUnit(y));
+      const last = (this.dividers[pno] || []).slice().sort((a, b) => b - a)[0] || 0;
+      if (v - last < MIN_GAP) {
+        ElementPlus.ElMessage.warning('结束线太靠上了 —— 至少要离最后一条分割线 ' + MIN_GAP);
+        return;
+      }
+      if (v >= 1000) {
+        const next = Object.assign({}, this.ends); delete next[pno];
+        this.ends = next;
+      } else {
+        this.ends = Object.assign({}, this.ends, { [pno]: v });
+      }
+      this.markDirty();
+    },
+    pageSkipped(pno) { return !!this.skips[pno]; },
+    async togglePageSkip(pno) {
+      const next = this.pageList.filter((p) => (p === pno ? !this.skips[p] : !!this.skips[p]));
+      this.busy = 'pskip';
+      try {
+        const d = await this.api('/api/homework-grades/' + this.gid + '/skipped-pages',
+          { method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ pages: next }) });
+        if (this.g) this.g = Object.assign({}, this.g, { skipped_pages: d.skipped_pages || [] });
+        const sk = {};
+        (d.skipped_pages || []).forEach((p) => { sk[num(p, 1)] = true; });
+        this.skips = sk;
+        ElementPlus.ElMessage.success(this.skips[pno] ? '这一页不送 AI 了（框都还留着）'
+          : '这一页会重新送去批改');
+      } catch (e) {
+        ElementPlus.ElMessage.error(e.message);
+      } finally { this.busy = ''; }
+    },
+
+    /* ============================ 分割：块操作 ============================ */
+    markDirty() { this.dirty = true; this.syncGroups(); },
+    /** 把「现在存在的段」补进 groups（新画的线 / 新框的），并清掉已消失的。
+     *  **不重排已有顺序** —— 老师拖过的顺序不能被下一次画线冲掉（录题页踩过）。 */
+    syncGroups() {
+      const live = new Set();
+      this.pageList.forEach((pno) => this.segsOf(pno).forEach((s) => live.add(s.key)));
+      const groups = this.groups.map((keys) => keys.filter((k) => live.has(k)))
+        .filter((keys) => keys.length);
+      const used = new Set();
+      groups.forEach((keys) => keys.forEach((k) => used.add(k)));
+      const fresh = [];
+      this.pageList.forEach((pno) => {
+        this.segsOf(pno).forEach((s) => { if (!used.has(s.key)) fresh.push(s); });
+      });
+      fresh.forEach((s) => groups.push([s.key]));
+      this.groups = groups;
+    },
+    toggleSkip(i) {
+      const b = this.blocks[i];
+      if (!b) return;
+      const want = !b.skipped;
+      const next = Object.assign({}, this.skipKeys);
+      b.segKeys.forEach((k) => { if (want) next[k] = true; else delete next[k]; });
+      this.skipKeys = next;
+      this.dirty = true;
+    },
+    shiftBlock(i, dir) {
+      const j = i + dir;
+      if (j < 0 || j >= this.groups.length) return;
+      const g = this.groups.slice();
+      const tmp = g[i]; g[i] = g[j]; g[j] = tmp;
+      this.groups = g;
+      this.dirty = true;
+    },
+    mergePrev(i) {
+      if (i <= 0) return;
+      const g = this.groups.slice();
+      g[i - 1] = g[i - 1].concat(g[i]);
+      g.splice(i, 1);
+      this.groups = g;
+      this.dirty = true;
+    },
+    removeBlock(i) {
+      const b = this.blocks[i];
+      if (!b) return;
+      // 删块 = 把这些段从编排里拿出去。线段会「长回来」（它由线推导），
+      // 所以删线段要走「删线」这条路 —— 这里只处理真正要消失的框选段。
+      const segs = b.regions;
+      const rectKeys = segs.filter((s) => s.src === 'rect').map((s) => s.key);
+      if (rectKeys.length) {
+        this.rects = this.rects.filter((r) => !rectKeys.includes('R' + r.n));
+      }
+      const lineSegs = segs.filter((s) => s.src === 'line');
+      if (lineSegs.length && !rectKeys.length) {
+        // 全是线段：删它上边那条线（语义 = 并到相邻那段去）
+        const pno = lineSegs[0].page;
+        const cur = (this.dividers[pno] || []).slice().sort((a, b) => a - b);
+        const y0 = num(lineSegs[0].box[1]);
+        let idx = -1;
+        cur.forEach((y, k) => { if (y <= y0 + 1) idx = k; });
+        if (idx < 0 && cur.length) idx = 0;
+        if (idx >= 0) { this.removeDivider(pno, idx); this.syncGroups(); return; }
+      }
+      const g = this.groups.slice();
+      g.splice(i, 1);
+      this.groups = g;
+      this.markDirty();
+    },
+    dragStart(i, ev) {
+      this.dragFrom = i;
+      if (ev && ev.dataTransfer) {
+        ev.dataTransfer.effectAllowed = 'move';
+        try { ev.dataTransfer.setData('text/plain', String(i)); } catch (e) { /* 忽略 */ }
+      }
+    },
+    onDragOver(i) { this.dragOver = i; },
+    dropOn(i) {
+      const from = this.dragFrom;
+      this.dragFrom = null; this.dragOver = null;
+      if (from === null || from === i) return;
+      const g = this.groups.slice();
+      const moved = g.splice(from, 1)[0];
+      if (moved === undefined) return;
+      g.splice(i, 0, moved);
+      this.groups = g;
+      this.dirty = true;
+    },
+    dragEnd() { this.dragFrom = null; this.dragOver = null; },
+
+    /* ============================ 保存分割 ============================ */
+    async saveRegions() {
+      this.syncGroups();
+      /* seq 直接按「块」的最终顺序编号 —— 跨页题的两段共用一个 seq，
+       * 后端就靠它把两段竖拼成一张图。
+       * ⚠️ 一块里的所有段共用同一个 `skipped`：后端 `put_regions` 也会把同一题
+       *    归一成一致（只跳上半段等于只批半道题）。 */
+      const segs = [];
+      this.blocks.forEach((b, n) => {
+        b.regions.forEach((s) => {
+          segs.push({
+            page_no: s.page, seq: n, q_no: '', box: s.box, skipped: !!b.skipped,
+          });
+        });
+      });
+      this.busy = 'regions';
+      try {
+        const res = await this.api('/api/homework-grades/' + this.gid + '/regions',
+          { method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ grouped: true, regions: segs }) });
+        if (this.g) this.g = Object.assign({}, this.g, { regions: res.regions });
+        this.syncRegions();
+        const blocks = this.blocks;
+        const cross = blocks.filter((b) => b.regions.length > 1).length;
+        const skipped = blocks.filter((b) => b.skipped).length;
+        ElementPlus.ElMessage.success(segs.length
+          ? '已保存 ' + blocks.length + ' 题（' + segs.length + ' 段'
+            + (cross ? '，其中 ' + cross + ' 题跨页' : '')
+            + (skipped ? '，' + skipped + ' 题不判' : '') + '）'
+          : '已清空全部分割 —— 整份退回整页批');
+        this.$nextTick(() => this.setupLazy());
+      } catch (e) {
+        ElementPlus.ElMessage.error(e.message);
+      } finally { this.busy = ''; }
+    },
+
+    /* ============================ 批改 ============================ */
+    async runGrade() {
+      this.submitting = true;
+      try {
+        const d = await this.api('/api/homework-grades/' + this.gid + '/run', { method: 'POST' });
+        // ⚠️ 只合并**进度字段**：整份 Object.assign 会把 regions 一起换掉，
+        //    而老师可能刚画了线还没保存（那一下就被冲没了）。
+        if (this.g) this.g = Object.assign({}, this.g, {
+          status: d.status, done: d.done, total: d.total, failed: d.failed,
+          error: d.error, finished_at: d.finished_at,
+        });
+        this.tab = 'review';
+        this.startPoll();
+      } catch (e) {
+        ElementPlus.ElMessage.error(e.message);
+      } finally { this.submitting = false; }
+    },
+    /** 轮询：**只刷 status/进度/items**，不动分割草稿（否则刚画的线会被冲掉）。 */
+    startPoll() {
+      this.stopPoll();
+      this._poll = setInterval(async () => {
+        try {
+          const d = await this.api('/api/homework-grades/' + this.gid);
+          if (!this.g) return;
+          const keep = { regions: this.g.regions, skipped_pages: this.g.skipped_pages };
+          this.g = Object.assign({}, this.g, d, this.dirty ? keep : {});
+          if (d.status !== 'running' && d.status !== 'queued') this.stopPoll();
+        } catch (e) { /* 轮询失败不打扰（下一轮再来） */ }
+      }, 2000);
+    },
+    stopPoll() { if (this._poll) { clearInterval(this._poll); this._poll = null; } },
+    async setVerdict(it, v) {
+      try {
+        const r = await this.api('/api/grade-items/' + it.id,
+          { method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ verdict: v }) });
+        Object.assign(it, r.item || r);
+        ElementPlus.ElMessage.success('已改成「' + this.verdictLabel(v) + '」');
+      } catch (e) { ElementPlus.ElMessage.error(e.message); }
+    },
+    async rerunItem(it) {
+      try {
+        await this.api('/api/grade-items/' + it.id + '/rerun', { method: 'POST' });
+        ElementPlus.ElMessage.success('已提交重批，稍等刷新');
+      } catch (e) { ElementPlus.ElMessage.error(e.message); }
+    },
+    gotoPage(pno) {
+      const el = document.getElementById('pg' + num(pno, 1));
+      if (el && el.scrollIntoView) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    },
+    gotoItem(it) { this.gotoPage(it.page_no); },
+
+    /* ============================ 富文本（题干 / 作答渲染） ============================ */
+    setRich(el, key) {
+      if (!el) return;
+      this._rich.set(key, el);
+      this.$nextTick(() => this.paintOne(key));
+    },
+    paintAll() {
+      if (!this._rich) return;
+      Array.from(this._rich.keys()).forEach((k) => this.paintOne(k));
+    },
+    paintOne(key) {
+      const el = this._rich && this._rich.get(key);
+      if (!el) return;
+      const m = /^(stem|ans)(\d+)$/.exec(key);
+      if (!m) return;
+      const it = this.items.find((x) => String(x.id) === m[2]);
+      if (!it) { el.innerHTML = ''; return; }
+      const src = m[1] === 'stem' ? it.stem : it.student_answer;
+      const text = bodyText(src).trim();
+      if (!text) { el.innerHTML = '<span style="color:#c0c4cc">（空）</span>'; return; }
+      el.innerHTML = this.renderRich(text);
+    },
+    /** 渲染管线（与项目里 mathRender.js 同一套顺序）：先 marked 出 HTML → DOMPurify 洗 →
+     *  最后 auto-render 把 $…$ 变成公式。顺序反了公式里的下划线会被当成强调。 */
+    renderRich(text) {
+      try {
+        const md = String(text || '');
+        const html = (window.marked && window.marked.parse) ? window.marked.parse(md)
+          : md.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/\n/g, '<br>');
+        const safe = (window.DOMPurify && window.DOMPurify.sanitize)
+          ? window.DOMPurify.sanitize(html) : html;
+        if (window.renderMathInElement) {
+          const wrap = document.createElement('div');
+          wrap.innerHTML = safe;
+          try {
+            window.renderMathInElement(wrap, { delimiters: [
+              { left: '$$', right: '$$', display: true },
+              { left: '$', right: '$', display: false },
+              { left: '\\(', right: '\\)', display: false },
+              { left: '\\[', right: '\\]', display: true },
+            ], throwOnError: false });
+          } catch (e) { /* 公式挂了正文照常显示 */ }
+          return wrap.innerHTML;
+        }
+        return safe;
+      } catch (e) { return String(text || ''); }
+    },
+  },
+});
+app.use(ElementPlus);
+
+// 兜底：组件在渲染或事件里抛异常时，Vue 默认只把这一处更新丢掉 ——
+// 用户看到的就是「报了个错然后页面点不动」。统一记一笔并提示，其余部分继续可用。
+app.config.errorHandler = (err, instance, info) => {
+  console.error('[workbench] 未捕获异常：' + info, err);
+  ElementPlus.ElMessage.error({
+    message: '页面出错：' + ((err && err.message) || err) + '（详情见浏览器控制台）',
+    duration: 6000,
+  });
+};
+window.addEventListener('unhandledrejection', (ev) => {
+  console.error('[workbench] 未处理的 Promise 异常', ev.reason);
+});
+
+app.mount('#app');
+</script>
+</body>
+</html>

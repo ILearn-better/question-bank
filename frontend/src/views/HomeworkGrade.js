@@ -1535,6 +1535,11 @@ export default {
       <h1>作业批改</h1>
       <span class="sub" v-if="detail">课时 #{{ detail.lesson_id }}</span>
       <div class="spacer"></div>
+      <!-- 新工作台（路线 B）：整条文件处理链路照批量录题那一套（所有页竖排滚动 +
+           右边块卡片逐块处理）。两个入口并存，老师对比后再决定删哪个 ——
+           所以这里是一个**普通链接，不是路由**（那是独立的零构建页面）。 -->
+      <a v-if="detail" class="btn" :href="'/workbench.html?gid=' + detail.id"
+         title="所有页竖排滚动、右边块卡片逐块处理（照批量录题那一套）">新版工作台</a>
       <router-link v-if="detail" :to="'/students/' + detail.student_id" class="btn">返回学生</router-link>
       <router-link v-else to="/students" class="btn">返回学生</router-link>
     </div>
