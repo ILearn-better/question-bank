@@ -98,6 +98,36 @@ function DETAIL() {
   };
 }
 
+/* ★★ 从后端源码读「哪条路径允许哪些方法」，桩按它校验。
+ *
+ *   为什么非要这么干：这次真机报「分割没存上：Method Not Allowed」——
+ *   产品写的是 `POST /regions`，后端是 `PUT`，而**桩也写 POST**。
+ *   两边照同一个错误假设写，挂载检查全绿、真机 405。
+ *   手写桩永远可能按自己的假设对齐，所以这里让桩去读后端真正的
+ *   `@router.<method>("path")`，方法不对就照 FastAPI 的样子回 405。
+ *
+ *   路径里的 `{gid}` / `{pno}` 归一成 `*`，请求侧的数字段也归一成 `*`。 */
+const BACKEND_ROUTES = (function readBackendRoutes() {
+  const file = path.join(ROOT, '..', 'backend', 'app', 'routers', 'homework_grades.py');
+  const map = {};
+  let src = '';
+  try { src = fs.readFileSync(file, 'utf8'); } catch (e) { return map; }
+  const re = /@router\.(get|post|put|patch|delete)\(\s*"([^"]+)"/g;
+  let m;
+  while ((m = re.exec(src))) {
+    const key = m[2].replace(/\{[^}]+\}/g, '*');
+    if (!map[key]) map[key] = [];
+    map[key].push(m[1].toUpperCase());
+  }
+  return map;
+}());
+/** 请求 URL → 路由表的 key（去掉 /api 前缀与查询串，数字段归一成 *）。 */
+function routeKey(u) {
+  return String(u).replace(/^\/api/, '').split('?')[0].replace(/\/\d+(?=\/|$)/g, '/*');
+}
+/** 路径对、方法错 —— 真机上就是 405。 */
+const BAD_METHOD = [];
+
 /** 极简 fetch 桩。`region-image` / `page` 是 <img src>，不走这里。 */
 const CALLS = [];
 let LAST_DETAIL = null;
@@ -117,6 +147,13 @@ function makeFetch() {
       try { body = JSON.parse(opt.body); } catch (e) { body = opt.body; }
     }
     CALLS.push({ url: u, method, body });
+    /* ★ 方法校验：路径在后端路由表里、但方法不对 → 照 FastAPI 回 405。
+       真机就是这么报「分割没存上：Method Not Allowed」的，桩必须一样硬。 */
+    const key = routeKey(u);
+    if (BACKEND_ROUTES[key] && BACKEND_ROUTES[key].indexOf(method) < 0) {
+      BAD_METHOD.push(method + ' ' + u + ' → 后端只允许 ' + BACKEND_ROUTES[key].join('/'));
+      return reply({ detail: 'Method Not Allowed' }, 405);
+    }
     if (u === '/api/homework-grades' && method === 'GET') {
       return reply([{ id: 7, status: 'reviewing', total: 3, done: 3, created_at: '2026-10-19T10:00:00' }]);
     }
@@ -124,7 +161,7 @@ function makeFetch() {
       LAST_DETAIL = DETAIL();
       return reply(LAST_DETAIL);
     }
-    if (u === '/api/homework-grades/7/regions' && method === 'POST') {
+    if (u === '/api/homework-grades/7/regions' && method === 'PUT') {
       // 真后端是「整份替换」，且会把同一题的几段归一成一致的 skipped
       const rows = (body && body.regions) || [];
       const skip = {};
@@ -358,11 +395,16 @@ async function main() {
   const before = CALLS.filter((c) => c.url.endsWith('/regions')).length;
   await vm.saveRegions();
   await sleep(300);
-  const puts = CALLS.filter((c) => c.url.endsWith('/regions') && c.method === 'POST');
-  check('保存分割 → POST /regions', puts.length, before + 1);
-  const sent = (puts[puts.length - 1].body || {}).regions || [];
+  /* ★ 必须是 PUT：后端 `@router.put("/homework-grades/{gid}/regions")`。
+   *   写 POST 真机会 405 ——「分割没存上：Method Not Allowed」，2026-10-20 实际踩到。 */
+  const puts = CALLS.filter((c) => c.url.endsWith('/regions') && c.method === 'PUT');
+  check('保存分割 → PUT /regions', puts.length, before + 1);
+  /* ⚠️ 上面那条万一红了（方法写错 → puts 为空），这里必须还能往下走 ——
+   *   否则一崩就看不到后面的断言，等于「只报第一个错」。 */
+  const lastPut = puts[puts.length - 1] || { body: {} };
+  const sent = (lastPut.body || {}).regions || [];
   checkTrue('整份替换：显式声明 grouped（跨页题才不会被拆）',
-    (puts[puts.length - 1].body || {}).grouped === true, (puts[puts.length - 1].body || {}).grouped);
+    (lastPut.body || {}).grouped === true, (lastPut.body || {}).grouped);
   check('★ 段的条数 = 所有块的所有段（一块不多一块不少）',
     sent.length, vm.blocks.reduce((n, b) => n + b.regions.length, 0));
   checkTrue('★ 每段都带 skipped（不是在界面上标着就算完）',
@@ -490,7 +532,7 @@ async function main() {
   /* ★ 画完线直接点开始批改：必须**先把分割存上**，否则批的是库里旧分区
    *   （老师会觉得「我切的没用」）。 */
   const regBefore = CALLS.filter((c) => c.url === '/api/homework-grades/7/regions'
-    && c.method === 'POST').length;
+    && c.method === 'PUT').length;
   const blocksBefore = vm.blocks.length;
   checkTrue('手上还有题块可存', blocksBefore > 0, blocksBefore);
   vm.markDirty();
@@ -499,8 +541,9 @@ async function main() {
   const runBefore = CALLS.filter((c) => c.url === '/api/homework-grades/7/run').length;
   await vm.runGrade();
   await sleep(300);
-  check('★ 有没保存的分割 → 先 POST /regions', CALLS.filter((c) =>
-    c.url === '/api/homework-grades/7/regions' && c.method === 'POST').length, regBefore + 1);
+  check('★ 有没保存的分割 → 先 PUT /regions（后端是 PUT，不是 POST）',
+    CALLS.filter((c) => c.url === '/api/homework-grades/7/regions'
+      && c.method === 'PUT').length, regBefore + 1);
   check('★ 存完才开批（分割没丢）', vm.blocks.length, blocksBefore);
   check('★ 存成功后 dirty 放下（按钮不再写「保存分割」）', vm.dirty, false);
   check('★ 开始批改 → POST /run', CALLS.filter((c) => c.url === '/api/homework-grades/7/run')
@@ -533,6 +576,21 @@ async function main() {
   await sleep(200);
   check('★ 换记录 → 「点过开批」的旗跟着重置', vm.runAsked, false);
   vm.stopPoll();
+
+  /* ============ 16. 请求方法与真后端对账（这次 405 的根治） ============ */
+  /* ★★ 这条是全局防线：桩会按后端源码里的 `@router.<method>("path")` 校验，
+   *   路径对、方法错就回 405 并记进 BAD_METHOD。产品代码里任何一个方法写错，
+   *   这里都会红 —— 不再需要靠人记得「regions 是 PUT」。 */
+  checkTrue('★ 全程没有一个请求打到「路径对、方法错」的路由（真机会 405）',
+    BAD_METHOD.length === 0, BAD_METHOD);
+  /* ★ 防空转：读不到后端源码 / 正则没匹配上时，上面那条永远绿 —— 必须先证明
+   *   表真的是读出来的，而且 regions 那条读对了方法。 */
+  checkTrue('★ 后端路由表真读到了（不是空表导致的假绿）',
+    Object.keys(BACKEND_ROUTES).length >= 15, Object.keys(BACKEND_ROUTES).length);
+  /* 这条路径同时有 GET（读现有分割）和 PUT（整份替换）——**就是没有 POST**，
+     写 POST 的那个就是这次的「Method Not Allowed」。 */
+  check('★ 路由表里 /regions = GET + PUT，没有 POST',
+    (BACKEND_ROUTES['/homework-grades/*/regions'] || []).slice().sort(), ['GET', 'PUT']);
 
   console.log('\n共 ' + total + ' 项，失败 ' + fails.length + ' 项');
   if (fails.length) {

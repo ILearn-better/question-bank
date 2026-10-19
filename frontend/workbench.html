@@ -1210,8 +1210,12 @@ const app = createApp({
       });
       this.busy = 'regions';
       try {
+        /* ⚠️ 这里是 **PUT**，不是 POST。后端 `store.put_regions` 注册的是
+         *   `@router.put("/homework-grades/{gid}/regions")` —— 写成 POST 会被
+         *   FastAPI 回 **405 Method Not Allowed**，界面上的表现就是
+         *   「分割没存上」。判断依据是「整份替换」语义，所以叫 put。 */
         const res = await this.api('/api/homework-grades/' + this.gid + '/regions',
-          { method: 'POST', headers: { 'Content-Type': 'application/json' },
+          { method: 'PUT', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ grouped: true, regions: segs }) });
         if (this.g) this.g = Object.assign({}, this.g, { regions: res.regions });
         this.syncRegions();
