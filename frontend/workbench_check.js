@@ -101,6 +101,8 @@ function DETAIL() {
 /** 极简 fetch 桩。`region-image` / `page` 是 <img src>，不走这里。 */
 const CALLS = [];
 let LAST_DETAIL = null;
+/** 下一回 /run 故意失败一次 —— 用来验「没开起来，按钮要能恢复」。 */
+let FAIL_RUN_ONCE = false;
 function makeFetch() {
   const reply = (obj, status) => ({
     ok: (status || 200) < 400,
@@ -139,6 +141,7 @@ function makeFetch() {
       return reply({ skipped_pages: LAST_DETAIL.skipped_pages });
     }
     if (u === '/api/homework-grades/7/run' && method === 'POST') {
+      if (FAIL_RUN_ONCE) { FAIL_RUN_ONCE = false; return reply({ detail: 'AI 服务 502' }, 502); }
       LAST_DETAIL.status = 'queued'; LAST_DETAIL.done = 0;
       return reply(LAST_DETAIL);
     }
@@ -459,15 +462,77 @@ async function main() {
     (patches[patches.length - 1].body || {}).verdict, 'wrong');
 
   /* ============ 15. 开始批改 ============ */
+
+  /* ★ 回归：用户 2026-10-19 报的「开始批改没法按」。
+   *   真因是 `running` 把 `status === 'queued'` 一律当成在跑 —— 而 queued 就是
+   *   「建档了、还没人开批」的初始状态（保存并批改只建档，唯一开批处是本页）。
+   *   于是按钮一进来就 disabled、标签还写「排队中」，点不动也没提示。
+   *   ⚠️ 这条断言必须**先**把状态摆成 queued 且「没点过」，否则测不出这个 bug。 */
+  vm.g = Object.assign({}, vm.g, { status: 'queued', done: 0, items: [] });
+  await sleep(10);
+  check('★ queued 但老师没点过开始 → 不算「在跑」（按钮必须可点）', vm.running, false);
+  check('★ 一次都没批过 → 按钮写「开始批改」', vm.runLabel, '开始批改');
+  /* 批过的记录写「重新批改」——这个判断**看 items/done，不看 status**：
+     queued 的记录也可能带着上一次的结果（重批），status 说不了这件事。 */
+  vm.g = Object.assign({}, vm.g, { done: 2 });
+  await sleep(10);
+  check('★ 已经判过题 → 按钮写「重新批改」（status 是 queued 也一样）',
+    vm.runLabel, '重新批改');
+  vm.g = Object.assign({}, vm.g, { done: 0 });
+  const runBtn = Array.prototype.slice.call(D.querySelectorAll('.el-button'))
+    .filter((b) => /开始批改|重新批改|批改中/.test(b.textContent))[0];
+  checkTrue('★ 那按钮真的在页面上、而且没被禁用',
+    !!runBtn && !/is-disabled/.test(runBtn.className),
+    runBtn ? runBtn.className : '没找到按钮');
+  checkTrue('★ 状态标签写的是「未开始」，不是「排队中」',
+    body().includes('未开始'), true);
+
+  /* ★ 画完线直接点开始批改：必须**先把分割存上**，否则批的是库里旧分区
+   *   （老师会觉得「我切的没用」）。 */
+  const regBefore = CALLS.filter((c) => c.url === '/api/homework-grades/7/regions'
+    && c.method === 'POST').length;
+  const blocksBefore = vm.blocks.length;
+  checkTrue('手上还有题块可存', blocksBefore > 0, blocksBefore);
+  vm.markDirty();
+  check('画过线 → dirty', vm.dirty, true);
+
   const runBefore = CALLS.filter((c) => c.url === '/api/homework-grades/7/run').length;
   await vm.runGrade();
   await sleep(300);
+  check('★ 有没保存的分割 → 先 POST /regions', CALLS.filter((c) =>
+    c.url === '/api/homework-grades/7/regions' && c.method === 'POST').length, regBefore + 1);
+  check('★ 存完才开批（分割没丢）', vm.blocks.length, blocksBefore);
+  check('★ 存成功后 dirty 放下（按钮不再写「保存分割」）', vm.dirty, false);
   check('★ 开始批改 → POST /run', CALLS.filter((c) => c.url === '/api/homework-grades/7/run')
     .length, runBefore + 1);
-  check('★ 立刻进「在跑」状态（queued 也算在跑 —— 不能只看 running）', vm.running, true);
+  check('★ 点过之后即使状态还是 queued 也算在跑（服务端来不及写 running）', vm.running, true);
+  check('★ 按钮跟着变「批改中…」', vm.runLabel, '批改中…');
   checkTrue('★ 只合并进度字段，**不动**还没保存的分割（刚画的线不能被冲掉）',
     Array.isArray(vm.blocks) && vm.blocks.length > 0, vm.blocks.length);
   vm.stopPoll();                           // 别让定时器挂住进程
+
+  /* ★ 没开起来要能恢复：/run 报错时旗必须放下，否则按钮永远是灰的、
+   *   老师只能刷新页面（这也是「没法按」的另一种形态）。 */
+  FAIL_RUN_ONCE = true;
+  await vm.runGrade();
+  await sleep(200);
+  check('★ 开批失败 → 「点过」的旗放下', vm.runAsked, false);
+  check('★ 失败后不再算在跑（按钮能重点）', vm.running, false);
+  vm.stopPoll();
+
+  /* ★ 服务端一直不接手（进程重启把任务丢了）：90 秒后自己收场，
+   *   不能让按钮灰一辈子。这条走的是定时器，测试里不真等 45 轮 ——
+   *   断言兜底分支还在（删掉它就等于把这个死胡同还回去）。 */
+  checkTrue('★ 一直卡在 queued 时有兜底（放开按钮 + 提示）',
+    /_queuedTicks\s*>=?\s*45/.test(html) && html.includes('没开起来'), true);
+
+  /* ★ 换一份记录：「点过」的旗必须跟着重置，否则上一份的旗会把新的 queued
+   *   记录顶成「批改中」。 */
+  vm.runAsked = true;
+  await vm.loadGrade(7);
+  await sleep(200);
+  check('★ 换记录 → 「点过开批」的旗跟着重置', vm.runAsked, false);
+  vm.stopPoll();
 
   console.log('\n共 ' + total + ' 项，失败 ' + fails.length + ' 项');
   if (fails.length) {

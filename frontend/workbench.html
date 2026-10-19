@@ -326,7 +326,7 @@
               <div style="flex:1"></div>
               <el-button v-if="g" size="small" type="primary" :loading="submitting"
                          :disabled="running" @click="runGrade">
-                {{ g.done && g.status !== 'queued' ? '重新批改' : '开始批改' }}
+                {{ runLabel }}
               </el-button>
             </div>
           </template>
@@ -347,6 +347,13 @@
             <div v-else-if="g.status === 'reviewing'" class="hint" style="margin-bottom:8px">
               <el-tag type="success" effect="plain" size="small">批完了</el-tag>
               共 {{ g.total }} 页 · {{ items.length }} 题 —— 逐条核一遍，改完点右边「确认」
+            </div>
+            <!-- queued = 建档了、没人开批。必须说这一句：以前这个状态下按钮是灰的，
+                 老师只能干看着，不知道是「在跑」还是「没跑」。 -->
+            <div v-else-if="g.status === 'queued'" class="hint" style="margin-bottom:8px">
+              <el-tag effect="plain" size="small">未开始</el-tag>
+              还没批改过 —— 分割好之后点右上角「开始批改」
+              （当前 {{ blocks.length }} 题<template v-if="skippedCount">，其中 {{ skippedCount }} 题不判</template>）
             </div>
 
             <el-tabs v-model="tab">
@@ -546,6 +553,12 @@ const app = createApp({
       dragFrom: null, dragOver: null,
       dirty: false,
       busy: '', submitting: false,
+      /** 「这次会话里老师真的点过开始批改」。**只认它，不认 status==='queued'** ——
+       *  queued 有两个来源：①新建之后还没人开批（保存并批改只建档、唯一开批处是
+       *  这个页面的 run）②刚点开批、服务端线程还来不及写 running。
+       *  把 ① 当成「在跑」→ 按钮一进来就是灰的、页面上还写着「排队中」，
+       *  老师点不动只能干等（2026-10-17 与 10-19 各踩过一次）。 */
+      runAsked: false,
       // 批改
       tab: 'blocks',
       selItem: null,
@@ -581,11 +594,31 @@ const app = createApp({
       });
       return n;
     },
-    /** ⚠️ 「在跑」不能只看 status==='running'：刚点开始那一瞬服务端还是 queued。
-     *  这是本项目踩过两次的坑（表现是「点了没反应」）。 */
+    /** ⚠️⚠️ 「在跑」= 服务端说 running，**或者这次会话里老师真的点过开始**
+     *  （runAsked）而服务端还来不及写 running。
+     *
+     *  绝不能用 `status === 'queued'` 单独当判据：queued 就是「建档了、还没人开批」
+     *  的初始状态（「保存并批改」只建档 + 跳转，唯一开批处是本页 run()）。
+     *  把它算成在跑 → 按钮 disabled、标签写「排队中」，老师点不动也没提示，
+     *  表现就是「开始批改没法按」。本项目已经踩过三次，别再踩。 */
     running() {
       if (!this.g) return false;
-      return this.g.status === 'running' || this.g.status === 'queued';
+      if (this.g.status === 'running') return true;
+      return this.runAsked && this.g.status === 'queued';
+    },
+    /** 服务端那边「还没结束」—— 决定要不要继续轮询。这个**含 queued**：
+     *  刚提交时状态就是 queued，不轮询就永远看不到它变成 running。 */
+    busyRemote() {
+      return !!this.g && (this.g.status === 'running' || this.g.status === 'queued');
+    },
+    /** 按钮怎么写字。**「有没有判过题」看 done/items，不看 status** ——
+     *  queued 的记录也可能已经有上一次的题（重批），status 说不了这件事。 */
+    runLabel() {
+      if (this.running) return '批改中…';
+      const g = this.g;
+      if (!g) return '开始批改';
+      if (Number(g.done || 0) > 0 || (g.items || []).length > 0) return '重新批改';
+      return '开始批改';
     },
     jobPct() {
       const g = this.g;
@@ -630,7 +663,10 @@ const app = createApp({
         (x.total || 0) + ' 页 · ' + t;
     },
     statusLabel(s) {
-      return ({ queued: '排队中', running: '批改中', reviewing: '待复核',
+      /* queued 写「未开始」而不是「排队中」：它绝大多数时候表示「建档了还没开批」，
+         写「排队中」会让人以为服务端已经在干活、只是还没轮到（2026-10-17 就是这么
+         误判成「跑了半天没出来」的）。真在排队这个界面也看不出来，不如说实话。 */
+      return ({ queued: '未开始', running: '批改中', reviewing: '待复核',
         done: '已确认', failed: '失败', partial: '部分失败' })[s] || s || '';
     },
     statusType(s) {
@@ -676,6 +712,9 @@ const app = createApp({
       this.dragFrom = null;
       this.dirty = false;
       this.selItem = null;
+      // ⚠️ 「点过开批」的旗必须跟着记录走。不重置的话，切到另一份 queued 的记录时
+      //    会被上一份的旗顶成「批改中」→ 按钮又是灰的。
+      this.runAsked = false;
       this.teardownLazy();
       try {
         const d = await this.api('/api/homework-grades/' + id);
@@ -1151,7 +1190,11 @@ const app = createApp({
     dragEnd() { this.dragFrom = null; this.dragOver = null; },
 
     /* ============================ 保存分割 ============================ */
-    async saveRegions() {
+    /** 保存分割。
+     *  `silent=true`：给「点开始批改时顺手保存」用 —— 不弹成功提示，免得与开批的
+     *  提示叠在一起，但**失败照样要报**（静默失败会让老师以为批的是新分割）。
+     *  返回 true/false，调用方据此决定要不要继续开批。 */
+    async saveRegions(silent) {
       this.syncGroups();
       /* seq 直接按「块」的最终顺序编号 —— 跨页题的两段共用一个 seq，
        * 后端就靠它把两段竖拼成一张图。
@@ -1172,23 +1215,37 @@ const app = createApp({
             body: JSON.stringify({ grouped: true, regions: segs }) });
         if (this.g) this.g = Object.assign({}, this.g, { regions: res.regions });
         this.syncRegions();
+        // ⚠️ 保存成功必须把 dirty 放下：忘了这一步按钮会永远写着「保存分割」，
+        //    而且老师会以为「没存上」反复点（每次都是整份替换，白跑）。
+        this.dirty = false;
         const blocks = this.blocks;
         const cross = blocks.filter((b) => b.regions.length > 1).length;
         const skipped = blocks.filter((b) => b.skipped).length;
-        ElementPlus.ElMessage.success(segs.length
+        if (!silent) ElementPlus.ElMessage.success(segs.length
           ? '已保存 ' + blocks.length + ' 题（' + segs.length + ' 段'
             + (cross ? '，其中 ' + cross + ' 题跨页' : '')
             + (skipped ? '，' + skipped + ' 题不判' : '') + '）'
           : '已清空全部分割 —— 整份退回整页批');
         this.$nextTick(() => this.setupLazy());
+        return true;
       } catch (e) {
-        ElementPlus.ElMessage.error(e.message);
+        ElementPlus.ElMessage.error('分割没存上：' + e.message);
+        return false;
       } finally { this.busy = ''; }
     },
 
     /* ============================ 批改 ============================ */
     async runGrade() {
+      /* ★ 有没保存的分割就先存。老师画完线直接点「开始批改」是最自然的顺序，
+       *   而库里还是上一次的分割 → 批出来的题跟他刚才切的对不上，看起来像
+       *   「我切的没用」。存不上就**不要开批**（否则批的是旧分区，更糟）。 */
+      if (this.dirty) {
+        const saved = await this.saveRegions(true);
+        if (!saved) return;
+      }
       this.submitting = true;
+      // 先立「点过了」的旗：服务端写 running 之前按钮就该进「批改中」，否则连点两次。
+      this.runAsked = true;
       try {
         const d = await this.api('/api/homework-grades/' + this.gid + '/run', { method: 'POST' });
         // ⚠️ 只合并**进度字段**：整份 Object.assign 会把 regions 一起换掉，
@@ -1199,20 +1256,44 @@ const app = createApp({
         });
         this.tab = 'review';
         this.startPoll();
+        // 服务端可能一提交就跑完了（题目极少 / 全部跳过），那就没必要留着「在跑」。
+        if (!this.running) this.runAsked = false;
       } catch (e) {
-        ElementPlus.ElMessage.error(e.message);
+        // 没开起来：旗必须放下，否则按钮永远是灰的（正是这次那个「点不动」）。
+        this.runAsked = false;
+        ElementPlus.ElMessage.error({ message: '没开起来：' + e.message, duration: 6000 });
       } finally { this.submitting = false; }
     },
     /** 轮询：**只刷 status/进度/items**，不动分割草稿（否则刚画的线会被冲掉）。 */
     startPoll() {
       this.stopPoll();
+      this._queuedTicks = 0;
       this._poll = setInterval(async () => {
         try {
           const d = await this.api('/api/homework-grades/' + this.gid);
           if (!this.g) return;
           const keep = { regions: this.g.regions, skipped_pages: this.g.skipped_pages };
           this.g = Object.assign({}, this.g, d, this.dirty ? keep : {});
-          if (d.status !== 'running' && d.status !== 'queued') this.stopPoll();
+          if (d.status === 'queued') {
+            /* 刚提交时服务端还是 queued（正常）；但一直 queued = 线程没接住
+             * （进程重启把任务丢了 / 起批失败）。这时按钮灰着、进度条不动，
+             * 老师只能干等 —— 90 秒（45 轮）后自己收场，把按钮放开让他重点。 */
+            this._queuedTicks = (this._queuedTicks || 0) + 1;
+            if (this._queuedTicks >= 45) {
+              this.runAsked = false;
+              this.stopPoll();
+              ElementPlus.ElMessage.warning({
+                message: '批改没开起来（服务端一直没接手），可以再点一次「开始批改」',
+                duration: 8000,
+              });
+            }
+            return;
+          }
+          this._queuedTicks = 0;
+          if (d.status !== 'running') {
+            this.runAsked = false;   // 跑完 / 失败，旗的使命结束
+            this.stopPoll();
+          }
         } catch (e) { /* 轮询失败不打扰（下一轮再来） */ }
       }, 2000);
     },
