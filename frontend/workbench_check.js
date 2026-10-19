@@ -84,19 +84,25 @@ function DETAIL() {
         student_answer: '$x=2$ 或 $x=3$', correct_answer: '$x=2$ 或 $x=3$',
         verdict: 'correct', score: null, full_score: null, basis: '因式分解后两根都对',
         confidence: 'high', kp_name: '一元二次方程', tags: [], error_reason: '',
-        flags: [], figure_note: '', block_kind: 'question', tail_note: '', status: 'pending' },
+        flags: [], figure_note: '', block_kind: 'question', tail_note: '', status: 'pending',
+        /* 0031：模型给的分类标签。故意**乱序 + 带一个空值 + 带一个多余的键**，
+           用来验「显示顺序固定 / 空值不渲染半个标签 / 多余键被丢掉」。 */
+        labels: { exam: '公式变形', stage: '初中', kp: '一元二次方程',
+                  system: '数与代数', difficulty: '中档', blank: '   ' } },
       { id: 'ff0011223344', seq: 2, page_no: 1, q_no: '2', qtype: '证明题', stem: '如图，求证 $AD\\perp BC$。',
         student_answer: '因为 $AB=AC$，所以垂直', correct_answer: '',
         verdict: 'partial', score: null, full_score: null, basis: '结论对但缺全等这一步',
         confidence: 'medium', kp_name: '', tags: [], error_reason: '',
         flags: ['low_confidence'], figure_note: '',
         block_kind: 'question',
+        labels: { stage: '初中', system: '图形与几何', kp: '等腰三角形性质',
+                  exam: '逻辑推理' },
         tail_note: '底部有邻题的残字，这一块可能把下一题的开头也读进来了', status: 'pending' },
       { id: '0abc9def5678', seq: 3, page_no: 2, q_no: '3', qtype: '', stem: '', student_answer: '',
         correct_answer: '', verdict: 'ungradable', score: null, full_score: null, basis: '',
         confidence: '', kp_name: '', tags: [], error_reason: '框里没读到任何作答内容',
         flags: ['region_empty'], figure_note: '', block_kind: 'header', tail_note: '',
-        status: 'pending' },
+        status: 'pending', labels: {} },
     ],
     marks: [],
   };
@@ -567,6 +573,29 @@ async function main() {
     body().includes('邻题的残字') && body().includes('末段底边'), true);
   check('判不了的那一题给了原因（不能只留一个灰点）',
     D.querySelectorAll('.g-un').length, 1);
+
+  /* ============ 13b. 模型给的分类标签（0031） ============ */
+  /* 用户原话：「ai输出中要附带对这道题的标签(例如:学段\知识点\体系\考法等)」。
+   * 三个容易做错的点：
+   *   ① **顺序必须固定**。JSON 的键序跨语言（Python → JSON → JS）之后不保证，
+   *      直接遍历 Object.keys() 会让四个标签的先后跳来跳去。用 LABEL_ORDER 数组。
+   *   ② **空值不能渲染成半个标签**（「学段·」比没有还难看）。
+   *   ③ **模型多给的键要丢掉**（difficulty 不是这组的，界面上不该出现）。
+   *   ④ 没有标签的题（比如框里没读到题）**整行都不显示**，不留空行。 */
+  const lb1 = Array.from(gcards[0].querySelectorAll('.g-label')).map((e) => e.textContent.trim());
+  check('★ 第 1 题有 4 个标签', lb1.length, 4);
+  check('★ 显示顺序固定 = 学段 → 体系 → 知识点 → 考法（不跟 JSON 键序走）',
+    lb1.map((t) => t.split('·')[0]), ['学段', '体系', '知识点', '考法']);
+  checkTrue('★ 标签带取值（不是只有名字）', lb1[0] === '学段·初中', lb1[0]);
+  checkTrue('★ 模型多给的键被丢掉（difficulty 不是这一组的）',
+    lb1.every((t) => !/中档|difficulty/.test(t)), lb1);
+  checkTrue('★ 空值不渲染成半个标签（没有「空·」这种）',
+    lb1.every((t) => !/·\s*$/.test(t)), lb1);
+  checkTrue('★ 「学段」有单独的样式（它是唯一能拿来筛的枚举）',
+    !!gcards[0].querySelector('.g-label.lb-stage'), true);
+  check('第 2 题也有标签', gcards[1].querySelectorAll('.g-label').length, 4);
+  check('★ 没标签的题 → 整行都不显示（不留一条空行）',
+    gcards[2].querySelectorAll('.g-label').length, 0);
 
   /* ============ 14. 改判定 ============ */
   const vbtns = D.querySelectorAll('.g-card .g-vbtn');

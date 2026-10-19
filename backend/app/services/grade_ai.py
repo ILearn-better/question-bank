@@ -113,6 +113,20 @@ _KP_LIMIT = 30
 # 比 error_reason 短。给到 200 已经够宽松，再长就说明模型在写小作文。
 _TAIL_NOTE_LIMIT = 200
 
+# ---------------------------------------------------------------- 分类标签（0031）
+# 用户 2026-10-20 点名要的：「ai 输出中要附带对这道题的标签（学段 / 知识点 /
+# 体系 / 考法等）」。这四个是**一组**，界面上并排显示，所以打包成一个对象。
+#
+# ⚠️ 只有 stage 是枚举（学段是客观事实，枚举能让它可筛）；system / exam 刻意留成
+#    自由短词 —— 「体系」和「考法」的叫法随教材变（人教 / 北师大 / DSE / IGCSE
+#    各有一套），硬编枚举会让模型在拿不准时瞎选一个，那还不如让它写原话。
+LABEL_KEYS: tuple[str, ...] = ("stage", "system", "kp", "exam")
+# 学段。**认不出就留空**，不猜 —— 猜错了会进筛选条件，比空着有害得多。
+LABEL_STAGES: tuple[str, ...] = ("小学", "初中", "高中", "大学", "其他")
+# 每个值的长度上限。这些是要**并排显示在题卡上一行**的，长了会把卡片撑变形。
+_LABEL_VALUE_LIMIT = 24
+_LABEL_COUNT_LIMIT = 8
+
 _VERDICTS = ("correct", "partial", "wrong", "blank", "ungradable")
 
 # verdict 的常见别写。模型对枚举极不老实：要 "correct" 它给 "正确"/"√"/"right"。
@@ -278,6 +292,22 @@ _FIELD_RULES = (
     "10 个汉字以内（例如「一元二次方程」「线面垂直的判定」）。判断不了给空字符串。\n"
     '  "error_reason"    字符串。错因，人话，10~30 字（例如「漏了根的取舍」「移项没变号」）。'
     "判 correct 或 blank 时给空字符串。\n"
+    '  "labels"          对象。**这一题的分类标签**（学段 / 体系 / 知识点 / 考法），'
+    "四个键，都拿不准就给空字符串：\n"
+    "                      · `stage`  学段。**必须**是下面之一："
+    + "、".join(LABEL_STAGES) + "。"
+    "拿不准就**留空字符串**，不要猜 —— 猜错了会进筛选条件，比空着有害得多。\n"
+    "                      · `system` 体系 / 知识领域，中文短词，12 字以内"
+    "（例如「数与代数」「图形与几何」「统计与概率」「综合与实践」「香港 DSE 数学」）。"
+    "按**这份卷子所属的课程体系**写，不要自造。\n"
+    "                      · `kp`     知识点，中文短词，12 字以内。"
+    "**与上面的 `kp_name` 写同一个说法** —— 两者会被当成同一个东西，"
+    "写两个说法界面上就会出现自相矛盾的两处。\n"
+    "                      · `exam`   考法 / 解题路子，中文短词，12 字以内"
+    "（例如「直接计算」「公式变形」「数形结合」「分类讨论」「方程建模」"
+    "「逻辑推理」「空间想象」「数据分析」）。\n"
+    "                    例：\"labels\": {\"stage\": \"初中\", \"system\": \"数与代数\", "
+    "\"kp\": \"一元二次方程\", \"exam\": \"公式变形\"}\n"
     '  "figure_note"     字符串。**这一题图上的关键信息**（不是「有没有图」的开关）：\n'
     "                       · 几何图 → 点与字母；连的线（**学生后加的辅助线要写成可核对的形式**，"
     "如「过 $D$ 作 $DP\\perp BP$」）；角/直角/等长/平行/圆弧记号；图上写的数值。"
@@ -313,6 +343,7 @@ _OUTPUT_EXAMPLE = (
     '"basis":"第 1 步两边同除以 $x$ 时没有讨论 $x=0$，丢了一个根",'
     '"evidence_quote":"两边同除以 $x$，得 $x=3$","confidence":"medium",'
     '"kp_name":"一元二次方程","error_reason":"除未知数时漏了 $x=0$ 的情况",'
+    '"labels":{"stage":"初中","system":"数与代数","kp":"一元二次方程","exam":"公式变形"},'
     '"figure_note":"","flags":[]},'
     # 几何题的示例**必须有**：figure_note 的「分句 + 确定性标注」这个写法，
     # 只靠上面几行文字描述，模型多半会退回成「画了一个三角形」那种空话。
@@ -328,6 +359,8 @@ _OUTPUT_EXAMPLE = (
     '"error_reason":"",'
     '"figure_note":"$D$ 在 $BC$ 上，$AD$ 已画出（确定）；'
     '$AB$、$AC$ 上有等长记号（确定）；$\\angle ADB$ 处有直角符号（确定）",'
+    '"labels":{"stage":"初中","system":"图形与几何","kp":"等腰三角形性质",'
+    '"exam":"逻辑推理"},'
     '"flags":[]}'
     "]}\n"
 )
@@ -805,6 +838,44 @@ def _clip(s: str, n: int) -> str:
     return s if len(s) <= n else s[:n] + "…"
 
 
+def _labels(o: dict, kp_name: str = "") -> dict[str, str]:
+    """模型给的「学段 / 体系 / 知识点 / 考法」四个分类标签 → 干净的 dict。
+
+    ⚠️ 三条刻意的设计：
+
+    ① **只收 `LABEL_KEYS` 里的键**。模型很容易顺手加一个 `"difficulty"` 或把
+       整段解释塞进来 —— 那会让题卡上多出一个说不清的标签。多余的一律丢掉。
+
+    ② **`kp` 不给就回填 `kp_name`**。知识点有两个来源会让同一道题出现两个说法；
+       `kp_name` 是权威值（要拿去挂知识树），所以以它为准。
+
+    ③ **`stage` 认不出就留空，不猜**。理由同 `_qtype`：空着老师自己看，
+       猜错了会进筛选条件，比空着有害。
+
+    `labels` 也可能是字符串（模型偶尔把对象写成一行 JSON），那时整体当空处理 ——
+    不试图去 parse，parse 出来的键更容易乱。
+    """
+    raw = o.get("labels")
+    if not isinstance(raw, dict):
+        raw = {}
+    out: dict[str, str] = {}
+    for k in LABEL_KEYS:
+        v = _as_str(raw.get(k)).strip().strip("。；;,. ")
+        if not v:
+            continue
+        out[k] = _clip(v, _LABEL_VALUE_LIMIT)
+        if len(out) >= _LABEL_COUNT_LIMIT:
+            break
+    stage = out.get("stage", "")
+    if stage and stage not in LABEL_STAGES:
+        # 不在枚举里就丢掉（不猜）。「高中一年级」这类也不收 —— 学段只要四档，
+        # 年级不是学段，混进来就没法按学段筛了。
+        out.pop("stage", None)
+    if not out.get("kp") and kp_name:
+        out["kp"] = _clip(kp_name.strip(), _LABEL_VALUE_LIMIT)
+    return out
+
+
 def _qtype(o: dict) -> tuple[str | None, bool]:
     raw = _as_str(_pick(o, *_ALIAS["qtype"]))
     if raw in taxonomy.QTYPES:
@@ -935,6 +1006,10 @@ def _item_from_obj(o: dict, born: list[str]) -> dict:
         # 判对就没有错因。模型常在这时塞一句「无」/「没有错误」，那会在前端变成噪音。
         error_reason = ""
 
+    # 知识点单独取一次：`labels.kp` 缺省时要拿它回填（见 `_labels`），
+    # 免得同一道题的知识点在两处说法不一致。
+    kp_name = _clip(_as_str(_pick(o, *_ALIAS["kp_name"])), _KP_LIMIT)
+
     item = {
         "q_no": _clip(_as_str(_pick(o, *_ALIAS["q_no"])), 16),
         "qtype": qtype,
@@ -949,7 +1024,7 @@ def _item_from_obj(o: dict, born: list[str]) -> dict:
         "full_score": None,
         "basis": _clip(_as_str(_pick(o, *_ALIAS["basis"])), _BASIS_LIMIT),
         "confidence": _confidence(o),
-        "kp_name": _clip(_as_str(_pick(o, *_ALIAS["kp_name"])), _KP_LIMIT),
+        "kp_name": kp_name,
         "error_reason": error_reason,
         "flags": flags,
         # 图上读到的东西（几何要点 / 统计图表的数表）。**必须落库并给老师看**：
@@ -961,6 +1036,9 @@ def _item_from_obj(o: dict, born: list[str]) -> dict:
         #    与「认不出就归空」的策略放在一处，免得两处规则漂移。
         "block_kind": _as_str(o.get("block_kind")).strip()[:16],
         "tail_note": _clip(_as_str(o.get("tail_note")), _TAIL_NOTE_LIMIT),
+        # 分类标签（0031）：学段 / 体系 / 知识点 / 考法。归一化全在 `_labels` 里，
+        # 这里只负责取 —— 规则放一处，免得与提示词里的说法漂移。
+        "labels": _labels(o, kp_name),
         # 模型这一题的原始输出：复核/重放用。meta 里补「哪个模型、有没有被截断、哪种依据」，
         # 但不塞 prompt（一整段提示词几十 KB，存进每一行毫无意义）。
         "raw": {

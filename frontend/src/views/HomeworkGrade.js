@@ -90,6 +90,15 @@ const FLAG_LABEL = {
   region_multi: '框画大了（读到多道题）',
 };
 
+/** 模型给的分类标签（0031）：学段 / 体系 / 知识点 / 考法。
+ *  **数组不是对象** —— 显示顺序要固定；JSON 的键序跨语言之后不保证。 */
+const LABEL_ORDER = [
+  { k: 'stage', name: '学段' },
+  { k: 'system', name: '体系' },
+  { k: 'kp', name: '知识点' },
+  { k: 'exam', name: '考法' },
+];
+
 const q = (s) => String(s === undefined || s === null ? '' : s).trim();
 
 export default {
@@ -1486,6 +1495,15 @@ export default {
       const k = String((item && item.block_kind) || '').trim();
       return k && k !== 'question' ? (BLOCK_KIND_LABEL[k] || BLOCK_KIND_LABEL.other) : '';
     };
+    /** 模型给的分类标签（0031）。⚠️ **按固定顺序**输出，不遍历 `Object.keys()`：
+     *  JSON 的键序跨语言（Python → JSON → JS）之后不保证，四个标签的先后会跳。
+     *  空值与纯空白一律滤掉 —— 「学段·」这种半个标签比没有还难看。 */
+    const labelsOf = (item) => {
+      const m = (item && item.labels && typeof item.labels === 'object') ? item.labels : {};
+      return LABEL_ORDER
+        .filter((x) => String(m[x.k] || '').trim())
+        .map((x) => ({ k: x.k, name: x.name, v: String(m[x.k]).trim() }));
+    };
     /** 有框才谈得上「设成不判」—— 整页批的记录里没有块可点。 */
     const hasBlocks = computed(() => regions.value.length > 0);
     /** 从题卡跳到那一页的分割模式，让老师自己点「这块不判」。
@@ -1527,7 +1545,7 @@ export default {
       setRich, setCard, goPage, prevPage, nextPage, onPick,
       verdictLabel, confLabel, flagLabel, naReason,
       // 模型回的两个信号（只当提示，不自动跳过）
-      oddKind, hasBlocks, gotoSkipBlock,
+      oddKind, hasBlocks, gotoSkipBlock, labelsOf,
       setupMode, setupAnswer, setupRubric, setupTouched, setupBusy, setupEditable,
       setupAnswerFiles, setupImages, answerImgCount, uploadAnswerImage, clearAnswerImages,
       touchSetup, saveSetup, onAnswerDrop, onPaste,
@@ -1879,6 +1897,14 @@ export default {
                       class="tag orange">{{ flagLabel(f) }}</span>
                 <div class="spacer"></div>
                 <button class="btn ghost sm" @click.stop="goPage(item.page_no)">第 {{ item.page_no }} 页</button>
+              </div>
+
+              <!-- 模型给的分类标签（0031）：学段 / 体系 / 知识点 / 考法。
+                   这是「这一份作业覆盖了哪些学段/体系/考法」的唯一来源 —— 以前它只
+                   躺在模型的原始输出里，老师想知道得自己一题题翻。 -->
+              <div v-if="labelsOf(item).length" class="g-labels">
+                <span v-for="lb in labelsOf(item)" :key="'lb-' + item.id + '-' + lb.k"
+                      class="g-label" :class="'lb-' + lb.k">{{ lb.name }}·{{ lb.v }}</span>
               </div>
 
               <!-- 模型说「这块不像一道题」。**只提示、不自动跳过** —— 它也可能读错，

@@ -76,6 +76,7 @@ const item = (o) => Object.assign({
   confidence: 'high', kp_name: '', tags: [], error_reason: '', flags: [],
   figure_note: '', status: 'pending', question_id: null,
   block_kind: '', tail_note: '',
+  labels: {},                 // 0031：模型给的分类标签（学段/体系/知识点/考法）
 }, o);
 
 /** 三题：① 普通代数题 ② 几何题（有新加的 figure_note + tail_note）
@@ -88,6 +89,8 @@ const DETAIL = {
   files: [{ id: 1, role: 'submission', name: '作业.pdf', pages: 2 }],
   items: [
     item({ id: 101, seq: 1, q_no: '1', qtype: '解答题', verdict: 'correct',
+      labels: { exam: '公式变形', stage: '初中', kp: '一元二次方程',
+                system: '数与代数', difficulty: '中档' },
            block_kind: 'question',
            stem: '解方程：$x^2-5x+6=0$。', student_answer: '$x=2$ 或 $x=3$',
            correct_answer: '$x=2$ 或 $x=3$', basis: '因式分解后两根都对',
@@ -998,6 +1001,28 @@ async function main() {
       ['region', 'line'].includes(vm.tool), vm.tool + ' / 第 ' + vm.pageNo + ' 页');
     check('★ 只跳过去，**不自动把这块设成不判**（模型说像卷头也可能读错）',
       vm.regionBlocks.filter((b) => b.skipped).length, skipBefore);
+
+  /* ============ 模型给的分类标签（0031） ============ */
+  /* 用户原话：「ai输出中要附带对这道题的标签(例如:学段\知识点\体系\考法等)」。
+   * 与工作台同一组断言（两个界面都要显示，规则必须一致）：
+   *   ① 顺序固定 —— JSON 键序跨语言（Python → JSON → JS）之后不保证，
+   *      直接遍历 Object.keys() 会让四个标签的先后跳来跳去。所以用 LABEL_ORDER 数组。
+   *   ② 模型多给的键要丢掉（difficulty 不是这一组的，界面上不该出现）
+   *   ③ 「学段」有单独样式 —— 它是唯一能拿来筛的枚举值 */
+  vm.detail.items = vm.detail.items.map((x, i) => Object.assign({}, x,
+    i === 0 ? { labels: { exam: '公式变形', stage: '初中', kp: '一元二次方程',
+                          system: '数与代数', difficulty: '中档' } } : {}));
+  await sleep(220);
+  const lbs = Array.from(D.querySelectorAll('.g-item .g-label')).map((e) => e.textContent.trim());
+  checkTrue('★ A 页面也显示了分类标签', lbs.length >= 4, lbs);
+  check('★ 顺序固定 = 学段 → 体系 → 知识点 → 考法（不跟 JSON 键序走）',
+    lbs.slice(0, 4).map((t) => t.split('·')[0]), ['学段', '体系', '知识点', '考法']);
+  checkTrue('★ 标签带取值（不是只有名字）', /学段·初中/.test(lbs[0] || ''), lbs[0]);
+  checkTrue('★ 模型多给的键被丢掉（difficulty 不是这一组的）',
+    lbs.every((t) => !/中档|difficulty/.test(t)), lbs);
+  checkTrue('★ 「学段」有单独样式（它是唯一能拿来筛的枚举值）',
+    !!D.querySelector('.g-item .g-label.lb-stage'), true);
+
   } finally {
     try { fs.rmSync(tmp, { recursive: true, force: true }); } catch (e) { /* 删不掉留着也无妨 */ }
   }

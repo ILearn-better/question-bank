@@ -1698,6 +1698,139 @@ def t_cancel() -> None:
           "★ 收尾文案里写「已手动终止」（老师能分辨是自己停的还是系统出错）")
 
 
+def _t_labels_unit() -> None:
+    """`grade_ai._labels` 的归一化规则（纯函数，不碰库）。
+
+    这组断言守的是「**表里存的 labels 一定是四个短字符串键**」这个不变量 ——
+    只要它成立，界面上就敢直接遍历渲染，不用再写一遍防御。
+
+    三条最容易写错、也最要命的：
+      ① `stage` 认不出就**丢掉**，不猜（猜错了会进筛选条件）
+      ② 模型多给的键（difficulty 之类）一律丢掉
+      ③ `kp` 没给时**回填 kp_name**（同一道题的知识点不该有两处说法）
+    """
+    from app.services import grade_ai as A
+
+    check(A._labels({}, "") == {}, "空输入 → 空标签（不造默认值）")
+
+    got = A._labels({"labels": {"stage": "初中", "system": "数与代数",
+                                "kp": "", "exam": "公式变形"}}, "一元二次方程")
+    check(got.get("kp") == "一元二次方程", "★ kp 没给 → 回填 kp_name（同一道题两处说法会打架）", got)
+    check(got.get("stage") == "初中", "stage 合法 → 保留", got)
+    check(got.get("system") == "数与代数", "system 是自由短词 → 原样保留", got)
+
+    # 学段不在枚举里 → 丢掉，不猜
+    got2 = A._labels({"labels": {"stage": "高中一年级"}}, "")
+    check("stage" not in got2, "★ 学段不在枚举里 → 丢掉（不猜；猜错会进筛选条件）", got2)
+
+    # 多余的键 + 超长的值
+    got3 = A._labels({"labels": {"difficulty": "中档", "chapter": "第三章",
+                                 "system": "数" * 100}}, "")
+    check("difficulty" not in got3 and "chapter" not in got3,
+          "★ 模型多给的键一律丢掉（只收学段/体系/知识点/考法）", got3)
+    check(len(got3.get("system", "")) <= 25, "★ 超长的值截断（标签要并排显示，长了会撑变形）",
+          len(got3.get("system", "")))
+
+    # labels 被写成字符串（模型偶尔这么干）→ 整体当空，不试着 parse
+    check(A._labels({"labels": '{"stage":"初中"}'}, "") == {},
+          "★ labels 是字符串时整体当空（不试着 parse，parse 出来的键更乱）")
+
+    # kp 与 kp_name 不一致时：以模型给的为准？不 —— 以 kp_name 为准。
+    got4 = A._labels({"labels": {"kp": "二次方程"}}, "一元二次方程")
+    check(got4.get("kp") == "二次方程",
+          "kp 给了就用给的（只有**没给**才回填，不是覆盖）", got4)
+
+
+def t_labels() -> None:
+    """分类标签（0031）：学段 / 体系 / 知识点 / 考法。
+
+    需求原话（用户 2026-10-20）：
+    「ai输出中要附带对这道题的标签(例如:学段\\知识点\\体系\\考法等)」
+
+    守的几件事：
+
+      1. 提示词**真的要求**了这四个字段（不要求模型就不会给）。
+      2. 输出示例里有它（只靠字段说明，模型多半会漏；示例才是它真正抄的）。
+      3. 归一化规则：学段认不出就丢、多余键丢掉、kp 缺省回填 kp_name。
+      4. 落库 → 读出来 → 前端拿得到（`item_dict` 里有 labels）。
+      5. 提示词里「不要输出上面没列出的字段」那条**不能**把 labels 挡掉 ——
+         labels 已经写进字段清单了，所以整页模式与区域模式都要它。
+    """
+    print("\n-- ⑨d 分类标签（学段 / 体系 / 知识点 / 考法）--")
+
+    _t_labels_unit()
+
+    from app.services import grade_ai as A
+    src = (BE / "app" / "services" / "grade_ai.py").read_text(encoding="utf-8")
+
+    # ① 提示词真的要求了
+    check('"labels"' in src, "★ 提示词要求 labels 字段")
+    for k in ("stage", "system", "kp", "exam"):
+        check(("`" + k + "`") in src, f"★ 提示词写清了 {k} 这一项怎么填")
+    check("学段" in src and "体系" in src, "★ 提示词用了老师的话（学段 / 体系）")
+    # ② 输出示例里也有
+    check('"labels":{' in src.replace(" ", ""),
+          "★ 输出示例里带 labels（模型真正抄的是示例）")
+
+    # ③ item_dict 给前端
+    store_src = (BE / "app" / "services" / "grade_store.py").read_text(encoding="utf-8")
+    check('"labels": _labels_of(' in store_src,
+          "★ item_dict 把 labels 给前端（界面要显示）")
+    check("_json_dict" in store_src,
+          "★ 读库用 _json_dict（坏数据当空，不让渲染整页崩）")
+
+    # ④ 落库 → 读出来
+    db = SessionLocal()
+    try:
+        st = Student(id=90031, name="标签测试")
+        db.add(st)
+        ls = Lesson(id=90031, student_id=90031, start_at="2026-10-20T11:00:00",
+                    duration_min=60)
+        db.add(ls)
+        db.flush()
+        lf = mk_pdf_submission(db, ls, pages=1, name="标签卷.pdf")
+        g = G.create_grade(db, GradeIn(lesson_id=ls.id, file_ids=[lf.id], answer_mode="ai"))
+        gid = g.id
+        db.commit()
+
+        payload = item_payload()
+        payload["kp_name"] = "一元二次方程"
+        payload["labels"] = {"exam": "公式变形", "stage": "初中",
+                             "kp": "一元二次方程", "system": "数与代数",
+                             "difficulty": "中档"}
+        it = G._item_row(payload, gid, 1, 0)
+        db.add(it)
+        db.commit()
+        db.refresh(it)
+
+        check(it.labels != "" and it.labels != "{}", "★ labels 落库了（不是空对象）", it.labels)
+        saved = json.loads(it.labels)
+        check("difficulty" not in saved, "★ 多余键在落库这一层又被挡掉一次（第二道口子）", saved)
+        check(saved.get("stage") == "初中", "落库后学段还在", saved)
+
+        d = G.item_dict(it)
+        check(d.get("labels", {}).get("stage") == "初中",
+              "★ item_dict 读回来是 dict（不是 JSON 字符串）", d.get("labels"))
+        check(len(d.get("labels", {})) == 4, "★ 四个标签一个不少（界面上一行四个）",
+              d.get("labels"))
+
+        # ⑤ 坏数据：labels 列被写成非法 JSON → 当空，不炸
+        it.labels = "{坏掉的"
+        db.commit()
+        db.refresh(it)
+        check(G.item_dict(it).get("labels") == {},
+              "★ 库里是坏 JSON → 当空（不能让整页崩）")
+    finally:
+        db.close()
+
+    # ⑥ 迁移 0031
+    mig = (BE / "alembic" / "versions" / "0031_grade_item_labels.py").read_text(encoding="utf-8")
+    check('revision: str = "0031"' in mig, "迁移 0031 的 revision 对")
+    check('down_revision: Union[str, None] = "0030"' in mig, "迁移 0031 接在 0030 后面")
+    check(mig.count("add_column") == 1, "迁移只加一列（labels）")
+    check('server_default="{}"' in mig, "★ 加了 server_default（旧记录零影响）")
+
+
 def t_cross_page() -> None:
     """跨页题（0029）：一题两段，竖拼成一张图、只调一次模型。
 
@@ -1995,6 +2128,7 @@ def main() -> int:
     t_marks_batch()
     t_skips_and_signals()
     t_cancel()
+    t_labels()
     t_run_with_stub()
     t_frontend()
     t_ink_export()

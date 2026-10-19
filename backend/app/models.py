@@ -1295,6 +1295,11 @@ class HomeworkGradeItem(Base):
     # 为什么值得单列：这是「每页尾部处理不到位」缺的那条信息 —— 以前模型看到了也不说，
     # 老师只能从判定结果反推「最后一题怎么判错了」。
     tail_note: Mapped[str] = mapped_column(Text, default="", server_default="")
+    # 模型给的结构化分类标签（0031）：{"stage": 学段, "system": 体系, "kp": 知识点,
+    # "exam": 考法}。JSON 文本而不是四列 —— 取值随体系变，加一个维度不该再迁移一次。
+    # ⚠️ 与 `tags` 的区别：`tags` 是老师随手打的（可改、重批不覆盖），
+    #    `labels` 是模型给的（只读、重批就换）。混在一起会出现「老师删了、重批又回来」。
+    labels: Mapped[str] = mapped_column(Text, default="{}", server_default="{}")
     flags: Mapped[str] = mapped_column(Text, default="[]", server_default="[]")     # transcription_conflict / insufficient_evidence …
     raw: Mapped[str] = mapped_column(Text, default="{}", server_default="{}")       # 模型原始输出（供复核与重放）
     transcription_version: Mapped[int] = mapped_column(Integer, default=1, server_default="1")

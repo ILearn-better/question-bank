@@ -146,6 +146,15 @@ def _json_list(raw: str | None) -> list:
     return v if isinstance(v, list) else []
 
 
+def _json_dict(raw: str | None) -> dict:
+    """同 `_json_list`，只是要的是对象（labels 用）。坏数据一律当空，绝不抛。"""
+    try:
+        v = json.loads(raw or "{}")
+    except (TypeError, ValueError):
+        return {}
+    return v if isinstance(v, dict) else {}
+
+
 def _num(v) -> float | None:
     """分数：**缺数据就是 None，绝不用 0**。0 分和"没判"混成一个数会带偏正确率。"""
     if v is None or v == "":
@@ -175,6 +184,32 @@ def _confidence(v) -> str:
 # 「这一块是什么」（0030）。**空字符串是合法值**：整页口径不产这个字段，
 # 老记录也没有 —— 界面见到空就什么都不显示。
 BLOCK_KINDS = ("question", "header", "section", "footer", "blank", "other")
+
+
+def _labels_of(v) -> dict:
+    """落库前再收一道口子（提示词那边 `grade_ai._labels` 已经归一过一次）。
+
+    为什么要两道：提示词是**别人写的模型输出**经过 `_item_from_obj` 来的；但
+    `patch_item` / 以后可能的导入路径也会碰到这个字段。落库这一层是底线 ——
+    只有这一层能保证「表里存的 labels 一定是「四个短字符串键」的形式」，
+    界面上才敢直接遍历渲染，不用再写一遍防御。
+    """
+    from app.services import grade_ai                    # 迟导入：避免循环 import
+
+    if not isinstance(v, dict):
+        return {}
+    out: dict[str, str] = {}
+    for k in grade_ai.LABEL_KEYS:
+        val = v.get(k)
+        if not isinstance(val, str):
+            continue
+        val = val.strip()[:24]
+        if val:
+            out[k] = val
+    stage = out.get("stage", "")
+    if stage and stage not in grade_ai.LABEL_STAGES:
+        out.pop("stage", None)
+    return out
 
 
 def _block_kind(v) -> str:
@@ -247,6 +282,8 @@ def item_dict(it: HomeworkGradeItem) -> dict:
         # 界面上是两句提示，不参与判定 —— 判错一块等于丢一道题，宁可让老师自己点。
         "block_kind": it.block_kind or "",
         "tail_note": it.tail_note or "",
+        # 分类标签（0031）：学段 / 体系 / 知识点 / 考法。界面上并排显示成一行标签。
+        "labels": _labels_of(_json_dict(it.labels)),
         "status": it.status,
         "question_id": it.question_id,
     }
@@ -1383,6 +1420,9 @@ def _item_row(r: dict, gid: int, pno: int, seq: int) -> HomeworkGradeItem:
         # 「这块像页脚」的提示消失，猜成 header 又会诱导老师跳过一道真题。
         block_kind=_block_kind(r.get("block_kind")),
         tail_note=str(r.get("tail_note") or "").strip()[:200],
+        # 分类标签（0031）。只收「键值都是短字符串」的那些 —— 模型偶尔把一整段
+        # 解释塞进来，那会在题卡上变成一个大得离谱的标签。
+        labels=json.dumps(_labels_of(r.get("labels")), ensure_ascii=False),
         flags=json.dumps(flags, ensure_ascii=False),
         raw=raw_txt,
         transcription_version=1,
