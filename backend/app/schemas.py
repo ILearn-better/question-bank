@@ -694,11 +694,17 @@ class GradeSetupPatch(BaseModel):
     已经批完再换依据，等于拿旧判定冒充新标准，那必须走「重新批改」（会清空结果）。
 
     字段是 Optional 且 `None = 不改`（同其它 Patch 的语义）；传空串 = 清空。
+
+    `answer_file_ids` 是**整份替换**答案依据文件（`None = 不改`，`[] = 清空`）。
+    为什么要能改：原来只有建任务那一次能挑答案文件，老师建完发现答案照片拍错了
+    就只能重建任务、把已选好的提交件重新选一遍。现在开批之前随时能换。
+    ⚠️ 换文件**不清已批的结果**：这个接口本来就只允许在没批出结果之前用（见上）。
     """
 
     answer_mode: Optional[Literal["ai", "key", "rubric"]] = None
     answer_text: Optional[str] = None
     rubric_text: Optional[str] = None
+    answer_file_ids: Optional[List[int]] = None
 
 
 class GradeItemPatch(BaseModel):
@@ -746,26 +752,44 @@ class GradeMarkPatch(BaseModel):
 
 
 class GradeRegionIn(BaseModel):
-    """一题一区域的**一个框**。坐标按页归一化 0~1000（与标注同制，不是像素）。
+    """一题一区域的**一段**。坐标按页归一化 0~1000（与标注同制，不是像素）。
+
+    一段 = 一个框。**一道题可以有多段**（跨页题）：`seq` 相同的几段属于同一题，
+    `seg` 决定它们竖着拼起来的先后。单页题只发一段，`seg` 留 0 即可。
 
     `q_no` 空着也行：批改时会回落到模型自己认的题号。填了就以它为准 ——
     这样学生把「第 3 题」写成「第 8 题」时归属仍然是第 3 题。
     """
 
+    page_no: int = 1
+    seq: int = 0                                        # 题序号（同一题的多段共用）
+    seg: int = 0                                        # 段内序号（0 起，拼接顺序）
     q_no: str = ""
     box: List[float] = Field(default_factory=list)      # [x0, y0, x1, y1]
 
 
 class GradeRegionsPut(BaseModel):
-    """**整页替换**老师画的框。
+    """**整份替换**老师画的框（不再按页分开发）。
 
-    为什么是整页替换而不是逐条增删：画框这件事在界面上是一次性画完再保存的，
-    逐条同步会带来「删了又加、id 对不上」的一堆中间态；整页替换的结果永远等于
-    老师屏幕上看到的东西，不会出现「界面上 5 个框、库里有 7 条」。
+    为什么从「按页替换」改成「整份替换」：跨页题的两段**天然落在不同页上**，
+    按页提交的话，保存第 2 页时第 1 页那段还是库里的旧值，「一题两段」这个
+    组合根本没有一个时刻能被原子地写进去。整份替换把整份作业的框当成一张表，
+    一次写完 —— 结果永远等于老师屏幕上看到的样子。
+
+    ⚠️ 一次批改最多 60 段（`MAX_REGIONS_PER_PAGE × 页数` 的老上限按段算），
+    段数太多说明框画碎了，模型调用次数会线性涨。
+
+    `grouped` 是**显式的分组意愿**，不能靠猜：
+
+      · `False`（默认）—— 每个框就是一道题。老口径，也最安全。
+      · `True` —— 按 `seq` 分组，同一个 `seq` 的几段合成一题（跨页题）。
+
+    为什么不「所有 seq 都是 0 就当一题多段」：那正好和「前端没填 seq 的 8 个独立框」
+    长得一模一样，猜错的代价是 8 道题被并成一道。多一个布尔字段比赌一次强。
     """
 
-    page_no: int = 1
     regions: List[GradeRegionIn] = Field(default_factory=list)
+    grouped: bool = False
 
 
 class GradeRegionsCopy(BaseModel):

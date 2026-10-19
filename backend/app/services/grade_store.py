@@ -82,9 +82,22 @@ MAX_REGIONS_PER_PAGE = 60
 # 4 倍足够把 300px 宽的一小块提到 1200px（模型实际吃的是 GRADE_MAX_EDGE）。
 REGION_MAX_ZOOM = 4.0
 
+# 跨页题拼接时，PDF 点 → 像素的放大倍数。A4 宽 595pt × 3 ≈ 1785px；
+# 两段竖拼后高度约 4000px，再由 grade_ai 统一压到 GRADE_MAX_EDGE，
+# 于是每段大约还有 1100px 高 —— 仍明显优于整页判（整页 2200 高要摊给一整页）。
+REGION_PDF_ZOOM = 3.0
+
+# 跨页拼接的两段之间留的白缝（像素）。不留缝会让人以为「上一段最后一行
+# 和下一段第一行是同一行」，模型也容易把两段的字连成一句。
+REGION_GAP = 8
+
 # 可以直接当"一页"渲染的图片格式（与 routers/documents.py 的 PAGE_IMAGE_EXTS 同制）。
 # 不进那个常量是分层问题：services 不该 import routers。
 _IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".bmp")
+
+
+def _is_image_name(name: str) -> bool:
+    return Path(str(name or "")).suffix.lower() in _IMAGE_EXTS
 
 
 class GradeError(Exception):
@@ -256,6 +269,13 @@ def detail(db: Session, grade: HomeworkGrade) -> dict:
     # 判定依据的原文，给批改页回显用（老师切到「AI 自己解」时也要能看见自己填过的答案，
     # 所以这里**不受 answer_mode 影响** —— respect_mode=False）。
     out["answer_text"], out["rubric_text"] = _answer_texts(db, grade, respect_mode=False)
+    # 答案/细则**引用的文件**与**真正的图片**。前端要能回显「这次用的是哪张照片」——
+    # 只给文字的话，老师传了照片却看到答案框空着，会以为没生效。
+    out["answer_file_ids"] = [
+        int(f.lesson_file_id) for f in files
+        if f.lesson_file_id and f.role in ("answer", "rubric")
+    ]
+    out["answer_images"] = _answer_images(db, grade)
     return out
 
 
@@ -357,15 +377,19 @@ def create_grade(db: Session, payload: GradeIn) -> HomeworkGrade:
         raise GradeError(422, "选了「老师给答案」，但答案还是空的 —— 粘一段文字，或传一份答案文件")
     if payload.answer_mode == "rubric" and not (rubric_text or ans_files):
         raise GradeError(422, "选了「评分细则」，但细则还是空的 —— 每步多少分、什么情况扣分，得写下来")
-    # 答案文件必须是**能读出文字**的：批改靠文本比对，照片里的答案没有文字就等于没给，
-    # 模型会退回"自己解题"却仍然显示「按老师答案判」—— 那是拿错标准批学生，必须当场拦住。
+    # 答案文件要么**能读出文字**，要么是**图片**（走视觉通道）。
+    # 都不是就当场拦住：一份既没文字、又没法当图看的文件等于没给答案，
+    # 而模型会退回"自己解题"却仍然显示「按老师答案判」—— 那是拿错标准批学生。
+    # （2026-10 起放行图片：`_answer_images` 会把图真的送进模型，
+    #   不再是「说按老师答案判、其实没看见答案」。）
     for lf in ans_files:
-        if not (lf.text or "").strip():
-            raise GradeError(
-                422,
-                f"答案文件「{lf.name}」里没有可读的文字"
-                f"（{lf.reason or '照片/扫描件不抽文字'}）—— 请把答案直接粘贴进文本框",
-            )
+        if (lf.text or "").strip() or _is_image_name(lf.name):
+            continue
+        raise GradeError(
+            422,
+            f"答案文件「{lf.name}」里没有可读的文字"
+            f"（{lf.reason or '这种格式不抽文字'}）—— 请粘贴文字，或直接传一张答案照片",
+        )
 
     total = sum(_page_count(lf) for lf in sub_files)
     if total > MAX_PAGES:
@@ -442,14 +466,38 @@ def patch_setup(db: Session, gid: int, payload: GradeSetupPatch) -> HomeworkGrad
         if payload.rubric_text.strip():
             _add_answer_text_file(db, grade, payload.rubric_text.strip(), "rubric", "评分细则（粘贴）")
 
+    # 换/补**引用文件**（答案照片、细则照片、答案 PDF）。整份替换，粘贴的 txt 不动 ——
+    # 它们是老师刚敲的字，跟这批文件是两回事。
+    if payload.answer_file_ids is not None:
+        db.execute(delete(HomeworkGradeFile).where(
+            HomeworkGradeFile.grade_id == grade.id,
+            HomeworkGradeFile.role.in_(("answer", "rubric")),
+            HomeworkGradeFile.lesson_file_id.is_not(None),
+        ))
+        ans_role = "rubric" if (payload.answer_mode or grade.answer_mode) == "rubric" else "answer"
+        for fid in dict.fromkeys(int(x) for x in payload.answer_file_ids):
+            lf = _lesson_file(db, fid, grade.lesson_id, "答案文件")
+            if not ((lf.text or "").strip() or _is_image_name(lf.name)):
+                raise GradeError(
+                    422,
+                    f"答案文件「{lf.name}」里没有可读的文字（{lf.reason or '这种格式不抽文字'}）"
+                    "—— 请粘贴文字，或直接传一张答案照片",
+                )
+            db.add(HomeworkGradeFile(
+                owner_id=config.OWNER_ID, grade_id=grade.id, lesson_file_id=lf.id,
+                name=lf.name, stored="", role=ans_role, kind=lf.kind,
+                size_bytes=lf.size_bytes or 0, pages=lf.pages or 0,
+            ))
+
     db.flush()
     # 改完重新校验：切到 key/rubric 却没依据，等于拿「AI 自己解」冒充「按老师答案判」——
-    # 那是拿错标准批学生，必须在开批前拦住。
+    # 那是拿错标准批学生，必须在开批前拦住。**图也算依据**（会真的送进模型）。
     key_text, rub_text = _answer_texts(db, grade)
-    if grade.answer_mode == "key" and not key_text:
-        raise GradeError(422, "选了「老师给答案」，但答案还是空的 —— 粘一段文字再开始批改")
-    if grade.answer_mode == "rubric" and not rub_text:
-        raise GradeError(422, "选了「评分细则」，但细则还是空的 —— 每步多少分、什么情况扣分，得写下来")
+    imgs = _answer_images(db, grade)
+    if grade.answer_mode == "key" and not (key_text or imgs["answer"]):
+        raise GradeError(422, "选了「老师给答案」，但答案还是空的 —— 粘一段文字，或传一张答案照片")
+    if grade.answer_mode == "rubric" and not (rub_text or imgs["rubric"]):
+        raise GradeError(422, "选了「评分细则」，但细则还是空的 —— 写下来，或传一张细则照片")
 
     db.commit()
     return grade
@@ -486,8 +534,10 @@ def region_dict(r: HomeworkGradeRegion) -> dict:
         "id": r.id,
         "page_no": int(r.page_no or 1),
         "seq": int(r.seq or 0),
+        "seg": int(r.seg or 0),
         "q_no": q,
         # 给老师看、也写进提示词帮模型定位。**不参与题号绑定**（绑定看 q_no）。
+        # 同一个 seq 的几段 label 相同 —— 它们本来就是同一道题。
         "label": q or str(int(r.seq or 0) + 1),
         "box": _json_list(r.box),
     }
@@ -497,7 +547,8 @@ def _regions_of(db: Session, gid: int) -> list[HomeworkGradeRegion]:
     return list(db.scalars(
         select(HomeworkGradeRegion)
         .where(HomeworkGradeRegion.grade_id == int(gid))
-        .order_by(HomeworkGradeRegion.page_no, HomeworkGradeRegion.seq, HomeworkGradeRegion.id)
+        .order_by(HomeworkGradeRegion.seq, HomeworkGradeRegion.seg,
+                  HomeworkGradeRegion.page_no, HomeworkGradeRegion.id)
     ).all())
 
 
@@ -505,8 +556,68 @@ def list_regions(db: Session, gid: int) -> list[dict]:
     return [region_dict(r) for r in _regions_of(db, gid)]
 
 
+def _seg_key(seg: dict) -> tuple:
+    """拼接顺序的排序键：先页、再上边、最后段号。
+
+    为什么不信前端给的 `seg`：段序是**几何事实**（谁在上面谁在前面），
+    让界面去维护它，迟早出现「两段 seg 都是 0」或「seg=2 却画在 seg=1 上面」。
+    后端按坐标重排，前端只管「哪几段是同一题」。
+    """
+    box = seg.get("box") or [0, 0, 0, 0]
+    try:
+        top = float(box[1])
+    except (TypeError, ValueError, IndexError):
+        top = 0.0
+    return (int(seg.get("page_no") or 1), top, int(seg.get("seg") or 0))
+
+
+def blocks_of(db: Session, gid: int) -> list[dict]:
+    """把「段」聚合成「题」：**一道题 = `seq` 相同的 1..N 段**（可跨页）。
+
+    这是与批量录题 `blocks` 对齐的地方：那边也是「一段或多段合成一道题」，
+    只不过那边要的是录进题库的题目，这边要的是一条判定 ——
+    管道相同，喂进去的内容和要回来的形状不同。
+
+    返回按 `seq` 排序的块列表，每块：
+        seq / q_no / label / segments[{page_no, box, seg}] / pages / cross_page
+    """
+    groups: dict[int, list] = {}
+    for r in _regions_of(db, gid):
+        groups.setdefault(int(r.seq or 0), []).append(r)
+
+    out: list[dict] = []
+    for seq in sorted(groups):
+        segs = [region_dict(r) for r in groups[seq]]
+        segs.sort(key=_seg_key)
+        q_no = next((s["q_no"] for s in segs if s["q_no"]), "")
+        pages = [s["page_no"] for s in segs]
+        out.append({
+            "seq": seq,
+            "q_no": q_no,
+            "label": q_no or str(seq + 1),
+            # seg 重排成 0..n-1：前端给的值只当提示，真正顺序由几何决定。
+            "segments": [{**s, "seg": i} for i, s in enumerate(segs)],
+            "pages": pages,
+            "cross_page": len(set(pages)) > 1,
+        })
+    return out
+
+
+def blocks_by_page(db: Session, gid: int) -> dict[int, list[dict]]:
+    """{起始页: [块, …]}。
+
+    **块归它的第一段所在页** —— 跨页题只在起始页那一个线程里处理，
+    否则两页线程都会去批同一道题，结果互相覆盖。
+    """
+    out: dict[int, list[dict]] = {}
+    for b in blocks_of(db, gid):
+        first = b["segments"][0]["page_no"] if b["segments"] else 1
+        out.setdefault(int(first), []).append(b)
+    return out
+
+
 def regions_by_page(db: Session, gid: int) -> dict[int, list[dict]]:
-    """{页号: [框, …]}。批改线程里用 —— 线程内不碰 ORM 对象，只传纯 dict。"""
+    """{页号: [段, …]}。**保留扁平口径**：给「只想知道哪页有段」的调用方用。"""
     out: dict[int, list[dict]] = {}
     for r in _regions_of(db, gid):
         out.setdefault(int(r.page_no or 1), []).append(region_dict(r))
@@ -532,25 +643,38 @@ def _region_box(values) -> list[int] | None:
     return [x0, y0, x1, y1]
 
 
-def put_page_regions(db: Session, gid: int, payload: GradeRegionsPut) -> list[dict]:
-    """**整页替换**这一页的框。
+def put_regions(db: Session, gid: int, payload: GradeRegionsPut) -> list[dict]:
+    """**整份替换**老师画的框（段）。
 
-    为什么不逐条增删：画框在界面上是一次画完再保存的，逐条同步会带来
-    「删了又加、id 对不上」的一堆中间态。整页替换的结果永远等于老师屏幕上
-    看到的样子，不会出现「界面 5 个框、库里 7 条」。
+    为什么不是逐条增删、也不是按页替换：跨页题的两段天然落在不同页上，
+    按页提交的话，「一题两段」这个组合没有任何一个时刻能被原子地写进去。
+    整份替换的结果永远等于老师屏幕上看到的样子，不会出现「界面 5 段、库里 7 条」。
+
+    段的顺序（`seg`）由**后端按几何重排**：先页、再上边。前端只负责说
+    「这几段是同一题」（同一个 `seq`），不用维护拼接顺序。
     """
     grade = get_grade(db, gid)
     if grade.status == "running":
         raise GradeError(409, "正在批改，等这一遍跑完再改框 —— 否则这一批用的框是哪一版说不清")
-    page_no = max(1, int(payload.page_no or 1))
-    if int(grade.total or 0) and page_no > int(grade.total):
-        raise GradeError(422, f"这份作业只有 {int(grade.total)} 页，没有第 {page_no} 页")
 
     rows = list(payload.regions or [])
-    if len(rows) > MAX_REGIONS_PER_PAGE:
-        raise GradeError(422, f"一页最多画 {MAX_REGIONS_PER_PAGE} 个框")
-    keep: list[HomeworkGradeRegion] = []
+    pages = max(1, int(grade.total or 1))
+    limit = MAX_REGIONS_PER_PAGE * pages
+    if len(rows) > limit:
+        raise GradeError(422, f"这份作业最多画 {limit} 个框（每页 {MAX_REGIONS_PER_PAGE} 个）")
+
+    # ⚠️ 分组意愿必须由调用方**显式**给（`grouped`），不靠猜：
+    #    「所有 seq 都是 0」既可能是「一题两段」，也可能是「老调用方的 8 个独立框」，
+    #    猜错的方向是把 8 道题并成一道，比多传一个布尔字段糟得多。
+    seqs = [int(r.seq or 0) for r in rows]
+    if not payload.grouped:
+        seqs = list(range(len(rows)))
+
+    keep: list[dict] = []
     for i, reg in enumerate(rows):
+        page_no = int(reg.page_no or 1)
+        if page_no < 1 or page_no > pages:
+            raise GradeError(422, f"第 {i + 1} 个框画在第 {page_no} 页上，但这份作业只有 {pages} 页")
         box = _region_box(reg.box)
         if box is None:
             raise GradeError(
@@ -558,21 +682,34 @@ def put_page_regions(db: Session, gid: int, payload: GradeRegionsPut) -> list[di
                 f"第 {i + 1} 个框太小或位置不对 —— 要能框住一整道题"
                 f"（宽高都不能小于纸面的 {REGION_MIN_SIDE / 10:.0f}%）",
             )
-        keep.append(HomeworkGradeRegion(
+        keep.append({
+            "page_no": page_no,
+            "seq": seqs[i],
+            "q_no": str(reg.q_no or "").strip()[:16],
+            "box": box,
+        })
+
+    # 同一题内的拼接顺序：几何位置说了算，前端给的 seg 只当没有返回值时的兜底
+    by_seq: dict[int, list[dict]] = {}
+    for row in keep:
+        by_seq.setdefault(row["seq"], []).append(row)
+    for segs in by_seq.values():
+        segs.sort(key=_seg_key)
+        for i, row in enumerate(segs):
+            row["seg"] = i
+
+    db.execute(delete(HomeworkGradeRegion).where(HomeworkGradeRegion.grade_id == grade.id))
+    for row in sorted(keep, key=lambda x: (x["seq"], x["seg"])):
+        db.add(HomeworkGradeRegion(
             owner_id=config.OWNER_ID,
             grade_id=grade.id,
-            page_no=page_no,
-            seq=i,
-            q_no=str(reg.q_no or "").strip()[:16],
-            box=json.dumps(box),
+            page_no=row["page_no"],
+            seq=row["seq"],
+            seg=row["seg"],
+            q_no=row["q_no"],
+            box=json.dumps(row["box"]),
             created_at=_now(),
         ))
-    db.execute(delete(HomeworkGradeRegion).where(
-        HomeworkGradeRegion.grade_id == grade.id,
-        HomeworkGradeRegion.page_no == page_no,
-    ))
-    for r in keep:
-        db.add(r)
     db.commit()
     return list_regions(db, grade.id)
 
@@ -603,6 +740,7 @@ def copy_regions(db: Session, gid: int, from_gid: int) -> list[dict]:
             grade_id=grade.id,
             page_no=int(r.page_no or 1),
             seq=int(r.seq or 0),
+            seg=int(r.seg or 0),
             q_no=r.q_no or "",
             box=r.box or "[]",
             created_at=_now(),
@@ -663,14 +801,169 @@ def _crop_region(png_path: str, box, out_dir: Path, seq: int) -> Path | None:
         return None
 
 
-def _region_placeholder(reg: dict, reason: str) -> dict:
+def _stack_images(tiles: list, gap: int = REGION_GAP):
+    """把几张 Pillow 图竖着拼成一张（宽度取最宽，白底填充）。
+
+    只在「跨文件 / 照片」这条兜底路径上用。PDF 的多段拼接走
+    `pdf_adapter.crop_regions` —— 那边是渲染级拼接，比贴图更干净。
+    """
+    from PIL import Image
+
+    if not tiles:
+        return None
+    w = max(t.width for t in tiles)
+    h = sum(t.height for t in tiles) + gap * (len(tiles) - 1)
+    canvas = Image.new("RGB", (max(1, w), max(1, h)), (255, 255, 255))
+    y = 0
+    for t in tiles:
+        canvas.paste(t, (0, y))
+        y += t.height + gap
+    return canvas
+
+
+def _fit_to_edge(path: Path) -> Path:
+    """把已落盘的一张图缩放到长边 ≈ `GRADE_MAX_EDGE`（与 `_crop_region` 同一把尺子）。
+
+    为什么跨页拼图也要过这一道：单段走 `_crop_region` 会把图放大到 2200px，
+    而 `crop_regions` 只是按 zoom 渲染、不放大。不过这一道的话，
+    **跨页题反而比单页题糊** —— 它内容更多、本来更需要分辨率。
+    放大上限与单段一致（`REGION_MAX_ZOOM`）：再大只是把噪声一起放大。
+    """
+    from PIL import Image
+
+    try:
+        from .grade_ai import GRADE_MAX_EDGE
+    except Exception:                            # noqa: BLE001
+        GRADE_MAX_EDGE = 2200
+    try:
+        with Image.open(path) as im:
+            im = im.convert("RGB")
+            w, h = im.size
+            edge = max(w, h)
+            if edge <= 0:
+                return path
+            scale = float(GRADE_MAX_EDGE) / float(edge)
+            if scale > 1.0:
+                scale = min(scale, REGION_MAX_ZOOM)
+            if abs(scale - 1.0) < 0.02:
+                return path
+            im = im.resize((max(1, int(w * scale)), max(1, int(h * scale))),
+                           Image.LANCZOS)
+            im.save(path, "PNG")
+        return path
+    except Exception:                            # noqa: BLE001
+        return path                              # 缩放失败就用原图，别因此判整块失败
+
+
+def _crop_block(block: dict, slots_by_pno: dict, out_dir: Path) -> Path | None:
+    """裁一个**块**（一道题，可含多段）成一张图。返回落盘路径，失败返回 None。
+
+    三条路径，按「能不能少造轮子」排：
+
+      1. **单段** → `_crop_region`（Pillow 从页图裁）。页图本来就是缓存的，
+         不需要把 0~1000 换算成 PDF 点。
+      2. **多段且都在同一个 PDF 上** → 复用 `pdf_adapter.crop_regions`。
+         它本来就是「多个区域（可跨页）竖着拼成一张 PNG」，批量录题的
+         跨页题原貌图走的就是它。这里只负责把归一化框换成点坐标。
+      3. **多段但跨文件 / 是照片** → 逐段 Pillow 裁再竖拼。
+         照片一页一张，理论上不会跨页；这条是兜底，保证不崩而不是主路径。
+
+    ⚠️ 与 `_crop_region` 一样：坏一个块不该毁一整页，所以**全部失败返回 None**，
+    由调用方补一条 ungradable 占位题。
+    """
+    segs = block.get("segments") or []
+    if not segs:
+        return None
+    seq = int(block.get("seq") or 0)
+
+    slots: list[dict] = []
+    for s in segs:
+        slot = slots_by_pno.get(int(s.get("page_no") or 1))
+        if slot is None or slot.get("path") is None:
+            return None
+        slots.append(slot)
+
+    if len(segs) == 1:
+        try:
+            png = pdf_adapter.render_page(
+                str(slots[0]["path"]), int(slots[0]["local"]), str(slots[0]["cache_dir"]))
+        except Exception:                        # noqa: BLE001
+            return None
+        return _crop_region(png, segs[0].get("box"), out_dir, seq)
+
+    src = str(slots[0]["path"])
+    same_src = len({str(s["path"]) for s in slots}) == 1
+    if same_src and src.lower().endswith(".pdf"):
+        regions = []
+        try:
+            for seg, slot in zip(segs, slots):
+                W, H = pdf_adapter.page_size(src, int(slot["local"]))
+                b = _region_box(seg.get("box"))
+                if b is None or W <= 0 or H <= 0:
+                    return None
+                pad_x = W * REGION_PAD / 1000.0
+                pad_y = H * REGION_PAD / 1000.0
+                regions.append((
+                    int(slot["local"]),
+                    max(0.0, b[0] / 1000.0 * W - pad_x),
+                    max(0.0, b[1] / 1000.0 * H - pad_y),
+                    min(W, b[2] / 1000.0 * W + pad_x),
+                    min(H, b[3] / 1000.0 * H + pad_y),
+                ))
+            out_dir.mkdir(parents=True, exist_ok=True)
+            name = pdf_adapter.crop_regions(
+                src, regions, str(out_dir), zoom=REGION_PDF_ZOOM, gap=REGION_GAP)
+            return _fit_to_edge(out_dir / name)
+        except Exception:                        # noqa: BLE001
+            return None
+
+    from PIL import Image
+
+    tiles = []
+    try:
+        for seg, slot in zip(segs, slots):
+            png = pdf_adapter.render_page(
+                str(slot["path"]), int(slot["local"]), str(slot["cache_dir"]))
+            b = _region_box(seg.get("box"))
+            if b is None:
+                return None
+            with Image.open(png) as im:
+                im = im.convert("RGB")
+                w, h = im.size
+                x0 = max(0, b[0] - REGION_PAD)
+                y0 = max(0, b[1] - REGION_PAD)
+                x1 = min(1000, b[2] + REGION_PAD)
+                y1 = min(1000, b[3] + REGION_PAD)
+                px0, py0 = int(w * x0 / 1000.0), int(h * y0 / 1000.0)
+                px1, py1 = int(w * x1 / 1000.0), int(h * y1 / 1000.0)
+                px1 = max(px0 + 2, min(w, px1))
+                py1 = max(py0 + 2, min(h, py1))
+                px0 = min(px0, px1 - 2)
+                py0 = min(py0, py1 - 2)
+                tiles.append(im.crop((px0, py0, px1, py1)).copy())
+        canvas = _stack_images(tiles)
+        if canvas is None:
+            return None
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out = out_dir / f"region_{seq:03d}.png"
+        canvas.save(out, "PNG")
+        return _fit_to_edge(out)
+    except Exception:                            # noqa: BLE001
+        return None
+
+
+def _region_placeholder(block: dict, reason: str) -> dict:
     """框里什么都没批出来时的**占位题**。
 
     必须留一条，否则老师只看到「这页比预期少一题」，会以为是自己漏画了框。
     verdict 给 ungradable（不是 wrong）：没读到 ≠ 学生没写。
+
+    参数是**块**（一道题，可能多段）。`region_box` 保留第一段，是为了不破坏
+    已经按它断言的老测试；多段的完整列表放在 `region_boxes`。
     """
+    boxes = [s.get("box") for s in (block.get("segments") or [])] or [[]]
     return {
-        "q_no": str(reg.get("q_no") or ""),
+        "q_no": str(block.get("q_no") or ""),
         "qtype": None,
         "stem": "",
         "student_answer": "",
@@ -683,7 +976,11 @@ def _region_placeholder(reg: dict, reason: str) -> dict:
         "figure_note": "",
         "flags": ["region_empty"],
         "raw": {
-            "question": {"region_box": reg.get("box"), "region_seq": reg.get("seq")},
+            "question": {
+                "region_box": boxes[0],
+                "region_boxes": boxes,
+                "region_seq": block.get("seq"),
+            },
             "meta": {"model": "", "finish_reason": "", "mode": "", "sample": 1},
         },
     }
@@ -758,14 +1055,63 @@ def _answer_texts(db: Session, grade: HomeworkGrade,
     return "\n\n".join(parts["answer"]), "\n\n".join(parts["rubric"])
 
 
+def _answer_images(db: Session, grade: HomeworkGrade) -> dict[str, list[str]]:
+    """「老师给的答案 / 评分细则」里的**图片**，按 role 分组返回磁盘路径。
+
+    为什么需要这条路：老师手上常常只有一张**答案照片**（参考答案页拍一张、
+    或者自己手写的细则拍一张）。以前只读抽取出来的文字，照片抽不出字 →
+    判据为空 → `create_grade` 干脆把这种文件拦在门外（422，让你去粘贴文字）。
+    现在把图**真的送进模型**，那条硬拦才不再需要。
+
+    规则：**已经有文字的文件不再送图**。同一份 PDF 答案既有文字层又要送图，
+    等于把 token 花两遍，而文字比图更省、更准。
+    `ai` 模式返回空 —— 老师没给依据，就不该往 ctx 里塞东西。
+    """
+    out: dict[str, list[str]] = {"answer": [], "rubric": []}
+    if grade.answer_mode == "ai":
+        return out
+    rows = db.scalars(
+        select(HomeworkGradeFile)
+        .where(HomeworkGradeFile.grade_id == grade.id,
+               HomeworkGradeFile.role.in_(("answer", "rubric")))
+        .order_by(HomeworkGradeFile.id)
+    ).all()
+    for f in rows:
+        role = f.role if f.role in out else "answer"
+        text = ""
+        path: Path | None = None
+        if f.lesson_file_id:
+            lf = db.get(LessonFile, f.lesson_file_id)
+            if lf is not None:
+                text = lf.text or ""
+                path = storage.safe_join(lf.stored)
+        elif (f.stored or "").strip():
+            path = storage.safe_join(f.stored)
+            if path is not None and path.exists() and path.suffix.lower() == ".txt":
+                try:
+                    text = path.read_bytes().decode("utf-8-sig")
+                except (OSError, UnicodeDecodeError):
+                    text = ""
+        if (text or "").strip():
+            continue
+        if path is not None and path.exists() and path.suffix.lower() in _IMAGE_EXTS:
+            out[role].append(str(path))
+    return out
+
+
 def _ctx_base(db: Session, grade: HomeworkGrade) -> dict:
     stu = db.get(Student, grade.student_id)
     key_text, rubric_text = _answer_texts(db, grade)
+    imgs = _answer_images(db, grade)
     return {
         "student": (stu.name if stu is not None else "") or "",
         "answer_mode": grade.answer_mode,
         "answer_text": key_text,
         "rubric_text": rubric_text,
+        # 答案/细则的**图片**（老师拍的照片）。没有文字依据时才非空，
+        # 由 grade_ai 作为额外图一起送进模型。
+        "answer_images": imgs["answer"],
+        "rubric_images": imgs["rubric"],
     }
 
 
@@ -1012,16 +1358,19 @@ def _run_grade(gid: int) -> None:
         curriculum_id = grade.curriculum_id
         # 框必须在关 session 之前读成纯 dict —— 线程里不许碰 ORM 对象。
         # 空 dict = 一页都没画框 = 整条流程退回老口径（整页一次判）。
-        by_page = regions_by_page(db, gid)
+        # 这里读成**块**（一题可多段），跨页题的几段由起始页那个线程一起处理。
+        by_page = blocks_by_page(db, gid)
     finally:
         db.close()
 
+    slots_by_pno = {int(s["pno"]): s for s in slots}
     done = failed = 0
     first_err = ""
     try:
         with ThreadPoolExecutor(max_workers=WORKERS) as pool:
             futures = {
-                pool.submit(_run_one_page, slot, base_ctx, by_page.get(int(slot["pno"]))):
+                pool.submit(_run_one_page, slot, base_ctx,
+                            by_page.get(int(slot["pno"])), slots_by_pno):
                     slot["pno"]
                 for slot in slots
             }
@@ -1052,16 +1401,20 @@ def _run_grade(gid: int) -> None:
 
 
 def _run_one_page(slot: dict, ctx_base: dict,
-                  regions: list[dict] | None = None) -> tuple[list[dict], str]:
+                  blocks: list[dict] | None = None,
+                  slots_by_pno: dict | None = None) -> tuple[list[dict], str]:
     """在一个工作线程里处理一页：渲染页图 + 调 AI。**不碰数据库**，纯 I/O。
 
     两种口径：
-      · **有框**（`regions` 非空）→ 一框一裁切一调用。有效分辨率翻几倍、
-        题号由框绑定、框外内容根本看不见（跨题污染从物理上消失）。
-      · **没框** → 保持老行为：整页一次判。老记录、没画框的人零影响。
+      · **有块**（`blocks` 非空）→ 一块一裁一切。有效分辨率翻几倍、
+        题号由块绑定、块外内容根本看不见（跨题污染从物理上消失）。
+        跨页题的几段在这里**竖拼成一张图**再送 —— 与批量录题的 blocks 同一套语义。
+      · **没块** → 保持老行为：整页一次判。老记录、没画框的人零影响。
 
-    ⚠️ 单框失败**不毁整页**：失败的那个框留一条 ungradable 占位（老师看得见），
-    其余框照常出结果。只有**一个都没成**才把整页算失败 —— 那种情况多半是
+    ⚠️ 块只归它的**第一段所在页**（`blocks_by_page` 就是这么分的），
+    否则跨页题会被两页线程各批一次、结果互相覆盖。
+    ⚠️ 单块失败**不毁整页**：失败的那块留一条 ungradable 占位（老师看得见），
+    其余块照常出结果。只有**一个都没成**才把整页算失败 —— 那种情况多半是
     接口挂了 / 没配，重试整页才有意义。
     """
     path = slot["path"]
@@ -1075,39 +1428,44 @@ def _run_one_page(slot: dict, ctx_base: dict,
         return [], f"页图渲染不出来（{type(e).__name__}: {e}）"
 
     pno = int(slot["pno"])
-    if not regions:
+    if not blocks:
         return _recognize_page(png, {**ctx_base, "page_no": pno})
+
+    lookup = dict(slots_by_pno or {})
+    lookup.setdefault(pno, slot)
 
     items: list[dict] = []
     good = 0
     first_err = ""
-    for reg in regions:
-        label = str(reg.get("label") or reg.get("seq") or "")
-        tile = _crop_region(png, reg.get("box"), Path(slot["cache_dir"]),
-                            int(reg.get("seq") or 0))
+    for block in blocks:
+        label = str(block.get("label") or (int(block.get("seq") or 0) + 1))
+        tile = _crop_block(block, lookup, Path(slot["cache_dir"]))
         if tile is None:
-            first_err = first_err or f"第 {label} 题的框不可用（太小或画在纸外）"
-            items.append(_region_placeholder(reg, "这个框裁不出内容 —— 框可能画到了纸外或太小"))
+            first_err = first_err or f"第 {label} 题的框不可用（太小、画在纸外，或原件读不出来）"
+            items.append(_region_placeholder(block, "这个框裁不出内容 —— 框可能画到了纸外或太小"))
             continue
+        ctx = {**ctx_base, "page_no": pno, "region": True, "region_label": label}
+        if block.get("cross_page"):
+            # 让提示词知道「这一张图是两页拼起来的」：否则模型看到中间的白缝
+            # 会以为题目到此为止，把下半段当另一道题丢掉。
+            ctx["span_pages"] = list(block.get("pages") or [])
         try:
-            got, err = _recognize_region(str(tile), {
-                **ctx_base, "page_no": pno, "region": True, "region_label": label,
-            })
+            got, err = _recognize_region(str(tile), ctx)
         except Exception as e:                       # noqa: BLE001
             got, err = [], f"{type(e).__name__}: {e}"
         if err:
             first_err = first_err or err
-            items.append(_region_placeholder(reg, err))
+            items.append(_region_placeholder(block, err))
             continue
         if not got:
             # 框画在空白处 / 这一块确实没题。**不是错误**，但要留痕。
-            items.append(_region_placeholder(reg, "这个框里没读到题目 —— 框画空了？"))
+            items.append(_region_placeholder(block, "这个框里没读到题目 —— 框画空了？"))
             continue
         it = got[0]
         # 题号绑定：老师填的 q_no 一律优先，模型认的那个只当兜底。
         # 这是「消掉题号错配」的关键一步 —— 学生把第 3 题写成第 8 题也不影响归属。
-        if str(reg.get("q_no") or "").strip():
-            it["q_no"] = str(reg["q_no"]).strip()
+        if str(block.get("q_no") or "").strip():
+            it["q_no"] = str(block["q_no"]).strip()
         elif not str(it.get("q_no") or "").strip():
             it["q_no"] = label
         good += 1
@@ -1219,9 +1577,23 @@ def rerun_item(db: Session, iid: str) -> HomeworkGradeItem:
         raise GradeError(422, f"找不到第 {it.page_no} 页（原件可能已被删除）")
 
     ctx = {**_ctx_base(db, grade), "page_no": slot["pno"]}
-    # 有框的页必须走「按框批」—— 否则重批会退回整页口径，题号对不上，
-    # 还会用一次便宜的整页结果覆盖掉当初按框批出来的、更准的那一版。
-    items, err = _run_one_page(slot, ctx, regions_by_page(db, grade.id).get(int(slot["pno"])))
+    # 有块（画过框）的页必须走「按块批」—— 否则重批会退回整页口径，题号对不上，
+    # 还会用一次便宜的整页结果覆盖掉当初按块批出来的、更准的那一版。
+    by_page = blocks_by_page(db, grade.id)
+    blocks = by_page.get(int(it.page_no))
+    if blocks is None:
+        # 这道题可能是**跨页块的下半段**：它入库时记在起始页，但页号也可能
+        # 因为老数据/手工改过而对不上。扫一遍：哪个块的段跨到了这一页，
+        # 就用那个块的起始页 —— 否则会静默退回整页口径，重批反而更差。
+        for pno, bls in by_page.items():
+            if any(any(int(s["page_no"]) == int(it.page_no) for s in b["segments"])
+                   for b in bls):
+                blocks = bls
+                slot = next((s for s in slots if s["pno"] == pno), slot)
+                ctx = {**ctx, "page_no": int(pno)}
+                break
+    items, err = _run_one_page(slot, ctx, blocks or [],
+                               {int(s["pno"]): s for s in slots})
     if err:
         raise GradeError(422, f"这页没批成：{err}")
 

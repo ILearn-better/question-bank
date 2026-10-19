@@ -230,15 +230,15 @@ def list_regions(gid: int, db: Session = Depends(get_db)):
 
 
 @router.put("/homework-grades/{gid}/regions")
-def put_page_regions(gid: int, payload: GradeRegionsPut, db: Session = Depends(get_db)):
-    """**整页替换**这一页的框。
+def put_regions(gid: int, payload: GradeRegionsPut, db: Session = Depends(get_db)):
+    """**整份替换**这份作业画的框（每项是「一段」，同一 `seq` 的几段合成一题）。
 
-    为什么是 PUT 整页替换而不是逐条增删：画框在界面上是一次画完再保存，
-    整页替换的结果永远等于老师屏幕上看到的样子，不会留下「删了又加」的中间态。
-    传空数组 = 清空这一页的框（这一页退回整页批）。
+    为什么从「按页替换」改成「整份替换」：跨页题的两段天然落在不同页上，
+    按页提交时「一题两段」这个组合没有任何一个时刻能被原子写进去。
+    传空数组 = 清空全部框（整份退回整页批）。
     """
     try:
-        regions = store.put_page_regions(db, gid, payload)
+        regions = store.put_regions(db, gid, payload)
     except store.GradeError as e:
         raise _fail(e) from e
     return {"regions": regions}

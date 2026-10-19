@@ -79,7 +79,7 @@ const DETAIL = {
   answer_mode: 'ai', answer_text: '', rubric_text: '',
   total: 3, done: 3, failed: 0, score: null, full_score: null, error: '',
   created_at: '2026-10-19T10:00:00', finished_at: '2026-10-19T10:03:00', reviewed_at: null,
-  files: [{ id: 1, role: 'submission', name: '作业.pdf', pages: 1 }],
+  files: [{ id: 1, role: 'submission', name: '作业.pdf', pages: 2 }],
   items: [
     item({ id: 101, seq: 1, q_no: '1', qtype: '解答题', verdict: 'correct',
            stem: '解方程：$x^2-5x+6=0$。', student_answer: '$x=2$ 或 $x=3$',
@@ -110,6 +110,13 @@ const DETAIL = {
   ],
 };
 
+export const lessonFilesApi = {
+  upload: async (lessonId, fd, role) => {
+    push('uploadFile', [lessonId, role, fd && fd.get ? (fd.get('file') || {}).name : '']);
+    return { id: 555, name: '答案照片.png', kind: 'image', role };
+  },
+};
+
 export const gradeApi = {
   get: async (gid) => { push('get', [gid]); return JSON.parse(JSON.stringify(DETAIL)); },
   list: async (lessonId) => {
@@ -118,13 +125,11 @@ export const gradeApi = {
   },
   putRegions: async (gid, body) => {
     push('putRegions', [gid, body]);
-    // 真实后端是**整页替换**后回整份列表，这里照做（回带 id 的正式框）
-    const rows = body.regions.map((r, i) => ({
-      id: 400 + i, page_no: body.page_no, seq: i, q_no: r.q_no,
-      label: r.q_no || String(i + 1), box: r.box,
+    // 真实后端是**整份替换**（page_no / seq 都在每一段上），这里照做
+    DETAIL.regions = body.regions.map((r, i) => ({
+      id: 400 + i, page_no: Number(r.page_no), seq: Number(r.seq || 0), seg: 0,
+      q_no: r.q_no, label: r.q_no || String(Number(r.seq || 0) + 1), box: r.box,
     }));
-    const others = DETAIL.regions.filter((r) => r.page_no !== body.page_no);
-    DETAIL.regions = others.concat(rows);
     return { regions: JSON.parse(JSON.stringify(DETAIL.regions)) };
   },
   copyRegions: async (gid, fromId) => {
@@ -255,6 +260,8 @@ async function main() {
     global.window = W;
     global.document = W.document;
     global.navigator = W.navigator;
+    // 视图里用 new FormData() 传答案照片（见 uploadAnswerImage）—— jsdom 有，全局没有
+    global.FormData = W.FormData;
     for (const f of VENDOR) {
       const p = path.join(ROOT, f);
       checkTrue('vendor 存在：' + f, fs.existsSync(p));
@@ -410,8 +417,12 @@ async function main() {
     check('保存框发了 1 次请求', puts.length, 1);
     if (puts.length) {
       const body0 = puts[0].args[1];
-      check('整页替换：page_no 带上了', body0.page_no, 1);
-      check('整页替换：传的是这一页全部 4 个框（不是只传改动的）', body0.regions.length, 4);
+      check('★ 整份替换：带 grouped=true（显式声明按 seq 分组）', body0.grouped, true);
+      check('每段都带 page_no（跨页题全靠它）',
+        body0.regions.map((r) => r.page_no), [1, 1, 1, 1]);
+      check('每段都带 seq（同一题的几段共用）',
+        body0.regions.map((r) => Number(r.seq)), [0, 1, 2, 3]);
+      check('整份替换：传的是全部 4 个框（不是只传改动的）', body0.regions.length, 4);
       check('每个框都是 [x0,y0,x1,y1] 四个数',
         body0.regions.map((r) => (Array.isArray(r.box) ? r.box.length : -1)), [4, 4, 4, 4]);
       check('改了号的框按新题号提交', body0.regions[0].q_no, '7');
@@ -421,6 +432,44 @@ async function main() {
     }
     await sleep(200);
     checkTrue('保存完「未保存」提示消失', !body().includes('未保存'));
+
+    /* ============ 9b. 跨页题：第 2 页画一段 → 并入上一题 ============
+     * 这是「参考批量录题的分割/跨页」那批改动的界面部分。要证的三件事：
+     *   1. 草稿是**整份按页分桶**的 —— 翻页不丢（否则跨页根本画不出来）
+     *   2. 「并入上一题」真的把两段合成一题，面板上看得见「跨第 1 + 2 页」
+     *   3. 提交时同一题的几段**共用同一个 seq**，后端靠它拼成一张图 */
+    check('保存后草稿是 4 段', vm.draftSegCount, 4);
+    vm.pageNo = 2;
+    await sleep(150);
+    check('★ 翻到第 2 页，草稿还在（整份分桶，不是当前页一份）', vm.draftSegCount, 4);
+    check('第 2 页本身还没框', vm.editRegions.length, 0);
+
+    vm.addRegionBox([40, 60, 900, 380]);
+    await sleep(150);
+    check('第 2 页画完，总框数 +1', vm.draftSegCount, 5);
+    check('现在 5 题（每段各成一题）', vm.regionBlocks.length, 5);
+
+    const tailBlock = vm.regionBlocks[vm.regionBlocks.length - 1];
+    vm.mergeRegion(tailBlock);
+    await sleep(150);
+    check('★ 并入上一题：题数 5 → 4', vm.regionBlocks.length, 4);
+    const crossBlock = vm.regionBlocks[vm.regionBlocks.length - 1];
+    check('★ 这一题变成两段', crossBlock.segs.length, 2);
+    check('★ 两段落在不同页上（跨页题才成立）', crossBlock.pages, [1, 2]);
+    checkTrue('面板上标出「跨第 1 + 2 页」', body().includes('跨第 1 + 2 页'));
+
+    await vm.saveRegions();
+    await sleep(250);
+    const puts2 = (await import(pathToFileURL(path.join(tmp, 'src', 'calls.js')).href)).CALLS
+      .filter((c) => c.name === 'putRegions');
+    const b2 = puts2[puts2.length - 1].args[1];
+    const crossSegs = b2.regions.filter((r) => Number(r.seq) === Number(crossBlock.seq));
+    check('★ 跨页的两段共用同一个 seq（后端靠它拼成一张）', crossSegs.length, 2);
+    check('★ 那两段的 page_no 是 1 和 2',
+      crossSegs.map((r) => r.page_no), [1, 2]);
+
+    vm.pageNo = 1;
+    await sleep(120);
 
     /* ============ 10. 离开框题模式：没保存不能悄悄丢 ============ */
     // ⚠️ 顺序要注意：confirm 返回 true 的那一下**真的会切走**，所以「不放弃」这条
@@ -481,6 +530,40 @@ async function main() {
     await sleep(300);
     checkTrue('★ 单题重批打到那一题的接口', calls.some((c) => c.name === 'rerunItem' && c.args[0] === 102),
       JSON.stringify(calls.filter((c) => c.name === 'rerunItem').map((c) => c.args)));
+
+    /* ============ 15. 判定依据传照片（答案 / 细则可以是一张图） ============
+     * 这条链路后端已经通了（`_answer_images` 把图送进模型），界面要保证：
+     *   1. 可编辑时真的有入口；
+     *   2. `input` 上**没有** accept（本机经验：accept 会把老师想选的文件藏起来）；
+     *   3. 上传后文件 id **立刻**挂进判定依据，而不是等老师再点一次保存。
+     * 第 3 条最容易漏 —— 传完看着成功了，其实图没挂上，批的时候还在按旧依据判。 */
+    vm.detail.status = 'queued';
+    vm.detail.done = 0;
+    vm.detail.answer_images = { answer: [], rubric: [] };
+    vm.setupMode = 'key';
+    await sleep(180);
+    checkTrue('可编辑时出现「传照片」入口', body().includes('直接传照片'));
+
+    const fileEl = D.querySelector('.grade-ansfile input[type="file"]');
+    checkTrue('有 file input', !!fileEl);
+    checkTrue('★ file input 上不设 accept（设了会把老师要选的文件藏起来）',
+      !!fileEl && !fileEl.getAttribute('accept'));
+    if (fileEl) {
+      const f = new W.File([new W.Blob(['x'], { type: 'image/png' })], '答案照片.png',
+        { type: 'image/png' });
+      Object.defineProperty(fileEl, 'files', { value: [f], configurable: true });
+      fileEl.dispatchEvent(new W.Event('change'));
+      await sleep(400);
+    }
+    const calls2 = (await import(pathToFileURL(path.join(tmp, 'src', 'calls.js')).href)).CALLS;
+    const ups = calls2.filter((c) => c.name === 'uploadFile');
+    check('★ 答案照片走了这一课的文件接口', ups.length, 1);
+    check('★ role 用 homework（与提交件同一份清单，不会变成没人认领的孤儿文件）',
+      ups.length ? ups[0].args[1] : null, 'homework');
+    const ps = calls2.filter((c) => c.name === 'patchSetup');
+    const lastPatch = ps.length ? ps[ps.length - 1].args[1] : {};
+    check('★ 上传完立刻把文件 id 挂进判定依据（不是等老师再点保存）',
+      lastPatch.answer_file_ids || [], [555]);
   } finally {
     try { fs.rmSync(tmp, { recursive: true, force: true }); } catch (e) { /* 删不掉留着也无妨 */ }
   }

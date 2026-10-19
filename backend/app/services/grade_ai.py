@@ -75,6 +75,10 @@ from .images import MAX_IMAGE_BYTES
 #      改它等于把别人的回归基线一起挪了。批改要更高分辨率就在本文件里另定。
 GRADE_MAX_EDGE = 2200
 
+# 一次最多附几张「老师给的答案 / 细则」图。2 张是成本与够用的折中：
+# 一张答案 + 一张细则已经是常见上限，再多就是在为「拍糊了重拍一张」付费。
+_MAX_ANSWER_IMAGES = 2
+
 # JPEG 质量。同样因为手写：细笔画在 q85 上会被振铃吃掉，q90 的码率代价很小。
 GRADE_JPEG_QUALITY = 90
 
@@ -346,6 +350,34 @@ _ONE_ITEM_TAIL = (
 )
 
 
+def _images_block(ctx: dict) -> str:
+    """一次送了多张图时，**必须说清每张图是什么**。
+
+    不说的话最常见的错是「把答案照片当成学生作答」→ 判出全对，
+    而且看起来完全合理（老师给的答案当然对）。这个错比漏判更危险，
+    因为它是「自信地判对」。
+    """
+    mode = _as_str(ctx.get("answer_mode")) or "ai"
+    if mode == "key":
+        extra = list(ctx.get("answer_images") or [])
+        what = "老师的标准答案"
+    elif mode == "rubric":
+        extra = list(ctx.get("rubric_images") or [])
+        what = "老师的评分细则"
+    else:
+        return ""
+    if not extra:
+        return ""
+    lines = [f"\n\n## 这一批图（共 {len(extra) + 1} 张，按顺序）",
+             "第 1 张：**学生作答** —— 要判的就是它。"]
+    for i in range(len(extra)):
+        lines.append(
+            f"第 {i + 2} 张：{what} —— 这是**判据，不是学生写的**。"
+            "不要把它上面的内容当成 student_answer，也不要因为它写对了就判学生对。"
+        )
+    return "\n".join(lines)
+
+
 def _context_block(ctx: dict) -> str:
     """只写「批改需要的上下文」，**不写学生姓名**。
 
@@ -361,7 +393,16 @@ def _context_block(ctx: dict) -> str:
         where = f"第 {page_no} 页" if page_no else "一页作业"
         label = str(ctx.get("region_label") or "").strip()
         tip = f"（系统把这一块标成了「{label}」）" if label else ""
-        return f"\n\n## 这一张图\n这是从{where}上裁下来的一道题{tip}。"
+        span = ctx.get("span_pages") or []
+        cross = ""
+        if span:
+            # 跨页题：一张图里是两页的段落竖拼的。不说清的话，中间的接缝
+            # 会被当成「题目到此结束」，下半段直接被丢掉。
+            cross = (
+                f" ⚠️ 这一张图是**跨页拼起来的**（{ '、'.join('第 %s 页' % p for p in span) }"
+                " 上的几段上下拼接），中间的白缝不是题目结束 —— 它是一道完整的题。"
+            )
+        return f"\n\n## 这一张图\n这是从{where}上裁下来的一道题{tip}。{cross}" + _images_block(ctx)
 
     lines = ["\n\n## 这一页"]
     if page_no:
@@ -370,13 +411,17 @@ def _context_block(ctx: dict) -> str:
         "题号一律写**卷面上印的题号**（不要自己从 1 开始重编）。"
         "这一页可能有几道题，也可能只是一道大题的一小部分。"
     )
-    return "\n".join(lines)
+    return "\n".join(lines) + _images_block(ctx)
 
 
 def _reference_block(mode: str, ctx: dict) -> str:
     """三种 answer_mode 的差别**只在于参考依据从哪来**，判定口径完全一样。"""
     if mode == "key":
         text = (ctx.get("answer_text") or "").strip()
+        if not text and (ctx.get("answer_images") or []):
+            # 老师给的是**答案照片**（没粘贴文字）。这里必须交代清楚，
+            # 否则「〔老师的答案〕」下面空着，模型会退回自己解题却仍声称按老师答案判。
+            text = "（答案在附图上 —— 第 2 张起来的图是老师给的答案，不是学生写的）"
         steps = ctx.get("answer_steps") or None
         block = (
             "\n\n## 本次的依据：老师提供的标准答案\n"
@@ -404,6 +449,8 @@ def _reference_block(mode: str, ctx: dict) -> str:
 
     if mode == "rubric":
         text = (ctx.get("rubric_text") or "").strip()
+        if not text and (ctx.get("rubric_images") or []):
+            text = "（评分细则在附图上 —— 第 2 张起来的图是老师给的细则，不是学生写的）"
         return (
             "\n\n## 本次的依据：评分细则（分步给分点 / 扣分条件）\n"
             "下面是老师给的评分细则，**以它为准**。\n"
@@ -477,6 +524,33 @@ def _prepare_image(path) -> str:
     buf = io.BytesIO()
     im.save(buf, "JPEG", quality=GRADE_JPEG_QUALITY, optimize=True)
     return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def _image_uris(png_path, ctx: dict) -> list[str]:
+    """学生作答那张 + 老师给的答案/细则图（如果有）。**顺序不能变**。
+
+    顺序就是提示词里「第 1 张 / 第 2 张」的指向，`_images_block` 按同一顺序写说明。
+    答案图先压到 `GRADE_MAX_EDGE`，与页图同一条通道 —— 一张 4000px 的手机
+    照片不压会直接超上限。
+
+    ⚠️ 单张答案图坏掉**不整单失败**：跳过它比让老师「整份批改失败、
+    还看不出是答案照片的问题」要好。但主图（学生作答）坏了必须抛 ——
+    没有作答就没法判。
+    """
+    uris = [_prepare_image(png_path)]
+    mode = _as_str(ctx.get("answer_mode")) or "ai"
+    if mode == "key":
+        extra = list(ctx.get("answer_images") or [])
+    elif mode == "rubric":
+        extra = list(ctx.get("rubric_images") or [])
+    else:
+        extra = []
+    for p in extra[:_MAX_ANSWER_IMAGES]:
+        try:
+            uris.append(_prepare_image(p))
+        except _GradeError:
+            continue
+    return uris
 
 
 # ---------------------------------------------------------------- 配置
@@ -980,20 +1054,25 @@ def _finish_reason(data: dict) -> str:
         return ""
 
 
-def _call_model(uri: str, prompt: str, cfg: dict, temperature: float = 0) -> tuple[str, str]:
+def _call_model(uris, prompt: str, cfg: dict, temperature: float = 0) -> tuple[str, str]:
     """发一次请求（含三级降级 + 截断重试）。返回 (正文, finish_reason)。
+
+    `uris` 可以是单张也可以是**一串**：串里第 1 张永远是学生作答，
+    后面的是老师给的答案/细则图（顺序与 `_images_block` 的说明一一对应）。
 
     降级顺序照抄 batch_page.recognize_page，理由一样：这些参数都是「锦上添花」，
     宁可退化成靠提示词约束，也不能让整条链路因为某个服务商不认某个参数而不可用：
         去掉 response_format → 去掉 reasoning_effort → 降 max_tokens
     """
+    if isinstance(uris, str):
+        uris = [uris]
     body = {
         "model": cfg["model"],
         "messages": [{
             "role": "user",
             # 图在前、要求在后：先看清内容，再读该怎么输出（与 vision/batch_page 一致）
             "content": [
-                {"type": "image_url", "image_url": {"url": uri}},
+                *({"type": "image_url", "image_url": {"url": u}} for u in uris),
                 {"type": "text", "text": prompt},
             ],
         }],
@@ -1068,9 +1147,11 @@ def _recognize(png_path: str, ctx: dict) -> tuple[list[dict], str]:
         raise _GradeError(
             f"不认识的批改依据「{answer_mode}」，只能是 ai / key / rubric"
         )
-    if answer_mode == "key" and not _as_str(ctx.get("answer_text")):
+    if answer_mode == "key" and not (_as_str(ctx.get("answer_text"))
+                                     or (ctx.get("answer_images") or [])):
         raise _GradeError("选择了「按老师答案批改」，但没有读到答案内容")
-    if answer_mode == "rubric" and not _as_str(ctx.get("rubric_text")):
+    if answer_mode == "rubric" and not (_as_str(ctx.get("rubric_text"))
+                                        or (ctx.get("rubric_images") or [])):
         raise _GradeError("选择了「按评分细则批改」，但没有读到细则内容")
 
     cfg = _load_cfg(ctx)
@@ -1083,9 +1164,9 @@ def _recognize(png_path: str, ctx: dict) -> tuple[list[dict], str]:
             "批改和公式识别共用这一份配置。"
         )
 
-    uri = _prepare_image(png_path)
+    uris = _image_uris(png_path, ctx)
     prompt = _prompt_for(answer_mode, ctx)
-    text, finish = _call_model(uri, prompt, cfg, temperature=0)
+    text, finish = _call_model(uris, prompt, cfg, temperature=0)
 
     items, err = _parse_grade_text(text)
     if err:
@@ -1118,7 +1199,7 @@ def _recognize(png_path: str, ctx: dict) -> tuple[list[dict], str]:
         samples = 1
     if samples >= 2 and items:
         try:
-            text2, finish2 = _call_model(uri, prompt, cfg, temperature=0.7)
+            text2, finish2 = _call_model(uris, prompt, cfg, temperature=0.7)
             items2, _err2 = _parse_grade_text(text2)
             if items2:
                 for it in items2:

@@ -1354,6 +1354,22 @@ class HomeworkGradeRegion(Base):
 
     ⚠️ `box` 与标注同制：**按页归一化的 0~1000 整数**，不是像素。
     页图尺寸随渲染 dpi 变，存像素的框换个 dpi 就全错位。
+
+    ## 一段 ≠ 一题：`seq` 是题、`seg` 是段（0029 起）
+
+    一道题可能被页界切开（解答题跨页很常见），所以「一题」= `seq` 相同的一到多行：
+
+        seq=1 seg=0 page=1 box=…     第 1 题的上半段
+        seq=1 seg=1 page=2 box=…     第 1 题的下半段（接在上一段下面）
+        seq=2 seg=0 page=2 box=…     第 2 题
+
+    这样跨页题裁出来是**一张竖拼的图**，题号也仍然只有一个 —— 与批量录题的
+    `blocks`（一段或多段合成一道题）是同一套语义，只是这里给 AI 的是一道题、
+    要回来的是一条判定。旧的单选题记录 `seg` 全是 0，行为与 0028 完全一致。
+
+    ⚠️ 为什么复用 `pdf_adapter.crop_regions` 而不是自己拼：它本来就是
+    「多个区域（可跨页）竖着拼成一张 PNG」，批量录题的原貌图走的就是它；
+    拼接用的是 insert_image 渲染（Pixmap.copy 贴出来是全白的，踩过）。
     """
 
     __tablename__ = "homework_grade_regions"
@@ -1364,10 +1380,13 @@ class HomeworkGradeRegion(Base):
         ForeignKey("homework_grades.id", ondelete="CASCADE"), nullable=False
     )
     page_no: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
-    seq: Mapped[int] = mapped_column(Integer, default=0, server_default="0")      # 页内顺序 = 批改顺序
+    # 题序号（0 起）。**同一道题的几段共用同一个 seq** —— 这是「跨页题」的表示法。
+    seq: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    # 段序号（0 起）。单页题恒为 0；跨页题按页界先后 0,1,…，拼接顺序就是它。
+    seg: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     # 卷面题号。老师填了就一定用它（不采信模型认的题号）；空着才回落到模型的 q_no。
     q_no: Mapped[str] = mapped_column(String, default="", server_default="")
     box: Mapped[str] = mapped_column(Text, default="[]", server_default="[]")     # [x0,y0,x1,y1]，0~1000
     created_at: Mapped[str] = mapped_column(Text, default=_now, server_default=NOW)
 
-    __table_args__ = (Index("idx_hwregions_grade", "grade_id", "page_no", "seq"),)
+    __table_args__ = (Index("idx_hwregions_grade", "grade_id", "seq", "seg"),)

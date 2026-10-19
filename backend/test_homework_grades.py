@@ -1056,7 +1056,7 @@ def t_regions() -> None:
         db.commit()
 
         # ---------------- 存框 / 整页替换 ----------------
-        out = G.put_page_regions(db, g.id, GradeRegionsPut(page_no=1, regions=[
+        out = G.put_regions(db, g.id, GradeRegionsPut(regions=[
             GradeRegionIn(q_no="1", box=[50, 100, 900, 300]),
             GradeRegionIn(q_no="2", box=[50, 320, 900, 520]),
             GradeRegionIn(q_no="", box=[50, 540, 900, 700]),
@@ -1070,28 +1070,28 @@ def t_regions() -> None:
         check("detail 里能拿到 regions（前端要靠它画框）",
               len(G.detail(db, g)["regions"]) == 3)
 
-        out2 = G.put_page_regions(db, g.id, GradeRegionsPut(page_no=1, regions=[
+        out2 = G.put_regions(db, g.id, GradeRegionsPut(regions=[
             GradeRegionIn(q_no="1", box=[40, 90, 940, 380]),
         ]))
         check("再存一次是**整页替换**（3 → 1，不叠加）", len(out2) == 1, len(out2))
-        out3 = G.put_page_regions(db, g.id, GradeRegionsPut(page_no=1, regions=[]))
+        out3 = G.put_regions(db, g.id, GradeRegionsPut(regions=[]))
         check("传空数组 = 清空这一页的框（退回整页批）", out3 == [], out3)
 
         # ---------------- 拒绝无效输入 ----------------
-        st, msg = expect_err(G.put_page_regions, db, g.id, GradeRegionsPut(
-            page_no=1, regions=[GradeRegionIn(box=[10, 10, 20, 20])]))
+        st, msg = expect_err(G.put_regions, db, g.id, GradeRegionsPut(regions=[GradeRegionIn(box=[10, 10, 20, 20])]))
         check("框太小 → 422", st == 422, (st, msg))
         check("并且说人话（指出第几个框、要框住一整题）",
               "一整道题" in msg and "第 1 个框" in msg, msg)
 
         g.total = 1
         db.commit()
-        st, msg = expect_err(G.put_page_regions, db, g.id, GradeRegionsPut(page_no=2, regions=[]))
+        st, msg = expect_err(G.put_regions, db, g.id, GradeRegionsPut(
+            regions=[GradeRegionIn(page_no=2, box=[50, 100, 900, 300])]))
         check("页号超出这份作业 → 422", st == 422 and "只有 1 页" in msg, (st, msg))
 
         g.status = "running"
         db.commit()
-        st, msg = expect_err(G.put_page_regions, db, g.id, GradeRegionsPut(page_no=1, regions=[]))
+        st, msg = expect_err(G.put_regions, db, g.id, GradeRegionsPut(regions=[]))
         check("正在批改时不许改框 → 409", st == 409, (st, msg))
         g.status = "reviewing"
         db.commit()
@@ -1101,7 +1101,7 @@ def t_regions() -> None:
         db.commit()
         g2 = G.create_grade(db, GradeIn(lesson_id=ls.id, file_ids=[s2.id], answer_mode="ai"))
         db.commit()
-        G.put_page_regions(db, g.id, GradeRegionsPut(page_no=1, regions=[
+        G.put_regions(db, g.id, GradeRegionsPut(regions=[
             GradeRegionIn(q_no="1", box=[50, 100, 900, 300]),
             GradeRegionIn(q_no="2", box=[50, 320, 900, 520]),
         ]))
@@ -1147,7 +1147,7 @@ def t_regions() -> None:
         # ---------------- 按框批：一框一次调用 ----------------
         g4 = G.create_grade(db, GradeIn(lesson_id=ls.id, file_ids=[s1.id], answer_mode="ai"))
         db.commit()
-        G.put_page_regions(db, g4.id, GradeRegionsPut(page_no=1, regions=[
+        G.put_regions(db, g4.id, GradeRegionsPut(regions=[
             GradeRegionIn(q_no="1", box=[50, 100, 900, 300]),
             GradeRegionIn(q_no="2", box=[50, 320, 900, 520]),
         ]))
@@ -1191,7 +1191,7 @@ def t_regions() -> None:
         # ---------------- 单框失败不毁整页 ----------------
         g5 = G.create_grade(db, GradeIn(lesson_id=ls.id, file_ids=[s1.id], answer_mode="ai"))
         db.commit()
-        G.put_page_regions(db, g5.id, GradeRegionsPut(page_no=1, regions=[
+        G.put_regions(db, g5.id, GradeRegionsPut(regions=[
             GradeRegionIn(q_no="1", box=[50, 100, 900, 300]),
             GradeRegionIn(q_no="2", box=[50, 320, 900, 520]),
         ]))
@@ -1227,7 +1227,7 @@ def t_regions() -> None:
         # ---------------- 全失败 → 整页失败 ----------------
         g6 = G.create_grade(db, GradeIn(lesson_id=ls.id, file_ids=[s1.id], answer_mode="ai"))
         db.commit()
-        G.put_page_regions(db, g6.id, GradeRegionsPut(page_no=1, regions=[
+        G.put_regions(db, g6.id, GradeRegionsPut(regions=[
             GradeRegionIn(q_no="1", box=[50, 100, 900, 300]),
         ]))
 
@@ -1289,6 +1289,313 @@ def t_regions() -> None:
         db.close()
 
 
+# ================================================================ ⑩ 跨页题（一题多段）
+def make_pdf(path: Path, pages: int = 2) -> None:
+    """手造一张多页 PDF。跨页题**只可能**发生在 PDF 上（照片一页一张）。"""
+    import pymupdf         # 只在测试里用；生产代码的 AGPL 边界在 adapters/pdf.py
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    doc = pymupdf.open()
+    for i in range(pages):
+        page = doc.new_page(width=595, height=842)
+        page.insert_text((72, 120), f"page {i + 1}")
+    doc.save(str(path))
+    doc.close()
+
+
+def mk_pdf_submission(db, ls: Lesson, pages: int = 2, name: str = "两页卷.pdf") -> LessonFile:
+    p = config.UPLOAD_DIR / "students" / f"u{ls.student_id}_x" / "hw" / name
+    make_pdf(p, pages)
+    lf = LessonFile(lesson_id=ls.id, name=name, stored=_rel(p), role="homework",
+                    kind="pdf", size_bytes=p.stat().st_size, pages=pages)
+    db.add(lf)
+    db.flush()
+    return lf
+
+
+def t_cross_page() -> None:
+    """跨页题（0029）：一题两段，竖拼成一张图、只调一次模型。
+
+    需求原话（用户 2026-10-19）：
+    「参考该项目批量录题的部分逻辑吧，即可分割、可框图，还有跨页题目分割方案，
+      区别在给 AI 的内容和输出结果不同，部分功能完全没必要重新造轮子」
+
+    守的几件事：
+
+      1. 同一 `seq` 的多段 = **一道题**，跨页题只调一次模型（不是两次）。
+      2. 拼接顺序由**几何**决定（先页、再上边），不信前端给的 `seg` ——
+         段序是事实，让界面维护它迟早出错。
+      3. 跨页块只在**起始页**处理。否则两页线程各批一次同一道题，结果互相覆盖。
+      4. 跨页裁切走 `pdf_adapter.crop_regions`（批量录题的原貌图就是它），
+         不自己写拼接 —— 这是「不重造轮子」最具体的一处。
+      5. 照片提交件不假装能跨页：一页一张，页号越界要被挡住。
+    """
+    print("\n=== ⑩ 跨页题（一题多段竖拼） ===")
+    db = SessionLocal()
+    try:
+        stu = mk_student(db, "跨页测试学生")
+        ls = mk_lesson(db, stu)
+        lf = mk_pdf_submission(db, ls, pages=2)
+        db.commit()
+        g = G.create_grade(db, GradeIn(lesson_id=ls.id, file_ids=[lf.id], answer_mode="ai"))
+        db.commit()
+        check("两页 PDF 建出来的 total = 2（页数，不是题数）", g.total == 2, g.total)
+
+        out = G.put_regions(db, g.id, GradeRegionsPut(grouped=True, regions=[
+            GradeRegionIn(page_no=1, seq=0, q_no="1", box=[50, 600, 950, 980]),
+            GradeRegionIn(page_no=2, seq=0, q_no="1", box=[50, 20, 950, 400]),
+            GradeRegionIn(page_no=2, seq=1, q_no="2", box=[50, 450, 950, 900]),
+        ]))
+        check("三段都存下来了", len(out) == 3, len(out))
+
+        blocks = G.blocks_of(db, g.id)
+        check("★ 同一 seq 的多段合成一题（3 段 → 2 题）", len(blocks) == 2, len(blocks))
+        check("第 1 题被判成跨页题", blocks[0]["cross_page"] is True, blocks[0])
+        check("跨页题的两段按「先页、再上边」排（拼出来才对得上）",
+              [s["page_no"] for s in blocks[0]["segments"]] == [1, 2], blocks[0]["segments"])
+        check("段的 seg 被重排成 0,1（不信前端给的顺序）",
+              [s["seg"] for s in blocks[0]["segments"]] == [0, 1],
+              [s["seg"] for s in blocks[0]["segments"]])
+        check("第 2 题只有一段、不是跨页（单页题不受影响）",
+              len(blocks[1]["segments"]) == 1 and blocks[1]["cross_page"] is False, blocks[1])
+
+        bp = G.blocks_by_page(db, g.id)
+        check("★ 跨页题只归起始页（第 1 页），第 2 页不会重复批",
+              len(bp.get(1) or []) == 1 and len(bp.get(2) or []) == 1,
+              {k: len(v) for k, v in bp.items()})
+
+        # 前端给的 seg 故意写反：后端必须按几何纠正
+        G.put_regions(db, g.id, GradeRegionsPut(grouped=True, regions=[
+            GradeRegionIn(page_no=2, seq=0, seg=0, box=[50, 20, 950, 400]),
+            GradeRegionIn(page_no=1, seq=0, seg=1, box=[50, 600, 950, 980]),
+        ]))
+        fixed = G.blocks_of(db, g.id)[0]
+        check("★ 前端把 seg 写反了也会被几何纠正（第 1 页那段排在前）",
+              [s["page_no"] for s in fixed["segments"]] == [1, 2], fixed["segments"])
+
+        # ---------------- 裁切：复用 pdf_adapter.crop_regions ----------------
+        G.put_regions(db, g.id, GradeRegionsPut(grouped=True, regions=[
+            GradeRegionIn(page_no=1, seq=0, q_no="1", box=[50, 600, 950, 980]),
+            GradeRegionIn(page_no=2, seq=0, q_no="1", box=[50, 20, 950, 400]),
+            GradeRegionIn(page_no=2, seq=1, q_no="2", box=[50, 450, 950, 900]),
+        ]))
+        blocks = G.blocks_of(db, g.id)
+        slots = {s["pno"]: s for s in G._page_slots(db, g)}
+        outdir = TMP / "crops_cross"
+        tiled = G._crop_block(blocks[0], slots, outdir)
+        check("跨页块能裁出一张图", tiled is not None and Path(tiled).exists(), tiled)
+        single = G._crop_block(blocks[1], slots, outdir)
+        check("单段块也能裁出来（这条路没被跨页改坏）",
+              single is not None and Path(single).exists(), single)
+
+        from PIL import Image
+        with Image.open(tiled) as im:
+            tw, th = im.size
+        with Image.open(single) as im:
+            sw, sh = im.size
+        # ⚠️ 不能比像素高度：单段与跨页图都会缩放到长边 GRADE_MAX_EDGE，
+        #    比出来一样高（那不是没拼）。要比**高宽比** —— 两段竖拼后明显更竖。
+        check("★ 拼出来的图明显更竖（两段真的竖拼了，不是只裁了第一段）",
+              (th / tw) > (sh / sw) * 1.5, (th, tw, sh, sw))
+
+        # ---------------- 一题一次调用 ----------------
+        seen: list[dict] = []
+        orig = G._recognize_region
+
+        def fake(png, ctx):
+            seen.append({"span": ctx.get("span_pages"), "label": ctx.get("region_label"),
+                         "page": ctx.get("page_no"), "region": ctx.get("region")})
+            return ([item_payload(q_no="9", verdict="correct")], "")
+
+        G._recognize_region = fake
+        try:
+            G.launch(db, g)
+            for _ in range(200):
+                db.refresh(g)
+                if g.status in ("reviewing", "done", "partial", "failed"):
+                    break
+                time.sleep(0.1)
+        finally:
+            G._recognize_region = orig
+
+        check("★ 3 段 2 题 → 只调 2 次模型（跨页题不是两题）", len(seen) == 2, seen)
+        check("每次都是单题口径（region=True）", all(s["region"] is True for s in seen), seen)
+        check("★ 跨页那一次带上了 span_pages（提示词要说明图是拼起来的）",
+              any(s["span"] == [1, 2] for s in seen), seen)
+        check("单段那一次没有 span_pages（不冒充跨页）",
+              any(s["span"] is None for s in seen), seen)
+
+        items = db.scalars(select(HomeworkGradeItem)
+                           .where(HomeworkGradeItem.grade_id == g.id)
+                           .order_by(HomeworkGradeItem.seq)).all()
+        check("落库还是 2 题（跨页题没被拆成两条）", len(items) == 2, len(items))
+        check("题号用块绑定的（模型给的是 9）", [i.q_no for i in items] == ["1", "2"],
+              [i.q_no for i in items])
+
+        # ---------------- 提示词：跨页要说清 ----------------
+        from app.services import grade_ai as A
+        p_cross = A._prompt_for("ai", {"page_no": 1, "region": True,
+                                       "region_label": "1", "span_pages": [1, 2]})
+        check("★ 提示词说明「这一张图是跨页拼起来的」", "跨页拼起来" in p_cross)
+        check("并且点明白缝不是题目结束（否则下半段会被丢）", "白缝不是题目结束" in p_cross)
+        check("单段口径里不出现跨页那段（不能无中生有）",
+              "跨页拼起来" not in A._prompt_for("ai", {"page_no": 1, "region": True}))
+
+        # ---------------- 前端接线：跨页得靠界面才画得出来 ----------------
+        view = read(FE / "src" / "views" / "HomeworkGrade.js")
+        check("前端有「并入上一题」（跨页题的收口动作）",
+              "并入上一题" in view and "mergeRegion" in view)
+        check("★ 保存时显式声明 grouped=true（不传就退成「一框一题」，跨页题会被拆两题）",
+              "grouped: true" in view)
+        check("★ 草稿是整份按页分桶的（editAll）—— 否则翻一下页上半段就丢了",
+              "const editAll = ref({})" in view)
+        check("★ 翻页不再弹「未保存」（跨页画框本来就要来回翻）",
+              "翻页就丢了" not in code_only(view))
+        check("面板上标出跨页（跨第 N + M 页）", "跨第" in view and "pages.join" in view)
+    finally:
+        db.close()
+
+
+# ================================================================ ⑪ 判据传图
+def mk_answer_image(db, ls: Lesson, name: str = "答案.png") -> LessonFile:
+    p = config.UPLOAD_DIR / "students" / f"u{ls.student_id}_x" / "hw" / name
+    make_png(p, 200, 260)
+    lf = LessonFile(lesson_id=ls.id, name=name, stored=_rel(p), role="homework",
+                    kind="image", size_bytes=p.stat().st_size, text="",
+                    reason="照片/扫描件不抽文字")
+    db.add(lf)
+    db.flush()
+    return lf
+
+
+def t_answer_images() -> None:
+    """判据能传图（老师给的答案/细则是一张照片）。
+
+    需求原话：「判定依据中的『用我给的答案』『用我的评分细则』，要求能够传图」
+
+    以前的做法是**把这种文件拦在门外**（422：照片不抽文字，请粘贴文字）。
+    那个拦截本身是对的 —— 模型看不见答案却仍然显示「按老师答案判」是拿错标准批学生。
+    真正的解法不是放宽校验，而是**把图真的送进去**，所以这里三处一起改：
+
+      1. `create_grade` 放行图片答案（不再 422）；
+      2. `_ctx_base` 带上 `answer_images` / `rubric_images`；
+      3. `grade_ai` 多图一起发，并在提示词里**说清第几张是什么**。
+    """
+    print("\n=== ⑪ 判据传图（答案/细则可以是照片） ===")
+    db = SessionLocal()
+    try:
+        stu = mk_student(db, "判据传图学生")
+        ls = mk_lesson(db, stu)
+        sub = mk_submission(db, ls, "作业.png")
+        ans = mk_answer_image(db, ls, "答案照片.png")
+        db.commit()
+
+        # ---------------- 建任务：图片答案不再被拦 ----------------
+        g = G.create_grade(db, GradeIn(lesson_id=ls.id, file_ids=[sub.id],
+                                       answer_mode="key", answer_file_ids=[ans.id]))
+        db.commit()
+        check("★ 图片答案能建任务（以前直接 422）", g.id is not None, g.id)
+
+        ctx = G._ctx_base(db, g)
+        check("ctx 里带上了答案图", len(ctx.get("answer_images") or []) == 1,
+              ctx.get("answer_images"))
+        check("答案文字仍然为空（图没被当成文字）", (ctx.get("answer_text") or "") == "",
+              ctx.get("answer_text"))
+        check("rubric 模式那份不混进答案图", (ctx.get("rubric_images") or []) == [],
+              ctx.get("rubric_images"))
+
+        # ---------------- AI 层：多图 + 说清第几张 ----------------
+        from app.services import grade_ai as A
+        uri_ctx = {**ctx, "answer_mode": "key"}
+        uris = A._image_uris(str(TMP / "page_for_crop.png"), uri_ctx)
+        check("★ 送模型的是 2 张图（学生作答 + 老师答案）", len(uris) == 2, len(uris))
+        check("两张都是 data URI", all(u.startswith("data:image/jpeg;base64,") for u in uris),
+              [u[:24] for u in uris])
+
+        p_key = A._prompt_for("key", uri_ctx)
+        check("★ 提示词说清「第 1 张是学生作答」", "第 1 张：**学生作答**" in p_key, p_key[:200])
+        check("★ 提示词说清「第 2 张是老师答案，不是学生写的」",
+              "第 2 张" in p_key and "不是学生写的" in p_key)
+        check("并且明说不要把答案算进 student_answer",
+              "不要把它上面的内容当成 student_answer" in p_key)
+        check("答案正文为空时点明「在附图上」（不能说空着就按老师答案判）",
+              "答案在附图上" in p_key)
+
+        # rubric 走另一组字段，不能串
+        ans2 = mk_answer_image(db, ls, "细则照片.png")
+        db.commit()
+        g_rub = G.create_grade(db, GradeIn(lesson_id=ls.id, file_ids=[sub.id],
+                                          answer_mode="rubric", answer_file_ids=[ans2.id]))
+        db.commit()
+        ctx_r = G._ctx_base(db, g_rub)
+        check("rubric 模式的图进 rubric_images", len(ctx_r.get("rubric_images") or []) == 1,
+              ctx_r.get("rubric_images"))
+        check("并且不混进 answer_images", (ctx_r.get("answer_images") or []) == [],
+              ctx_r.get("answer_images"))
+        p_rub = A._prompt_for("rubric", {**ctx_r, "answer_mode": "rubric"})
+        check("细则的提示词点明「在附图上」", "评分细则在附图上" in p_rub)
+        check("细则模式下第 2 张被叫作评分细则（不是答案）",
+              "老师的评分细则" in p_rub and "老师的标准答案" not in p_rub)
+
+        # ---------------- 有文字的文件不重复送图 ----------------
+        g_txt = G.create_grade(db, GradeIn(lesson_id=ls.id, file_ids=[sub.id],
+                                           answer_mode="key", answer_text="答案：x=2 或 x=3"))
+        db.commit()
+        ctx_txt = G._ctx_base(db, g_txt)
+        check("粘贴了文字 → 不再额外送图（同一份依据别花两遍 token）",
+              (ctx_txt.get("answer_images") or []) == [], ctx_txt.get("answer_images"))
+        check("文字依据原样在 ctx 里", "x=2 或 x=3" in (ctx_txt.get("answer_text") or ""),
+              ctx_txt.get("answer_text"))
+
+        # ---------------- 开批前换图 ----------------
+        g_sw = G.create_grade(db, GradeIn(lesson_id=ls.id, file_ids=[sub.id],
+                                          answer_mode="key", answer_text="先给个占位"))
+        db.commit()
+        G.patch_setup(db, g_sw.id, GradeSetupPatch(answer_file_ids=[ans.id]))
+        check("★ 开批前能把答案换成照片（以前只能重建任务）",
+              len((G._ctx_base(db, g_sw) or {}).get("answer_images") or []) == 1)
+        G.patch_setup(db, g_sw.id, GradeSetupPatch(answer_file_ids=[]))
+        check("传 [] 能清空（回到只有文字）",
+              (G._ctx_base(db, g_sw).get("answer_images") or []) == [])
+        check("清空文件后粘贴的文字还在（两件事互不覆盖）",
+              "占位" in (G._ctx_base(db, g_sw).get("answer_text") or ""))
+
+        # ---------------- 既没文字、又不是图片：仍然要拦 ----------------
+        dummy = config.UPLOAD_DIR / "students" / f"u{stu.id}_x" / "hw" / "答案.docx"
+        dummy.parent.mkdir(parents=True, exist_ok=True)
+        dummy.write_bytes(b"x")
+        bad = LessonFile(lesson_id=ls.id, name="答案.docx",
+                         stored=_rel(dummy), role="homework",
+                         kind="docx", size_bytes=10, text="")
+        db.add(bad)
+        db.commit()
+        st, msg = expect_err(G.create_grade, db, GradeIn(
+            lesson_id=ls.id, file_ids=[sub.id], answer_mode="key", answer_file_ids=[bad.id]))
+        check("★ 既没文字又不能当图看 → 仍然 422（不能偷偷按 AI 自解批）", st == 422, (st, msg))
+        check("并且给了可执行的出路（粘文字 / 传照片）",
+              "粘贴文字" in msg and "答案照片" in msg, msg)
+
+        # ai 模式不该带任何依据
+        g_ai = G.create_grade(db, GradeIn(lesson_id=ls.id, file_ids=[sub.id], answer_mode="ai"))
+        db.commit()
+        ctx_ai = G._ctx_base(db, g_ai)
+        check("ai 模式下不塞任何答案图（老师没给依据）",
+              (ctx_ai.get("answer_images") or []) == [] and
+              (ctx_ai.get("answer_text") or "") == "", ctx_ai)
+
+        # ---------------- 前端：设置区能传照片 ----------------
+        view = read(FE / "src" / "views" / "HomeworkGrade.js")
+        check("设置区有「直接传照片」入口", "直接传照片" in view)
+        check("★ 上传后立刻把文件 id 挂进判定依据（不是等老师再点一次保存）",
+              "answer_file_ids: setupAnswerFiles.value" in view)
+        check("★ file input 不设 accept（本机经验：accept 会把老师要选的文件藏起来）",
+              "accept=" not in view)
+        check("上传走这一课的文件接口（role=homework，与提交件同一份清单）",
+              "lessonFilesApi.upload(detail.value.lesson_id, fd, 'homework')" in view)
+    finally:
+        db.close()
+
+
 # ================================================================ main
 def main() -> int:
     Base.metadata.create_all(engine)
@@ -1304,6 +1611,8 @@ def main() -> int:
     t_frontend()
     t_ink_export()
     t_regions()
+    t_cross_page()
+    t_answer_images()
 
     print("\n" + "=" * 72)
     print(f"共 {total} 项，失败 {len(fails)} 项")

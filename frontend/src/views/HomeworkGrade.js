@@ -20,7 +20,7 @@
 //    停下来那一刻提示一次，不每轮都弹。轮询失败不弹错误（下一轮还会来）。
 import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue';
 import { useRoute } from 'vue-router';
-import { gradeApi } from '../api.js';
+import { gradeApi, lessonFilesApi } from '../api.js';
 import { ensureLibs, renderRichEl } from '../mathRender.js';
 import { fail, ok, warn } from '../store.js';
 import GradeMarkLayer from '../components/GradeMarkLayer.js';
@@ -152,65 +152,183 @@ export default {
     const pageRegions = computed(
       () => regions.value.filter((r) => Number(r.page_no || 1) === pageNo.value),
     );
-    const editRegions = ref([]);        // 当前页的本地草稿（只在框题模式有意义）
+    /* ⚠️ 草稿是**整份**的（按页分桶），不是「当前页一份」。
+     *    跨页题的几段天然落在不同页上：第 1 页画上半、翻页画下半，然后合成一道题。
+     *    如果草稿只存当前页，翻一下页上半段就没了 —— 跨页根本画不出来。
+     *    翻页**不提示未保存**（那是框题的常态操作），只有离开框题模式才提示。 */
+    const editAll = ref({});            // { 页号: [段…] }，每段 { id, seq, q_no, box }
+    const editRegions = computed(() => editAll.value[pageNo.value] || []);
     const regionsDirty = ref(false);
     const editingRegions = computed(() => tool.value === 'region');
 
+    /** 把一串段按「题」（`seq`）聚合成块。界面上一行是一道题，不是一个框。 */
+    function groupSegs(list) {
+      const by = new Map();
+      (list || []).forEach((s) => {
+        const k = Number(s.seq || 0);
+        if (!by.has(k)) by.set(k, []);
+        by.get(k).push(s);
+      });
+      return Array.from(by.entries())
+        .sort((a, b) => a[0] - b[0])
+        .map(([seq, segs]) => {
+          const ordered = segs.slice().sort(
+            (a, b) => Number(a.page_no || 1) - Number(b.page_no || 1)
+              || Number((a.box || [0, 0])[1] || 0) - Number((b.box || [0, 0])[1] || 0),
+          );
+          const q = (ordered.find((s) => String(s.q_no || '').trim()) || {}).q_no || '';
+          return {
+            seq, q_no: String(q).trim(), label: String(q).trim() || String(seq + 1),
+            segs: ordered, pages: ordered.map((s) => Number(s.page_no || 1)),
+          };
+        });
+    }
+
+    /** 草稿摊平成段（每段补上它属于哪一页）。 */
+    function allDraftSegs() {
+      const out = [];
+      Object.entries(editAll.value || {}).forEach(([p, list]) => {
+        (list || []).forEach((s) => out.push({ ...s, page_no: Number(p) }));
+      });
+      return out;
+    }
+
+    /** 面板要显示的「题」：框题模式下是草稿，平时是服务器存的。 */
+    const regionBlocks = computed(
+      () => groupSegs(editingRegions.value ? allDraftSegs() : regions.value),
+    );
+    /** 草稿里的**框**（段）总数 —— 与「题数」不是一个数，跨页题是 1 题 2 框。 */
+    const draftSegCount = computed(() => allDraftSegs().length);
+
+    /** 交给标注层画的框：每段一个框，label 用**它所属那道题**的标签（跨页两段同号）。 */
+    const layerRegions = computed(() => {
+      if (!editingRegions.value) return pageRegions.value;
+      const labels = new Map(regionBlocks.value.map((b) => [Number(b.seq), b.label]));
+      return editRegions.value.map((s) => ({
+        ...s, label: labels.get(Number(s.seq)) || '',
+      }));
+    });
+
     function syncRegions() {
-      editRegions.value = pageRegions.value.map((r) => ({ ...r }));
+      const by = {};
+      regions.value.forEach((r) => {
+        const p = Number(r.page_no || 1);
+        (by[p] = by[p] || []).push({
+          id: r.id, seq: Number(r.seq || 0), q_no: r.q_no || '',
+          box: (r.box || []).slice(), page_no: p,
+        });
+      });
+      editAll.value = by;
       regionsDirty.value = false;
     }
 
     /** 画完一个框（标注层发上来的是 [x0,y0,x1,y1]）。只在本地，点「保存框」才落库。 */
     function addRegionBox(box) {
-      const n = editRegions.value.length + 1;
-      editRegions.value = editRegions.value.concat([
-        { id: null, q_no: '', box, label: String(n) },
-      ]);
+      const p = pageNo.value;
+      const list = (editAll.value[p] || []).slice();
+      const used = allDraftSegs().map((s) => Number(s.seq || 0));
+      const seq = used.length ? Math.max(...used) + 1 : 0;
+      list.push({ id: null, seq, q_no: '', box, page_no: p });
+      editAll.value = { ...editAll.value, [p]: list };
       regionsDirty.value = true;
     }
 
-    /** 点图上的框 / 列表里的 × → 只从草稿里去掉（保存时才真的删）。 */
+    /** 点图上的框 → 只从草稿里去掉这一段（保存时才真的删）。 */
     function dropRegion(r) {
-      editRegions.value = editRegions.value.filter((x) => x !== r);
+      const p = pageNo.value;
+      editAll.value = {
+        ...editAll.value, [p]: editRegions.value.filter((x) => x !== r),
+      };
       regionsDirty.value = true;
       relabelRegions();
     }
 
-    /** 序号跟着当前位置走：老师删掉中间一个，后面的框号要顺上来，否则 1、3、4 看着像丢了一个。 */
+    /** 删掉**整道题**（跨页题的两段一起删）—— 面板上的「删」按钮。 */
+    function dropBlock(b) {
+      const next = {};
+      Object.entries(editAll.value).forEach(([p, list]) => {
+        next[p] = (list || []).filter((s) => Number(s.seq) !== Number(b.seq));
+      });
+      editAll.value = next;
+      regionsDirty.value = true;
+      relabelRegions();
+    }
+
+    /** 把这道题并入**上一题**（跨页题的收口动作，与批量录题的「并入上一块」同一个意思）。 */
+    function mergeRegion(b) {
+      const blocks = regionBlocks.value;
+      const i = blocks.findIndex((x) => Number(x.seq) === Number(b.seq));
+      if (i <= 0) {
+        warn('这就是第一题，上面没有可以并的');
+        return;
+      }
+      const prev = Number(blocks[i - 1].seq);
+      const next = {};
+      Object.entries(editAll.value).forEach(([p, list]) => {
+        next[p] = (list || []).map(
+          (s) => (Number(s.seq) === Number(b.seq) ? { ...s, seq: prev } : s),
+        );
+      });
+      editAll.value = next;
+      regionsDirty.value = true;
+      relabelRegions();
+    }
+
+    /** 题号重排成 0..n-1：老师删掉中间一题后，后面的要顺上来，否则 1、3、4 像丢了一题。 */
     function relabelRegions() {
-      editRegions.value = editRegions.value.map((x, i) => ({
-        ...x, label: String(x.q_no || '').trim() || String(i + 1),
-      }));
+      const blocks = groupSegs(allDraftSegs());
+      const remap = new Map(blocks.map((b, i) => [Number(b.seq), i]));
+      const next = {};
+      Object.entries(editAll.value).forEach(([p, list]) => {
+        next[p] = (list || []).map((s) => {
+          const k = Number(s.seq);
+          return { ...s, seq: remap.has(k) ? remap.get(k) : k };
+        });
+      });
+      editAll.value = next;
     }
 
-    function setRegionQNo(r, v) {
-      r.q_no = v;
+    /** 改题号 = 改**整道题**（跨页题两段一起改，否则会变成两道题）。 */
+    function setRegionQNo(b, v) {
+      const next = {};
+      Object.entries(editAll.value).forEach(([p, list]) => {
+        next[p] = (list || []).map(
+          (s) => (Number(s.seq) === Number(b.seq) ? { ...s, q_no: v } : s),
+        );
+      });
+      editAll.value = next;
       regionsDirty.value = true;
-      relabelRegions();
     }
 
-    /** 清空本页草稿（**只是草稿**，点保存才真的从库里删）。 */
+    /** 清空**整份**草稿（跨页框存在之后，「本页」这个词已经不够用了）。 */
     function clearRegions() {
-      if (!editRegions.value.length) return;
-      editRegions.value = [];
+      if (!allDraftSegs().length) return;
+      editAll.value = {};
       regionsDirty.value = true;
     }
 
     async function saveRegions() {
       busy.value = 'regions';
       try {
+        const segs = allDraftSegs();
+        // `grouped: true` 是**显式声明**「我按 seq 分好组了」。不传的话后端按
+        // 「一框一题」处理 —— 那是安全的默认值，但跨页题会被拆成两题。
         const res = await gradeApi.putRegions(gid, {
-          page_no: pageNo.value,
-          regions: editRegions.value.map((r) => ({
-            q_no: String(r.q_no || '').trim(), box: r.box,
+          grouped: true,
+          regions: segs.map((s) => ({
+            page_no: Number(s.page_no),
+            seq: Number(s.seq || 0),
+            q_no: String(s.q_no || '').trim(),
+            box: s.box,
           })),
         });
         detail.value.regions = res.regions;
         syncRegions();
-        ok(editRegions.value.length
-          ? `已保存 ${editRegions.value.length} 个框`
-          : '已清空这一页的框（这一页退回整页批）');
+        const blocks = groupSegs(res.regions || []);
+        const cross = blocks.filter((b) => b.pages.length > 1).length;
+        ok(segs.length
+          ? `已保存 ${blocks.length} 题（${segs.length} 个框${cross ? `，其中 ${cross} 题跨页` : ''}）`
+          : '已清空全部框 —— 整份退回整页批');
         if (items.value.length) {
           warn('框改了要重新批改一次才生效 —— 点右边「重新批改」');
         }
@@ -235,7 +353,9 @@ export default {
         const res = await gradeApi.copyRegions(gid, others[0].id);
         detail.value.regions = res.regions;
         syncRegions();
-        ok(`已沿用另一份的 ${res.regions.length} 个框 —— 扫一眼，框偏了就重画`);
+        const blocks = groupSegs(res.regions || []);
+        ok(`已沿用另一份的 ${blocks.length} 题（${(res.regions || []).length} 个框）`
+          + ' —— 扫一眼，框偏了就重画');
       } catch (e) {
         fail(e.message);
       } finally {
@@ -297,6 +417,18 @@ export default {
     const setupRubric = ref('');
     const setupTouched = ref(false);      // 用户动过没动过 —— 没动过就跟着服务端走
     const setupBusy = ref(false);
+    /** 答案/细则**引用的文件**（lesson_files.id）。
+     *  为什么要有这条：老师手上常常只有一张答案照片，没有可粘贴的文字。 */
+    const setupAnswerFiles = ref([]);
+    /** 服务器上「真的会被送进模型」的图片（按 role 分）。只给文字的话，
+     *  老师传了照片却看到答案框空着，会以为没生效。 */
+    const setupImages = computed(
+      () => (detail.value && detail.value.answer_images) || { answer: [], rubric: [] },
+    );
+    const answerImgCount = computed(
+      () => (setupImages.value.answer || []).length
+        + (setupImages.value.rubric || []).length,
+    );
     const setupEditable = computed(() => !!detail.value
       && ['queued', 'failed'].includes(detail.value.status) && !detail.value.done);
 
@@ -305,6 +437,7 @@ export default {
       setupMode.value = detail.value.answer_mode || 'ai';
       setupAnswer.value = detail.value.answer_text || '';
       setupRubric.value = detail.value.rubric_text || '';
+      setupAnswerFiles.value = (detail.value.answer_file_ids || []).map(Number);
       setupTouched.value = false;
     }
     function touchSetup() { setupTouched.value = true; }
@@ -318,6 +451,7 @@ export default {
           answer_mode: setupMode.value,
           answer_text: setupAnswer.value,
           rubric_text: setupRubric.value,
+          answer_file_ids: setupAnswerFiles.value,
         });
         initSetup();
         ok('判定依据改好了');
@@ -325,6 +459,60 @@ export default {
       } catch (e) {
         fail(e.message);
         return false;
+      } finally {
+        setupBusy.value = false;
+      }
+    }
+
+    /** 传一张答案 / 细则**照片**。图会真的随卷面一起送进模型（不是抽文字）。
+     *
+     *  为什么走 `role=homework`：这是**这次作业**的文件（答案页 / 细则页扫描件），
+     *  与提交件同一份清单，老师回头在「交作业」里也找得到，不会变成一份没人认领的孤儿。
+     *  ⚠️ `input` 上**不要**设 `accept` —— 本机经验：accept 会把老师想选的文件藏起来
+     *     （.lnk 那种），比选错更烦。格式不对后端会当场说清楚。 */
+    async function uploadAnswerImage(e) {
+      const file = (e.target && e.target.files && e.target.files[0]) || null;
+      if (e.target) e.target.value = '';      // 清掉 value：同一个文件再选一次也能触发
+      if (!file) return;
+      if (!setupEditable.value) {
+        warn('这份已经开始批了 —— 换依据要重建任务');
+        return;
+      }
+      setupBusy.value = true;
+      try {
+        const fd = new FormData();
+        fd.append('file', file);
+        const up = await lessonFilesApi.upload(detail.value.lesson_id, fd, 'homework');
+        setupAnswerFiles.value = setupAnswerFiles.value.concat([Number(up.id)]);
+        detail.value = await gradeApi.patchSetup(gid, {
+          answer_mode: setupMode.value,
+          answer_text: setupAnswer.value,
+          rubric_text: setupRubric.value,
+          answer_file_ids: setupAnswerFiles.value,
+        });
+        initSetup();
+        ok('答案照片传上去了 —— 批改时会把这张图一起给模型看');
+      } catch (err) {
+        fail(err.message);
+      } finally {
+        setupBusy.value = false;
+      }
+    }
+
+    async function clearAnswerImages() {
+      if (!setupEditable.value) {
+        warn('这份已经开始批了 —— 换依据要重建任务');
+        return;
+      }
+      setupBusy.value = true;
+      try {
+        detail.value = await gradeApi.patchSetup(gid, {
+          answer_mode: setupMode.value, answer_file_ids: [],
+        });
+        initSetup();
+        ok('已去掉答案照片 —— 只按粘贴的文字判');
+      } catch (err) {
+        fail(err.message);
       } finally {
         setupBusy.value = false;
       }
@@ -417,7 +605,7 @@ export default {
       const next = tool.value === t ? 'view' : t;   // 再点一次退出，不用另找「选择」按钮
       // 离开「框题」时没保存的框不能悄悄丢 —— 老师画了五个框最怕这个
       if (tool.value === 'region' && next !== 'region' && regionsDirty.value
-          && !window.confirm('这一页的框还没保存，切换就丢了。要放弃这些框吗？')) {
+          && !window.confirm('这些框还没保存，切换就丢了。要放弃吗？')) {
         return;
       }
       tool.value = next;
@@ -630,13 +818,11 @@ export default {
     function goPage(n) {
       const target = Math.min(Math.max(1, Number(n) || 1), pageCount.value);
       if (target === pageNo.value) return;
-      if (tool.value === 'region' && regionsDirty.value
-          && !window.confirm('这一页的框还没保存，翻页就丢了。要放弃吗？')) {
-        return;
-      }
+      // ⚠️ 框题模式下翻页**不提示未保存**：草稿是整份按页分桶存的（editAll），
+      //    翻页只是换一桶看。跨页题本来就是「第 1 页画一半、翻到第 2 页画另一半」，
+      //    每翻一次都弹一次确认，等于把这条操作路径堵死。
       pageNo.value = target;
       pageBroken.value = false;
-      if (tool.value === 'region') syncRegions();
     }
     const prevPage = () => goPage(pageNo.value - 1);
     const nextPage = () => goPage(pageNo.value + 1);
@@ -680,15 +866,17 @@ export default {
       setRich, setCard, goPage, prevPage, nextPage, onPick,
       verdictLabel, confLabel, flagLabel, naReason,
       setupMode, setupAnswer, setupRubric, setupTouched, setupBusy, setupEditable,
+      setupAnswerFiles, setupImages, answerImgCount, uploadAnswerImage, clearAnswerImages,
       touchSetup, saveSetup,
       // 手写批改
       tool, inkColor, textDraft, exporting, INK_COLORS, teacherMarks, layerEl,
       setTool, addMark, eraseMarks, onTextAt, saveText, moveMark,
       undoLast, clearPageMarks, exportFile,
       // 一题一区域（框题）：有框按框批，没框仍整页批
-      pageRegions, editRegions, regionsDirty, editingRegions,
-      addRegionBox, dropRegion, setRegionQNo, saveRegions, copyRegions, syncRegions,
-      clearRegions,
+      pageRegions, editRegions, layerRegions, regionsDirty, editingRegions,
+      regionBlocks, draftSegCount,
+      addRegionBox, dropRegion, dropBlock, mergeRegion, setRegionQNo,
+      saveRegions, copyRegions, syncRegions, clearRegions,
     };
   },
   template: `
@@ -784,6 +972,20 @@ export default {
           <textarea rows="5" v-model="setupRubric" :disabled="!setupEditable" @input="touchSetup"
                     placeholder="第 3 题（10 分）：设未知数 2 分；列方程 3 分；解方程 3 分；检验作答 2 分。只写答案不写过程最多给 4 分。"></textarea>
         </div>
+        <div v-if="setupMode !== 'ai'" class="field" style="margin-top:8px">
+          <label class="small">或者直接传照片
+            <span class="muted">（答案页 / 手写细则，拍一张就行 —— 图会随卷面一起给模型看）</span></label>
+          <div class="grade-ansfile">
+            <input type="file" :disabled="!setupEditable || setupBusy"
+                   @change="uploadAnswerImage">
+            <span v-if="answerImgCount" class="small" style="color:var(--success, #16a34a)">
+              已附 {{ answerImgCount }} 张
+            </span>
+            <button v-if="answerImgCount" class="btn ghost sm" :disabled="setupBusy"
+                    @click="clearAnswerImages">去掉</button>
+          </div>
+          <div v-if="!setupEditable" class="small muted">已开始批了，依据不能再换。</div>
+        </div>
         <div class="small muted" v-if="setupMode === 'ai'">
           AI 会自己先解一遍再对照。它解错时整题会判错 —— 核对时留意一下。
         </div>
@@ -836,36 +1038,42 @@ export default {
           <!-- ============ 框题面板：只在「框题」模式下出现 ============ -->
           <div v-if="tool === 'region'" class="grade-regions">
             <div class="gr-head">
-              <b>第 {{ pageNo }} 页的框</b>
-              <span class="small muted">{{ editRegions.length }} 个</span>
+              <b>框题</b>
+              <span class="small muted">{{ regionBlocks.length }} 题 · {{ draftSegCount }} 个框</span>
               <span v-if="regionsDirty" class="small" style="color:var(--warning)">未保存</span>
               <div class="spacer"></div>
               <button class="btn ghost sm" :disabled="busy === 'copy'" @click="copyRegions">
                 {{ busy === 'copy' ? '沿用中…' : '沿用上一份' }}
               </button>
-              <button class="btn ghost sm" :disabled="!editRegions.length" @click="clearRegions">全清</button>
+              <button class="btn ghost sm" :disabled="!draftSegCount" @click="clearRegions">全清</button>
               <button class="btn sm" :disabled="busy === 'regions'" @click="saveRegions">
                 {{ busy === 'regions' ? '保存中…' : '保存框' }}
               </button>
             </div>
-            <div v-if="!editRegions.length" class="small muted" style="padding:6px 0">
-              这一页还没画框 —— 拖一个框出来。有框的页<b>一框一次</b>判，
-              没框的页仍然整页判一次。切到「框题」再看这页就会带上框。
+            <div v-if="!regionBlocks.length" class="small muted" style="padding:6px 0">
+              还没画框 —— 在卷面上拖出一个框，把一道题（题干 + 作答）整个框进去。
+              有框的页<b>一框一次</b>判，没框的页仍然整页判一次。
             </div>
             <div v-else class="gr-list">
-              <div v-for="(r, i) in editRegions" :key="'r-' + i" class="gr-row">
-                <span class="gr-no">{{ i + 1 }}</span>
+              <div v-for="b in regionBlocks" :key="'b-' + b.seq" class="gr-row">
+                <span class="gr-no">{{ b.seq + 1 }}</span>
                 <label class="small">题号</label>
-                <input class="gr-q" :value="r.q_no" placeholder="留空就按顺序"
-                       @input="setRegionQNo(r, $event.target.value)">
-                <span class="small muted">框内批出来的题都记到这个题号上</span>
+                <input class="gr-q" :value="b.q_no" placeholder="留空就按顺序"
+                       @input="setRegionQNo(b, $event.target.value)">
+                <span v-if="b.pages.length > 1" class="gr-span" :title="'两段会竖拼成一张图再判'">
+                  跨第 {{ b.pages.join(' + ') }} 页 · {{ b.pages.length }} 段
+                </span>
+                <span v-else class="small muted">第 {{ b.pages[0] }} 页</span>
                 <div class="spacer"></div>
-                <button class="btn ghost sm" @click="dropRegion(r)">删</button>
+                <button v-if="b.seq > 0" class="btn ghost sm" @click="mergeRegion(b)"
+                        title="跨页题：并到上一题，两段竖拼成一张图">并入上一题</button>
+                <button class="btn ghost sm" @click="dropBlock(b)">删</button>
               </div>
             </div>
             <div class="small muted" style="margin-top:6px">
               题号由框绑定 —— 学生把「第 3 题」写成「第 8 题」也不会判错归属。
-              <b>画完一定要点「保存框」</b>，然后重新批改。
+              <b>跨页题</b>：在第 1 页框上半段、翻到第 2 页框下半段，再点下面那行的
+              「并入上一题」合成一道。<b>画完一定要点「保存框」</b>，然后重新批改。
             </div>
           </div>
 
@@ -875,7 +1083,7 @@ export default {
             <!-- ⚠️ 成对写，别写成自闭合：零构建的模板里自闭合会把后面的节点吞掉 -->
             <GradeMarkLayer ref="layerEl" :marks="pageMarks" :selected-item-id="selectedItemId"
                             :mode="tool" :color="inkColor"
-                            :regions="tool === 'region' ? editRegions : pageRegions"
+                            :regions="layerRegions"
                             @pick="onPick" @create="addMark" @erase="eraseMarks"
                             @text-at="onTextAt" @stamp="addMark" @move="moveMark"
                             @region="addRegionBox" @region-remove="dropRegion"></GradeMarkLayer>
