@@ -1,0 +1,500 @@
+/**
+ * 批改台（HomeworkGrade）的真挂载检查 —— 框题、图上读数、逐题卡片到底上没上屏。
+ *
+ *   node frontend/grade_mount_check.js    # 退出码即结果（0 通过 / 跳过，非 0 失败）
+ *
+ * ## 为什么要挂这一页
+ *
+ * 批改台是整个工作台里**最复杂的一屏**（左页图 + 标注层 + 工具条 + 框题面板 + 逐题卡片），
+ * 却是唯一一个「只有静态模板编译校验、没有真挂载」的视图 —— `papers` / `plan` / `prep`
+ * / `render` 都有 mount check，唯独它没有。而这一页正好踩满了本项目的两个经典坑：
+ *
+ *   ① **零构建 in-DOM 模板里自定义组件不能自闭合**。`<GradeMarkLayer />` 会把后面的
+ *      兄弟节点整个吞掉 → Vue compiler 报错 → **整页白屏，而接口测试全绿**。
+ *      静态断言只能看出「写没写成对」，看不出「挂起来之后还剩几个节点」。
+ *   ② **渲染容器必须空 div + 函数 ref**。`.g-rich` 里只要有插值，KaTeX 换掉文本节点后
+ *      内容就永远停在第一版。这只有真挂起来数 `.katex` 才知道。
+ *
+ * ## 本轮新增的两件事，静态断言都证明不了
+ *
+ *   · **一题一区域（框题）**：`regions` 传进标注层之后，`.rg-rect` 真的画出来了没有？
+ *     本地新画的草稿框（`id` 是 null）和服务器已存的框混在一个 v-for 里，
+ *     key 撞了没有？—— 撞了的话「删中间那个框」会删错格子，而**界面上看不出来**。
+ *   · **图上读到的（figure_note）**：这道题真的多出一块 `.g-figure` 吗？
+ *     没有 figure_note 的题是不是**不会**凭空多一块空壳？（.g-sec 会撑一条分隔线）
+ *
+ * ## 判据：挂载痕迹，不是「innerHTML 长度」
+ *
+ * 找不到 jsdom 就 **SKIP 并退出 0** —— 它只是开发期加固，不该把回归弄红。
+ */
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { pathToFileURL } = require('url');
+
+const ROOT = __dirname;                 // frontend/
+
+let JSDOM = null;
+
+/** jsdom 是**可选依赖**：按候选顺序找，都找不到就跳过（与 papers_mount_check.js 同一套）。 */
+function loadJsdom() {
+  const home = process.env.USERPROFILE || process.env.HOME || '';
+  const cands = [
+    process.env.SHIKE_JSDOM_DIR,
+    path.join(ROOT, '..', 'node_modules', 'jsdom'),
+    ...String(process.env.NODE_PATH || '').split(path.delimiter).map((p) => p && path.join(p, 'jsdom')),
+    home && path.join(home, '.workbuddy', 'binaries', 'node', 'workspace', 'node_modules', 'jsdom'),
+  ].filter(Boolean);
+  for (const c of cands) {
+    try {
+      const m = require(c);
+      if (m && m.JSDOM) { JSDOM = m.JSDOM; return c; }
+    } catch (e) { /* 换下一个候选 */ }
+  }
+  return null;
+}
+
+/* ====================== 桩：形状取自真实接口响应（不猜结构） ====================== */
+
+/** 收所有调用，最后拿它核对「点了按钮到底发了什么请求」。 */
+const CALLS_STUB = `
+export const CALLS = [];
+export const push = (name, args) => { CALLS.push({ name, args }); return name; };
+`;
+
+/** item 的形状照 backend/app/services/grade_store.py::item_dict 逐字来。 */
+const API_STUB = `
+import { CALLS, push } from './calls.js';
+
+const item = (o) => Object.assign({
+  id: 0, seq: 1, page_no: 1, q_no: '', qtype: '', stem: '', student_answer: '',
+  correct_answer: '', verdict: 'correct', score: null, full_score: null, basis: '',
+  confidence: 'high', kp_name: '', tags: [], error_reason: '', flags: [],
+  figure_note: '', status: 'pending', question_id: null,
+}, o);
+
+/** 三题：① 普通代数题 ② 几何题（有新加的 figure_note）③ 框里没读到题的占位。 */
+const DETAIL = {
+  id: 7, student_id: 5, lesson_id: 31, status: 'reviewing',
+  answer_mode: 'ai', answer_text: '', rubric_text: '',
+  total: 3, done: 3, failed: 0, score: null, full_score: null, error: '',
+  created_at: '2026-10-19T10:00:00', finished_at: '2026-10-19T10:03:00', reviewed_at: null,
+  files: [{ id: 1, role: 'submission', name: '作业.pdf', pages: 1 }],
+  items: [
+    item({ id: 101, seq: 1, q_no: '1', qtype: '解答题', verdict: 'correct',
+           stem: '解方程：$x^2-5x+6=0$。', student_answer: '$x=2$ 或 $x=3$',
+           correct_answer: '$x=2$ 或 $x=3$', basis: '因式分解后两根都对',
+           kp_name: '一元二次方程', tags: ['因式分解'] }),
+    item({ id: 102, seq: 2, q_no: '2', qtype: '证明题', verdict: 'partial',
+           stem: '如图，$AB=AC$，$D$ 为 $BC$ 中点，求证 $AD\\\\perp BC$。',
+           student_answer: '因为 $AB=AC$，$D$ 是中点，所以 $AD$ 垂直 $BC$',
+           correct_answer: '用 SSS 证 $\\\\triangle ABD\\\\cong\\\\triangle ACD$，得 $\\\\angle ADB=\\\\angle ADC=90^\\\\circ$',
+           basis: '结论对但缺「全等」这一步',
+           figure_note: '① 点与字母：A 在顶、B 左下、C 右下、D 在 BC 上（确定）；'
+             + '② 连线：AB、AC、AD，其中 AD 画成虚线（确定）；'
+             + '③ 记号：AD 与 BC 交点处有一个直角方框（确定）；④ 数值：无（确定）',
+           flags: ['low_confidence'], confidence: 'medium' }),
+    item({ id: 103, seq: 3, q_no: '3', qtype: '', verdict: 'ungradable',
+           stem: '', student_answer: '', error_reason: '框里没读到任何作答内容',
+           flags: ['region_empty'], confidence: '' }),
+  ],
+  marks: [
+    { id: 201, item_id: 101, page_no: 1, kind: 'check', geo: [120, 300, 40, 40],
+      points: [], text: '', color: '#dc2626', created_by: 'ai' },
+    { id: 202, item_id: 102, page_no: 1, kind: 'text', geo: [300, 520],
+      points: [], text: '缺全等', color: '#dc2626', created_by: 'teacher' },
+  ],
+  regions: [
+    { id: 301, page_no: 1, seq: 0, q_no: '1', label: '1', box: [40, 60, 900, 300] },
+    { id: 302, page_no: 1, seq: 1, q_no: '2', label: '2', box: [40, 340, 900, 620] },
+  ],
+};
+
+export const gradeApi = {
+  get: async (gid) => { push('get', [gid]); return JSON.parse(JSON.stringify(DETAIL)); },
+  list: async (lessonId) => {
+    push('list', [lessonId]);
+    return [{ id: 7, status: 'done' }, { id: 9, status: 'done' }];
+  },
+  putRegions: async (gid, body) => {
+    push('putRegions', [gid, body]);
+    // 真实后端是**整页替换**后回整份列表，这里照做（回带 id 的正式框）
+    const rows = body.regions.map((r, i) => ({
+      id: 400 + i, page_no: body.page_no, seq: i, q_no: r.q_no,
+      label: r.q_no || String(i + 1), box: r.box,
+    }));
+    const others = DETAIL.regions.filter((r) => r.page_no !== body.page_no);
+    DETAIL.regions = others.concat(rows);
+    return { regions: JSON.parse(JSON.stringify(DETAIL.regions)) };
+  },
+  copyRegions: async (gid, fromId) => {
+    push('copyRegions', [gid, fromId]);
+    return { regions: JSON.parse(JSON.stringify(DETAIL.regions)) };
+  },
+  pageUrl: (gid, pno) => '/api/homework-grades/' + gid + '/page/' + pno,
+  exportUrl: (gid, fmt, page) => '/api/homework-grades/' + gid + '/export?fmt=' + fmt + '&page=' + page,
+  patchItem: async (iid, body) => { push('patchItem', [iid, body]); return { ok: 1 }; },
+  rerunItem: async (iid) => { push('rerunItem', [iid]); return { ok: 1 }; },
+  toBank: async (iid, body) => { push('toBank', [iid, body]); return { ok: 1 }; },
+  patchSetup: async (gid, body) => { push('patchSetup', [gid, body]); return JSON.parse(JSON.stringify(DETAIL)); },
+  run: async (gid) => { push('run', [gid]); return JSON.parse(JSON.stringify(DETAIL)); },
+  confirm: async (gid, note) => { push('confirm', [gid, note]); return JSON.parse(JSON.stringify(DETAIL)); },
+  addMark: async (gid, body) => { push('addMark', [gid, body]); return { id: 999 }; },
+  patchMark: async (mid, body) => { push('patchMark', [mid, body]); return { ok: 1 }; },
+  removeMark: async (mid) => { push('removeMark', [mid]); return { ok: 1 }; },
+};
+export const CALLS_REF = CALLS;
+`;
+
+const STORE_STUB = `
+export const state = {};
+export const ok = () => {};
+export const fail = () => {};
+export const warn = () => {};
+`;
+
+/** 视图里写的是 \`from 'vue-router'\`；只用到 useRoute().params.id。 */
+const ROUTER_PKG = JSON.stringify({
+  name: 'vue-router', version: '0.0.0-stub', type: 'module',
+  main: 'index.js', exports: { '.': './index.js' },
+}, null, 2);
+const ROUTER_STUB = `
+export const useRoute = () => ({ params: { id: '7' }, query: {}, path: '/grade/7' });
+export const useRouter = () => ({ push: async () => {} });
+`;
+
+const VUE_PKG = JSON.stringify({
+  name: 'vue', version: '0.0.0-stub', type: 'module',
+  main: 'index.js', exports: { '.': './index.js' },
+}, null, 2);
+
+const VUE_SHIM = `
+const V = globalThis.__VUE__;
+if (!V) throw new Error('jsdom window 上没有 Vue —— vendor 没喂进去');
+export const computed = (...a) => V.computed(...a);
+export const nextTick = (...a) => V.nextTick(...a);
+export const ref = (...a) => V.ref(...a);
+export const watch = (...a) => V.watch(...a);
+export const reactive = (...a) => V.reactive(...a);
+export const onMounted = (...a) => V.onMounted(...a);
+export const onBeforeUnmount = (...a) => V.onBeforeUnmount(...a);
+export const createApp = (...a) => V.createApp(...a);
+export default V;
+`;
+
+/** 按依赖顺序喂：auto-render 一加载就把 window.katex 抓进闭包，必须排在 katex 后面。 */
+const VENDOR = [
+  'vendor/vue.global.prod.js',
+  'vendor/marked.min.js',
+  'vendor/purify.min.js',
+  'vendor/katex/katex.min.js',
+  'vendor/katex/auto-render.min.js',
+];
+
+/* ============================== 断言 ============================== */
+
+let total = 0;
+const fails = [];
+function check(label, got, want) {
+  total += 1;
+  const okk = JSON.stringify(got) === JSON.stringify(want);
+  console.log((okk ? '  [OK ] ' : '  [FAIL] ') + label + ': ' + JSON.stringify(got)
+    + (okk ? '' : '  期望 ' + JSON.stringify(want)));
+  if (!okk) fails.push(label);
+}
+function checkTrue(label, cond, detail) {
+  total += 1;
+  console.log((cond ? '  [OK ] ' : '  [FAIL] ') + label + (detail === undefined ? '' : ': ' + detail));
+  if (!cond) fails.push(label);
+}
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/* ============================== main ============================== */
+
+async function main() {
+  console.log('批改台 · 真挂载检查（jsdom 挂 HomeworkGrade.js，数渲染痕迹）');
+
+  const jsdomDir = loadJsdom();
+  if (!jsdomDir) {
+    console.log('  [SKIP] 没找到 jsdom（可选依赖），跳过');
+    return 0;
+  }
+  console.log('  jsdom: ' + jsdomDir);
+
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'grade_mount_'));
+  try {
+    // ---- 1. 搭骨架：视图与组件原样复制，依赖换桩 ----
+    fs.mkdirSync(path.join(tmp, 'src', 'views'), { recursive: true });
+    fs.mkdirSync(path.join(tmp, 'src', 'components'), { recursive: true });
+    fs.mkdirSync(path.join(tmp, 'node_modules', 'vue'), { recursive: true });
+    fs.mkdirSync(path.join(tmp, 'node_modules', 'vue-router'), { recursive: true });
+    const copy = (rel) => {
+      fs.mkdirSync(path.dirname(path.join(tmp, rel)), { recursive: true });
+      fs.copyFileSync(path.join(ROOT, rel), path.join(tmp, rel));
+    };
+    copy('src/views/HomeworkGrade.js');
+    copy('src/components/GradeMarkLayer.js');
+    // 坐标换算与渲染都走真代码 —— 框画在哪儿、公式渲不渲染，全靠这两个
+    copy('src/markGeom.js');
+    copy('src/mathRender.js');
+    fs.writeFileSync(path.join(tmp, 'src', 'calls.js'), CALLS_STUB);
+    fs.writeFileSync(path.join(tmp, 'src', 'api.js'), API_STUB);
+    fs.writeFileSync(path.join(tmp, 'src', 'store.js'), STORE_STUB);
+    fs.writeFileSync(path.join(tmp, 'node_modules', 'vue', 'package.json'), VUE_PKG);
+    fs.writeFileSync(path.join(tmp, 'node_modules', 'vue', 'index.js'), VUE_SHIM);
+    fs.writeFileSync(path.join(tmp, 'node_modules', 'vue-router', 'package.json'), ROUTER_PKG);
+    fs.writeFileSync(path.join(tmp, 'node_modules', 'vue-router', 'index.js'), ROUTER_STUB);
+
+    // ---- 2. jsdom + vendor ----
+    const dom = new JSDOM('<!DOCTYPE html><html><body><div id="app"></div></body></html>', {
+      url: 'http://127.0.0.1:8000/#/grade/7',
+      runScripts: 'outside-only',        // 给 window.eval 用；页面内脚本仍然不执行
+      pretendToBeVisual: true,
+    });
+    const W = dom.window;
+    global.window = W;
+    global.document = W.document;
+    global.navigator = W.navigator;
+    for (const f of VENDOR) {
+      const p = path.join(ROOT, f);
+      checkTrue('vendor 存在：' + f, fs.existsSync(p));
+      if (!fs.existsSync(p)) return 1;
+      W.eval(fs.readFileSync(p, 'utf8'));
+    }
+    global.__VUE__ = W.Vue;
+    checkTrue('Vue / marked / katex 都进了 window',
+      !!(W.Vue && W.marked && W.katex && W.renderMathInElement),
+      ['Vue', 'marked', 'katex', 'renderMathInElement'].filter((k) => !W[k]).join(', ') || '齐全');
+
+    /* jsdom 不下载外链脚本（没开 resources），但 mathRender.ensureLibs() 会建 <script src>
+     * 然后等 onload —— 事件永不到，paintAll 就卡在 await 上，公式一条都不会渲。
+     * 所以这里把「插 head」拦下来：vendor 已经用 eval 喂进 window 了，
+     * 直接把 onload 触发一下即可（等价于「脚本早就加载好了」）。 */
+    const head = W.document.head;
+    const origAppend = head.appendChild.bind(head);
+    head.appendChild = (el) => {
+      const r = origAppend(el);
+      const tag = String((el && el.tagName) || '').toUpperCase();
+      if (tag === 'SCRIPT' || tag === 'LINK') {
+        setTimeout(() => { try { if (el.onload) el.onload(); } catch (e) { /* 桩不该炸 */ } }, 0);
+      }
+      return r;
+    };
+
+    // jsdom 的 confirm / prompt 是「未实现就抛」；这页有两处真的会调，先接管
+    const asked = [];
+    W.confirm = (msg) => { asked.push(String(msg)); return W.__confirmAnswer !== false; };
+    W.prompt = (msg) => (W.__promptAnswer === undefined ? '老师备注' : W.__promptAnswer);
+
+    // ---- 3. 挂载真视图 ----
+    const mod = await import(pathToFileURL(path.join(tmp, 'src', 'views', 'HomeworkGrade.js')).href);
+    const app = W.Vue.createApp(mod.default);
+    // 真实应用里 router-link 是全局注册的；这里给个最小的，不然整片导航会消失
+    app.component('router-link', {
+      props: ['to'],
+      template: '<a :href="to"><slot></slot></a>',
+    });
+    const vm = app.mount('#app');
+    await sleep(500);
+
+    const D = W.document;
+    const root = D.querySelector('#app');
+    /* ⚠️ 必须**每次重新读**，不能 `const body = root.innerHTML` 存一份：
+     * 挂载后还会切模式、画框、保存，快照永远停在第一帧，断言就变成「验快照」了。 */
+    const body = () => root.innerHTML;
+    checkTrue('视图真的挂起来了（不是只剩未编译的模板）',
+      !body().includes('{{ ') && !body().includes('v-else-if=')
+      && /class="g-item/.test(body()),
+      '含 ' + body().length + ' 字符');
+    checkTrue('页头渲染出来了', (root.querySelector('h1') || {}).textContent === '作业批改',
+      (root.querySelector('h1') || {}).textContent);
+
+    /* ============ 4. 逐题卡片：文字、公式、判定 ============ */
+    const cards = () => Array.from(D.querySelectorAll('.g-item'));
+    check('逐题卡片 3 张', cards().length, 3);
+    checkTrue('★ 题干公式真的渲染了（.katex ≥ 2）',
+      D.querySelectorAll('.g-rich .katex').length >= 2,
+      D.querySelectorAll('.g-rich .katex').length + ' 个');
+    const richtexts = Array.from(D.querySelectorAll('.g-rich')).map((el) => el.textContent || '');
+    checkTrue('★ 容器里不再残留 $…$ 原文（= 渲染真生效）',
+      !richtexts.some((t) => /\$[^$]+\$/.test(t)),
+      richtexts.map((t) => t.slice(0, 20)).join(' | '));
+    check('判定标签按 对/部分对/判不了 显示',
+      Array.from(D.querySelectorAll('.g-verdict')).map((e) => (e.textContent || '').trim()),
+      ['对', '部分对', '判不了']);
+    checkTrue('判不了必须说清为什么（不能只给一个灰点）',
+      (D.querySelector('.g-ungradable') || {}).textContent
+        && D.querySelector('.g-ungradable').textContent.includes('框里没读到任何作答内容'),
+      (D.querySelector('.g-ungradable') || {}).textContent);
+
+    /* ============ 5. 图上读到的（本轮新加） ============ */
+    const figs = () => Array.from(D.querySelectorAll('.g-figure'));
+    check('★ 只有几何那道题多出「图上读到的」（1 块，其余两题没有空壳）', figs().length, 1);
+    checkTrue('★ figure_note 原样上屏，把握标注也在（（确定）能作数）',
+      figs().length && figs()[0].textContent.includes('（确定）')
+      && figs()[0].textContent.includes('直角方框'),
+      figs().length ? figs()[0].textContent.slice(0, 60) : '无');
+    checkTrue('「图上读到的」标题把三分档口径写给老师看',
+      body().includes('（确定）能作数 /（看不清）只作疑'));
+
+    /* ============ 6. 标记的显示名 ============ */
+    checkTrue('★ 新标记 region_empty 有中文名（不是兜底的「需留意」）',
+      body().includes('框里没读到题'), '');
+
+    /* ============ 7. 框题：默认不显示，切过去才显示 ============ */
+    const layer = () => D.querySelector('.gmark-layer');
+    checkTrue('标注层挂上了', !!layer());
+    check('默认「选择」模式下不画框（平时不该满页虚线框）',
+      D.querySelectorAll('.gmark-regions').length, 0);
+    checkTrue('工具条上有「框题」按钮', !!Array.from(D.querySelectorAll('.g-tool'))
+      .find((b) => (b.textContent || '').trim() === '框题'));
+
+    const btnRegion = Array.from(D.querySelectorAll('.g-tool'))
+      .find((b) => (b.textContent || '').trim() === '框题');
+    btnRegion.click();
+    await sleep(150);
+    checkTrue('★ 点「框题」后框题面板出现', !!D.querySelector('.grade-regions'));
+    checkTrue('提示文案说了「宁大勿小」（切掉笔画读不回来）',
+      body().includes('框宁大勿小') || (D.querySelector('.grade-toolhint') || {}).textContent.includes('宁大勿小'),
+      (D.querySelector('.grade-toolhint') || {}).textContent);
+    check('★ 服务器上已存的 2 个框画出来了', D.querySelectorAll('.rg-rect').length, 2);
+    check('框的编号标签 2 个', D.querySelectorAll('.gmark-rlabel').length, 2);
+    check('编号按 q_no 显示',
+      Array.from(D.querySelectorAll('.gmark-rlabel')).map((e) => (e.textContent || '').trim()),
+      ['1 ×', '2 ×']);
+    check('面板里 2 行可改题号', D.querySelectorAll('.gr-row').length, 2);
+    check('框的坐标按 0~1000 直接铺（不是像素）',
+      [D.querySelectorAll('.rg-rect')[0].getAttribute('x'),
+        D.querySelectorAll('.rg-rect')[0].getAttribute('width')],
+      ['40', '860']);
+
+    /* ============ 8. 本地画框：草稿 id 是 null，这里最容易撞 key ============ */
+    // 三块互不相同的位置，靠 y 区分 —— 撞 key 的话「删中间」会删错格子
+    vm.addRegionBox([40, 640, 900, 700]);
+    vm.addRegionBox([40, 720, 900, 780]);
+    vm.addRegionBox([40, 800, 900, 860]);
+    await sleep(150);
+    check('★ 画了 3 个草稿框 → 一共 5 个', D.querySelectorAll('.rg-rect').length, 5);
+    check('草稿框的编号顺下来', 
+      Array.from(D.querySelectorAll('.gmark-rlabel')).map((e) => (e.textContent || '').trim()),
+      ['1 ×', '2 ×', '3 ×', '4 ×', '5 ×']);
+    checkTrue('有未保存提示', body().includes('未保存'));
+
+    // 删中间那个草稿（y=720 那块），剩下的应当是 640 / 800 / 860
+    const mid = vm.editRegions.find((r) => r.box[1] === 720);
+    checkTrue('能找到中间那个草稿框', !!mid);
+    vm.dropRegion(mid);
+    await sleep(150);
+    check('删掉中间一个 → 剩 4 个', D.querySelectorAll('.rg-rect').length, 4);
+    check('★ 删的是那一块（剩下的是 60/340/640/800，不是 60/340/640/720 这种删错格子）',
+      Array.from(D.querySelectorAll('.rg-rect')).map((e) => Number(e.getAttribute('y'))),
+      [60, 340, 640, 800]);
+    check('删完编号顺上来（不留 1、2、4、5 像丢了一个）',
+      Array.from(D.querySelectorAll('.gmark-rlabel')).map((e) => (e.textContent || '').trim()),
+      ['1 ×', '2 ×', '3 ×', '4 ×']);
+
+    // 改题号：框里批出来的题都记到这个号上
+    vm.setRegionQNo(vm.editRegions[0], '7');
+    await sleep(150);
+    check('改了题号，图上标签跟着变',
+      (D.querySelectorAll('.gmark-rlabel')[0].textContent || '').trim(), '7 ×');
+
+    /* ============ 9. 保存框：整页替换，发的是这一页的完整列表 ============ */
+    const saveBtn = Array.from(D.querySelectorAll('.grade-regions button'))
+      .find((b) => (b.textContent || '').trim() === '保存框');
+    checkTrue('面板上有「保存框」按钮', !!saveBtn);
+    saveBtn.click();
+    await sleep(300);
+    const puts = (await import(pathToFileURL(path.join(tmp, 'src', 'calls.js')).href)).CALLS
+      .filter((c) => c.name === 'putRegions');
+    check('保存框发了 1 次请求', puts.length, 1);
+    if (puts.length) {
+      const body0 = puts[0].args[1];
+      check('整页替换：page_no 带上了', body0.page_no, 1);
+      check('整页替换：传的是这一页全部 4 个框（不是只传改动的）', body0.regions.length, 4);
+      check('每个框都是 [x0,y0,x1,y1] 四个数',
+        body0.regions.map((r) => (Array.isArray(r.box) ? r.box.length : -1)), [4, 4, 4, 4]);
+      check('改了号的框按新题号提交', body0.regions[0].q_no, '7');
+      // 原来那两个框本来就带题号 1 / 2（服务器上下来的），只有新画的两个是空串
+      check('没改号的框原样提交空串（交给后端按顺序编）',
+        body0.regions.slice(1).map((r) => r.q_no), ['2', '', '']);
+    }
+    await sleep(200);
+    checkTrue('保存完「未保存」提示消失', !body().includes('未保存'));
+
+    /* ============ 10. 离开框题模式：没保存不能悄悄丢 ============ */
+    // ⚠️ 顺序要注意：confirm 返回 true 的那一下**真的会切走**，所以「不放弃」这条
+    //    必须先把模式切回 region 再测，否则 setTool('view') 时 tool 已经是 view、
+    //    守卫直接跳过，测出来的是假的「没留在 region」。
+    vm.addRegionBox([40, 880, 900, 940]);
+    await sleep(120);
+    asked.length = 0;
+    W.__confirmAnswer = false;            // 老师选「算了，不放弃」
+    vm.setTool('view');
+    await sleep(120);
+    check('★ 有未保存的框，离开框题模式必须问一句', asked.length, 1);
+    checkTrue('问的是「框还没保存」', /框还没保存/.test(asked[0] || ''), asked[0]);
+    check('选了「不放弃」→ 还留在框题模式', vm.tool, 'region');
+    check('还留在框题模式时框还画着（4 个已存 + 刚画的 1 个）',
+      D.querySelectorAll('.rg-rect').length, 5);
+    W.__confirmAnswer = true;
+    asked.length = 0;
+    vm.setTool('view');
+    await sleep(120);
+    check('选了「放弃」→ 真的切走了', vm.tool, 'view');
+    check('切走后框不再画（.gmark-regions 消失）', D.querySelectorAll('.gmark-regions').length, 0);
+
+    /* ============ 11. 沿用上一份：先取同课时的列表，再拷别人的 ============ */
+    asked.length = 0;
+    vm.setTool('region');
+    await sleep(150);
+    const copyBtn = Array.from(D.querySelectorAll('.grade-regions button'))
+      .find((b) => (b.textContent || '').trim() === '沿用上一份');
+    checkTrue('面板上有「沿用上一份」按钮', !!copyBtn);
+    copyBtn.click();
+    await sleep(300);
+    const calls = (await import(pathToFileURL(path.join(tmp, 'src', 'calls.js')).href)).CALLS;
+    checkTrue('★ 沿用前先按 lesson_id 取列表（不猜 id —— 猜错会把别人的卷面当模板）',
+      calls.some((c) => c.name === 'list' && c.args[0] === 31),
+      JSON.stringify(calls.filter((c) => c.name === 'list').map((c) => c.args)));
+    checkTrue('★ 拷的是**另一份**（id 7 自己排除掉），不是自己拷自己',
+      calls.some((c) => c.name === 'copyRegions' && c.args[1] === 9),
+      JSON.stringify(calls.filter((c) => c.name === 'copyRegions').map((c) => c.args)));
+
+    /* ============ 12. 逐题卡片上的操作仍然通着 ============ */
+    // 判定按钮：点「错」应该 PATCH 到 grade-items/<id>
+    const wrongBtn = Array.from(cards()[0].querySelectorAll('.g-vbtn'))
+      .find((b) => (b.textContent || '').trim() === '错');
+    checkTrue('第一题有「错」判定按钮', !!wrongBtn);
+    wrongBtn.click();
+    await sleep(200);
+    const patches = calls.filter((c) => c.name === 'patchItem');
+    checkTrue('★ 点判定 → PATCH 到那一题（不是别的题）',
+      patches.some((c) => c.args[0] === 101 && c.args[1].verdict === 'wrong'),
+      JSON.stringify(patches.map((c) => c.args)));
+
+    // 「只重批这一题」：必须带 regions 一起重批，否则会退回整页口径覆盖掉好的结果
+    const rrBtn = Array.from(cards()[1].querySelectorAll('button'))
+      .find((b) => (b.textContent || '').trim() === '只重批这一题');
+    checkTrue('第二题有「只重批这一题」', !!rrBtn);
+    rrBtn.click();
+    await sleep(300);
+    checkTrue('★ 单题重批打到那一题的接口', calls.some((c) => c.name === 'rerunItem' && c.args[0] === 102),
+      JSON.stringify(calls.filter((c) => c.name === 'rerunItem').map((c) => c.args)));
+  } finally {
+    try { fs.rmSync(tmp, { recursive: true, force: true }); } catch (e) { /* 删不掉留着也无妨 */ }
+  }
+
+  console.log('\n共 ' + total + ' 项，失败 ' + fails.length + ' 项');
+  if (fails.length) {
+    fails.forEach((f) => console.log('  - ' + f));
+    return 1;
+  }
+  console.log('全部通过 ✅');
+  return 0;
+}
+
+main().then((code) => process.exit(code)).catch((e) => {
+  console.error('挂载检查崩了：', e);
+  process.exit(1);
+});

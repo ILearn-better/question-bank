@@ -853,6 +853,26 @@ table.tbl td.pending { color: var(--warning); font-weight: 600; }
 .g-color.on { box-shadow: 0 0 0 2px var(--primary); }
 .grade-toolhint { margin: -2px 0 8px; }
 
+/* ---------------- 框题面板（一题一区域）----------------
+   只在「框题」模式下出现：它改的是**批改口径**（有框就一框一次判），
+   不是批注，所以不跟画笔那排混在一起占视觉。 */
+.grade-regions { border: 1px dashed var(--border); border-radius: 8px;
+                 padding: 8px 10px; margin: 0 0 8px; background: var(--bg-2, #fafafa); }
+.gr-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.gr-list { margin-top: 6px; max-height: 168px; overflow: auto; }
+.gr-row { display: flex; align-items: center; gap: 6px; padding: 3px 0;
+          border-top: 1px solid var(--border); }
+.gr-no { display: inline-flex; align-items: center; justify-content: center;
+         min-width: 20px; height: 20px; border-radius: 4px; background: #2563eb;
+         color: #fff; font-size: 11px; }
+.gr-q { width: 84px; padding: 2px 6px; font-size: 12.5px;
+        border: 1px solid var(--border); border-radius: 5px; background: #fff; }
+
+/* 图的读数：等宽、可换行，像一张小表；不自作主张渲染 LaTeX（这里没有 $ 包裹） */
+.g-figure { white-space: pre-wrap; font-size: 12.5px; line-height: 1.6;
+            background: var(--bg-2, #fafafa); border: 1px solid var(--border);
+            border-radius: 6px; padding: 5px 7px; color: var(--text-2); }
+
 /* ⚠️ 画/擦/放标记时整层接事件；同时让**已有标注**失去指针 ——
    否则笔一落就被某条标注吃掉（<g> 默认 pointer-events:auto），画不出线。 */
 .gmark-layer.mode-ink, .gmark-layer.mode-erase,
@@ -862,13 +882,31 @@ table.tbl td.pending { color: var(--warning); font-weight: 600; }
 .gmark-layer.mode-ink { cursor: crosshair; }
 .gmark-layer.mode-erase { cursor: cell; }
 .gmark-layer.mode-text { cursor: text; }
-.gmark-layer.mode-check, .gmark-layer.mode-cross { cursor: copy; }
-.gmark-layer.mode-ink .gmark, .gmark-layer.mode-erase .gmark,
+.gmark-layer.mode-check, .gmark-layer.mode-cross { cursor: copy; }.gmark-layer.mode-ink .gmark, .gmark-layer.mode-erase .gmark,
 .gmark-layer.mode-text .gmark, .gmark-layer.mode-check .gmark,
 .gmark-layer.mode-cross .gmark,
 .gmark-layer.mode-ink .gmark-label, .gmark-layer.mode-erase .gmark-label,
 .gmark-layer.mode-text .gmark-label, .gmark-layer.mode-check .gmark-label,
 .gmark-layer.mode-cross .gmark-label { pointer-events: none; }
+
+/* ---------------- 一题一区域（框题）----------------
+   与标注同一条 svg、同一套 0~1000 坐标，但语义不同：
+   标注是「老师批的话」，框是「批改单元」—— 有框的页一框一次模型调用。
+   框只用蓝虚线，不与红笔标注抢眼；编号是白字蓝底的小标签，点一下就删。 */
+.gmark-layer.mode-region { pointer-events: auto; touch-action: none; cursor: crosshair; }
+/* 画框时已有标注必须失去指针，否则起手那一下就被某条标注吃掉（同画笔那条坑） */
+.gmark-layer.mode-region .gmark,
+.gmark-layer.mode-region .gmark-label { pointer-events: none; }
+.gmark-region { pointer-events: auto; cursor: pointer; }
+.rg-rect { fill: rgba(37, 99, 235, .05); stroke: #2563eb; stroke-width: 1.8;
+           stroke-dasharray: 8 6; vector-effect: non-scaling-stroke; }
+.rg-rect:hover { fill: rgba(37, 99, 235, .14); }
+.rg-draft { fill: rgba(37, 99, 235, .1); stroke: #2563eb; stroke-width: 2;
+            vector-effect: non-scaling-stroke; pointer-events: none; }
+.gmark-rlabel { position: absolute; transform: translate(0, -100%); pointer-events: auto;
+                cursor: pointer; font-size: 11px; line-height: 1.5; padding: 0 6px;
+                border-radius: 4px; white-space: nowrap; background: #2563eb; color: #fff; }
+.gmark-rlabel:hover { background: #b91c1c; }
 
 /* 老师笔迹：比 AI 的框更活泼一点（粗、圆头、圆角），一眼能分出「这是我画的」 */
 .gmark .shape.ink { stroke-width: 3; }

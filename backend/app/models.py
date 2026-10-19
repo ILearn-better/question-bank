@@ -1273,6 +1273,11 @@ class HomeworkGradeItem(Base):
     score: Mapped[float | None] = mapped_column(REAL)
     full_score: Mapped[float | None] = mapped_column(REAL)
     basis: Mapped[str] = mapped_column(Text, default="", server_default="")         # 判定依据（人话）
+    # 图上读到的东西：几何要点（点/线/辅助线/记号 + 「（确定）」「（看不清）」标注）
+    # 或统计图表的数表（「区间:频数」等）。
+    # ⚠️ 2026-10 之前它只躺在 raw 里 —— 于是「凭图判分」的结论对老师完全不可核对，
+    #    他没法判断模型说的「有直角符号」是不是真有。现在单独一列、界面上直接给出来。
+    figure_note: Mapped[str] = mapped_column(Text, default="", server_default="")
     confidence: Mapped[str] = mapped_column(String, default="low", server_default="low")
     kp_name: Mapped[str] = mapped_column(Text, default="", server_default="")
     node_id: Mapped[int | None] = mapped_column(ForeignKey("nodes.id"))
@@ -1321,7 +1326,48 @@ class HomeworkGradeMark(Base):
     text: Mapped[str] = mapped_column(Text, default="", server_default="")
     color: Mapped[str] = mapped_column(String, default="", server_default="")
     created_by: Mapped[str] = mapped_column(String, default="ai", server_default="ai")
-    flags: Mapped[str] = mapped_column(Text, default="[]", server_default="[]")     # mark_rough …
+    flags: Mapped[str] = mapped_column(String, default="[]", server_default="[]")     # mark_rough …
     created_at: Mapped[str] = mapped_column(Text, default=_now, server_default=NOW)
 
     __table_args__ = (Index("idx_hwgrade_marks_grade", "grade_id", "page_no"),)
+
+
+class HomeworkGradeRegion(Base):
+    """**一题一区域**：老师在这页上框出「第 N 题的作答在哪」，每框单独裁切、单独调模型。
+
+    为什么值得单开一张表（而不是继续整页一次判所有题）：
+
+    1. **整页理解是最大的系统性误差源**。整页 4000×3000 里，单题的作答可能只有
+       300×300；视觉编码器一降采样，角度符号、上下标、小数点全糊。裁出来再放大，
+       等于把「有效分辨率」翻几倍 —— 不动模型、不花钱。
+    2. **消掉题号错配**。题号由框索引（`seq` / `q_no`）决定，不依赖模型认学生手写的
+       「第 3 题」—— 学生写串行、写漏题号都不会再判错归属。
+    3. **隔离跨题污染**。上一题的字迹伸进下一题区域，是「打乱分组」的直接原因；
+       框外的东西模型根本看不见，这个问题从物理上消失。
+
+    ⚠️ **为什么不建「卷面模板」这一层实体**：一套卷的框要复用，做法是
+    `PUT regions?copy_from=<同课时另一份>`，把框拷过来即可。多一层模板表意味着
+    「模板 / 记录」两处都能改、还要处理「模板改了旧记录跟不跟」。
+    **代价**必须写在这里：不同学生的照片会有平移/旋转，拷过来的框会偏。
+    所以（a）前端画框时提示「宁大勿小」，（b）裁切时按 `REGION_PAD` 外扩，
+    （c）框偏到裁掉了作答时，右栏会看到「转写为空」——老师能当场发现并修框。
+
+    ⚠️ `box` 与标注同制：**按页归一化的 0~1000 整数**，不是像素。
+    页图尺寸随渲染 dpi 变，存像素的框换个 dpi 就全错位。
+    """
+
+    __tablename__ = "homework_grade_regions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    owner_id: Mapped[int] = mapped_column(Integer, nullable=False, default=OWNER_ID, server_default=str(OWNER_ID))
+    grade_id: Mapped[int] = mapped_column(
+        ForeignKey("homework_grades.id", ondelete="CASCADE"), nullable=False
+    )
+    page_no: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    seq: Mapped[int] = mapped_column(Integer, default=0, server_default="0")      # 页内顺序 = 批改顺序
+    # 卷面题号。老师填了就一定用它（不采信模型认的题号）；空着才回落到模型的 q_no。
+    q_no: Mapped[str] = mapped_column(String, default="", server_default="")
+    box: Mapped[str] = mapped_column(Text, default="[]", server_default="[]")     # [x0,y0,x1,y1]，0~1000
+    created_at: Mapped[str] = mapped_column(Text, default=_now, server_default=NOW)
+
+    __table_args__ = (Index("idx_hwregions_grade", "grade_id", "page_no", "seq"),)

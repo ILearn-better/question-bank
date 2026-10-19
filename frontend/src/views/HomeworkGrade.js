@@ -70,6 +70,8 @@ const FLAG_LABEL = {
   insufficient_evidence: '证据不足',
   figure_guess: '图题待确认',
   low_confidence: '识别把握低',
+  region_empty: '框里没读到题',
+  region_multi: '框画大了（读到多道题）',
 };
 
 const q = (s) => String(s === undefined || s === null ? '' : s).trim();
@@ -92,7 +94,7 @@ export default {
 
     /* 手写批改：老师直接在卷面上画。三种手段都是「往 marks 里加一条」，
      * 唯一区别是 mode —— 组件只管采集，落库/删除都在这一层（失败要能提示）。 */
-    const tool = ref('view');          // view | ink | erase | text | check | cross
+    const tool = ref('view');          // view | ink | erase | text | check | cross | region
     const inkColor = ref('#dc2626');
     const textDraft = ref(null);       // {x, y, text}：点完位置弹出来的输入框
     const exporting = ref('');         // 正在导出的格式（按钮置灰）
@@ -139,6 +141,107 @@ export default {
     const pageMarks = computed(() => marks.value.filter((m) => Number(m.page_no || 1) === pageNo.value));
     /** 老师自己放的（笔迹 / 文字 / √×）。撤销、清空只动这些 —— AI 猜的框一个字不碰。 */
     const teacherMarks = computed(() => pageMarks.value.filter((m) => m.created_by === 'teacher'));
+
+    /* ---------------- 一题一区域（框题） ----------------
+     * 有框的页按框逐题批，没框的页整页一次判 —— 两条口径并存，所以这里必须
+     * 分清「服务器上已经存了的框」和「正在拖但还没保存的草稿」。
+     *
+     * ⚠️ 进「框题」模式才把草稿从服务器同步一份：平时不该有两份状态，
+     *    否则轮询一刷新就把老师刚拖的框冲掉（或者反过来，草稿盖掉别人的改动）。 */
+    const regions = computed(() => (detail.value && detail.value.regions) || []);
+    const pageRegions = computed(
+      () => regions.value.filter((r) => Number(r.page_no || 1) === pageNo.value),
+    );
+    const editRegions = ref([]);        // 当前页的本地草稿（只在框题模式有意义）
+    const regionsDirty = ref(false);
+    const editingRegions = computed(() => tool.value === 'region');
+
+    function syncRegions() {
+      editRegions.value = pageRegions.value.map((r) => ({ ...r }));
+      regionsDirty.value = false;
+    }
+
+    /** 画完一个框（标注层发上来的是 [x0,y0,x1,y1]）。只在本地，点「保存框」才落库。 */
+    function addRegionBox(box) {
+      const n = editRegions.value.length + 1;
+      editRegions.value = editRegions.value.concat([
+        { id: null, q_no: '', box, label: String(n) },
+      ]);
+      regionsDirty.value = true;
+    }
+
+    /** 点图上的框 / 列表里的 × → 只从草稿里去掉（保存时才真的删）。 */
+    function dropRegion(r) {
+      editRegions.value = editRegions.value.filter((x) => x !== r);
+      regionsDirty.value = true;
+      relabelRegions();
+    }
+
+    /** 序号跟着当前位置走：老师删掉中间一个，后面的框号要顺上来，否则 1、3、4 看着像丢了一个。 */
+    function relabelRegions() {
+      editRegions.value = editRegions.value.map((x, i) => ({
+        ...x, label: String(x.q_no || '').trim() || String(i + 1),
+      }));
+    }
+
+    function setRegionQNo(r, v) {
+      r.q_no = v;
+      regionsDirty.value = true;
+      relabelRegions();
+    }
+
+    /** 清空本页草稿（**只是草稿**，点保存才真的从库里删）。 */
+    function clearRegions() {
+      if (!editRegions.value.length) return;
+      editRegions.value = [];
+      regionsDirty.value = true;
+    }
+
+    async function saveRegions() {
+      busy.value = 'regions';
+      try {
+        const res = await gradeApi.putRegions(gid, {
+          page_no: pageNo.value,
+          regions: editRegions.value.map((r) => ({
+            q_no: String(r.q_no || '').trim(), box: r.box,
+          })),
+        });
+        detail.value.regions = res.regions;
+        syncRegions();
+        ok(editRegions.value.length
+          ? `已保存 ${editRegions.value.length} 个框`
+          : '已清空这一页的框（这一页退回整页批）');
+        if (items.value.length) {
+          warn('框改了要重新批改一次才生效 —— 点右边「重新批改」');
+        }
+      } catch (e) {
+        fail(e.message);
+      } finally {
+        busy.value = '';
+      }
+    }
+
+    /** 沿用上一份的框：一套卷只画一次。**先取同课时的列表再拷**，
+     *  不猜 id —— 猜错了会把别人的卷面当成模板。 */
+    async function copyRegions() {
+      busy.value = 'copy';
+      try {
+        const rows = await gradeApi.list(detail.value.lesson_id);
+        const others = (rows || []).filter((r) => String(r.id) !== String(gid));
+        if (!others.length) {
+          warn('这节课只有这一份，没有可沿用的框 —— 先画一次');
+          return;
+        }
+        const res = await gradeApi.copyRegions(gid, others[0].id);
+        detail.value.regions = res.regions;
+        syncRegions();
+        ok(`已沿用另一份的 ${res.regions.length} 个框 —— 扫一眼，框偏了就重画`);
+      } catch (e) {
+        fail(e.message);
+      } finally {
+        busy.value = '';
+      }
+    }
 
     /** 页数：优先数提交件的 pages（total 就是页数，不是题数）；没有就按题上的最大页码兜底。 */
     const pageCount = computed(() => {
@@ -260,11 +363,18 @@ export default {
         if (pageNo.value > pageCount.value) pageNo.value = pageCount.value;
         if (pageNo.value < 1) pageNo.value = 1;
         if (!setupTouched.value) initSetup();     // 没动过才跟服务端走，别把老师刚敲的字冲掉
+        /* ⚠️ **先关 loading，再画**。题目区在模板里是 `v-else`（`v-if="loading"` 的反面），
+         * loading 还是 true 的时候那几个 `.g-rich` 容器**根本不在 DOM 里**，`setRich` 没被调过
+         * → `paintKey` 全部命中 `if (!el) return` → 题干 / 学生作答 / 参考答案**一片空白**。
+         * 2026-10-19 用 jsdom 真挂一遍才发现：容器有 3 个、内容 0 个。
+         * 为什么平时没露馅：轮询与「跑完自动刷新」都走 load(true)（silent，不动 loading），
+         * 容器早就在了 —— **只有第一次打开/刷新这一页**才白。 */
+        if (!silent) loading.value = false;
         await paintAll();
       } catch (e) {
         if (!silent) { loadError.value = e.message; fail(e.message); }
       } finally {
-        if (!silent) loading.value = false;
+        if (!silent) loading.value = false;      // 兜底：上面那行之前就抛了也要放出来
       }
     }
 
@@ -304,8 +414,15 @@ export default {
      *    两边各算一次，迟早会出现「屏幕上是准的、导出的 PDF 跑位」。 */
 
     function setTool(t) {
-      tool.value = tool.value === t ? 'view' : t;   // 再点一次退出，不用另找「选择」按钮
+      const next = tool.value === t ? 'view' : t;   // 再点一次退出，不用另找「选择」按钮
+      // 离开「框题」时没保存的框不能悄悄丢 —— 老师画了五个框最怕这个
+      if (tool.value === 'region' && next !== 'region' && regionsDirty.value
+          && !window.confirm('这一页的框还没保存，切换就丢了。要放弃这些框吗？')) {
+        return;
+      }
+      tool.value = next;
       if (tool.value !== 'text') textDraft.value = null;
+      if (tool.value === 'region') syncRegions();
     }
 
     async function addMark(payload) {
@@ -511,8 +628,15 @@ export default {
       else cardEls.delete(String(id));
     }
     function goPage(n) {
-      pageNo.value = Math.min(Math.max(1, Number(n) || 1), pageCount.value);
+      const target = Math.min(Math.max(1, Number(n) || 1), pageCount.value);
+      if (target === pageNo.value) return;
+      if (tool.value === 'region' && regionsDirty.value
+          && !window.confirm('这一页的框还没保存，翻页就丢了。要放弃吗？')) {
+        return;
+      }
+      pageNo.value = target;
       pageBroken.value = false;
+      if (tool.value === 'region') syncRegions();
     }
     const prevPage = () => goPage(pageNo.value - 1);
     const nextPage = () => goPage(pageNo.value + 1);
@@ -561,6 +685,10 @@ export default {
       tool, inkColor, textDraft, exporting, INK_COLORS, teacherMarks, layerEl,
       setTool, addMark, eraseMarks, onTextAt, saveText, moveMark,
       undoLast, clearPageMarks, exportFile,
+      // 一题一区域（框题）：有框按框批，没框仍整页批
+      pageRegions, editRegions, regionsDirty, editingRegions,
+      addRegionBox, dropRegion, setRegionQNo, saveRegions, copyRegions, syncRegions,
+      clearRegions,
     };
   },
   template: `
@@ -689,6 +817,8 @@ export default {
             <button class="g-tool g-mark" :class="{ on: tool === 'cross' }" title="点一下卷面就放一个 ×"
                     @click="setTool('cross')">×</button>
             <span class="g-sep"></span>
+            <button class="g-tool" :class="{ on: tool === 'region' }" title="框出每道题的作答范围：有框就一题一裁一判，比整页判准得多"
+                    @click="setTool('region')">框题</button>
             <button v-for="c in INK_COLORS" :key="c.v" class="g-color" :class="{ on: inkColor === c.v }"
                     :style="{ background: c.v }" :title="c.n" @click="inkColor = c.v"></button>
             <div class="spacer"></div>
@@ -699,7 +829,44 @@ export default {
             {{ tool === 'ink' ? '按住左键在卷面上写 / 画，松手就存。'
               : tool === 'erase' ? '按住左键划过要擦的笔迹（AI 的框也能擦）。'
               : tool === 'text' ? '在卷面上点一下，弹框里写批注，Ctrl+Enter 放上去。'
+              : tool === 'region' ? '按住拖出一个框，把一道题（题干 + 作答）整个框进去。框宁大勿小 —— 切掉笔画就再也读不回来了。'
               : '在要判的地方点一下，就放一个 ' + (tool === 'check' ? '√' : '×') + '。' }}
+          </div>
+
+          <!-- ============ 框题面板：只在「框题」模式下出现 ============ -->
+          <div v-if="tool === 'region'" class="grade-regions">
+            <div class="gr-head">
+              <b>第 {{ pageNo }} 页的框</b>
+              <span class="small muted">{{ editRegions.length }} 个</span>
+              <span v-if="regionsDirty" class="small" style="color:var(--warning)">未保存</span>
+              <div class="spacer"></div>
+              <button class="btn ghost sm" :disabled="busy === 'copy'" @click="copyRegions">
+                {{ busy === 'copy' ? '沿用中…' : '沿用上一份' }}
+              </button>
+              <button class="btn ghost sm" :disabled="!editRegions.length" @click="clearRegions">全清</button>
+              <button class="btn sm" :disabled="busy === 'regions'" @click="saveRegions">
+                {{ busy === 'regions' ? '保存中…' : '保存框' }}
+              </button>
+            </div>
+            <div v-if="!editRegions.length" class="small muted" style="padding:6px 0">
+              这一页还没画框 —— 拖一个框出来。有框的页<b>一框一次</b>判，
+              没框的页仍然整页判一次。切到「框题」再看这页就会带上框。
+            </div>
+            <div v-else class="gr-list">
+              <div v-for="(r, i) in editRegions" :key="'r-' + i" class="gr-row">
+                <span class="gr-no">{{ i + 1 }}</span>
+                <label class="small">题号</label>
+                <input class="gr-q" :value="r.q_no" placeholder="留空就按顺序"
+                       @input="setRegionQNo(r, $event.target.value)">
+                <span class="small muted">框内批出来的题都记到这个题号上</span>
+                <div class="spacer"></div>
+                <button class="btn ghost sm" @click="dropRegion(r)">删</button>
+              </div>
+            </div>
+            <div class="small muted" style="margin-top:6px">
+              题号由框绑定 —— 学生把「第 3 题」写成「第 8 题」也不会判错归属。
+              <b>画完一定要点「保存框」</b>，然后重新批改。
+            </div>
           </div>
 
           <div class="grade-page">
@@ -708,8 +875,10 @@ export default {
             <!-- ⚠️ 成对写，别写成自闭合：零构建的模板里自闭合会把后面的节点吞掉 -->
             <GradeMarkLayer ref="layerEl" :marks="pageMarks" :selected-item-id="selectedItemId"
                             :mode="tool" :color="inkColor"
+                            :regions="tool === 'region' ? editRegions : pageRegions"
                             @pick="onPick" @create="addMark" @erase="eraseMarks"
-                            @text-at="onTextAt" @stamp="addMark" @move="moveMark"></GradeMarkLayer>
+                            @text-at="onTextAt" @stamp="addMark" @move="moveMark"
+                            @region="addRegionBox" @region-remove="dropRegion"></GradeMarkLayer>
             <div v-if="pageBroken" class="grade-page-miss small">
               这一页的图还没生成出来（点「开始批改」之后才有），或者这一页渲染失败了
             </div>
@@ -804,6 +973,16 @@ export default {
                 </div>
                 <div v-if="item.basis" class="g-basis">{{ item.basis }}</div>
                 <div v-if="!item.basis && !item.error_reason" class="small muted">AI 还没给出依据</div>
+              </div>
+
+              <!-- 图上读到的东西。**必须显示**：图形证据现在可以作判定依据了，
+                   老师得能核对「它说的那条直角符号」到底在不在图上，否则等于盲信。 -->
+              <div class="g-sec" v-if="item.figure_note">
+                <div class="g-lb">
+                  图上读到的
+                  <span class="muted small">（（确定）能作数 /（看不清）只作疑）</span>
+                </div>
+                <div class="g-figure">{{ item.figure_note }}</div>
               </div>
 
               <div class="g-meta" v-if="item.kp_name || (item.tags || []).length">

@@ -163,6 +163,11 @@ const MIN_STEP = 2.2;      // 抽稀：两点距离小于这个就不记（一�
 const MOVE_KINDS = ['box', 'ellipse', 'check', 'cross', 'arrow', 'text'];
 const DRAG_MIN = 4;        // 屏幕像素：手一抖几个像素不该被当成拖动（与月历那边同一个经验）
 
+/** 「框题」的最小边长（0~1000 制，20 ≈ 纸面 2%）。
+ *  **与后端 grade_store.REGION_MIN_SIDE 同值** —— 前端先挡一层，
+ *  省得老师为一次手抖发一个请求再吃一个 422。改一处必须改两处。 */
+const REGION_MIN = 20;
+
 export default {
   name: 'GradeMarkLayer',
   props: {
@@ -174,13 +179,19 @@ export default {
     mode: { type: String, default: 'view' },
     /** 画笔颜色（老师批改常用红，其次蓝）。 */
     color: { type: String, default: '#dc2626' },
+    /** 这一页已经画好的「一题一区域」框（{id, seq, label, box}）。**只传当前页**。 */
+    regions: { type: Array, default: () => [] },
   },
-  emits: ['pick', 'create', 'erase', 'text-at', 'stamp', 'move'],
+  emits: ['pick', 'create', 'erase', 'text-at', 'stamp', 'move', 'region', 'region-remove'],
   setup(props, { emit, expose }) {
     const svgEl = ref(null);
     const drawing = ref(false);
     const draft = ref([]);        // 正在画的那一笔（[[x,y],…]）
     const erasing = ref([]);      // 这次按住橡皮已经划掉的 id（松手才真删）
+    /* 「框题」模式正在拖的那一个框（region 模式专用）。
+     * 与 draft 分开：draft 是笔迹点列，regionDraft 是两个角点 —— 混在一起，
+     * 判断「松手时该发 create 还是 region」就得靠 mode 二次分叉，很容易漏。 */
+    const regionDraft = ref(null);   // { x0, y0, x1, y1 }
 
     /* ---- 拖动移动（只在 view 模式）----
      * offsets: { [markId]: { base, dx, dy } }
@@ -379,6 +390,14 @@ export default {
           geo: [x - half, y - half, x + half, y + half],
           color: props.mode === 'check' ? '#16a34a' : '#dc2626',
         });
+        return;
+      }
+      if (props.mode === 'region') {
+        // 拖出一个框。**必须 setPointerCapture**：老师常在页图边缘起手，
+        // 不捕获的话指针一移出 svg 就收不到 pointermove，框会停在半路。
+        drawing.value = true;
+        regionDraft.value = { x0: x, y0: y, x1: x, y1: y };
+        try { svgEl.value.setPointerCapture(e.pointerId); } catch (err) { /* 老浏览器 */ }
       }
     }
 
@@ -398,12 +417,35 @@ export default {
       if (props.mode === 'erase') {
         const m = hitTest(x, y);
         if (m) markErased(m);
+        return;
       }
+      if (props.mode === 'region' && regionDraft.value) {
+        regionDraft.value = { ...regionDraft.value, x1: x, y1: y };
+      }
+    }
+
+    /** 松手时的框 → 规整成 [x0,y0,x1,y1]（左上到右下）。太小就不算数。 */
+    function draftBox() {
+      const d = regionDraft.value;
+      if (!d) return null;
+      const x0 = Math.min(d.x0, d.x1), x1 = Math.max(d.x0, d.x1);
+      const y0 = Math.min(d.y0, d.y1), y1 = Math.max(d.y0, d.y1);
+      if (x1 - x0 < REGION_MIN || y1 - y0 < REGION_MIN) return null;
+      return [x0, y0, x1, y1].map((v) => Math.round(clamp(v)));
     }
 
     function onUp() {
       if (!drawing.value) return;
       drawing.value = false;
+
+      if (props.mode === 'region') {
+        const box = draftBox();
+        regionDraft.value = null;
+        // 太小 = 手抖点了一下，不当作画框（与后端 REGION_MIN_SIDE 同口径，
+        // 前端先挡一层，省得每次都吃一个 422）
+        if (box) emit('region', box);
+        return;
+      }
 
       if (props.mode === 'ink' && draft.value.length >= 2) {
         const pts = draft.value;
@@ -426,10 +468,26 @@ export default {
     expose({ clearOffsets });   // 父组件 PATCH 失败时调它，界面退回原位
 
     return {
-      svgEl, drawing, draft, erasing,
+      svgEl, drawing, draft, erasing, regionDraft,
       shapesFor, isPicked, isLinked, isGone, canMove, isDragging, pick, onPickClick,
       onDown, onMove, onUp, startDrag, dragTo, endDrag, cancelDrag,
       draftPoly: (pts) => pts.map((p) => `${r1(p[0])},${r1(p[1])}`).join(' '),
+      /** 框 → 画图要用的四个数 + 标签位置。**永不返回 null**（模板里直接取属性）。 */
+      regionRect: (box) => {
+        const b = numList(box);
+        if (b.length < 4) return { x: 0, y: 0, w: 0, h: 0, lx: '0%', ly: '0%' };
+        const x = Math.min(b[0], b[2]);
+        const y = Math.min(b[1], b[3]);
+        return {
+          x: r1(x), y: r1(y),
+          w: r1(Math.abs(b[2] - b[0])), h: r1(Math.abs(b[3] - b[1])),
+          lx: pct(x), ly: pct(y),
+        };
+      },
+      draftRect: (d) => ({
+        x: r1(Math.min(d.x0, d.x1)), y: r1(Math.min(d.y0, d.y1)),
+        w: r1(Math.abs(d.x1 - d.x0)), h: r1(Math.abs(d.y1 - d.y0)),
+      }),
     };
   },
   template: `
@@ -439,6 +497,22 @@ export default {
          画笔/橡皮/文字模式下由 CSS 反向打开整层的事件，同时让标注失去指针。 -->
     <svg class="gmark-svg" ref="svgEl" viewBox="0 0 1000 1000" preserveAspectRatio="none"
          @pointerdown="onDown" @pointermove="onMove" @pointerup="onUp" @pointercancel="onUp">
+      <!-- 一题一区域：**只在「框题」模式下显示**。平时也画出来的话整页都是虚线框，
+           老师就看不 clean 自己批到哪儿了。 -->
+      <g v-if="mode === 'region'" class="gmark-regions">
+        <!-- ⚠️ key 里**必须带下标兜底**。刚画出来还没保存的框 id 是 null（父组件只给了
+             { id: null, q_no, box }），只写 'rg-' + r.id 的话连画三个 →
+             三个 'rg-null' 撞在一起。Vue 的 keyed diff 靠 key 找回节点，撞了就**删中间那个会删错格子**，
+             而界面上看着仍然「有这么多框」，谁也发现不了。
+             ⚠️ 这段注释在模板字面量里，**别写反引号**（会把模板提前截断，整文件语法错）。 -->
+        <g v-for="(r, i) in regions" :key="'rg-' + (r.id == null ? 'new' + i : r.id)" class="gmark-region"
+           @pointerdown.stop @click.stop="$emit('region-remove', r)">
+          <rect :x="regionRect(r.box).x" :y="regionRect(r.box).y"
+                :width="regionRect(r.box).w" :height="regionRect(r.box).h" class="rg-rect" />
+        </g>
+        <rect v-if="regionDraft" :x="draftRect(regionDraft).x" :y="draftRect(regionDraft).y"
+              :width="draftRect(regionDraft).w" :height="draftRect(regionDraft).h" class="rg-draft" />
+      </g>
       <g v-for="s in shapesFor(marks).filter(x => !isGone(x))" :key="s.key" class="gmark"
          :class="{ sel: isPicked(s), linked: isLinked(s), rough: s.mark.created_by !== 'teacher',
                    mv: canMove(s), drag: isDragging(s) }"
@@ -492,5 +566,12 @@ export default {
           @pointerdown="startDrag($event, s)" @pointermove="dragTo"
           @pointerup="endDrag" @pointercancel="cancelDrag"
           @click.stop="onPickClick(s)">{{ s.text }}</span>
+
+    <!-- 框的编号：写「3 ×」，点一下就删（删框走列表也行，这里图省事）。
+         key 同样要有下标兜底 —— 理由见上面 gmark-regions 那段。 -->
+    <span v-for="(r, i) in (mode === 'region' ? regions : [])"
+          :key="'rgl-' + (r.id == null ? 'new' + i : r.id)"
+          class="gmark-rlabel" :style="{ left: regionRect(r.box).lx, top: regionRect(r.box).ly }"
+          @click.stop="$emit('region-remove', r)" :title="'点一下删掉这个框'">{{ r.label }} ×</span>
   </div>`,
 };

@@ -38,6 +38,7 @@ from ..models import (
     HomeworkGradeFile,
     HomeworkGradeItem,
     HomeworkGradeMark,
+    HomeworkGradeRegion,
     Lesson,
     LessonFile,
     Question,
@@ -49,6 +50,7 @@ from ..schemas import (
     GradeItemPatch,
     GradeMarkIn,
     GradeMarkPatch,
+    GradeRegionsPut,
     GradeSetupPatch,
     GradeToBankIn,
 )
@@ -61,6 +63,24 @@ WORKERS = 3
 MAX_PAGES = 30
 
 VERDICTS = ("correct", "partial", "wrong", "blank", "ungradable")
+
+# ---------------------------------------------------------------- 一题一区域
+# 裁切时框向外扩多少（单位是 0~1000 的归一化坐标，12 ≈ 纸面 1.2%）。
+# 为什么要外扩：老师画框会贴着字画，正好切掉笔画的上缘/下缘（尤其是分数线、
+# 根号的上横线）；不同学生的照片还有平移，拷过来的框本来就偏。
+# 宁可多带一点页边 —— 多带的空白模型会忽略，切掉的笔画是永久丢失。
+REGION_PAD = 12
+
+# 框太小就当没画（0~1000 制下 20 ≈ 纸面 2%）。比这更小的框裁出来只是一团糊字，
+# 送模型等于花钱买一个「读不清」。
+REGION_MIN_SIDE = 20
+
+# 单页最多几个框。与 MAX_ITEMS_PER_PAGE 同量级：正常一页 10~40 题。
+MAX_REGIONS_PER_PAGE = 60
+
+# 裁出来的小块放大上限。放太大只是把 JPEG 噪声一起放大、还更贵；
+# 4 倍足够把 300px 宽的一小块提到 1200px（模型实际吃的是 GRADE_MAX_EDGE）。
+REGION_MAX_ZOOM = 4.0
 
 # 可以直接当"一页"渲染的图片格式（与 routers/documents.py 的 PAGE_IMAGE_EXTS 同制）。
 # 不进那个常量是分层问题：services 不该 import routers。
@@ -186,6 +206,9 @@ def item_dict(it: HomeworkGradeItem) -> dict:
         "tags": _json_list(it.tags),
         "error_reason": it.error_reason,
         "flags": _json_list(it.flags),
+        # 图上读到的东西。**必须给前端**：没有它，老师无法核对「模型说有直角符号」
+        # 到底是不是真有，而这条已经从「一律不采信」改成「可作判定依据」了。
+        "figure_note": it.figure_note or "",
         "status": it.status,
         "question_id": it.question_id,
     }
@@ -225,6 +248,8 @@ def detail(db: Session, grade: HomeworkGrade) -> dict:
     out["items"] = [item_dict(i) for i in items]
     out["files"] = [file_dict(f) for f in files]
     out["marks"] = [mark_dict(m) for m in marks]
+    # 老师画的「一题一区域」框。有框的页按框逐题批，没框的页保持整页一次判。
+    out["regions"] = list_regions(db, grade.id)
     # pages 是 total 的别名：前端按 1..pages 逐张去取 /page/{pno}。
     # 不另立第二套"总页数"概念 —— 两个字段各存一份，迟早有一个忘更新。
     out["pages"] = grade.total
@@ -454,6 +479,216 @@ def _drop_pasted(db: Session, grade: HomeworkGrade, role: str) -> None:
         db.delete(f)
 
 
+# ---------------------------------------------------------------- 一题一区域
+def region_dict(r: HomeworkGradeRegion) -> dict:
+    q = (r.q_no or "").strip()
+    return {
+        "id": r.id,
+        "page_no": int(r.page_no or 1),
+        "seq": int(r.seq or 0),
+        "q_no": q,
+        # 给老师看、也写进提示词帮模型定位。**不参与题号绑定**（绑定看 q_no）。
+        "label": q or str(int(r.seq or 0) + 1),
+        "box": _json_list(r.box),
+    }
+
+
+def _regions_of(db: Session, gid: int) -> list[HomeworkGradeRegion]:
+    return list(db.scalars(
+        select(HomeworkGradeRegion)
+        .where(HomeworkGradeRegion.grade_id == int(gid))
+        .order_by(HomeworkGradeRegion.page_no, HomeworkGradeRegion.seq, HomeworkGradeRegion.id)
+    ).all())
+
+
+def list_regions(db: Session, gid: int) -> list[dict]:
+    return [region_dict(r) for r in _regions_of(db, gid)]
+
+
+def regions_by_page(db: Session, gid: int) -> dict[int, list[dict]]:
+    """{页号: [框, …]}。批改线程里用 —— 线程内不碰 ORM 对象，只传纯 dict。"""
+    out: dict[int, list[dict]] = {}
+    for r in _regions_of(db, gid):
+        out.setdefault(int(r.page_no or 1), []).append(region_dict(r))
+    return out
+
+
+def _region_box(values) -> list[int] | None:
+    """校验并规整成一个框。**位置反了自动纠正，太小就判无效**。
+
+    太小不是「凑合能用」而是真的不能用：0~1000 制下 20 ≈ 纸面 2%，
+    比这更小的框裁出来只是一团糊字，送模型等于花钱买一句「读不清」。
+    """
+    try:
+        v = [int(round(float(x))) for x in (values or [])]
+    except (TypeError, ValueError):
+        return None
+    if len(v) != 4:
+        return None
+    x0, x1 = sorted((max(0, min(1000, v[0])), max(0, min(1000, v[2]))))
+    y0, y1 = sorted((max(0, min(1000, v[1])), max(0, min(1000, v[3]))))
+    if (x1 - x0) < REGION_MIN_SIDE or (y1 - y0) < REGION_MIN_SIDE:
+        return None
+    return [x0, y0, x1, y1]
+
+
+def put_page_regions(db: Session, gid: int, payload: GradeRegionsPut) -> list[dict]:
+    """**整页替换**这一页的框。
+
+    为什么不逐条增删：画框在界面上是一次画完再保存的，逐条同步会带来
+    「删了又加、id 对不上」的一堆中间态。整页替换的结果永远等于老师屏幕上
+    看到的样子，不会出现「界面 5 个框、库里 7 条」。
+    """
+    grade = get_grade(db, gid)
+    if grade.status == "running":
+        raise GradeError(409, "正在批改，等这一遍跑完再改框 —— 否则这一批用的框是哪一版说不清")
+    page_no = max(1, int(payload.page_no or 1))
+    if int(grade.total or 0) and page_no > int(grade.total):
+        raise GradeError(422, f"这份作业只有 {int(grade.total)} 页，没有第 {page_no} 页")
+
+    rows = list(payload.regions or [])
+    if len(rows) > MAX_REGIONS_PER_PAGE:
+        raise GradeError(422, f"一页最多画 {MAX_REGIONS_PER_PAGE} 个框")
+    keep: list[HomeworkGradeRegion] = []
+    for i, reg in enumerate(rows):
+        box = _region_box(reg.box)
+        if box is None:
+            raise GradeError(
+                422,
+                f"第 {i + 1} 个框太小或位置不对 —— 要能框住一整道题"
+                f"（宽高都不能小于纸面的 {REGION_MIN_SIDE / 10:.0f}%）",
+            )
+        keep.append(HomeworkGradeRegion(
+            owner_id=config.OWNER_ID,
+            grade_id=grade.id,
+            page_no=page_no,
+            seq=i,
+            q_no=str(reg.q_no or "").strip()[:16],
+            box=json.dumps(box),
+            created_at=_now(),
+        ))
+    db.execute(delete(HomeworkGradeRegion).where(
+        HomeworkGradeRegion.grade_id == grade.id,
+        HomeworkGradeRegion.page_no == page_no,
+    ))
+    for r in keep:
+        db.add(r)
+    db.commit()
+    return list_regions(db, grade.id)
+
+
+def copy_regions(db: Session, gid: int, from_gid: int) -> list[dict]:
+    """把**同一节课另一份**的框照抄过来（一套卷只画一次）。
+
+    ⚠️ 拷的是坐标本身，不是「模板」。不同学生拍照会有平移/旋转，框会偏 ——
+    所以界面必须提示「宁大勿小」，且 `_crop_region` 会按 `REGION_PAD` 外扩兜一层。
+    跨课时不拷：不同卷子的排版不一样，拷过去只会把框画在错误的题上。
+    """
+    grade = get_grade(db, gid)
+    if grade.status == "running":
+        raise GradeError(409, "正在批改，等这一遍跑完再改框")
+    if int(from_gid) == grade.id:
+        raise GradeError(422, "不能从自己这一份抄框")
+    src = get_grade(db, from_gid)
+    if int(src.lesson_id) != int(grade.lesson_id):
+        raise GradeError(422, "只能沿用同一节课里的框 —— 不同卷子的排版不一样")
+    src_rows = _regions_of(db, src.id)
+    if not src_rows:
+        raise GradeError(422, "那一份还没有画框，没有可沿用的")
+
+    db.execute(delete(HomeworkGradeRegion).where(HomeworkGradeRegion.grade_id == grade.id))
+    for r in src_rows:
+        db.add(HomeworkGradeRegion(
+            owner_id=config.OWNER_ID,
+            grade_id=grade.id,
+            page_no=int(r.page_no or 1),
+            seq=int(r.seq or 0),
+            q_no=r.q_no or "",
+            box=r.box or "[]",
+            created_at=_now(),
+        ))
+    db.commit()
+    return list_regions(db, grade.id)
+
+
+def _crop_region(png_path: str, box, out_dir: Path, seq: int) -> Path | None:
+    """按 0~1000 的框从页图上裁一块，外扩 `REGION_PAD`，放大后落盘。
+
+    返回新文件路径；框不可用 / 图读不出来时返回 **None**（不抛）：
+    一个框坏了不该毁掉一整页的批改结果。
+    """
+    from PIL import Image      # 与 grade_export 同一条依赖，不引新库
+
+    b = _region_box(box)
+    if b is None:
+        return None
+    try:
+        # 与 grade_ai 的送模型分辨率对齐。延迟 import：grade_ai 缺席时整条链路
+        # 应该走「AI 模块没就位」的既有分支，而不是在这里 ImportError。
+        try:
+            from .grade_ai import GRADE_MAX_EDGE
+        except Exception:                        # noqa: BLE001
+            GRADE_MAX_EDGE = 2200
+        with Image.open(png_path) as im:
+            im = im.convert("RGB")
+            w, h = im.size
+            if w < 8 or h < 8:
+                return None
+            x0 = max(0, b[0] - REGION_PAD)
+            y0 = max(0, b[1] - REGION_PAD)
+            x1 = min(1000, b[2] + REGION_PAD)
+            y1 = min(1000, b[3] + REGION_PAD)
+            px0 = int(w * x0 / 1000.0)
+            px1 = int(w * x1 / 1000.0)
+            py0 = int(h * y0 / 1000.0)
+            py1 = int(h * y1 / 1000.0)
+            # 至少 2px：极小框在极端比例下会算出 0 宽，crop 会抛
+            px1 = max(px0 + 2, min(w, px1))
+            py1 = max(py0 + 2, min(h, py1))
+            px0 = min(px0, px1 - 2)
+            py0 = min(py0, py1 - 2)
+            tile = im.crop((px0, py0, px1, py1))
+            zoom = min(REGION_MAX_ZOOM,
+                       max(1.0, float(GRADE_MAX_EDGE) / float(max(tile.size))))
+            if zoom > 1.01:
+                tile = tile.resize(
+                    (max(1, int(tile.width * zoom)), max(1, int(tile.height * zoom))),
+                    Image.LANCZOS,
+                )
+            out_dir.mkdir(parents=True, exist_ok=True)
+            out = out_dir / f"region_{int(seq):03d}.png"
+            tile.save(out, "PNG")
+            return out
+    except Exception:                            # noqa: BLE001
+        return None
+
+
+def _region_placeholder(reg: dict, reason: str) -> dict:
+    """框里什么都没批出来时的**占位题**。
+
+    必须留一条，否则老师只看到「这页比预期少一题」，会以为是自己漏画了框。
+    verdict 给 ungradable（不是 wrong）：没读到 ≠ 学生没写。
+    """
+    return {
+        "q_no": str(reg.get("q_no") or ""),
+        "qtype": None,
+        "stem": "",
+        "student_answer": "",
+        "correct_answer": "",
+        "verdict": "ungradable",
+        "basis": reason,
+        "confidence": "low",
+        "kp_name": "",
+        "error_reason": "",
+        "figure_note": "",
+        "flags": ["region_empty"],
+        "raw": {
+            "question": {"region_box": reg.get("box"), "region_seq": reg.get("seq")},
+            "meta": {"model": "", "finish_reason": "", "mode": "", "sample": 1},
+        },
+    }
+
+
 # ---------------------------------------------------------------- 页 ↔ 文件
 def _page_slots(db: Session, grade: HomeworkGrade) -> list[dict]:
     """把「整份作业的第 N 页」摊平成一张表：第 N 页在哪个文件的第几页。
@@ -567,6 +802,23 @@ def _recognize_page(png: str, ctx: dict) -> tuple[list[dict], str]:
     return items, ""
 
 
+def _recognize_region(png: str, ctx: dict) -> tuple[list[dict], str]:
+    """调一次「单题区域」识别。契约与 `_recognize_page` 完全一致（两者互斥）。"""
+    ready, why = _ai_ready()
+    if not ready:
+        return [], why
+    from .grade_ai import recognize_region
+    try:
+        items, err = recognize_region(png, ctx)
+    except Exception as e:                           # noqa: BLE001
+        return [], f"AI 层异常（{type(e).__name__}: {e}）"
+    if err:
+        return [], str(err)
+    if not isinstance(items, list):
+        return [], "AI 层返回的不是逐题列表"
+    return items, ""
+
+
 # ---------------------------------------------------------------- 逐页写入
 def _item_row(r: dict, gid: int, pno: int, seq: int) -> HomeworkGradeItem:
     raw = r.get("raw")
@@ -590,6 +842,7 @@ def _item_row(r: dict, gid: int, pno: int, seq: int) -> HomeworkGradeItem:
         score=_num(r.get("score")),               # 没判就是 NULL，不给 0
         full_score=_num(r.get("full_score")),
         basis=str(r.get("basis") or ""),
+        figure_note=str(r.get("figure_note") or ""),
         confidence=_confidence(r.get("confidence")),
         kp_name=str(r.get("kp_name") or "").strip(),
         tags=json.dumps(knowledge.clean_tags(r.get("tags")), ensure_ascii=False),
@@ -757,6 +1010,9 @@ def _run_grade(gid: int) -> None:
         db.commit()
         base_ctx = _ctx_base(db, grade)
         curriculum_id = grade.curriculum_id
+        # 框必须在关 session 之前读成纯 dict —— 线程里不许碰 ORM 对象。
+        # 空 dict = 一页都没画框 = 整条流程退回老口径（整页一次判）。
+        by_page = regions_by_page(db, gid)
     finally:
         db.close()
 
@@ -764,7 +1020,11 @@ def _run_grade(gid: int) -> None:
     first_err = ""
     try:
         with ThreadPoolExecutor(max_workers=WORKERS) as pool:
-            futures = {pool.submit(_run_one_page, slot, base_ctx): slot["pno"] for slot in slots}
+            futures = {
+                pool.submit(_run_one_page, slot, base_ctx, by_page.get(int(slot["pno"]))):
+                    slot["pno"]
+                for slot in slots
+            }
             for fut in as_completed(futures):
                 pno = futures[fut]
                 try:
@@ -791,8 +1051,19 @@ def _run_grade(gid: int) -> None:
     _finalize(gid, done, first_err)
 
 
-def _run_one_page(slot: dict, ctx_base: dict) -> tuple[list[dict], str]:
-    """在一个工作线程里处理一页：渲染页图 + 调 AI。**不碰数据库**，纯 I/O。"""
+def _run_one_page(slot: dict, ctx_base: dict,
+                  regions: list[dict] | None = None) -> tuple[list[dict], str]:
+    """在一个工作线程里处理一页：渲染页图 + 调 AI。**不碰数据库**，纯 I/O。
+
+    两种口径：
+      · **有框**（`regions` 非空）→ 一框一裁切一调用。有效分辨率翻几倍、
+        题号由框绑定、框外内容根本看不见（跨题污染从物理上消失）。
+      · **没框** → 保持老行为：整页一次判。老记录、没画框的人零影响。
+
+    ⚠️ 单框失败**不毁整页**：失败的那个框留一条 ungradable 占位（老师看得见），
+    其余框照常出结果。只有**一个都没成**才把整页算失败 —— 那种情况多半是
+    接口挂了 / 没配，重试整页才有意义。
+    """
     path = slot["path"]
     if path is None or not Path(path).exists():
         return [], "原件不在了（可能已被删除）"
@@ -802,7 +1073,49 @@ def _run_one_page(slot: dict, ctx_base: dict) -> tuple[list[dict], str]:
         png = pdf_adapter.render_page(str(path), int(slot["local"]), str(slot["cache_dir"]))
     except Exception as e:                           # noqa: BLE001
         return [], f"页图渲染不出来（{type(e).__name__}: {e}）"
-    return _recognize_page(png, {**ctx_base, "page_no": slot["pno"]})
+
+    pno = int(slot["pno"])
+    if not regions:
+        return _recognize_page(png, {**ctx_base, "page_no": pno})
+
+    items: list[dict] = []
+    good = 0
+    first_err = ""
+    for reg in regions:
+        label = str(reg.get("label") or reg.get("seq") or "")
+        tile = _crop_region(png, reg.get("box"), Path(slot["cache_dir"]),
+                            int(reg.get("seq") or 0))
+        if tile is None:
+            first_err = first_err or f"第 {label} 题的框不可用（太小或画在纸外）"
+            items.append(_region_placeholder(reg, "这个框裁不出内容 —— 框可能画到了纸外或太小"))
+            continue
+        try:
+            got, err = _recognize_region(str(tile), {
+                **ctx_base, "page_no": pno, "region": True, "region_label": label,
+            })
+        except Exception as e:                       # noqa: BLE001
+            got, err = [], f"{type(e).__name__}: {e}"
+        if err:
+            first_err = first_err or err
+            items.append(_region_placeholder(reg, err))
+            continue
+        if not got:
+            # 框画在空白处 / 这一块确实没题。**不是错误**，但要留痕。
+            items.append(_region_placeholder(reg, "这个框里没读到题目 —— 框画空了？"))
+            continue
+        it = got[0]
+        # 题号绑定：老师填的 q_no 一律优先，模型认的那个只当兜底。
+        # 这是「消掉题号错配」的关键一步 —— 学生把第 3 题写成第 8 题也不影响归属。
+        if str(reg.get("q_no") or "").strip():
+            it["q_no"] = str(reg["q_no"]).strip()
+        elif not str(it.get("q_no") or "").strip():
+            it["q_no"] = label
+        good += 1
+        items.append(it)
+
+    if good == 0 and first_err:
+        return [], first_err
+    return items, ""
 
 
 # ---------------------------------------------------------------- 老师改题
@@ -906,7 +1219,9 @@ def rerun_item(db: Session, iid: str) -> HomeworkGradeItem:
         raise GradeError(422, f"找不到第 {it.page_no} 页（原件可能已被删除）")
 
     ctx = {**_ctx_base(db, grade), "page_no": slot["pno"]}
-    items, err = _run_one_page(slot, ctx)
+    # 有框的页必须走「按框批」—— 否则重批会退回整页口径，题号对不上，
+    # 还会用一次便宜的整页结果覆盖掉当初按框批出来的、更准的那一版。
+    items, err = _run_one_page(slot, ctx, regions_by_page(db, grade.id).get(int(slot["pno"])))
     if err:
         raise GradeError(422, f"这页没批成：{err}")
 
@@ -932,6 +1247,7 @@ def rerun_item(db: Session, iid: str) -> HomeworkGradeItem:
     it.score = _num(hit.get("score"))
     it.full_score = _num(hit.get("full_score"))
     it.basis = str(hit.get("basis") or "")
+    it.figure_note = str(hit.get("figure_note") or "")
     it.confidence = _confidence(hit.get("confidence"))
     it.error_reason = str(hit.get("error_reason") or "")
     it.raw = hit.get("raw") if isinstance(hit.get("raw"), str) else json.dumps(

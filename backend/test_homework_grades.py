@@ -75,6 +75,8 @@ from app.schemas import (                              # noqa: E402
     GradeItemPatch,
     GradeMarkIn,
     GradeMarkPatch,
+    GradeRegionIn,
+    GradeRegionsPut,
     GradeSetupPatch,
     GradeToBankIn,
     GradeConfirmIn,
@@ -836,6 +838,18 @@ def t_frontend() -> None:
     check("标注层的模板编译通过（笔迹模式一改就白屏，得逐版编译）",
           re.search(r"TPL layer_template\.html OK", out) is not None, out[-300:])
 
+    # ⚠️ **模板字面量里不能出现反引号**（写在 HTML 注释里也算）。
+    #    它会把模板提前截断：剩下的半截 `xxx`.foo - regions 变成一个合法的 JS 表达式，
+    #    于是 —— `node --check` 语法照样过、`Vue.compile` 也照样过（它只看到被截短的那一小段，
+    #    而那一小段本身是合法的），**只有真挂载时才炸** `ReferenceError: regions is not defined`。
+    #    2026-10-19 一小时内踩到两次（`id` 和 `.gmark-regions` 各一次），都是这么漏过去的。
+    #    判据：`template:` 之后（含收尾那个）反引号**只能是 2 个**（开一个、闭一个）。
+    for src_text, label in ((view, "批改台"), (layer, "标注层")):
+        head = src_text.find("template: `")
+        ticks = src_text[head:].count("`") if head >= 0 else -1
+        check(f"{label}的模板字面量里没有多余反引号（有就会静默截断模板）", ticks == 2,
+              f"template 之后有 {ticks} 个反引号")
+
     # node --check（语法）。⚠️ `--input-type=module` 只认 stdin，不能跟文件路径
     # （会报 ERR_INPUT_TYPE_NOT_ALLOWED）；而直接对 .js 跑 --check 会按 CommonJS 解析，
     # 遇到 import 就报错。所以把源码喂进 stdin。
@@ -864,6 +878,25 @@ def t_frontend() -> None:
                   r.returncode == 0, (r.stdout or r.stderr or "")[-400:])
         except (OSError, subprocess.SubprocessError) as e:
             print(f"  [SKIP] mark_geom_check 没跑成：{e}")
+
+    # ---- 批改台真挂载（jsdom 挂 HomeworkGrade.js，数渲染痕迹）----
+    # 上面那一层（模板编译 + node --check + 静态断言）**证明不了**三件事，
+    # 而这三件事恰好是这一屏最容易坏的地方：
+    #   ① 首次打开时题干/作答是不是**空的**（paintAll 跑在 loading 关掉之前 → 容器不在 DOM 里）
+    #   ② 框题模式下服务器上的框、刚画的草稿框，是不是真画出来了、删中间那个会不会删错格子
+    #   ③ 图上读到的（figure_note）有没有上屏、没有这道题的卡片会不会多出空壳
+    # 找不到 jsdom 就跳过（脚本自己退 0），不会把回归弄红。
+    mount_check = FE / "grade_mount_check.js"
+    check("有批改台的真挂载检查", mount_check.exists(), str(mount_check))
+    if mount_check.exists():
+        try:
+            r = subprocess.run([node, str(mount_check)], capture_output=True, text=True,
+                               encoding="utf-8", errors="replace", timeout=180)
+            tail = ((r.stdout or "") + (r.stderr or "")).strip().splitlines()
+            check("批改台真挂载全过（首次渲染 / 框题 / 图上读数 / 判定接线）",
+                  r.returncode == 0, " | ".join(tail[-6:]))
+        except (OSError, subprocess.SubprocessError) as e:
+            print(f"  [SKIP] grade_mount_check 没跑成：{e}")
 
 
 def extract_template(src: str) -> str | None:
@@ -988,6 +1021,274 @@ def t_ink_export() -> None:
         db.close()
 
 
+# ================================================================ ⑨ 一题一区域
+def t_regions() -> None:
+    """一题一区域（2026-10 调研后加的第二条口径）。
+
+    守的四件事：
+
+      1. **不画框的人零影响**：有框才按框批，没框仍然整页一次判。
+      2. **题号由框绑定，不信模型认的题号**。学生把第 3 题写成第 8 题、
+         模型把 6 读成 8，都不该影响归属 —— 否则「判错人」比「判错分」糟得多。
+      3. **单框失败不毁整页**，但要留占位（ungradable + region_empty），
+         不能让老师看到「怎么少了一题」还以为是自己漏画了框。
+      4. **坐标是 0~1000 的归一化整数**，太小/越界要被挡掉，不能静默画到纸外。
+    """
+    print("\n=== ⑨ 一题一区域（按框裁切、按框批） ===")
+
+    # ---------------- 纯几何校验（不碰库） ----------------
+    check("正常框原样通过", G._region_box([100, 200, 500, 600]) == [100, 200, 500, 600])
+    check("左上右下写反了自动纠正", G._region_box([500, 600, 100, 200]) == [100, 200, 500, 600],
+          G._region_box([500, 600, 100, 200]))
+    check("越界坐标夹回 0~1000", G._region_box([-50, -20, 1200, 1100]) == [0, 0, 1000, 1000],
+          G._region_box([-50, -20, 1200, 1100]))
+    check("太小的框判无效（不是凑合能用）", G._region_box([10, 10, 20, 20]) is None)
+    check("不是 4 个数判无效", G._region_box([1, 2, 3]) is None)
+    check("非数字判无效", G._region_box(["a", 1, 2, 3]) is None)
+
+    db = SessionLocal()
+    try:
+        stu = mk_student(db, "框题测试学生")
+        ls = mk_lesson(db, stu)
+        s1 = mk_submission(db, ls, "框题.png")
+        db.commit()
+        g = G.create_grade(db, GradeIn(lesson_id=ls.id, file_ids=[s1.id], answer_mode="ai"))
+        db.commit()
+
+        # ---------------- 存框 / 整页替换 ----------------
+        out = G.put_page_regions(db, g.id, GradeRegionsPut(page_no=1, regions=[
+            GradeRegionIn(q_no="1", box=[50, 100, 900, 300]),
+            GradeRegionIn(q_no="2", box=[50, 320, 900, 520]),
+            GradeRegionIn(q_no="", box=[50, 540, 900, 700]),
+        ]))
+        check("三个框都存下来了", len(out) == 3, len(out))
+        check("框的顺序 = 老师画的顺序（seq 从 0 起）",
+              [r["seq"] for r in out] == [0, 1, 2], [r["seq"] for r in out])
+        check("题号原样保留", [r["q_no"] for r in out] == ["1", "2", ""], [r["q_no"] for r in out])
+        check("没填题号的框也有可读标签（退回它的序号）", out[2]["label"] == "3", out[2]["label"])
+        check("框坐标规整成整数", out[0]["box"] == [50, 100, 900, 300], out[0]["box"])
+        check("detail 里能拿到 regions（前端要靠它画框）",
+              len(G.detail(db, g)["regions"]) == 3)
+
+        out2 = G.put_page_regions(db, g.id, GradeRegionsPut(page_no=1, regions=[
+            GradeRegionIn(q_no="1", box=[40, 90, 940, 380]),
+        ]))
+        check("再存一次是**整页替换**（3 → 1，不叠加）", len(out2) == 1, len(out2))
+        out3 = G.put_page_regions(db, g.id, GradeRegionsPut(page_no=1, regions=[]))
+        check("传空数组 = 清空这一页的框（退回整页批）", out3 == [], out3)
+
+        # ---------------- 拒绝无效输入 ----------------
+        st, msg = expect_err(G.put_page_regions, db, g.id, GradeRegionsPut(
+            page_no=1, regions=[GradeRegionIn(box=[10, 10, 20, 20])]))
+        check("框太小 → 422", st == 422, (st, msg))
+        check("并且说人话（指出第几个框、要框住一整题）",
+              "一整道题" in msg and "第 1 个框" in msg, msg)
+
+        g.total = 1
+        db.commit()
+        st, msg = expect_err(G.put_page_regions, db, g.id, GradeRegionsPut(page_no=2, regions=[]))
+        check("页号超出这份作业 → 422", st == 422 and "只有 1 页" in msg, (st, msg))
+
+        g.status = "running"
+        db.commit()
+        st, msg = expect_err(G.put_page_regions, db, g.id, GradeRegionsPut(page_no=1, regions=[]))
+        check("正在批改时不许改框 → 409", st == 409, (st, msg))
+        g.status = "reviewing"
+        db.commit()
+
+        # ---------------- 沿用同课时另一份的框 ----------------
+        s2 = mk_submission(db, ls, "框题2.png")
+        db.commit()
+        g2 = G.create_grade(db, GradeIn(lesson_id=ls.id, file_ids=[s2.id], answer_mode="ai"))
+        db.commit()
+        G.put_page_regions(db, g.id, GradeRegionsPut(page_no=1, regions=[
+            GradeRegionIn(q_no="1", box=[50, 100, 900, 300]),
+            GradeRegionIn(q_no="2", box=[50, 320, 900, 520]),
+        ]))
+        copied = G.copy_regions(db, g2.id, g.id)
+        check("能沿用同课时另一份的框", len(copied) == 2, len(copied))
+        check("沿用时题号一起过来（不是只剩坐标）",
+              [r["q_no"] for r in copied] == ["1", "2"], [r["q_no"] for r in copied])
+        check("沿用时坐标一致", copied[0]["box"] == [50, 100, 900, 300], copied[0]["box"])
+        st, _msg = expect_err(G.copy_regions, db, g2.id, g2.id)
+        check("从自己这一份抄 → 422", st == 422, st)
+
+        stu2 = mk_student(db, "另一个班的学生")
+        ls2 = mk_lesson(db, stu2)
+        s3 = mk_submission(db, ls2, "别的卷.png")
+        db.commit()
+        g3 = G.create_grade(db, GradeIn(lesson_id=ls2.id, file_ids=[s3.id], answer_mode="ai"))
+        db.commit()
+        st, _msg = expect_err(G.copy_regions, db, g3.id, g.id)
+        check("跨课时不许沿用（版面不一样）→ 422", st == 422, st)
+
+        # ---------------- 裁图：真的裁出一块并放大 ----------------
+        page = TMP / "page_for_crop.png"
+        make_png(page, 400, 600)
+        tile = G._crop_region(str(page), [200, 200, 500, 400], TMP / "crops", 0)
+        check("按框裁出了一张图", tile is not None and Path(tile).exists(), tile)
+        from PIL import Image
+        with Image.open(page) as im:
+            W0, H0 = im.size
+        with Image.open(tile) as im:
+            TW, TH = im.size
+        # 独立按「归一化 × 页宽」算一遍期望的像素范围（不复用被测函数的代码）
+        cw = int((500 + G.REGION_PAD) / 1000 * W0) - int((200 - G.REGION_PAD) / 1000 * W0)
+        ch = int((400 + G.REGION_PAD) / 1000 * H0) - int((200 - G.REGION_PAD) / 1000 * H0)
+        # ⚠️ 比的是**裁切区域**，不是放大后的成品：放大 4 倍之后成品可能比整页还大，
+        #    那是刻意的（有效分辨率），不是裁错。
+        check("裁的是那一小块（框选区域比整页小得多）",
+              cw < W0 * 0.6 and ch < H0 * 0.6, (cw, ch, W0, H0))
+        check("裁完被放大（有效分辨率翻几倍，这是这条路线的全部意义）",
+              TW > cw and TH > ch, (TW, cw, TH, ch))
+        check("框太小/画到纸外 → 裁不出来时返回 None（不抛）",
+              G._crop_region(str(page), [0, 0, 5, 5], TMP / "crops", 1) is None)
+
+        # ---------------- 按框批：一框一次调用 ----------------
+        g4 = G.create_grade(db, GradeIn(lesson_id=ls.id, file_ids=[s1.id], answer_mode="ai"))
+        db.commit()
+        G.put_page_regions(db, g4.id, GradeRegionsPut(page_no=1, regions=[
+            GradeRegionIn(q_no="1", box=[50, 100, 900, 300]),
+            GradeRegionIn(q_no="2", box=[50, 320, 900, 520]),
+        ]))
+        seen: list[tuple] = []
+        orig_r = G._recognize_region
+
+        def fake_region(png, ctx):
+            seen.append((ctx.get("region"), ctx.get("region_label")))
+            # 模型**故意**把题号读错：检验「题号由框绑定」这条是不是真的成立
+            return ([item_payload(q_no="9", verdict="correct",
+                                  figure_note="$AD\\perp BC$，有直角符号（确定）")], "")
+
+        G._recognize_region = fake_region
+        try:
+            G.launch(db, g4)
+            for _ in range(150):
+                db.refresh(g4)
+                if g4.status in ("reviewing", "done", "partial", "failed"):
+                    break
+                time.sleep(0.1)
+        finally:
+            G._recognize_region = orig_r
+        check("有框时走的是按框批（两个框 = 两次调用，不是一次整页）",
+              len(seen) == 2, len(seen))
+        check("每次调用都标了 region=True（AI 层靠它换成单题口径）",
+              all(s[0] is True for s in seen), seen)
+        check("框的题号写进了上下文（帮模型定位，但不参与绑定）",
+              [s[1] for s in seen] == ["1", "2"], seen)
+        items4 = db.scalars(select(HomeworkGradeItem)
+                            .where(HomeworkGradeItem.grade_id == g4.id)
+                            .order_by(HomeworkGradeItem.seq)).all()
+        check("★ 题号用框绑定的，不用模型读出来的（模型给的是 9）",
+              [i.q_no for i in items4] == ["1", "2"], [i.q_no for i in items4])
+        check("两个框仍然只算 1 页 done（done 是页数，不是题数）",
+              g4.done == 1 and g4.total == 1, (g4.done, g4.total))
+        check("★ figure_note 落库了（图形证据不能让老师看不见）",
+              "直角符号" in (items4[0].figure_note or ""), items4[0].figure_note)
+        check("figure_note 也通过接口给出去了（前端要显示）",
+              "直角符号" in (G.item_dict(items4[0]).get("figure_note") or ""))
+
+        # ---------------- 单框失败不毁整页 ----------------
+        g5 = G.create_grade(db, GradeIn(lesson_id=ls.id, file_ids=[s1.id], answer_mode="ai"))
+        db.commit()
+        G.put_page_regions(db, g5.id, GradeRegionsPut(page_no=1, regions=[
+            GradeRegionIn(q_no="1", box=[50, 100, 900, 300]),
+            GradeRegionIn(q_no="2", box=[50, 320, 900, 520]),
+        ]))
+        seq_calls = {"n": 0}
+
+        def half(png, ctx):
+            seq_calls["n"] += 1
+            if seq_calls["n"] == 1:
+                return [], ""                      # 第一个框画空了
+            return ([item_payload(q_no="2", verdict="wrong")], "")
+
+        G._recognize_region = half
+        try:
+            G.launch(db, g5)
+            for _ in range(150):
+                db.refresh(g5)
+                if g5.status in ("reviewing", "done", "partial", "failed"):
+                    break
+                time.sleep(0.1)
+        finally:
+            G._recognize_region = orig_r
+        items5 = db.scalars(select(HomeworkGradeItem)
+                            .where(HomeworkGradeItem.grade_id == g5.id)
+                            .order_by(HomeworkGradeItem.seq)).all()
+        check("框画空 → 仍留一条占位（不是静默少一题）", len(items5) == 2, len(items5))
+        check("占位是 ungradable，**不是 wrong**（没读到 ≠ 没写）",
+              items5[0].verdict == "ungradable", items5[0].verdict)
+        check("占位带 region_empty 标记（界面能一眼看出是框的问题）",
+              "region_empty" in json.loads(items5[0].flags or "[]"), items5[0].flags)
+        check("另一半照常出结果，这一页仍算批完（不因一个框失败整页废掉）",
+              g5.done == 1 and g5.failed == 0, (g5.done, g5.failed))
+
+        # ---------------- 全失败 → 整页失败 ----------------
+        g6 = G.create_grade(db, GradeIn(lesson_id=ls.id, file_ids=[s1.id], answer_mode="ai"))
+        db.commit()
+        G.put_page_regions(db, g6.id, GradeRegionsPut(page_no=1, regions=[
+            GradeRegionIn(q_no="1", box=[50, 100, 900, 300]),
+        ]))
+
+        def allfail(png, ctx):
+            return [], "接口 401 未授权"
+
+        G._recognize_region = allfail
+        try:
+            G.launch(db, g6)
+            for _ in range(150):
+                db.refresh(g6)
+                if g6.status in ("reviewing", "done", "partial", "failed"):
+                    break
+                time.sleep(0.1)
+        finally:
+            G._recognize_region = orig_r
+        check("一个框都没批成 → 这一页算失败（这种情况重试整页才有意义）",
+              g6.failed >= 1, g6.failed)
+        check("失败原因写下来了", "401" in (g6.error or ""), g6.error)
+
+        # ---------------- 提示词：两种口径不能串 ----------------
+        from app.services import grade_ai as A
+        p_page = A._prompt_for("ai", {"page_no": 1})
+        p_reg = A._prompt_for("ai", {"page_no": 1, "region": True, "region_label": "第 2 题"})
+        check("区域口径：明确「只输出一个」", "恰好一个" in p_reg)
+        check("区域口径：q_no 交给系统绑定", "一律给空字符串" in p_reg)
+        check("区域口径：带上了这个框是第几题", "第 2 题" in p_reg)
+        check("整页口径里**不能**出现区域那段（否则整页只出一题）",
+              "裁下来的一道题" not in p_page)
+        check("整页口径里不能出现「最后再说一遍」（同上）", "最后再说一遍" not in p_page)
+
+        # ---------------- 图形规则：老口径必须真的删掉 ----------------
+        check("★ 图形证据三分档写进提示词", "看见的能作数" in p_page)
+        check("★ 老口径「图形描述不得作为判错依据」已经不在源码里",
+              "图形描述不得作为判错" not in code_only(read(BE / "app" / "services" / "grade_ai.py")))
+        check("看不清的只作疑、没看见的不作否",
+              "看不清的只作疑" in p_page and "没看见的不作否" in p_page)
+        check("仍然不因画得丑扣分（这条不能被三分档带没了）",
+              "画得丑" in p_page)
+        check("★ 统计图表题要求先读成表再算，不许「大概这么高」",
+              "先把图上的数读成一张表" in p_page and "大概这么高" in p_page)
+        check("figure_note 要求标确定性", "（确定）" in p_page and "（看不清）" in p_page)
+
+        # ---------------- 前端接线 ----------------
+        view = read(FE / "src" / "views" / "HomeworkGrade.js")
+        layer = read(FE / "src" / "components" / "GradeMarkLayer.js")
+        api = read(FE / "src" / "api.js")
+        check("批改台有「框题」按钮", "setTool('region')" in view and ">框题</button>" in view)
+        check("框的草稿交给标注层画出来（:regions）", ":regions=" in view)
+        check("标注层画完框能回传（@region）", '@region="addRegionBox"' in view)
+        check("框题面板能保存", "gradeApi.putRegions" in view and "putRegions:" in api)
+        check("能沿用同一节课另一份的框",
+              "gradeApi.copyRegions" in view and "regions/copy" in api)
+        check("★ 前后端的最小框边长必须同值（漂了就是前端以为能画、后端拒收）",
+              f"const REGION_MIN = {G.REGION_MIN_SIDE}" in layer, G.REGION_MIN_SIDE)
+        check("框题模式下已有标注失去指针（否则起手那一下就画不出框）",
+              ".gmark-layer.mode-region .gmark" in read(FE / "app.css"))
+    finally:
+        db.close()
+
+
 # ================================================================ main
 def main() -> int:
     Base.metadata.create_all(engine)
@@ -1002,6 +1303,7 @@ def main() -> int:
     t_run_with_stub()
     t_frontend()
     t_ink_export()
+    t_regions()
 
     print("\n" + "=" * 72)
     print(f"共 {total} 项，失败 {len(fails)} 项")

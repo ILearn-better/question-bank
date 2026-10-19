@@ -25,6 +25,8 @@ from ..schemas import (
     GradeItemPatch,
     GradeMarkIn,
     GradeMarkPatch,
+    GradeRegionsCopy,
+    GradeRegionsPut,
     GradeSetupPatch,
     GradeToBankIn,
 )
@@ -212,3 +214,45 @@ def delete_mark(mid: int, db: Session = Depends(get_db)):
     except store.GradeError as e:
         raise _fail(e) from e
     return {"ok": True}
+
+
+# ---------------------------------------------------------------- 一题一区域
+# 这一段是「整页一次判所有题」之外的另一条口径：老师框出每道题的作答在哪，
+# 每框单独裁切、单独调模型。**没有框的页仍然走整页**，所以是纯增量。
+@router.get("/homework-grades/{gid}/regions")
+def list_regions(gid: int, db: Session = Depends(get_db)):
+    """这份作业画过的所有框（按页号 + 页内顺序）。"""
+    try:
+        store.get_grade(db, gid)
+    except store.GradeError as e:
+        raise _fail(e) from e
+    return {"regions": store.list_regions(db, gid)}
+
+
+@router.put("/homework-grades/{gid}/regions")
+def put_page_regions(gid: int, payload: GradeRegionsPut, db: Session = Depends(get_db)):
+    """**整页替换**这一页的框。
+
+    为什么是 PUT 整页替换而不是逐条增删：画框在界面上是一次画完再保存，
+    整页替换的结果永远等于老师屏幕上看到的样子，不会留下「删了又加」的中间态。
+    传空数组 = 清空这一页的框（这一页退回整页批）。
+    """
+    try:
+        regions = store.put_page_regions(db, gid, payload)
+    except store.GradeError as e:
+        raise _fail(e) from e
+    return {"regions": regions}
+
+
+@router.post("/homework-grades/{gid}/regions/copy")
+def copy_regions(gid: int, payload: GradeRegionsCopy, db: Session = Depends(get_db)):
+    """沿用同一节课里另一份的框（一套卷只画一次）。
+
+    ⚠️ 拷的是坐标，不是模板 —— 不同学生的照片有平移/旋转，框会偏。
+    界面要提示「宁大勿小」，拷完建议扫一眼。
+    """
+    try:
+        regions = store.copy_regions(db, gid, payload.from_grade_id)
+    except store.GradeError as e:
+        raise _fail(e) from e
+    return {"regions": regions}

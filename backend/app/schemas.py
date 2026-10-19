@@ -745,6 +745,39 @@ class GradeMarkPatch(BaseModel):
     kind: Optional[Literal["box", "ellipse", "check", "cross", "arrow", "text", "ink"]] = None
 
 
+class GradeRegionIn(BaseModel):
+    """一题一区域的**一个框**。坐标按页归一化 0~1000（与标注同制，不是像素）。
+
+    `q_no` 空着也行：批改时会回落到模型自己认的题号。填了就以它为准 ——
+    这样学生把「第 3 题」写成「第 8 题」时归属仍然是第 3 题。
+    """
+
+    q_no: str = ""
+    box: List[float] = Field(default_factory=list)      # [x0, y0, x1, y1]
+
+
+class GradeRegionsPut(BaseModel):
+    """**整页替换**老师画的框。
+
+    为什么是整页替换而不是逐条增删：画框这件事在界面上是一次性画完再保存的，
+    逐条同步会带来「删了又加、id 对不上」的一堆中间态；整页替换的结果永远等于
+    老师屏幕上看到的东西，不会出现「界面上 5 个框、库里有 7 条」。
+    """
+
+    page_no: int = 1
+    regions: List[GradeRegionIn] = Field(default_factory=list)
+
+
+class GradeRegionsCopy(BaseModel):
+    """从**同一课时的另一份批改**把框拷过来（一套卷只画一次）。
+
+    ⚠️ 拷过来的是坐标本身。不同学生的照片会有平移/旋转，框会偏 ——
+    所以界面要提示「宁大勿小」，且拷完建议扫一眼。
+    """
+
+    from_grade_id: int
+
+
 class GradeToBankIn(BaseModel):
     """把一道错题挂到题库已有题上（B1 已定：**不自动建题**）。
 

@@ -386,6 +386,14 @@ export const gradeApi = {
   exportUrl: (gid, fmt = 'pdf', page = 1) =>
     `/api/homework-grades/${gid}/export?fmt=${encodeURIComponent(fmt)}&page=${Number(page) || 1}`,
 
+  /** 一题一区域：老师框出每道题的作答道在哪，一框一次判；没框的页仍整页判。 */
+  listRegions: (gid) => api.get(`/api/homework-grades/${gid}/regions`),
+  /** **整页替换**：传这一页的完整框列表，传空数组 = 清空这一页的框。 */
+  putRegions: (gid, body) => api.put(`/api/homework-grades/${gid}/regions`, body),
+  /** 沿用同一节课另一份的框（一套卷只画一次）。跨课时会 422。 */
+  copyRegions: (gid, fromGradeId) =>
+    api.post(`/api/homework-grades/${gid}/regions/copy`, { from_grade_id: fromGradeId }),
+
   /** 改一题的判定 / 学生作答 / 错因 / 考点 / 核对状态。
    *  ⚠️ 改 student_answer 会**作废这一题的判定并重跑**（旧的 evidence 引用已经不存在了）。 */
   patchItem: (iid, body) => api.patch(`/api/grade-items/${iid}`, body),
@@ -395,8 +403,7 @@ export const gradeApi = {
   toBank: (iid, body) => api.post(`/api/grade-items/${iid}/to-bank`, body),
 
   /** 原件上的标注：新增 / 改 / 删。 */
-  addMark: (gid, body) => api.post(`/api/homework-grades/${gid}/marks`, body),
-  patchMark: (mid, body) => api.patch(`/api/grade-marks/${mid}`, body),
+  addMark: (gid, body) => api.post(`/api/homework-grades/${gid}/marks`, body),  patchMark: (mid, body) => api.patch(`/api/grade-marks/${mid}`, body),
   removeMark: (mid) => api.del(`/api/grade-marks/${mid}`),
 };
 

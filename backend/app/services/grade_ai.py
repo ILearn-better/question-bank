@@ -102,6 +102,8 @@ _STEM_LIMIT = 4000
 _ANSWER_LIMIT = 4000
 _BASIS_LIMIT = 600
 _REASON_LIMIT = 300
+# 图上要点可能是一整张数表（直方图十几个区间），比 basis 需要更长。
+_FIGURE_LIMIT = 1200
 _KP_LIMIT = 30
 
 _VERDICTS = ("correct", "partial", "wrong", "blank", "ungradable")
@@ -178,9 +180,27 @@ _TRANSCRIBE_RULES = (
     "挤成一行就看不出是在哪一步出的错了。\n"
     "6. 选择题：只记录学生**勾 / 圈 / 涂 / 写了哪个选项字母**（写进 student_answer，例如 \"B\"）。"
     "看不清勾了哪个 → verdict 给 ungradable，**不要靠题目内容去猜他可能选哪个**。\n"
-    "7. 几何图：可以用一句话描述学生画了什么（例如「在 $AB$ 上取中点 $D$，连 $CD$」），"
-    "写进 figure_note。**图形描述不得作为判错或扣分的依据** —— 画图没有可核对的口径，"
-    "画错一条辅助线不等于推理错。\n"
+    "7. 几何图（**这一条 2026-10 改过，别按老口径判**）：\n"
+    "   · figure_note 里写**结构化的**图信息，不要只写「画了一个三角形」。尽量交代四样：\n"
+    "     ① 图上出现的点与字母（含学生新命名的）；\n"
+    "     ② 连线 —— 尤其是学生**自己加的辅助线**，要写成可核对的形式"
+    "（「过 $D$ 作 $DP\\perp BP$，垂足 $P$」），不要只写「加了一条线」；\n"
+    "     ③ 标出的角、直角符号、等长记号、平行记号、圆弧记号；\n"
+    "     ④ 图上写出来的数值与单位。\n"
+    "   · 每一句后面标把握：`（确定）` 或 `（看不清）`。**看不清的不许猜** —— "
+    "猜一个不存在的记号，比说「看不清」危害大得多。\n"
+    "   · 一句一件事，用「；」隔开，方便后面逐句引用。\n"
+    "   · 图上一个记号都没有（纯示意图）就照实写「除字母外无任何标记」，"
+    "**不要**把「看起来像直角」写成直角。\n"
+    "8. 统计图表 / 数据表（频率分布直方图、茎叶图、箱线图、散点图、折线图、"
+    "列联表、分布列…）：\n"
+    "   · **先把图上的数读成一张表，再算**。绝不用「柱子大概这么高」代替具体数值 —— "
+    "「大概」在求频率、求距离、求四分位时会直接算错，而且错得很像对的。\n"
+    "   · 表写进 figure_note：直方图写「区间:频数」，茎叶图写「茎:叶 叶 叶」，"
+    "箱线图写「最小/下四分位/中位/上四分位/最大」，并注明轴名、单位、刻度间隔。\n"
+    "   · 图上**没有印数字**（纯图形）时必须写明「刻度需按格数推算」，"
+    "并写出你数到的格数与换算过程，不要直接抛一个凭感觉的数。\n"
+    "   · 读不出来的格子写「读不清」并标 `（看不清）`，**不要用题型常识补一个看着合理的数**。\n"
 )
 
 _JUDGE_RULES = (
@@ -197,6 +217,19 @@ _JUDGE_RULES = (
     "或者依据本身缺失。**不要**把它落成 wrong —— 冤枉一个学生，"
     "比这题暂时没批完糟糕得多。\n"
     "6. 学生整题空白（没写任何字、也没勾选）→ verdict 给 blank，不要给 wrong。\n"
+    "7. **图上画的可以作数，但要按把握分档**（这是唯一允许拿图当依据的地方）。\n"
+    "   老口径是「图形描述一律不得作为判错依据」，那条已经在 2026-10 废止 —— "
+    "它把「过 $D$ 作 $DP\\perp BP$」这类**作图得分点**整片判死了，几何题因此长期漏判。\n"
+    "   · figure_note 里标了 `（确定）`、且与题干不矛盾的图形信息 → **可以**作为判定依据。"
+    "例如题干要求作 $DP\\perp BP$，figure_note 写「$DP\\perp BP$，有直角符号（确定）」，"
+    "这一得分点就算写到了。\n"
+    "   · 标了 `（看不清）` 的 → 只能作**疑似**：verdict 照常给，但 confidence 降一档，"
+    "并在 basis 里写明「图形此处未看清」。\n"
+    "   · 图上根本没看见的 → **不等于是「学生没写」**。缺这一项证据时按 ungradable 处理，"
+    "不要判 wrong —— 你没看见不等于他没画。\n"
+    "   · 仍然**不因画得丑、比例不对、线条歪而扣分**。判的是「这条线在不在、"
+    "是不是垂直/平行/过某点」，不是画得好不好。\n"
+    "   → 一句话：**看见的能作数，看不清的只作疑，没看见的不作否**。\n"
 )
 
 _FIELD_RULES = (
@@ -236,7 +269,14 @@ _FIELD_RULES = (
     "10 个汉字以内（例如「一元二次方程」「线面垂直的判定」）。判断不了给空字符串。\n"
     '  "error_reason"    字符串。错因，人话，10~30 字（例如「漏了根的取舍」「移项没变号」）。'
     "判 correct 或 blank 时给空字符串。\n"
-    '  "figure_note"     字符串。有几何图时用一句话描述图上画了什么；没有图给空字符串。\n'
+    '  "figure_note"     字符串。**这一题图上的关键信息**（不是「有没有图」的开关）：\n'
+    "                       · 几何图 → 点与字母；连的线（**学生后加的辅助线要写成可核对的形式**，"
+    "如「过 $D$ 作 $DP\\perp BP$」）；角/直角/等长/平行/圆弧记号；图上写的数值。"
+    "**每个分句后用 `（确定）` 或 `（看不清）` 标把握**，用「；」分隔。\n"
+    "                       · 统计图表 / 数据表 → 读出来的数表（「区间:频数」「茎:叶」"
+    "「五数概括」），含轴名、单位、刻度间隔。\n"
+    "                       · 没有图、也不需要读图 → 空字符串。\n"
+
     '  "flags"           字符串数组。上面规则要求打的标记放这里（例如 ["unreadable_char"]），'
     "没有就给 []。\n"
     "\n## 三条不要\n"
@@ -264,8 +304,45 @@ _OUTPUT_EXAMPLE = (
     '"basis":"第 1 步两边同除以 $x$ 时没有讨论 $x=0$，丢了一个根",'
     '"evidence_quote":"两边同除以 $x$，得 $x=3$","confidence":"medium",'
     '"kp_name":"一元二次方程","error_reason":"除未知数时漏了 $x=0$ 的情况",'
-    '"figure_note":"","flags":[]}'
+    '"figure_note":"","flags":[]},'
+    # 几何题的示例**必须有**：figure_note 的「分句 + 确定性标注」这个写法，
+    # 只靠上面几行文字描述，模型多半会退回成「画了一个三角形」那种空话。
+    '{"q_no":"5","qtype":"解答题",'
+    '"stem":"如图，在 $\\triangle ABC$ 中 $AB=AC$，$D$ 是 $BC$ 的中点。求证：$AD\\perp BC$。",'
+    '"student_answer":"因为 $AB=AC$，$D$ 是 $BC$ 中点，所以 $BD=CD$；\\n'
+    '又 $AD=AD$，所以 $\\triangle ABD\\cong\\triangle ACD$；\\n'
+    '所以 $\\angle ADB=\\angle ADC=90^{\\circ}$，即 $AD\\perp BC$",'
+    '"correct_answer":"$BD=CD$、$AD=AD$、$AB=AC$ ⇒ $\\triangle ABD\\cong\\triangle ACD$（SSS）'
+    '⇒ $\\angle ADB=\\angle ADC$，又两者互补 ⇒ 各 $90^{\\circ}$ ⇒ $AD\\perp BC$",'
+    '"verdict":"correct","basis":"SSS 用对了，最后用补角得直角也写到了",'
+    '"evidence_quote":"","confidence":"high","kp_name":"等腰三角形性质",'
+    '"error_reason":"",'
+    '"figure_note":"$D$ 在 $BC$ 上，$AD$ 已画出（确定）；'
+    '$AB$、$AC$ 上有等长记号（确定）；$\\angle ADB$ 处有直角符号（确定）",'
+    '"flags":[]}'
     "]}\n"
+)
+
+# 裁出来的一道题专用的那一段。**只在 ctx["region"] 为真时插进提示词** ——
+# 整页流程看到这段会以为「一张图只能出一道题」，把整页里其余题全丢掉。
+_REGION_BLOCK = (
+    "\n## 这一张图是**一道题**（不是一整页）\n"
+    "这张图是从一页作业上裁下来的**一道题**：题干 + 学生在它下面的作答，图题还带图。\n"
+    "· **只输出一个** questions 元素。裁切边缘若带进相邻题的一两行字，**忽略它们**，"
+    "不要为它另开一条。\n"
+    "· `q_no` 一律给空字符串 —— 题号由系统按「这是第几个框」绑定，你不用认它。\n"
+    "· `stem` 只录**这一道题**的题干，相邻题的残字不要混进来。\n"
+    "· 边缘被切掉半行时，在 basis 里说明「疑似被裁切」，**不要去猜**被切掉的内容。\n"
+    "· 这一块里确实没有题目（裁空了 / 整块空白）→ 输出 {\"questions\": []}。\n"
+)
+
+# 放在**最后**（输出示例之后）：示例里正好是三道题，只在前面的规则里说「只输出一个」
+# 压不住它 —— 模型更爱照抄示例的形状，把一道题拆成三条。
+_ONE_ITEM_TAIL = (
+    "\n\n## 最后再说一遍：你只需要一道题\n"
+    "上面的示例是「一整页」长什么样。你现在这张图是从一页上**裁下来的一道题**，"
+    "所以 questions 数组里**恰好一个**元素（这一块确实没题目时才是空数组）。"
+    "`q_no` 给空字符串。\n"
 )
 
 
@@ -275,9 +352,18 @@ def _context_block(ctx: dict) -> str:
     姓名对判定毫无用处（图和字迹已经指向他本人了），而它是最直接的隐私面 ——
     提示词会把内容发到第三方，能少给一个字段就少给一个。
     上层需要人名时自己有，不必经过模型。
+
+    两种口径：整页（默认）与**裁出来的一道题**（ctx["region"]）。后者不能再说
+    「这一页可能有几道题」—— 那句话会让模型在裁切残留的相邻题上多加一条。
     """
-    lines = ["\n\n## 这一页"]
     page_no = ctx.get("page_no")
+    if ctx.get("region"):
+        where = f"第 {page_no} 页" if page_no else "一页作业"
+        label = str(ctx.get("region_label") or "").strip()
+        tip = f"（系统把这一块标成了「{label}」）" if label else ""
+        return f"\n\n## 这一张图\n这是从{where}上裁下来的一道题{tip}。"
+
+    lines = ["\n\n## 这一页"]
     if page_no:
         lines.append(f"卷面第 {page_no} 页。")
     lines.append(
@@ -342,14 +428,20 @@ def _reference_block(mode: str, ctx: dict) -> str:
 
 
 def _prompt_for(mode: str, ctx: dict) -> str:
+    # ⚠️ 顺序有讲究：_REGION_BLOCK 紧跟 _context_block，**必须在 _FIELD_RULES 之前** ——
+    #    _FIELD_RULES 里「这一页有几道题就输出几个元素」那句是整页口径，
+    #    区域口径的那段要压在它前面才不会被它盖过去（模型更认靠后的指令）。
+    #    所以区域模式下 _REGION_BLOCK 还额外把「只输出一个」重复了一遍。
     return (
         _ROLE
         + _context_block(ctx)
+        + (_REGION_BLOCK if ctx.get("region") else "")
         + _TRANSCRIBE_RULES
         + _JUDGE_RULES
         + _FIELD_RULES
         + _reference_block(mode, ctx)
         + _OUTPUT_EXAMPLE
+        + (_ONE_ITEM_TAIL if ctx.get("region") else "")
     )
 
 
@@ -748,6 +840,10 @@ def _item_from_obj(o: dict, born: list[str]) -> dict:
         "kp_name": _clip(_as_str(_pick(o, *_ALIAS["kp_name"])), _KP_LIMIT),
         "error_reason": error_reason,
         "flags": flags,
+        # 图上读到的东西（几何要点 / 统计图表的数表）。**必须落库并给老师看**：
+        # 2026-10 之前它只躺在 raw 里，于是「凭图判分」的结论对老师完全不可核对 ——
+        # 他没法判断模型说的「有直角符号」是不是真有。
+        "figure_note": _clip(_as_str(_pick(o, *_ALIAS["figure_note"])), _FIGURE_LIMIT),
         # 模型这一题的原始输出：复核/重放用。meta 里补「哪个模型、有没有被截断、哪种依据」，
         # 但不塞 prompt（一整段提示词几十 KB，存进每一行毫无意义）。
         "raw": {
@@ -995,6 +1091,13 @@ def _recognize(png_path: str, ctx: dict) -> tuple[list[dict], str]:
     if err:
         return [], err
 
+    if ctx.get("region") and len(items) > 1:
+        # 框画大了，把下一题的抬头也裁了进来。只留第一条（题干在上面），并打标 ——
+        # **不能静默丢**：老师要知道「这个框框多了」，否则会以为邻题被判进了这一题。
+        items = items[:1]
+        if "region_multi" not in items[0]["flags"]:
+            items[0]["flags"].append("region_multi")
+
     for it in items:
         it["raw"]["meta"].update({
             "model": cfg["model"],
@@ -1057,3 +1160,20 @@ def recognize_page(png_path: str, ctx: dict) -> tuple[list[dict], str]:
     except Exception as e:                      # noqa: BLE001  这一层是兜底，什么都得接住
         # 不把 traceback 抛给上层：调用方是后台线程，抛出去的表现是「这页凭空消失」。
         return [], f"这一页批改失败：{type(e).__name__}: {_clip(str(e), 200)}"
+
+
+def recognize_region(png_path: str, ctx: dict) -> tuple[list[dict], str]:
+    """批改**一个框**（一道题）。契约与 `recognize_page` 完全一致。
+
+    ctx 多两个键：`region=True`（固定）、`region_label`（"第 3 题"，只写进提示词
+    帮模型定位，**不参与题号绑定**）。
+
+    返回 0 条**不是错误**：框画在了空白处 / 那一块确实没题。上层会补一条
+    「这个框里没读到题」的占位，让老师看见而不是让它凭空消失。
+    """
+    try:
+        return _recognize(png_path, {**(ctx or {}), "region": True})
+    except _GradeError as e:
+        return [], str(e)
+    except Exception as e:                      # noqa: BLE001
+        return [], f"这一题批改失败：{type(e).__name__}: {_clip(str(e), 200)}"
