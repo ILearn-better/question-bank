@@ -1095,6 +1095,26 @@ export default {
       }
     }
 
+    /** 终止批改。⚠️ 后端只是「受理」，在跑的 AI 调用掐不断（一次二三十秒），
+     *  所以：① 不能自己把 running 置 false（否则「状态说停了、题还在冒出来」）
+     *        ② 不能停轮询，要继续等状态真的落到 reviewing
+     *  已批的页后端会保留（reviewing），没批的就不批了。 */
+    async function cancelRun() {
+      if (!running.value || busy.value) return;
+      if (!window.confirm('终止后，已经批完的页会保留，没批的页就不批了。\n要现在停吗？')) return;
+      busy.value = 'cancel';
+      try {
+        await gradeApi.cancel(gid);
+        // 不把 runAsked 放下、也不改 status —— 等轮询看到后端真的收尾
+        startPolling();
+        ok('已请求终止，正在收尾（在跑的那几页会跑完）…');
+      } catch (e) {
+        fail(e.message);        // 后端 409 时 detail 里写的是「现在没在批改」
+      } finally {
+        busy.value = '';
+      }
+    }
+
     /* ---------------- 手写批改（画 / 擦 / 文字框 / 快放 √×） ----------------
      * 全部落到同一张 homework_grade_marks 表，kind 区分形状。
      * ⚠️ 坐标 0~1000、按页归一化，组件算好再交上来 —— 这里**不做任何坐标换算**，
@@ -1502,7 +1522,7 @@ export default {
       editId, draft, bankOpenId, bankQuestionId, bankTags,
       items, marks, pageMarks, pageCount, pageUrl, running, statusLabel, statusTag,
       runLabel, tallyText, VERDICTS,
-      load, run, setVerdict, toggleReviewed, openFix, closeFix, saveAnswer,
+      load, run, cancelRun, setVerdict, toggleReviewed, openFix, closeFix, saveAnswer,
       rerunItem, openBank, closeBank, saveToBank, confirm,
       setRich, setCard, goPage, prevPage, nextPage, onPick,
       verdictLabel, confLabel, flagLabel, naReason,
@@ -1562,6 +1582,13 @@ export default {
           <span v-if="polling" class="small muted">· 自动刷新中</span>
           <div class="spacer"></div>
           <button class="btn sm" :disabled="running || busy === 'run'" @click="run">{{ runLabel }}</button>
+          <!-- 终止：只在跑批时出现。一份 6 页的作业十几分钟，切错分割想重来时
+               没有「停」就只能刷新页面 —— 而刷新之后线程还在跑。 -->
+          <button v-if="running" class="btn sm danger" :disabled="busy === 'cancel'"
+                  :title="'停在这里。已经批完的页会保留，没批的页就不批了'"
+                  @click="cancelRun">
+            {{ busy === 'cancel' ? '正在收尾…' : '终止' }}
+          </button>
           <!-- 只有「待核对」才能确认：没批完就确认，等于确认了一份半成品 -->
           <button class="btn sm primary" :disabled="detail.status !== 'reviewing' || busy === 'confirm'"
                   :title="detail.status === 'reviewing' ? '确认后这份批改才会进统计' : '批完（待核对）才能确认'"

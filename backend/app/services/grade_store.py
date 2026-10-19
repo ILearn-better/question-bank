@@ -1442,12 +1442,18 @@ def _bump(gid: int, done: int, failed: int) -> None:
         db.close()
 
 
-def _finalize(gid: int, done: int, first_err: str = "", abort: str = "") -> None:
+def _finalize(gid: int, done: int, first_err: str = "", abort: str = "",
+              canceled: bool = False) -> None:
     """收尾。状态机与 `batch_page._finalize` 同一套（前端不用分叉）：
 
     全成 → reviewing（**不是 done**：等人看）；全失败 → failed；一半 → partial。
     `failed` 在这里按 `total - done` 补算：线程中途挂了的话，没轮到的页也要算没批成，
     否则前端会看到一个永远停在「3/5」的进度条。
+
+    ⚠️ **终止（canceled）不算失败**。老师点终止多半是因为「太慢了」，已批的那些页
+    是他要的结果 —— 所以批到几页就留几页，状态给 `reviewing` 让他照常复核，
+    只在 error 里写清「只批了 N/M 页」。把它标成 failed 的话，那些结果在列表里
+    会显示成失败、还要重新批一遍，等于白等。
     """
     db = SessionLocal()
     try:
@@ -1457,7 +1463,12 @@ def _finalize(gid: int, done: int, first_err: str = "", abort: str = "") -> None
         failed = max(0, int(g.total or 0) - done)
         g.done, g.failed = done, failed
         g.finished_at = _now()
-        if done == 0:
+        if canceled:
+            g.status = "reviewing" if done > 0 else "failed"
+            g.error = (f"已手动终止：只批了 {done}/{int(g.total or 0)} 页"
+                       + (f"（{first_err}）" if first_err else "")
+                       + ("，已批的可以照常复核" if done > 0 else "，一页都没批完"))
+        elif done == 0:
             g.status = "failed"
             g.error = abort or f"整份都没批成：{first_err or 'AI 没有返回结果'}"
         elif failed == 0:
@@ -1475,6 +1486,35 @@ def _finalize(gid: int, done: int, first_err: str = "", abort: str = "") -> None
 # ---------------------------------------------------------------- 线程
 _run_lock = threading.Lock()
 _running: set[int] = set()
+"""老师点了「终止」的 gid。
+
+⚠️ 为什么不在数据库里存一个 `cancel_requested` 字段：
+   写库要开 Session，而这里是从**请求线程**写、**批改线程**读；进程崩了还会留下
+   一个永远为真的僵尸标记，下次开批立刻自我终止。进程内的集合就没这个问题 ——
+   进程一崩它自动消失，语义正好是「这次运行被要求停」。
+
+⚠️ 为什么不用 threading.Event：每个 gid 一个 Event 得配一张 dict 还要清理，
+   而这里只需要「有没有被要求停」这一个布尔，集合的 add/discard 就够了。
+"""
+_cancel: set[int] = set()
+
+
+def is_canceled(gid: int) -> bool:
+    with _run_lock:
+        return gid in _cancel
+
+
+def request_cancel(gid: int) -> bool:
+    """请求终止。**只在本进程真的在跑这一份时才受理**（返回 True）。
+
+    没在跑却返回成功，前端会一直等一个永远不会来的状态变化 —— 那正是
+    「点了没反应」的经典来源。所以这里必须区分「受理了」和「没在跑」。
+    """
+    with _run_lock:
+        if gid not in _running:
+            return False
+        _cancel.add(gid)
+        return True
 
 
 def launch(db: Session, grade: HomeworkGrade) -> bool:
@@ -1488,6 +1528,10 @@ def launch(db: Session, grade: HomeworkGrade) -> bool:
         if grade.id in _running:
             return False
         _running.add(grade.id)
+        # ⚠️ 上一次留下的「终止」标记必须清掉。理论上 _cancel 在收尾时就 discard 了，
+        #    但线程被强杀 / 上次 _finalize 没走到时会留下 —— 不清的话新的一开批
+        #    就立刻自我终止，现象是「点开始 → 一秒钟就失败」。
+        _cancel.discard(grade.id)
     # 重跑＝重来：进度清零，**并且把上一次的"确认"作废**（reviewed_at 清空、回到 queued）。
     # 不这么做的话，重批中的结果会挂着一个旧的"已确认"，统计口径会读到半截数据。
     grade.status = "queued"
@@ -1511,6 +1555,7 @@ def run_grade(gid: int) -> None:
     finally:
         with _run_lock:
             _running.discard(gid)
+            _cancel.discard(gid)      # 标记绝不能留到下一次开批
 
 
 def _run_grade(gid: int) -> None:
@@ -1560,39 +1605,58 @@ def _run_grade(gid: int) -> None:
     slots_by_pno = {int(s["pno"]): s for s in slots}
     done = failed = 0
     first_err = ""
+    canceled = False
+    # ⚠️ 刻意不用 `with ThreadPoolExecutor(...)`：那个写法退出时会**等所有页跑完**，
+    #    老师点了「终止」却要干等十几页 AI 调用 —— 那就不是终止了。
+    #    改成显式 shutdown(wait=False, cancel_futures=True)：还没起跑的页当场作废。
+    pool = ThreadPoolExecutor(max_workers=WORKERS)
     try:
-        with ThreadPoolExecutor(max_workers=WORKERS) as pool:
-            futures = {}
-            for slot in slots:
-                pno = int(slot["pno"])
-                if pno in skip_pages or pno in noop_pages:
-                    # 「这一页不看」也要占一个 future：否则 done 永远追不上 total，
-                    # 任务就卡在 running 里出不来。返回空结果 = 读完但没批（0 题）。
-                    futures[pool.submit(lambda: ([], ""))] = slot["pno"]
-                    continue
-                futures[pool.submit(_run_one_page, slot, base_ctx,
-                                    by_page.get(pno), slots_by_pno)] = slot["pno"]
-            for fut in as_completed(futures):
-                pno = futures[fut]
+        futures = {}
+        for slot in slots:
+            pno = int(slot["pno"])
+            if is_canceled(gid):
+                canceled = True
+                break
+            if pno in skip_pages or pno in noop_pages:
+                # 「这一页不看」也要占一个 future：否则 done 永远追不上 total，
+                # 任务就卡在 running 里出不来。返回空结果 = 读完但没批（0 题）。
+                futures[pool.submit(lambda: ([], ""))] = slot["pno"]
+                continue
+            futures[pool.submit(_run_one_page, slot, base_ctx,
+                                by_page.get(pno), slots_by_pno)] = slot["pno"]
+        for fut in as_completed(futures):
+            # ★ 终止：跳出收集循环。**已经在跑的那几个线程没法掐断**（一次 AI 调用
+            #   二三十秒，Python 没有安全的线程 kill），但剩下的会被 cancel_futures
+            #   立刻作废。所以「点终止」的实际等待 ≈ 一个页的时间，不是一整份。
+            if is_canceled(gid):
+                canceled = True
+                break
+            pno = futures[fut]
+            try:
+                items, err = fut.result()
+            except Exception as e:               # noqa: BLE001
+                items, err = [], f"{type(e).__name__}: {e}"
+            if err:
+                failed += 1
+                first_err = first_err or f"第 {pno} 页：{err}"
+            else:
                 try:
-                    items, err = fut.result()
-                except Exception as e:               # noqa: BLE001
-                    items, err = [], f"{type(e).__name__}: {e}"
-                if err:
+                    _write_page_items(gid, pno, items, curriculum_id)
+                    # ⚠️ 一页 0 道题也算 done：空白页/纯页眉确实被读完了。
+                    #    done 是页数，不是题目数 —— 别在这里改成 len(items)。
+                    done += 1
+                except Exception as e:           # noqa: BLE001
                     failed += 1
-                    first_err = first_err or f"第 {pno} 页：{err}"
-                else:
-                    try:
-                        _write_page_items(gid, pno, items, curriculum_id)
-                        # ⚠️ 一页 0 道题也算 done：空白页/纯页眉确实被读完了。
-                        #    done 是页数，不是题目数 —— 别在这里改成 len(items)。
-                        done += 1
-                    except Exception as e:           # noqa: BLE001
-                        failed += 1
-                        first_err = first_err or f"第 {pno} 页写库失败：{e}"
-                _bump(gid, done, failed)
+                    first_err = first_err or f"第 {pno} 页写库失败：{e}"
+            _bump(gid, done, failed)
     except Exception as e:                           # noqa: BLE001
         _finalize(gid, done, first_err, abort=f"批改线程异常终止：{e}")
+        return
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+    if canceled:
+        _renumber(gid)
+        _finalize(gid, done, first_err, canceled=True)
         return
     _renumber(gid)
     _finalize(gid, done, first_err)

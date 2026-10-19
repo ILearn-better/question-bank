@@ -75,20 +75,24 @@ function DETAIL() {
       // 页 3：手拖的框（不是整页宽）→ 反推时不能变成线
       { id: 306, page_no: 3, seq: 4, seg: 0, q_no: '', label: '5', box: [40, 60, 900, 500], skipped: 0 },
     ],
+    /* ⚠️ item 的 id **必须是十六进制字符串** —— 真库里是 `uuid4().hex[:12]`。
+       用数字 id 会漏掉一个真 bug：`paintOne` 里若把 key 正则写成 `(stem|ans)(\d+)`，
+       十六进制 id 一个都匹配不上，题干/作答永远是空框 —— 而库里明明有内容
+       （2026-10-20 用户报「题干、学生作答没展示出来」，真因就是这个）。 */
     items: [
-      { id: 101, seq: 1, page_no: 1, q_no: '1', qtype: '解答题', stem: '解方程：$x^2-5x+6=0$。',
+      { id: 'a1b2c3d4e5f6', seq: 1, page_no: 1, q_no: '1', qtype: '解答题', stem: '解方程：$x^2-5x+6=0$。',
         student_answer: '$x=2$ 或 $x=3$', correct_answer: '$x=2$ 或 $x=3$',
         verdict: 'correct', score: null, full_score: null, basis: '因式分解后两根都对',
         confidence: 'high', kp_name: '一元二次方程', tags: [], error_reason: '',
         flags: [], figure_note: '', block_kind: 'question', tail_note: '', status: 'pending' },
-      { id: 102, seq: 2, page_no: 1, q_no: '2', qtype: '证明题', stem: '如图，求证 $AD\\perp BC$。',
+      { id: 'ff0011223344', seq: 2, page_no: 1, q_no: '2', qtype: '证明题', stem: '如图，求证 $AD\\perp BC$。',
         student_answer: '因为 $AB=AC$，所以垂直', correct_answer: '',
         verdict: 'partial', score: null, full_score: null, basis: '结论对但缺全等这一步',
         confidence: 'medium', kp_name: '', tags: [], error_reason: '',
         flags: ['low_confidence'], figure_note: '',
         block_kind: 'question',
         tail_note: '底部有邻题的残字，这一块可能把下一题的开头也读进来了', status: 'pending' },
-      { id: 103, seq: 3, page_no: 2, q_no: '3', qtype: '', stem: '', student_answer: '',
+      { id: '0abc9def5678', seq: 3, page_no: 2, q_no: '3', qtype: '', stem: '', student_answer: '',
         correct_answer: '', verdict: 'ungradable', score: null, full_score: null, basis: '',
         confidence: '', kp_name: '', tags: [], error_reason: '框里没读到任何作答内容',
         flags: ['region_empty'], figure_note: '', block_kind: 'header', tail_note: '',
@@ -177,18 +181,27 @@ function makeFetch() {
       LAST_DETAIL.skipped_pages = (body && body.pages) || [];
       return reply({ skipped_pages: LAST_DETAIL.skipped_pages });
     }
+    /* 终止：只在「真的在跑」时受理（后端是 409）。这里靠 LAST_DETAIL.status 判。 */
+    if (u === '/api/homework-grades/7/cancel' && method === 'POST') {
+      if (LAST_DETAIL.status !== 'running' && LAST_DETAIL.status !== 'queued') {
+        return reply({ detail: '这份作业现在没在批改' }, 409);
+      }
+      LAST_DETAIL.status = 'reviewing';
+      LAST_DETAIL.error = '已手动终止：只批了 1/3 页，已批的可以照常复核';
+      return reply({ ok: true, gid: 7 });
+    }
     if (u === '/api/homework-grades/7/run' && method === 'POST') {
       if (FAIL_RUN_ONCE) { FAIL_RUN_ONCE = false; return reply({ detail: 'AI 服务 502' }, 502); }
       LAST_DETAIL.status = 'queued'; LAST_DETAIL.done = 0;
       return reply(LAST_DETAIL);
     }
-    if (/^\/api\/grade-items\/\d+$/.test(u) && method === 'PATCH') {
+    if (/^\/api\/grade-items\/[0-9a-zA-Z_-]+$/.test(u) && method === 'PATCH') {
       const id = Number(u.split('/').pop());
       const it = LAST_DETAIL.items.find((x) => x.id === id);
       if (it && body && body.verdict) it.verdict = body.verdict;
       return reply({ item: it || {} });
     }
-    if (/^\/api\/grade-items\/\d+\/rerun$/.test(u) && method === 'POST') return reply({ ok: 1 });
+    if (/^\/api\/grade-items\/[0-9a-zA-Z_-]+\/rerun$/.test(u) && method === 'POST') return reply({ ok: 1 });
     return reply({ ok: 1 });
   };
 }
@@ -294,6 +307,27 @@ async function main() {
     };
     return a;
   };
+  /* ★ 确认框自动点「确定」。产品里的 confirm 是异步的，jsdom 里没人去点它 ——
+   *   不断言这一层的话，「终止」「删除」这类走二次确认的动作在测试里都是死的。
+   *   记下 `CONFIRMS` 好断言「真的问过老师一句」（未经确认就删东西是不能接受的）。 */
+  const CONFIRMS = [];
+  /* ★ 记下给用户看的那句话。产品里失败走 ElMessage.error 而**不抛异常**，
+   *   所以「到底提示了什么」只能在这里看 —— 不记的话这类断言全是空的。 */
+  const MSGS = [];
+  if (W.ElementPlus && W.ElementPlus.ElMessage) {
+    W.ElementPlus.ElMessage = {
+      error: (m) => MSGS.push({ type: 'error', text: String(m) }),
+      success: (m) => MSGS.push({ type: 'success', text: String(m) }),
+      warning: (m) => MSGS.push({ type: 'warning', text: String(m) }),
+      info: (m) => MSGS.push({ type: 'info', text: String(m) }),
+    };
+  }
+  if (W.ElementPlus && W.ElementPlus.ElMessageBox) {
+    W.ElementPlus.ElMessageBox.confirm = async function (msg, title, opt) {
+      CONFIRMS.push({ msg: String(msg), title: String(title || ''), opt: opt || {} });
+      return true;
+    };
+  }
   try {
     W.eval(inline);
   } catch (e) {
@@ -355,6 +389,27 @@ async function main() {
       .every((el) => String(el.getAttribute('src')).includes('/region-image?spec=')),
     Array.from(D.querySelectorAll('.blk-thumb'))[0]
       ? Array.from(D.querySelectorAll('.blk-thumb'))[0].getAttribute('src') : '');
+  /* ★ 缩略图的 spec 必须是**后端约定好的** `页号:x0,y0,x1,y1`，多段 `;` 连。
+     `/region-image` 是 0030 之后才有的接口 —— 后端跑旧进程时它就是 404，
+     那时页面上一张图都没有、却没有任何提示（2026-10-20 用户实际遇到）。
+     所以：① URL 得拼对 ② 图挂了得有替身，两条都要断言。 */
+  const spec0 = Array.from(D.querySelectorAll('.blk-thumb'))[0]
+    ? decodeURIComponent(String(Array.from(D.querySelectorAll('.blk-thumb'))[0]
+      .getAttribute('src')).split('spec=')[1]) : '';
+  checkTrue('★ 单块 spec 格式 = 页号:四个坐标（后端按它裁）',
+    /^\d+:-?\d+,-?\d+,-?\d+,-?\d+$/.test(spec0), spec0);
+  checkTrue('★ 缩略图 <img> 上有 @error 兜底（旧进程 404 时不至于一片破图）',
+    /@error="onThumbError/.test(html), true);
+  vm.onThumbError(vm.blocks[0]);
+  await sleep(60);
+  check('★ 图挂了 → 那一块换成说明文字（不是留个破图图标）',
+    D.querySelectorAll('.blk-thumb-fail').length, 1);
+  check('★ 只换坏的那一张，别的照常显示',
+    D.querySelectorAll('.blk-thumb').length, 4);
+  vm.thumbBroken = {};
+  await sleep(60);
+  check('★ 重开一份 → 「图挂了」的记录清掉（不带到下一份）',
+    D.querySelectorAll('.blk-thumb-fail').length, 0);
 
   /* ============ 5. 色带按 0~1000 算（不是 pt） ============ */
   const bands = Array.from(D.querySelectorAll('.blk-band'));
@@ -479,6 +534,29 @@ async function main() {
   checkTrue('★ 容器里不再残留 $…$ 原文（= 渲染真生效）',
     !D.querySelector('.g-card .g-rich').textContent.includes('$x^2'),
     D.querySelector('.g-card .g-rich').textContent.slice(0, 40));
+
+  /* ★★ 题干 / 学生作答**两个都得填**（用户 2026-10-20 报「没展示出来」）。
+   *   这两块是 `setRich` 存 ref、`paintOne` 写 innerHTML 的，而 `paintOne` 靠 key
+   *   回查是哪一题 —— key 里带的是 **item.id**，真库里是 12 位十六进制。
+   *   那段正则一旦写成 `(\d+)`，十六进制 id 一个都匹配不上 → 两个框全空，
+   *   而库里明明有内容。所以下面断言**逐卡**查「题干框」和「作答框」都有东西。 */
+  const richOf = (card) => Array.prototype.slice.call(card.querySelectorAll('.g-rich'))
+    .map((e) => (e.innerHTML || '').trim());
+  const r0 = richOf(gcards[0]);
+  checkTrue('★ 第 1 题：题干框有内容', r0.length > 0 && r0[0].length > 0,
+    JSON.stringify((r0[0] || '').slice(0, 40)));
+  checkTrue('★ 第 1 题：学生作答框有内容', r0.length > 1 && r0[1].length > 0,
+    JSON.stringify((r0[1] || '').slice(0, 40)));
+  const r1 = richOf(gcards[1]);
+  checkTrue('★ 第 2 题：题干框有内容', r1.length > 0 && r1[0].length > 0,
+    JSON.stringify((r1[0] || '').slice(0, 40)));
+  checkTrue('★ 第 2 题：学生作答框有内容', r1.length > 1 && r1[1].length > 0,
+    JSON.stringify((r1[1] || '').slice(0, 40)));
+  /* 第 3 题题干本来就是空的（框里没读到题）→ 必须给「（空）」占位，
+     不能留一个什么都不写的白框（老师会以为页面坏了）。 */
+  checkTrue('★ 第 3 题题干为空 → 给「（空）」占位而不是白框',
+    (richOf(gcards[2])[0] || '').includes('（空）'),
+    JSON.stringify((richOf(gcards[2])[0] || '').slice(0, 40)));
   check('判定徽章上屏（3 种不同判定）',
     D.querySelectorAll('.g-verdict').length, 3);
   check('★ 模型说「这块不像一道题」→ 有一行提示（不自动跳过）',
@@ -493,11 +571,11 @@ async function main() {
   /* ============ 14. 改判定 ============ */
   const vbtns = D.querySelectorAll('.g-card .g-vbtn');
   checkTrue('每道题都有 4 个判定按钮', vbtns.length >= 4, vbtns.length);
-  const patchBefore = CALLS.filter((c) => /\/api\/grade-items\/\d+$/.test(c.url)
+  const patchBefore = CALLS.filter((c) => /\/api\/grade-items\/[0-9a-zA-Z_-]+$/.test(c.url)
     && c.method === 'PATCH').length;
   vbtns[2].click();                        // 「错」
   await sleep(300);
-  const patches = CALLS.filter((c) => /\/api\/grade-items\/\d+$/.test(c.url)
+  const patches = CALLS.filter((c) => /\/api\/grade-items\/[0-9a-zA-Z_-]+$/.test(c.url)
     && c.method === 'PATCH');
   check('★ 点判定 → PATCH 到那一题', patches.length, patchBefore + 1);
   check('★ 发的是选中的那个判定（不是别的）',
@@ -591,6 +669,62 @@ async function main() {
      写 POST 的那个就是这次的「Method Not Allowed」。 */
   check('★ 路由表里 /regions = GET + PUT，没有 POST',
     (BACKEND_ROUTES['/homework-grades/*/regions'] || []).slice().sort(), ['GET', 'PUT']);
+
+  /* ============ 17. 终止批改 ============ */
+  /* 一页 14 题约 2.5 分钟，一份 6 页的作业十几分钟。跑起来发现不对（分割切错了、
+   * 模型配置不对）却没有「停」，只能刷新页面 —— 而刷新之后线程还在跑。
+   * 三个必须守住的点：
+   *   ① 只在跑批时出现（其他时候摆个按钮是噪音）
+   *   ② 要二次确认（终止会丢掉没批的页）
+   *   ③ 后端是「受理」不是「立刻停」—— 所以**不能**自己把 running 置 false */
+  vm.g = Object.assign({}, vm.g, { status: 'reviewing' });
+  vm.runAsked = false;
+  await sleep(80);
+  const cancelBtns = () => Array.prototype.slice.call(D.querySelectorAll('.el-button'))
+    .filter((b) => b.textContent.trim() === '终止');
+  check('★ 没在跑的时候不出现「终止」按钮', cancelBtns().length, 0);
+
+  vm.runAsked = true;
+  vm.g = Object.assign({}, vm.g, { status: 'running' });
+  await sleep(120);
+  check('★ 批改中 → 出现「终止」按钮', cancelBtns().length, 1);
+
+  const nConf = CONFIRMS.length;
+  const cancelBefore = CALLS.filter((c) => c.url === '/api/homework-grades/7/cancel').length;
+  cancelBtns()[0].click();
+  await sleep(300);
+  check('★ 点「终止」→ 先问一句（二次确认，不是点了就停）',
+    CONFIRMS.length, nConf + 1);
+  checkTrue('★ 确认框写清了后果（已批的保留 / 没批的不批）',
+    /保留/.test((CONFIRMS[CONFIRMS.length - 1] || {}).msg || ''),
+    (CONFIRMS[CONFIRMS.length - 1] || {}).msg);
+  /* 提示里的换行必须是**真的换行**。历史教训：bash heredoc 把 \\n 吃掉一层之后，
+     产品代码里留下的是字面量 \\n，提示框上会直接显示两个字符「\n」。 */
+  checkTrue('★ 确认框的换行是真的换行（不是显示出 "\\n" 两个字）',
+    !((CONFIRMS[CONFIRMS.length - 1] || {}).msg || '').includes('\\n'),
+    JSON.stringify((CONFIRMS[CONFIRMS.length - 1] || {}).msg || ''));
+  check('★ 确认后 → POST /cancel', CALLS.filter((c) =>
+    c.url === '/api/homework-grades/7/cancel').length, cancelBefore + 1);
+  /* ⚠️ 关键：终止**不能**自己把 running 置 false。后端只是受理，在跑的 AI 调用
+     掐不断；提前改会出现「状态说停了、题还在一条条冒出来」。要靠轮询等真状态。 */
+  checkTrue('★ 终止期间给一句「正在收尾」（不然老师以为又点了没反应）',
+    html.includes('正在收尾'), true);
+  vm.stopPoll();
+
+  /* ★ 后端说「没在跑」→ 409，前端要把 detail 里的理由说给老师听。 */
+  vm.g = Object.assign({}, vm.g, { status: 'reviewing' });
+  vm.runAsked = false;
+  await sleep(80);
+  const nMsg = MSGS.length;
+  await vm.cancelGrade();
+  await sleep(200);
+  /* 产品里失败是 `ElMessage.error(...)`,**不往外抛** —— 所以断言要看文案，
+     不能 try/catch（catch 到的是空的，那种断言永远绿，等于没写）。 */
+  check('★ 没在跑时点终止 → 提示了（没静默失败）', MSGS.length, nMsg + 1);
+  checkTrue('★ 提示写的是「没在批改」这句人话（不是干巴巴一个 409）',
+    /没在批改/.test((MSGS[MSGS.length - 1] || {}).text || ''),
+    (MSGS[MSGS.length - 1] || {}).text);
+  vm.stopPoll();
 
   console.log('\n共 ' + total + ' 项，失败 ' + fails.length + ' 项');
   if (fails.length) {

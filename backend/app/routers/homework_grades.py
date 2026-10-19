@@ -105,6 +105,31 @@ def run_grade(gid: int, db: Session = Depends(get_db)):
     return store.detail(db, grade)
 
 
+@router.post("/homework-grades/{gid}/cancel")
+def cancel_grade(gid: int, db: Session = Depends(get_db)):
+    """终止正在跑的批改。**只受理「本进程真的在跑」的那一批**（否则 409）。
+
+    为什么是「请求」而不是「立刻停」：一次 AI 调用二三十秒，Python 里没有安全的
+    线程 kill。这里做的是 —— ① 立旗 ② 让还没起跑的页当场作废（cancel_futures）。
+    所以真正在跑的最多还有 `WORKERS`(3) 页会跑完，状态会在几十秒内落到 reviewing。
+
+    ⚠️ 返回的是「已受理」而不是「已停」。前端拿到 200 后要**继续轮询**等状态落地；
+    别在这里同步 join 线程 —— 那就把「终止」变成「等它跑完」了。
+
+    ⚠️ 已批的页**保留**（状态 reviewing，error 里写明只批了几页）。
+    老师点终止通常是因为太慢，已出的结果是他要的，丢掉等于白等。
+    """
+    try:
+        grade = store.get_grade(db, gid)
+    except store.GradeError as e:
+        raise _fail(e) from e
+    if not store.request_cancel(gid):
+        raise HTTPException(
+            status_code=409,
+            detail=f"这份作业现在没在批改（当前状态：{grade.status}）—— 不用终止")
+    return {"ok": True, "gid": gid, "status": grade.status}
+
+
 @router.post("/homework-grades/{gid}/confirm")
 def confirm_grade(gid: int, payload: GradeConfirmIn | None = None, db: Session = Depends(get_db)):
     """老师确认整份。**确认之前，这里的判定只是 AI 初稿**，任何统计口径都不该读它。

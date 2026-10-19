@@ -1605,6 +1605,99 @@ def mk_pdf_submission(db, ls: Lesson, pages: int = 2, name: str = "两页卷.pdf
     return lf
 
 
+def t_cancel() -> None:
+    """终止批改（2026-10-20 加的）。
+
+    为什么需要：一份 6 页的作业要十几分钟。跑起来发现分割切错了、或者模型配置
+    不对，唯一的办法是刷新页面 —— 而刷新之后线程还在跑，回来又看到它在动。
+
+    守的几件事：
+
+      1. **只在真的在跑时才受理**。没在跑却返回成功，前端会一直等一个永远不会
+         来的状态变化 —— 那是「点了没反应」的经典来源。
+      2. **终止不算失败**。老师点终止多半是因为太慢，已批的那几页正是他要的
+         结果；标成 failed 的话那些结果在列表里显示为失败，等于白等。
+      3. **标记不能留到下一次开批**。线程被强杀时 `_cancel.discard` 走不到，
+         所以 `launch` 里必须再清一次 —— 否则下次点开始「一秒钟就失败」。
+      4. 一页都没批成就终止 → failed（reviewing 一个空结果更迷惑人）。
+    """
+    print("\n-- ⑨c 终止批改 --")
+
+    # ① 没在跑 → 不受理（这一步最关键：受理了就等于骗前端）
+    check(G.request_cancel(999999) is False,
+          "★ 没在跑的时候点终止 → 不受理（不能骗前端说受理了）")
+    check(G.is_canceled(999999) is False,
+          "★ 不受理时也不立旗（否则下次开批立刻自我终止）")
+
+    # ② 立了旗 → 看得见，且 launch 会清掉
+    with G._run_lock:
+        G._running.add(999999)
+        G._cancel.add(999999)          # 模拟「上次线程被强杀，旗没清掉」
+    check(G.is_canceled(999999) is True, "★ 立了旗 → is_canceled 看得见")
+
+    db = SessionLocal()
+    try:
+        st = Student(id=90021, name="终止测试")
+        db.add(st)
+        ls = Lesson(id=90021, student_id=90021, start_at="2026-10-20T10:00:00",
+                    duration_min=60)
+        db.add(ls)
+        db.flush()
+        lf = mk_pdf_submission(db, ls, pages=2, name="终止卷.pdf")
+        g = G.create_grade(db, GradeIn(lesson_id=ls.id, file_ids=[lf.id], answer_mode="ai"))
+        gid = g.id
+        db.commit()
+        G.launch(db, g)
+        # ⚠️ launch 必须把上一次残留的「终止」旗清掉。不清的话老师下次点开始，
+        #    第一个页还没提交就被 is_canceled 拦下 → 「一秒钟就失败」。
+        check(G.is_canceled(gid) is False,
+              "★ 开批时清掉上一次残留的终止旗（否则一点开始就自我终止）")
+
+        # ③ 在跑 → 受理
+        check(G.request_cancel(gid) is True, "★ 真的在跑 → 受理终止")
+        check(G.is_canceled(gid) is True, "★ 受理后旗立起来了")
+
+        # ④ 收尾：批了几页 → reviewing（保留结果，不是 failed）
+        g.total = 3
+        db.commit()
+        G._finalize(gid, done=1, canceled=True)
+        db.refresh(g)
+        check(g.status == "reviewing",
+              "★ 终止时已批了页 → reviewing（已出的结果留着复核，不算失败）", g.status)
+        check("已手动终止" in (g.error or ""),
+              "★ error 写清是「手动终止」，不是「批改失败」", g.error)
+        check("1/3" in (g.error or ""),
+              "★ error 写清批了几页 / 共几页", g.error)
+
+        # ⑤ 收尾：一页都没批成 → failed（给 reviewing 一个空结果更迷惑）
+        G._finalize(gid, done=0, canceled=True)
+        db.refresh(g)
+        check(g.status == "failed",
+              "★ 终止时一页都没批成 → failed（空结果不该显示成「待复核」）", g.status)
+
+        # ⑥ 收尾后旗要清掉（run_grade 的 finally 负责；这里手动走一遍防漏）
+        with G._run_lock:
+            G._running.discard(gid)
+            G._cancel.discard(gid)
+        check(G.is_canceled(gid) is False, "★ 收尾后旗清掉（不带到下一次）")
+        check(G.request_cancel(gid) is False, "★ 收尾后再点终止 → 不受理")
+    finally:
+        db.close()
+        with G._run_lock:
+            G._running.discard(999999)
+            G._cancel.discard(999999)
+
+    # ⑦ 接口契约：路由表里有这条 POST
+    src = (BE / "app" / "routers" / "homework_grades.py").read_text(encoding="utf-8")
+    check('@router.post("/homework-grades/{gid}/cancel")' in src,
+          "★ 有 POST /homework-grades/{gid}/cancel 这条路由")
+    check("没在批改" in src,
+          "★ 不受理时报的是人话「没在批改」（不是干巴巴一个 409）")
+    # ⑧ 提示词/收尾里「终止」的措辞：已批的保留
+    check("已手动终止" in (BE / "app" / "services" / "grade_store.py").read_text(encoding="utf-8"),
+          "★ 收尾文案里写「已手动终止」（老师能分辨是自己停的还是系统出错）")
+
+
 def t_cross_page() -> None:
     """跨页题（0029）：一题两段，竖拼成一张图、只调一次模型。
 
@@ -1901,6 +1994,7 @@ def main() -> int:
     t_marks()
     t_marks_batch()
     t_skips_and_signals()
+    t_cancel()
     t_run_with_stub()
     t_frontend()
     t_ink_export()

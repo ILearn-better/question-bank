@@ -164,6 +164,14 @@
     max-width: 100%; max-height: 120px; display: block; margin-top: 4px;
     border: 1px solid #ebeef5; border-radius: 3px; cursor: zoom-in; background: #fafafa;
   }
+  /* 预览图没载入时的替身。刻意做成**同样大小的块**：换掉 <img> 之后卡片高度不变，
+     列表不会跳 —— 一张图挂一次，整列卡片跳一次布局，很难接着调。 */
+  .blk-thumb-fail {
+    margin-top: 4px; padding: 14px 8px; text-align: center; font-size: 12px;
+    color: #e6a23c; line-height: 1.7;
+    border: 1px dashed #f0c78a; border-radius: 3px; background: #fdf6ec;
+    min-height: 56px; box-sizing: border-box;
+  }
 
   /* ===== 批改结果卡片 ===== */
   .g-card {
@@ -328,6 +336,11 @@
                          :disabled="running" @click="runGrade">
                 {{ runLabel }}
               </el-button>
+              <!-- ★ 终止。只在「跑批中」出现 —— 其他时候摆一个点不动的按钮只是噪音。
+                   点了之后后端不是立刻停（在跑的 AI 调用掐不断），所以要给一句
+                   「正在收尾」的反馈，不然老师会以为又点了没反应。 -->
+              <el-button v-if="g && running" size="small" type="danger" plain
+                         :loading="canceling" @click="cancelGrade">终止</el-button>
             </div>
           </template>
 
@@ -339,7 +352,8 @@
             <div v-if="running" style="margin-bottom:10px">
               <el-progress :percentage="jobPct" :stroke-width="14" text-inside></el-progress>
               <div class="hint" style="margin-top:4px">
-                正在批改 {{ g.done }} / {{ g.total }} 页 · 一页约 2~3 分钟（逐题裁切逐题判）
+                <template v-if="canceling">已请求终止，正在收尾（在跑的那几页会跑完）…</template>
+                <template v-else>正在批改 {{ g.done }} / {{ g.total }} 页 · 一页约 2~3 分钟（逐题裁切逐题判）</template>
               </div>
             </div>
             <el-alert v-else-if="g.error" :title="g.error" type="error"
@@ -421,8 +435,16 @@
                     <!-- 块的即时预览：这是「两条线之间到底切成了什么」的唯一凭据。
                          走 /region-image（服务端现裁、不落盘），改一下坐标 URL 就变。
                          ⚠️ draggable="false"：否则从缩略图上起手会拖成「拖图片」而不是拖这张卡 -->
-                    <img v-if="b.thumb" :src="b.thumb" class="blk-thumb" draggable="false"
-                         loading="lazy" alt="这一块切出来的样子" @click="zoom(b.thumb)">
+                    <img v-if="b.thumb && !thumbBroken[b.id]" :src="b.thumb" class="blk-thumb"
+                         draggable="false" loading="lazy" alt="这一块切出来的样子"
+                         @click="zoom(b.thumb)" @error="onThumbError(b)">
+                    <!-- ⚠️ 图挂了必须说人话。最常见的不是地址错，而是**后端跑着旧进程**
+                         （/region-image 是 0030 之后加的，旧进程上没有 → 404）。
+                         只留一个破图图标的话，老师会以为是自己的分割画错了。 -->
+                    <div v-else-if="b.thumb && thumbBroken[b.id]" class="blk-thumb-fail">
+                      这一块的预览图没载入<br>
+                      <span class="muted-hint">多半是后台服务还是旧的 —— 关掉重启一次就好</span>
+                    </div>
                   </div>
                 </div>
                 <div v-if="dirty" class="hint" style="color:#e6a23c">
@@ -553,6 +575,9 @@ const app = createApp({
       dragFrom: null, dragOver: null,
       dirty: false,
       busy: '', submitting: false,
+      /* 「已请求终止、等后端收尾」。与 `submitting` 分开：前者是开批，后者是终止，
+         混在一起会让「点终止」那一下loading 跑到「开始批改」按钮上。 */
+      canceling: false,
       /** 「这次会话里老师真的点过开始批改」。**只认它，不认 status==='queued'** ——
        *  queued 有两个来源：①新建之后还没人开批（保存并批改只建档、唯一开批处是
        *  这个页面的 run）②刚点开批、服务端线程还来不及写 running。
@@ -562,6 +587,10 @@ const app = createApp({
       // 批改
       tab: 'blocks',
       selItem: null,
+      /* 预览图加载失败的块（key = 块 id）。**按块记**而不是整页记一个布尔：
+         某一块的坐标算出界 → 只有那一块 404，别的块照常显示。
+         换了记录 / 重存分割要清掉（见 loadGrade / saveRegions）。 */
+      thumbBroken: {},
       VERDICTS,
       _poll: null,
       // DOM 元素不参与响应式：markRaw 一下，否则每次 setRich 都触发一轮 patch
@@ -680,6 +709,13 @@ const app = createApp({
       return k && k !== 'question' ? (BLOCK_KIND_LABEL[k] || BLOCK_KIND_LABEL.other) : '';
     },
     zoom(url) { if (url) window.open(url, '_blank'); },
+    /** 缩略图 404/500。不弹错误提示（几十块的卷子会刷屏），只在那一块上换一行说明。
+     *  ⚠️ 用新对象赋值（`this.thumbBroken = {...}`）：直接改属性在个别场景不触发更新，
+     *     而这里是「老师正盯着看的反馈」，宁可多一次赋值。 */
+    onThumbError(b) {
+      if (!b || !b.id || this.thumbBroken[b.id]) return;
+      this.thumbBroken = Object.assign({}, this.thumbBroken, { [b.id]: true });
+    },
     clampUnit(v) { return Math.round(clampUnit(v)); },
     unitPct(y) { return (clampUnit(y) / 10) + '%'; },
 
@@ -712,6 +748,8 @@ const app = createApp({
       this.dragFrom = null;
       this.dirty = false;
       this.selItem = null;
+      this.thumbBroken = {};      // 上一份记的「图挂了」不能带过来
+      this.canceling = false;
       // ⚠️ 「点过开批」的旗必须跟着记录走。不重置的话，切到另一份 queued 的记录时
       //    会被上一份的旗顶成「批改中」→ 按钮又是灰的。
       this.runAsked = false;
@@ -1239,6 +1277,27 @@ const app = createApp({
     },
 
     /* ============================ 批改 ============================ */
+    /* ★ 终止批改。⚠️ 后端是「受理」，不是「立刻停」—— 在跑的 AI 调用掐不断，
+     *   所以这里**不能**停轮询，要继续等状态落到 reviewing。
+     *   ⚠️ 也**不要**在这里把 running 置 false（自欺欺人地显示「已停」）：
+     *   真停了轮询自己会看到，提前改会出现「状态说停了、题还在一条条冒出来」。 */
+    async cancelGrade() {
+      if (!this.g || !this.gid || this.canceling) return;
+      try {
+        await ElementPlus.ElMessageBox.confirm(
+          '终止后，已经批完的页会保留，没批的页就不批了。\n要现在停吗？',
+          '终止批改', { confirmButtonText: '终止', cancelButtonText: '继续批',
+            type: 'warning' });
+      } catch (e) { return; }                 // 老师选了「继续批」
+      this.canceling = true;
+      try {
+        await this.api('/api/homework-grades/' + this.gid + '/cancel', { method: 'POST' });
+        ElementPlus.ElMessage.success('已请求终止，正在收尾…');
+        this.startPoll();                     // 确保轮询还活着，好看到状态落地
+      } catch (e) {
+        ElementPlus.ElMessage.error(e.message);
+      } finally { this.canceling = false; }
+    },
     async runGrade() {
       /* ★ 有没保存的分割就先存。老师画完线直接点「开始批改」是最自然的顺序，
        *   而库里还是上一次的分割 → 批出来的题跟他刚才切的对不上，看起来像
@@ -1336,7 +1395,12 @@ const app = createApp({
     paintOne(key) {
       const el = this._rich && this._rich.get(key);
       if (!el) return;
-      const m = /^(stem|ans)(\d+)$/.exec(key);
+      /* ⚠️⚠️ 后半段**不能写成 `(\d+)`**：item 的主键是 `uuid4().hex[:12]`
+       *   （如 `144668ab91d8`），**含字母**。写 `\d+` 时 12 位十六进制 id 一个都匹配不上，
+       *   `paintOne` 直接 return，题干和学生作答**永远是两个空框** —— 而库里明明有内容。
+       *   挂载检查里的假数据用的是数字 id（101/102），所以这条 bug 测不出来。
+       *   这里用 `(.+)`，并且在测试里把 id 换成真的十六进制。 */
+      const m = /^(stem|ans)(.+)$/.exec(key);
       if (!m) return;
       const it = this.items.find((x) => String(x.id) === m[2]);
       if (!it) { el.innerHTML = ''; return; }

@@ -377,6 +377,10 @@ export const gradeApi = {
   patchSetup: (gid, body) => api.patch(`/api/homework-grades/${gid}`, body),
   /** 开始/重跑。**幂等**：已经在跑时返回当前进度，不会重复开一个任务。 */
   run: (gid) => api.post(`/api/homework-grades/${gid}/run`),
+  /** 终止。**只受理「真的在跑」的那一批**，没在跑时后端给 409（detail 里是理由）。
+   *  ⚠️ 语义是「受理」而不是「立刻停」—— 在跑的那几页 AI 调用掐不断，
+   *     拿到 200 之后要继续轮询，等状态落到 reviewing。 */
+  cancel: (gid) => api.post(`/api/homework-grades/${gid}/cancel`),
   /** 整份确认（此后才进统计口径）。note 可以留空。 */
   confirm: (gid, note) => api.post(`/api/homework-grades/${gid}/confirm`, { note }),
 
