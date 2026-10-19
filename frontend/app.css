@@ -859,9 +859,13 @@ table.tbl td.pending { color: var(--warning); font-weight: 600; }
 .grade-regions { border: 1px dashed var(--border); border-radius: 8px;
                  padding: 8px 10px; margin: 0 0 8px; background: var(--bg-2, #fafafa); }
 .gr-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-.gr-list { margin-top: 6px; max-height: 168px; overflow: auto; }
-.gr-row { display: flex; align-items: center; gap: 6px; padding: 3px 0;
-          border-top: 1px solid var(--border); }
+.gr-list { margin-top: 6px; max-height: 300px; overflow: auto; }
+.gr-row { padding: 6px 0; border-top: 1px solid var(--border); }
+.gr-row-top { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+/* 「这块不判」：整行淡掉 + 缩略图去色，一眼与要送的块区分开（与录题页 .skipped 同一套视觉）。
+   ⚠️ 只淡、不禁用：还得能点回来。 */
+.gr-row.off { opacity: .62; }
+.gr-row.off .gr-thumb img { filter: grayscale(1); }
 .gr-no { display: inline-flex; align-items: center; justify-content: center;
          min-width: 20px; height: 20px; border-radius: 4px; background: #2563eb;
          color: #fff; font-size: 11px; }
@@ -870,11 +874,32 @@ table.tbl td.pending { color: var(--warning); font-weight: 600; }
 /* 跨页题：这一题由几段拼的。要显眼 —— 老师得一眼看出「这两段会拼成一张图」。 */
 .gr-span { font-size: 11.5px; color: #b45309; background: #fef3c7;
            border: 1px solid #fcd34d; border-radius: 4px; padding: 1px 6px; }
+/* 块缩略图：**「到底切成了什么」的唯一凭据**。
+   以前这一行只有「第 1 页 / 跨第 1+2 页」两句话，切歪了要等模型判完才知道。 */
+.gr-thumb { position: relative; margin-top: 5px; }
+.gr-thumb img { display: block; max-width: 100%; max-height: 118px; cursor: zoom-in;
+                border: 1px solid var(--border); border-radius: 6px; background: #fff; }
+.gr-off-tag { position: absolute; left: 6px; top: 6px; font-size: 11px; line-height: 1;
+              padding: 3px 7px; border-radius: 10px; background: #6b7280; color: #fff; }
+/* 每页尾部：末段底边的滑块。它是「每页尾部处理」那个旋钮，别藏进弹窗。 */
+.gr-tail { display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+           margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--border); }
+.gr-tail input[type="range"] { width: 140px; }
 
 /* 图的读数：等宽、可换行，像一张小表；不自作主张渲染 LaTeX（这里没有 $ 包裹） */
 .g-figure { white-space: pre-wrap; font-size: 12.5px; line-height: 1.6;
             background: var(--bg-2, #fafafa); border: 1px solid var(--border);
             border-radius: 6px; padding: 5px 7px; color: var(--text-2); }
+
+/* 模型说「这块不像一道题」（block_kind ≠ question）。
+   ⚠️ 是**提示条**，不是自动跳过 —— 所以用橙色描边警告，而不是直接把它灰掉。 */
+.g-odd { display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+         margin: 6px 0 2px; padding: 5px 8px; border-radius: 6px; font-size: 12px;
+         background: #fff7ed; border: 1px solid #fdba74; color: #9a3412; }
+/* 模型说「底部有问题」（tail_note）。与上面同理：只提示，不改任何状态。 */
+.g-tail-note { white-space: pre-wrap; font-size: 12.5px; line-height: 1.6;
+               background: #fff7ed; border: 1px solid #fcd34d;
+               border-radius: 6px; padding: 5px 7px; color: #92400e; }
 
 /* 判定依据里的「传照片」：file input 与「已附 N 张」同一行，别把设置区撑高 */
 .grade-ansfile { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 4px; }
@@ -952,6 +977,10 @@ table.tbl td.pending { color: var(--warning); font-weight: 600; }
 .gl-tip { position: absolute; left: 8px; transform: translate(0, -50%);
           font-size: 11px; line-height: 1.5; padding: 0 5px; border-radius: 4px;
           background: #b45309; color: #fff; pointer-events: none; }
+/* 末段以下（页脚带）：斜纹灰底 + 虚线边。**必须看得见** —— 否则老师不知道
+   「下面那 4% 去哪了」，会以为漏了一题。与录题页的 .tail-hint 同一套视觉语言。 */
+.gl-tail { fill: rgba(148, 163, 184, .22); stroke: #94a3b8; stroke-width: 1;
+           stroke-dasharray: 6 5; pointer-events: none; }
 
 /* 老师笔迹：比 AI 的框更活泼一点（粗、圆头、圆角），一眼能分出「这是我画的」 */
 .gmark .shape.ink { stroke-width: 3; }

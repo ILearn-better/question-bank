@@ -257,6 +257,12 @@ def t_contract() -> None:
         ("/api/grade-items/{iid}/to-bank", ("POST",)),
         ("/api/grade-marks/{mid}", ("PATCH",)),
         ("/api/grade-marks/{mid}", ("DELETE",)),
+        # 一题一区域（0028/0029）+ 0030 的两条
+        ("/api/homework-grades/{gid}/regions", ("GET",)),
+        ("/api/homework-grades/{gid}/regions", ("PUT",)),
+        ("/api/homework-grades/{gid}/regions/copy", ("POST",)),
+        ("/api/homework-grades/{gid}/region-image", ("GET",)),     # 切出来的图长什么样
+        ("/api/homework-grades/{gid}/skipped-pages", ("PATCH",)),  # 整页不送 AI
     ]
     for p, m in must:
         check(f"路由 {m[0]} {p}", (p, m) in paths)
@@ -269,6 +275,18 @@ def t_contract() -> None:
           'revision: str = "0027"' in mig and 'down_revision: Union[str, None] = "0026"' in mig)
     check("迁移只建新表、不 alter 既有表",
           "add_column" not in mig and "drop_column" not in mig)
+
+    # 0030：不送 AI 的两级 + 模型的两个结构信号。**纯加列**，老记录零影响。
+    mig30 = read(BE / "alembic" / "versions" / "0030_grade_skip_and_signals.py")
+    check("迁移 0030 接在 0029 后面",
+          'revision: str = "0030"' in mig30 and 'down_revision: Union[str, None] = "0029"' in mig30)
+    # ⚠️ 只看 upgrade 那半段：downgrade 里当然有 drop_column（那是回滚）。
+    up30 = code_only(mig30).split("def downgrade")[0]
+    check("0030 的 upgrade 是纯加列（不删不改既有列）",
+          up30.count("add_column") == 4 and "drop_column" not in up30,
+          up30.count("add_column"))
+    check("0030 每一列都有 server_default（旧行不许读成 NULL）",
+          up30.count("server_default=") == 4, up30.count("server_default="))
 
     # AGPL 边界：pymupdf 只能出现在 adapters/pdf.py。
     # ⚠️ 这里看的是**真正的 import 语句**，不是字面出现 —— 注释里解释这条约束的那句话
@@ -1343,6 +1361,8 @@ def t_regions() -> None:
               g6.failed >= 1, g6.failed)
         check("失败原因写下来了", "401" in (g6.error or ""), g6.error)
 
+
+
         # ---------------- 提示词：两种口径不能串 ----------------
         from app.services import grade_ai as A
         p_page = A._prompt_for("ai", {"page_no": 1})
@@ -1380,6 +1400,183 @@ def t_regions() -> None:
               f"const REGION_MIN = {G.REGION_MIN_SIDE}" in layer, G.REGION_MIN_SIDE)
         check("框题模式下已有标注失去指针（否则起手那一下就画不出框）",
               ".gmark-layer.mode-region .gmark" in read(FE / "app.css"))
+    finally:
+        db.close()
+
+
+# ============================================ ⑨b 不送 AI（0030）+ 两个结构信号
+def t_skips_and_signals() -> None:
+    """「没办法指定哪些图不传给 AI」这一问的正解，以及配套的模型输出。
+
+    要守住的四件事：
+
+      · **跳过 ≠ 删框**。删了要重画；跳过只是「别送模型」，框还得留着能改。
+      · **跨页题按整块跳过**。只跳上半段 = 只批半道题，比不批还糟。
+      · **一页的块全跳过时不能退回「整页一次判」**。那是老口径的兜底，
+        不拦住的结果正好相反：老师把整页都设成不判 → 整页被送给模型。
+      · **模型说的「这块像页脚」只是提示，绝不自动跳过**。判错一块等于丢一道题。
+    """
+    print("\n=== ⑨b 不送 AI（按块 / 按页）+ 模型的两个结构信号 ===")
+    db = SessionLocal()
+    try:
+        stu = mk_student(db, "跳过测试学生")
+        ls = mk_lesson(db, stu)
+        s1 = mk_submission(db, ls, "跳过.png")
+        db.commit()
+        g = G.create_grade(db, GradeIn(lesson_id=ls.id, file_ids=[s1.id], answer_mode="ai"))
+        db.commit()
+
+        # ---------------- 按块跳过：落库、读回、不删框 ----------------
+        out = G.put_regions(db, g.id, GradeRegionsPut(regions=[
+            GradeRegionIn(q_no="1", box=[50, 100, 900, 300]),
+            GradeRegionIn(q_no="", box=[50, 320, 900, 420], skipped=True),   # 结构说明段
+            GradeRegionIn(q_no="3", box=[50, 460, 900, 700]),
+        ]))
+        check("三个框都还在（跳过不删框）", len(out) == 3, len(out))
+        check("★ 第二块标了 skipped，另外两块没被带上",
+              [r["skipped"] for r in out] == [False, True, False],
+              [r["skipped"] for r in out])
+        blocks = G.blocks_of(db, g.id)
+        check("聚合到题上也是 skipped",
+              [b["skipped"] for b in blocks] == [False, True, False],
+              [b["skipped"] for b in blocks])
+
+        # 跨页题：只跳了上半段也要整块跳（只批半道题更糟）
+        out2 = G.put_regions(db, g.id, GradeRegionsPut(grouped=True, regions=[
+            GradeRegionIn(seq=0, page_no=1, box=[50, 600, 900, 800], skipped=True),
+            GradeRegionIn(seq=0, page_no=1, box=[50, 820, 900, 950]),
+        ]))
+        check("★ 同一题只跳了一段 → 两段都算跳（不批半道题）",
+              [r["skipped"] for r in out2] == [True, True],
+              [(r["page_no"], r["skipped"]) for r in out2])
+        check("这一段也没被丢掉（框还在）", len(out2) == 2, len(out2))
+
+        # ---------------- 按页跳过 ----------------
+        got = G.set_page_skips(db, g.id, [1])
+        check("整页跳过存下来了", got["skipped_pages"] == [1], got)
+        db.refresh(g)
+        check("detail 里带出来（前端要显示「这页不看」）",
+              G.detail(db, g)["skipped_pages"] == [1], G.detail(db, g)["skipped_pages"])
+        check("页号会去重排序（哪怕前端传得乱）",
+              G.set_page_skips(db, g.id, [1, 1])["skipped_pages"] == [1])
+        st, msg = expect_err(G.set_page_skips, db, g.id, [9])
+        check("不存在的页 → 422（不是悄悄忽略）", st == 422 and "只有 1 页" in msg, (st, msg))
+        check("传空数组 = 一页都不跳", G.set_page_skips(db, g.id, [])["skipped_pages"] == [])
+
+        g.status = "running"
+        db.commit()
+        st, _msg = expect_err(G.set_page_skips, db, g.id, [1])
+        check("正在批改时不许改「不看哪几页」→ 409", st == 409, st)
+        g.status = "queued"
+        db.commit()
+
+        # ---------------- _apply_skips：三种页要区分清楚 ----------------
+        kept, noop = G._apply_skips(
+            {1: [{"skipped": False}], 2: [{"skipped": True}], 3: []}, set())
+        check("块全跳过的页 2 → 记成 noop（不许退回整页批）", noop == {2}, noop)
+        check("还有块的页 1 照常批", list(kept) == [1], list(kept))
+        check("本来就没块的页 3 → 不进 noop（老口径，整页一次判）", 3 not in noop, noop)
+        kept2, noop2 = G._apply_skips({1: [{"skipped": False}]}, {1})
+        check("整页跳过 → 一个都不批也不进 noop（由 skip_pages 自己占位）",
+              kept2 == {} and noop2 == set(), (kept2, noop2))
+
+        # ---------------- 真跑一遍：跳过的不调模型 ----------------
+        g7 = G.create_grade(db, GradeIn(lesson_id=ls.id, file_ids=[s1.id], answer_mode="ai"))
+        db.commit()
+        G.put_regions(db, g7.id, GradeRegionsPut(regions=[
+            GradeRegionIn(q_no="1", box=[50, 100, 900, 300]),
+            GradeRegionIn(q_no="", box=[50, 320, 900, 420], skipped=True),
+            GradeRegionIn(q_no="3", box=[50, 460, 900, 700]),
+        ]))
+        calls: list[str] = []
+
+        def fake_region(png, ctx):
+            calls.append(str(ctx.get("region_label") or ""))
+            return ([item_payload()], "")
+
+        orig = G._recognize_region
+        G._recognize_region = fake_region
+        try:
+            G.launch(db, g7)
+            for _ in range(150):
+                db.refresh(g7)
+                if g7.status in ("reviewing", "done", "partial", "failed"):
+                    break
+                time.sleep(0.1)
+        finally:
+            G._recognize_region = orig
+        check("★ 标记跳过的那一块根本没调模型（不是调完再丢）",
+              calls == ["1", "3"], calls)
+        check("跳过的块也不产生题目卡片（不占一个假结果）",
+              len(G.detail(db, g7)["items"]) == 2, len(G.detail(db, g7)["items"]))
+        check("这一页仍然算批完（跳过的块不该让 done 差一页）",
+              g7.done == 1 and g7.failed == 0, (g7.done, g7.failed))
+
+        # 整页跳过 → 一次模型调用都不该有，但任务要能正常收尾
+        g8 = G.create_grade(db, GradeIn(lesson_id=ls.id, file_ids=[s1.id], answer_mode="ai"))
+        db.commit()
+        G.set_page_skips(db, g8.id, [1])
+        calls2: list[str] = []
+
+        def fake_page(png, ctx):
+            calls2.append("page")
+            return ([item_payload()], "")
+
+        orig_p = G._recognize_page
+        G._recognize_page = fake_page
+        try:
+            G.launch(db, g8)
+            for _ in range(150):
+                db.refresh(g8)
+                if g8.status in ("reviewing", "done", "partial", "failed"):
+                    break
+                time.sleep(0.1)
+        finally:
+            G._recognize_page = orig_p
+        check("★ 整页跳过 → 连整页那次模型调用都不发生", calls2 == [], calls2)
+        check("★ 但任务必须能收尾（done 追得上 total，不能卡在 running）",
+              g8.status in ("reviewing", "done") and g8.done == g8.total,
+              (g8.status, g8.done, g8.total))
+
+        # ---------------- 预览裁图：保存前就要能看 ----------------
+        png = G.region_preview_png(db, g.id, "1:50,100,900,300")
+        check("★ 预览接口能直接给出一张 PNG", png[:8] == b"\x89PNG\r\n\x1a\n", png[:8])
+        png2 = G.region_preview_png(db, g.id, "1:50,100,900,300;1:50,460,900,700")
+        check("跨页/多段的预览也能出图（竖拼）", png2[:4] == b"\x89PNG", png2[:4])
+        st, msg = expect_err(G.region_preview_png, db, g.id, "")
+        check("没给区域 → 422 说人话", st == 422, (st, msg))
+        st, msg = expect_err(G.region_preview_png, db, g.id, "1:0,0,5,5")
+        check("框太小 → 422（与存框同一条尺子）", st == 422 and "太小" in msg, (st, msg))
+        st, _msg = expect_err(G.region_preview_png, db, g.id, "9:50,100,900,300")
+        check("页号不存在 → 报错（不是裁一张空白图）", st in (404, 422), st)
+
+        # ---------------- 模型的两个结构信号 ----------------
+        from app.services import grade_ai as A
+        it = A._item_from_obj({"verdict": "ungradable", "block_kind": "Footer",
+                               "tail_note": "底部约 1/10 是页码与页脚"}, [])
+        check("block_kind 带出来了（大小写归一交给 store）", it["block_kind"] == "Footer", it["block_kind"])
+        check("tail_note 带出来了", "页码" in it["tail_note"], it["tail_note"])
+        check("★ block_kind 认不出就归空（不猜成 question，也不猜成 header）",
+              G._block_kind("nonsense") == "", G._block_kind("nonsense"))
+        check("空值也归空（整页口径没有这个字段）", G._block_kind(None) == "")
+        check("合法值原样保留（小写化）", G._block_kind(" SECTION ") == "section")
+
+        row = G._item_row({"block_kind": "footer", "tail_note": "底部是页码"}, g.id, 1, 0)
+        check("两列真的落到了行对象上", (row.block_kind, row.tail_note) == ("footer", "底部是页码"),
+              (row.block_kind, row.tail_note))
+        db.add(row)
+        db.commit()
+        check("item_dict 把它们给到前端（界面要显示提示）",
+              (G.item_dict(row)["block_kind"], G.item_dict(row)["tail_note"]) == ("footer", "底部是页码"))
+
+        # 提示词里必须真的要求了这两项，而且**豁免**了「不要输出没列出的字段」
+        src = read(BE / "app" / "services" / "grade_ai.py")
+        check("区域提示词要求 block_kind", "block_kind" in src)
+        check("区域提示词要求 tail_note", "tail_note" in src)
+        check("★ 明确豁免了「不要输出上面没列出的字段」（不豁免模型就不会给）",
+              "例外" in src and "只在这个流程里要" in src)
+        check("★ 不是题时要求「仍然输出一个元素」（空数组会让这块凭空消失）",
+              "仍然输出一个元素" in src)
     finally:
         db.close()
 
@@ -1703,6 +1900,7 @@ def main() -> int:
     t_items()
     t_marks()
     t_marks_batch()
+    t_skips_and_signals()
     t_run_with_stub()
     t_frontend()
     t_ink_export()

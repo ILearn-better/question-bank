@@ -200,6 +200,9 @@ export default {
     lines: { type: Array, default: () => [] },
     /** 这一页由线切出来的段（`[0,y0,1000,y1]`），只用于画淡色带 + 序号。 */
     bands: { type: Array, default: () => [] },
+    /** 末段以下那一截（`[0,endY,1000,1000]`）：页脚带。**不进任何块、不送 AI**。
+     *  没设结束线时是 null（末段一直切到页底，与历史行为一致）。 */
+    tail: { type: Array, default: null },
   },
   emits: ['pick', 'create', 'erase', 'text-at', 'stamp', 'move', 'region', 'region-remove',
     'add-line', 'move-line', 'remove-line'],
@@ -622,6 +625,10 @@ export default {
       <!-- 分割线：段带（淡）+ 线本身。**整组不收指针事件**（段是整页宽的，
            收事件就等于「页面任何地方都点不了新线」）。线的拖动由 svg 根节点统一处理。 -->
       <g v-if="mode === 'line'" class="gl-layer">
+        <!-- 末段以下（页脚带）：**明确画出来**，表示这一截不进任何块、不送 AI。
+             没有它的话老师只会看到「最后一段到 96%」，说不清下面那 4% 去哪了。 -->
+        <rect v-if="tail" class="gl-tail" x="0" :y="tail[1]" width="1000"
+              :height="Math.max(1, tail[3] - tail[1])" />
         <rect v-for="(b, i) in bandList()" :key="'glb-' + i" class="gl-band"
               x="0" :y="b.y" width="1000" :height="b.h" />
         <line v-for="(l, i) in lineList()" :key="'gll-' + i" class="gl-line"

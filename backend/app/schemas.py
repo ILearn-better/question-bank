@@ -782,6 +782,19 @@ class GradeRegionIn(BaseModel):
     seg: int = 0                                        # 段内序号（0 起，拼接顺序）
     q_no: str = ""
     box: List[float] = Field(default_factory=list)      # [x0, y0, x1, y1]
+    # 「这一段不送 AI」（0030）。卷头段、纯结构说明段、重复页上的段都走这里。
+    # ⚠️ 只是「别送模型」，框仍然留着 —— 删框再画一遍的成本高得多。
+    skipped: bool = False
+
+
+class GradePageSkipsIn(BaseModel):
+    """整页不送 AI（0030）：封页、空白作答页、草稿页。
+
+    与「按块跳过」的关系：**页跳过优先**。一页被跳过时，落在这一页上的块
+    （包括从这页开始、跨到下一页的块）一起不送 —— 只批半道跨页题比不批更糟。
+    """
+
+    pages: List[int] = Field(default_factory=list)
 
 
 class GradeRegionsPut(BaseModel):

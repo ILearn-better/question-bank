@@ -69,11 +69,17 @@ export function isFullWidth(box, tol = FULL_WIDTH_TOL) {
  * ⚠️ 重复的线先去重（同一个 y 点两下不该切出零高度的段）。
  * ⚠️ `0` 和 `1000` 本身不作为线（它们已经是边了）。
  */
-export function bandsOfPage(lines) {
+export function bandsOfPage(lines, endY = 1000) {
+  // 结束线（`endY`）：这一页切到哪儿为止。**默认 1000 = 到页底**，与历史行为一致。
+  // 老师把它拖到 96% 就表示「下面 4% 是页脚，别送 AI」——
+  // 这是「每页尾部处理」缺的那个旋钮，不用新增任何数据形态：
+  // 切出来的段仍然是整页宽的框，只是最后一段的底边不再是 1000。
+  const end = Math.round(clampUnit(num(endY, 1000))) || 1000;
   const ys = Array.from(new Set(
-    (lines || []).map((y) => Math.round(clampUnit(num(y)))).filter((y) => y > 0 && y < 1000),
+    (lines || []).map((y) => Math.round(clampUnit(num(y))))
+      .filter((y) => y > 0 && y < end),          // 结束线以下的线没有意义（切不出东西）
   )).sort((a, b) => a - b);
-  const edges = [0, ...ys, 1000];
+  const edges = [0, ...ys, end];
   const out = [];
   for (let i = 0; i + 1 < edges.length; i += 1) {
     const y0 = edges[i];
@@ -141,7 +147,7 @@ export function linesFromSegs(segs, tol = FULL_WIDTH_TOL) {
  * @param {Array} curSegs  这一页现有的段（含框选段与上一次切出来的线段）
  * @param {Array} lines    这一页的线
  */
-export function reslicePage(curSegs, lines) {
+export function reslicePage(curSegs, lines, endY = 1000) {
   const boxes = (curSegs || []).filter((s) => s && s.src !== 'line');
   /* ⚠️ **没有线就不产生线段**，哪怕一段都没有。
    *    `bandsOfPage([])` 按「全切」语义会返回整页那一段 —— 那在「分割线模式下一刀没画」
@@ -151,13 +157,32 @@ export function reslicePage(curSegs, lines) {
    *    因为单测里喂进去的线永远非空。 */
   const hasLines = (lines || []).some((y) => Number.isFinite(Number(y)));
   const bands = hasLines
-    ? bandsOfPage(lines).filter((b) => !boxes.some((x) => overlapRatio(b, x.box) >= COVER_RATIO))
+    ? bandsOfPage(lines, endY).filter((b) => !boxes.some((x) => overlapRatio(b, x.box) >= COVER_RATIO))
     : [];
   const lineSegs = bands.map((b) => ({
     id: null, seq: -1, q_no: '', box: b, src: 'line',
   }));
   // 框原样留下（保住它们的 id / seq / q_no / 跨页分组）
   return boxes.concat(lineSegs);
+}
+
+/**
+ * 从已存的段**反推结束线**（`endY`）：线切出来的段最下面那条底边。
+ *
+ * 为什么不用额外存一份 `endY`：它本来就已经在几何里了 —— 最后一段的底边就是它。
+ * 再存一份就等于同一个事实两个出处，迟早对不上（改了段没改 endY）。
+ *
+ * 没有整页宽的段（一页全是手拖的框，或者还没切）→ 返回 1000（到页底），
+ * 也就是历史行为，老数据零变化。
+ */
+export function endOfPageFromSegs(segs, tol = FULL_WIDTH_TOL) {
+  const bottoms = (segs || [])
+    .map((s) => normBox(s && s.box))
+    .filter((b) => b && isFullWidth(b, tol))
+    .map((b) => b[3]);
+  if (!bottoms.length) return 1000;
+  const end = Math.round(clampUnit(Math.max(...bottoms)));
+  return end > 0 ? end : 1000;
 }
 
 /**

@@ -36,9 +36,10 @@ import { fail, ok, warn } from '../store.js';
 import GradeMarkLayer from '../components/GradeMarkLayer.js';
 import { createDraft, isLocalMarkId, localMark, sameMark } from '../gradeDraft.js';
 import {
-  LINE_MIN_GAP, isFullWidth, lineToDropFor, linesFromSegs, reslicePage,
-  sortBlocksByGeometry,
+  LINE_MIN_GAP, endOfPageFromSegs, isFullWidth, lineToDropFor, linesFromSegs,
+  reslicePage, sortBlocksByGeometry,
 } from '../gradeLines.js';
+import { clampUnit } from '../markGeom.js';
 
 const POLL_MS = 2000;
 /** 轮询要继续的两个状态。⚠️ **只用于「停不停轮询」**，别拿它判断按钮禁不禁用（见 `running`）。
@@ -213,12 +214,20 @@ export default {
      *    跨页题的几段天然落在不同页上：第 1 页画上半、翻页画下半，然后合成一道题。
      *    如果草稿只存当前页，翻一下页上半段就没了 —— 跨页根本画不出来。
      *    翻页**不提示未保存**（那是框题的常态操作），只有离开框题模式才提示。 */
-    const editAll = ref({});            // { 页号: [段…] }，每段 { id, seq, q_no, box, src, page_no }
+    const editAll = ref({});            // { 页号: [段…] }，每段 { id, seq, q_no, box, src, page_no, skipped }
     /** 分割线：{ 页号: [y, …] }。**不是落库的实体** —— 它只决定「怎么切」，
      *  切出来的段才是。保存之后线能从整页宽的段反推回来（见 syncRegions）。 */
     const editLines = ref({});
+    /** 每页的**结束线**：`{ 页号: y }`，默认 1000（切到页底）。
+     *
+     *  这是「每页尾部处理不到位」那个旋钮：最后一题的作答区通常一直写到底，
+     *  但页脚、页码、条形码也在那儿。把它拖到 96% 就表示「下面 4% 不是题」。
+     *  ⚠️ 它**不是落库的实体**：切出来的最后一段底边就是它，重开页面从段反推
+     *     （`endOfPageFromSegs`）—— 同一个事实只有一个出处。 */
+    const editEnds = ref({});
     const editRegions = computed(() => editAll.value[pageNo.value] || []);
     const pageLines = computed(() => editLines.value[pageNo.value] || []);
+    const pageEnd = computed(() => Number(editEnds.value[pageNo.value] || 1000));
     const lineCount = computed(
       () => Object.values(editLines.value || {}).reduce((n, ys) => n + (ys || []).length, 0),
     );
@@ -245,6 +254,8 @@ export default {
           return {
             seq, q_no: String(q).trim(), label: String(q).trim() || String(seq + 1),
             segs: ordered, pages: ordered.map((s) => Number(s.page_no || 1)),
+            // 一块被跳过 = 它的每一段都标了跳过（后端 put_regions 会归一成这个状态）。
+            skipped: ordered.every((s) => !!s.skipped),
           };
         });
     }
@@ -291,6 +302,8 @@ export default {
     function syncRegions() {
       const by = {};
       const forLines = {};
+      const ends = {};
+      const byPage = {};
       regions.value.forEach((r) => {
         const p = Number(r.page_no || 1);
         const box = (r.box || []).slice();
@@ -299,24 +312,34 @@ export default {
         const src = isFullWidth(box) ? 'line' : 'box';
         (by[p] = by[p] || []).push({
           id: r.id, seq: Number(r.seq || 0), q_no: r.q_no || '',
-          box, page_no: p, src,
+          box, page_no: p, src, skipped: !!r.skipped,
         });
         (forLines[p] = forLines[p] || []).push({ box });
+        (byPage[p] = byPage[p] || []).push({ box });
       });
       const lines = {};
       Object.entries(forLines).forEach(([p, list]) => {
         const ys = linesFromSegs(list);
         if (ys.length) lines[p] = ys;
       });
+      // 结束线从段反推：最后一段的底边就是它（没有线段就是页底 1000）。
+      Object.entries(byPage).forEach(([p, list]) => {
+        const e = endOfPageFromSegs(list);
+        if (e < 1000) ends[p] = e;
+      });
       editAll.value = by;
       editLines.value = lines;
+      editEnds.value = ends;
       regionsDirty.value = false;
     }
 
     /** 草稿落本机（内部防抖）。框题一页十几刀，丢一次就是十几分钟 —— 必须随画随存。 */
     function touchRegionsDraft() {
       localDraft.touch({
-        regions: { dirty: !!regionsDirty.value, lines: editLines.value, segs: editAll.value },
+        regions: {
+          dirty: !!regionsDirty.value, lines: editLines.value,
+          ends: editEnds.value, segs: editAll.value,
+        },
       });
     }
 
@@ -342,11 +365,37 @@ export default {
      */
     function resliceOne(p) {
       const old = editAll.value[p] || [];
-      const raw = reslicePage(old, editLines.value[p] || []);
+      const raw = reslicePage(old, editLines.value[p] || [], editEnds.value[p] || 1000);
       let next = 0;
       allDraftSegs().forEach((s) => { next = Math.max(next, Number(s.seq) + 1); });
+      /* ★ **分组继承**：新带的**上边界**与某个旧线段相同，就把那个旧段的
+       *   `seq / q_no / skipped` 一起搬过来。
+       *
+       *   为什么必须有这一步：跨页题靠 `seq` 分组，而这里会把这一页的线段
+       *   **全部重建**。老师「把跨页题并好 → 顺手把末段底边拖到 96%」是很自然的
+       *   收尾顺序 —— 不继承的话，第 1 页那半段拿到一个新 seq，跨页题当场被拆成
+       *   两道（一道只有上半页、一道只有下半页）。界面上只表现为「题数多了一题」，
+       *   很难看出是哪一步拆的。
+       *
+       *   为什么按「上边界相同」而不是面积重叠比：一题的**起点**才是它的身份。
+       *   拖结束线只动末段的底边（y0 不变）→ 该继承；加一刀则下半段有一个新的
+       *   y0 → 该拿新 seq（「切歪了重切」就是在表达这个意思）。面积比两个方向
+       *   都会错：`new ⊂ old` 会把加一刀的两半都判成继承，`old ⊂ new` 则会把
+       *   「末段被截掉一大半」判成不继承 —— 跨页题照样被拆掉。
+       *   `taken` 保证一个旧段只被认领一次（两半继承同一个 seq 就并成一题了）。 */
+      const top = (b) => Math.round(Number((b || [])[1] || 0));
+      const taken = new Set();
       const out = raw.map((s) => {
         if (s.src !== 'line') return s;      // 框段原样：id / seq / q_no / 跨页分组全保住
+        const host = old.find((o) => o.src === 'line' && !taken.has(o)
+          && top(o.box) === top(s.box));
+        if (host) {
+          taken.add(host);
+          return {
+            ...s, seq: Number(host.seq || 0), q_no: host.q_no || '',
+            skipped: !!host.skipped, page_no: p,
+          };
+        }
         const seg = { ...s, seq: next, page_no: p };
         next += 1;
         return seg;
@@ -396,6 +445,95 @@ export default {
       const cur = (editLines.value[p] || []).filter((l) => Math.abs(l - v) > 0.5);
       editLines.value = { ...editLines.value, [p]: cur };
       resliceOne(p);
+    }
+
+    /* ---------------- 每页尾部：结束线（末段切到哪为止） ----------------
+     * 用户原话：「每页尾部处理也不到位」。真实情况是：最后一题的作答区一直写到
+     * 页底，而页底还有页脚 / 页码 / 条形码 —— 末段必然把那些一起送进模型。
+     * 这里给一个明确的旋钮：末段底边拖到 96%，下面 4% 就不进任何块。
+     * ⚠️ 只影响**线切出来的段**；手拖的框本来就由老师自己定边，不去动它。 */
+    function setPageEnd(y) {
+      const p = pageNo.value;
+      const v = Math.round(clampUnit(Number(y)));
+      if (!Number.isFinite(v) || v <= 0) return;
+      // 结束线必须落在最后一条线下方，否则会切出一个 0 高度的段（后端直接 422）
+      const lastLine = (editLines.value[p] || []).slice().sort((a, b) => b - a)[0] || 0;
+      if (v - lastLine < LINE_MIN_GAP) {
+        warn('结束线太靠上了 —— 至少要离最后一条分割线 ' + LINE_MIN_GAP + ' 的距离');
+        return;
+      }
+      editEnds.value = { ...editEnds.value, [p]: v };
+      resliceOne(p);
+    }
+
+    function resetPageEnd() {
+      const p = pageNo.value;
+      const next = { ...editEnds.value };
+      delete next[p];
+      editEnds.value = next;
+      resliceOne(p);
+    }
+
+    /** 末段下方那一截（页脚带）的位置，给标注层画一条提示 —— 没有就是 null。 */
+    const pageTail = computed(() => {
+      if (!editingRegions.value) return null;
+      const e = Number(editEnds.value[pageNo.value] || 1000);
+      return e < 1000 ? [0, e, 1000, 1000] : null;
+    });
+
+    /* ---------------- 不送 AI：按块 / 按页（0030） ---------------- */
+
+    /** 一块（可能多段）设不设「不判」。**只改草稿**，点「保存分割」才落库。
+     *  ⚠️ 按 `seq` 改**整块的所有段**：跨页题只跳上半段等于只批半道题。 */
+    function toggleBlockSkip(b) {
+      const seq = Number(b && b.seq);
+      const want = !(b && b.skipped);
+      const by = {};
+      Object.entries(editAll.value).forEach(([k, list]) => {
+        by[k] = (list || []).map((s) => (Number(s.seq) === seq ? { ...s, skipped: want } : s));
+      });
+      editAll.value = by;
+      regionsDirty.value = true;
+      touchRegionsDraft();
+    }
+
+    /** 整页不看：**立即落库**（它是一条独立接口，不跟着「保存分割」走）。
+     *  理由：老师说「这页不看」的那一刻就该生效，混在还没保存的框草稿里很容易漏。 */
+    const skippedPages = computed(
+      () => ((detail.value && detail.value.skipped_pages) || []).map(Number),
+    );
+    const pageSkipped = computed(() => skippedPages.value.includes(pageNo.value));
+    async function togglePageSkip() {
+      const next = pageSkipped.value
+        ? skippedPages.value.filter((n) => n !== pageNo.value)
+        : skippedPages.value.concat([pageNo.value]);
+      busy.value = 'pskip';
+      try {
+        const d = await gradeApi.setSkippedPages(gid, next);
+        if (detail.value) detail.value = { ...detail.value, skipped_pages: d.skipped_pages || [] };
+        ok(pageSkipped.value ? '这一页会重新送去批改' : '这一页不再送 AI 了（框都还留着）');
+      } catch (e) {
+        fail(e.message);
+      } finally {
+        busy.value = '';
+      }
+    }
+
+    /** 这一块切出来的样子（现裁、不落盘）。**保存前就能看** —— 这就是
+     *  「分割截图完后看不到图」的正解：切歪了当场发现，而不是等模型判完。
+     *  用 `id` 做 key 让浏览器缓存同一块的图；坐标一变 URL 就变，自然失效。 */
+    function blockPreview(b) {
+      const segs = (b && b.segs) || [];
+      if (!segs.length) return '';
+      const spec = segs
+        .map((s) => `${Number(s.page_no || 1)}:${(s.box || []).join(',')}`)
+        .join(';');
+      return gradeApi.regionImageUrl(gid, spec);
+    }
+    /** 大图：点缩略图新开一个页签看原尺寸（不引弹窗库）。 */
+    function openPreview(b) {
+      const url = blockPreview(b);
+      if (url) window.open(url, '_blank', 'noopener');
     }
 
     /** 画完一个框（标注层发上来的是 [x0,y0,x1,y1]）。只在本地，点「保存框」才落库。 */
@@ -534,6 +672,8 @@ export default {
             seq: Number(s.seq || 0),
             q_no: String(s.q_no || '').trim(),
             box: s.box,
+            // 「这块不送 AI」。后端会把同一题几段归一成一致的值。
+            skipped: !!s.skipped,
           })),
         });
         detail.value.regions = res.regions;
@@ -542,8 +682,10 @@ export default {
         localDraft.touch({ regions: null });
         const blocks = groupSegs(res.regions || []);
         const cross = blocks.filter((b) => b.pages.length > 1).length;
+        const skipped = blocks.filter((b) => b.skipped).length;
         ok(segs.length
-          ? `已保存 ${blocks.length} 题（${segs.length} 个段${cross ? `，其中 ${cross} 题跨页` : ''}）`
+          ? `已保存 ${blocks.length} 题（${segs.length} 个段${cross ? `，其中 ${cross} 题跨页` : ''}`
+            + `${skipped ? `，${skipped} 题不判` : ''}）`
           : '已清空全部框 —— 整份退回整页批');
         if (items.value.length) {
           warn('框改了要重新批改一次才生效 —— 点右边「重新批改」');
@@ -891,8 +1033,9 @@ export default {
           if (r && (Object.keys(r.segs || {}).length || Object.keys(r.lines || {}).length)) {
             editAll.value = r.segs || {};
             editLines.value = r.lines || {};
+            editEnds.value = r.ends || {};
             regionsDirty.value = true;
-            warn('恢复了上次没保存的框/分割线 —— 看一眼，对了就点「保存框」');
+            warn('恢复了上次没保存的框/分割线 —— 看一眼，对了就点「保存分割」');
           }
           if (boot.page_no > 1 && boot.page_no <= pageCount.value) pageNo.value = boot.page_no;
         }
@@ -1307,6 +1450,36 @@ export default {
     /** ungradable 必须说清为什么 —— 只给一个灰点，老师会当成「AI 没干活」。 */
     const naReason = (item) => item.error_reason || '识别不清 / 图题 / 没作答';
 
+    /* ---------------- 模型回的两个「界面上要用」的信号（0030） ----------------
+     * `block_kind` / `tail_note` 是区域模式才有的字段。**只在区域模式下发**，
+     * 老记录（整页批的）里是空串 —— 所以这里必须能优雅地什么都不显示。
+     *
+     * ⚠️ 它们**只当提示，绝不自动跳过**：模型说「这块像卷头」也可能是它读错了，
+     *    自动跳过就等于让模型决定「什么不判」，而老师根本不知道它跳了。
+     *    所以这里只给一行提示 + 一个「去设成不判」的跳转，决定权还在老师手上。 */
+    const BLOCK_KIND_LABEL = {
+      header: '卷头 / 页眉', section: '段落标题', footer: '页脚 / 页码',
+      blank: '空白', other: '其它（不像题目本体）',
+    };
+    /** 这块「不像一道题」时返回中文名，否则返回空串（question 和空都算正常题）。 */
+    const oddKind = (item) => {
+      const k = String((item && item.block_kind) || '').trim();
+      return k && k !== 'question' ? (BLOCK_KIND_LABEL[k] || BLOCK_KIND_LABEL.other) : '';
+    };
+    /** 有框才谈得上「设成不判」—— 整页批的记录里没有块可点。 */
+    const hasBlocks = computed(() => regions.value.length > 0);
+    /** 从题卡跳到那一页的分割模式，让老师自己点「这块不判」。
+     *  不替老师做决定，也不按 seq 猜是哪一块（item.seq 与 region.seq 不同源）。
+     *
+     *  ⚠️ `setTool` 是**切换**语义（再点一次退出）—— 已经在这个模式里就不能再调，
+     *     否则「去设成不判」会把人踢回选择模式，正好反着来（挂载检查抓到的）。 */
+    function gotoSkipBlock(item) {
+      if (!item) return;
+      if (Number(item.page_no) !== pageNo.value) goPage(Number(item.page_no));
+      if (editingRegions.value) return;
+      setTool(regions.value.some((r) => isFullWidth(r.box)) ? 'line' : 'region');
+    }
+
     onMounted(async () => {
       // 全局粘贴只服务于「判定依据传图」：贴文字时 onPaste 会立刻返回，
       // 不抢 textarea 的正常粘贴（见 onPaste 的说明）。
@@ -1333,6 +1506,8 @@ export default {
       rerunItem, openBank, closeBank, saveToBank, confirm,
       setRich, setCard, goPage, prevPage, nextPage, onPick,
       verdictLabel, confLabel, flagLabel, naReason,
+      // 模型回的两个信号（只当提示，不自动跳过）
+      oddKind, hasBlocks, gotoSkipBlock,
       setupMode, setupAnswer, setupRubric, setupTouched, setupBusy, setupEditable,
       setupAnswerFiles, setupImages, answerImgCount, uploadAnswerImage, clearAnswerImages,
       touchSetup, saveSetup, onAnswerDrop, onPaste,
@@ -1348,6 +1523,9 @@ export default {
       regionBlocks, draftSegCount,
       addRegionBox, dropRegion, dropBlock, mergeRegion, setRegionQNo,
       addLine, moveLine, removeLine,
+      // 不送 AI（按块 / 按页）+ 每页尾部（结束线）+ 块的缩略图
+      toggleBlockSkip, skippedPages, pageSkipped, togglePageSkip,
+      pageEnd, pageTail, setPageEnd, resetPageEnd, blockPreview, openPreview,
       saveRegions, copyRegions, syncRegions, clearRegions,
     };
   },
@@ -1485,6 +1663,14 @@ export default {
             <button class="btn ghost sm" :disabled="pageNo <= 1" @click="prevPage">← 上一页</button>
             <span class="small">第 {{ pageNo }} / {{ pageCount }} 页</span>
             <button class="btn ghost sm" :disabled="pageNo >= pageCount" @click="nextPage">下一页 →</button>
+            <!-- 整页不看（0030）：封页、空白作答页、草稿页。**立即生效**，
+                 不跟着「保存分割」走 —— 老师说这页不看的那一刻就该不看。 -->
+            <button class="btn ghost sm" :class="{ on: pageSkipped }" :disabled="busy === 'pskip'"
+                    :title="pageSkipped ? '这一页现在不送 AI，点一下恢复' : '这一页整页不送 AI（框都还留着）'"
+                    @click="togglePageSkip">
+              {{ pageSkipped ? '本页不判 · 恢复' : '本页不判' }}
+            </button>
+            <span v-if="pageSkipped" class="tag orange">不送 AI</span>
             <div class="spacer"></div>
             <span class="small muted" v-if="pageMarks.length">这一页 {{ pageMarks.length }} 处标注</span>
             <span class="small muted" v-else>这一页没有标注</span>
@@ -1553,20 +1739,51 @@ export default {
               有段的页<b>一段一次</b>判（切得越准，读得越清），没段的页仍然整页判一次。
             </div>
             <div v-else class="gr-list">
-              <div v-for="b in regionBlocks" :key="'b-' + b.seq" class="gr-row">
-                <span class="gr-no">{{ b.seq + 1 }}</span>
-                <label class="small">题号</label>
-                <input class="gr-q" :value="b.q_no" placeholder="留空就按顺序"
-                       @input="setRegionQNo(b, $event.target.value)">
-                <span v-if="b.pages.length > 1" class="gr-span" :title="'两段会竖拼成一张图再判'">
-                  跨第 {{ b.pages.join(' + ') }} 页 · {{ b.pages.length }} 段
-                </span>
-                <span v-else class="small muted">第 {{ b.pages[0] }} 页</span>
-                <div class="spacer"></div>
-                <button v-if="b.seq > 0" class="btn ghost sm" @click="mergeRegion(b)"
-                        title="跨页题：并到上一题，两段竖拼成一张图再判">并入上一题</button>
-                <button class="btn ghost sm" @click="dropBlock(b)">删</button>
+              <!-- 一行 = 一道题。**必须带缩略图**：以前这里只有「第 1 页 / 跨第 1+2 页」两句话，
+                   切歪了只能等模型判完才知道哪块不对 —— 这就是用户说的「分割截图完后看不到图」。
+                   图走 /region-image 现裁（不落盘），**保存前就能看**，改一下坐标 URL 就变。 -->
+              <div v-for="b in regionBlocks" :key="'b-' + b.seq" class="gr-row"
+                   :class="{ off: b.skipped }">
+                <div class="gr-row-top">
+                  <span class="gr-no">{{ b.seq + 1 }}</span>
+                  <label class="small">题号</label>
+                  <input class="gr-q" :value="b.q_no" placeholder="留空就按顺序"
+                         @input="setRegionQNo(b, $event.target.value)">
+                  <span v-if="b.pages.length > 1" class="gr-span" :title="'两段会竖拼成一张图再判'">
+                    跨第 {{ b.pages.join(' + ') }} 页 · {{ b.pages.length }} 段
+                  </span>
+                  <span v-else class="small muted">第 {{ b.pages[0] }} 页</span>
+                  <div class="spacer"></div>
+                  <button class="btn ghost sm" :class="{ on: b.skipped }" @click="toggleBlockSkip(b)"
+                          :title="b.skipped ? '恢复：这块会重新送去批改' : '这块不送 AI（卷头、结构说明段、重复页上的段）——框还留着'">
+                    {{ b.skipped ? '不判 · 恢复' : '这块不判' }}
+                  </button>
+                  <button v-if="b.seq > 0" class="btn ghost sm" @click="mergeRegion(b)"
+                          title="跨页题：并到上一题，两段竖拼成一张图再判">并入上一题</button>
+                  <button class="btn ghost sm" @click="dropBlock(b)">删</button>
+                </div>
+                <div class="gr-thumb">
+                  <img :src="blockPreview(b)" loading="lazy" alt="这块切出来的样子"
+                       @click="openPreview(b)" title="点一下看大图">
+                  <span v-if="b.skipped" class="gr-off-tag">不送 AI</span>
+                </div>
               </div>
+            </div>
+            <!-- 每页尾部：末段切到哪为止。默认到页底（历史行为），
+                 拖到 96% 就把页脚 / 页码那一截排除在块之外。 -->
+            <div v-if="tool === 'line'" class="gr-tail">
+              <span class="small">末段底边</span>
+              <input type="range" min="50" max="100" step="1" :value="pageEnd / 10"
+                     @input="setPageEnd($event.target.value * 10)">
+              <span class="small" :class="{ muted: pageEnd >= 1000 }">{{ pageEnd / 10 }}%</span>
+              <span v-if="pageEnd < 1000" class="small muted">
+                下面 {{ (1000 - pageEnd) / 10 }}% 不进任何块、不送 AI
+              </span>
+              <span v-else class="small muted">一直切到页底</span>
+              <div class="spacer"></div>
+              <button class="btn ghost sm" @click="setPageEnd(960)"
+                      title="页脚 / 页码通常在底部 4% 内">截掉页脚（96%）</button>
+              <button v-if="pageEnd < 1000" class="btn ghost sm" @click="resetPageEnd">到页底</button>
             </div>
             <div class="small muted" style="margin-top:6px">
               题号由段绑定 —— 学生把「第 3 题」写成「第 8 题」也不会判错归属。
@@ -1584,6 +1801,7 @@ export default {
             <GradeMarkLayer ref="layerEl" :marks="pageMarks" :selected-item-id="selectedItemId"
                             :mode="tool" :color="inkColor"
                             :regions="layerRegions" :lines="layerLines" :bands="pageBands"
+                            :tail="pageTail"
                             @pick="onPick" @create="addMark" @erase="eraseMarks"
                             @text-at="onTextAt" @stamp="addMark" @move="moveMark"
                             @region="addRegionBox" @region-remove="dropRegion"
@@ -1629,6 +1847,19 @@ export default {
                       class="tag orange">{{ flagLabel(f) }}</span>
                 <div class="spacer"></div>
                 <button class="btn ghost sm" @click.stop="goPage(item.page_no)">第 {{ item.page_no }} 页</button>
+              </div>
+
+              <!-- 模型说「这块不像一道题」。**只提示、不自动跳过** —— 它也可能读错，
+                   让模型决定"什么不判"而老师不知道，是最糟的一种自动化。 -->
+              <div v-if="oddKind(item)" class="g-odd">
+                <span class="tag orange">{{ oddKind(item) }}</span>
+                <span class="small">
+                  模型认为这一块不是题目本体，判出来多半是噪音
+                  <template v-if="hasBlocks">—— 可以在框题里点「这块不判」，框会留着</template>
+                </span>
+                <button v-if="hasBlocks" class="btn ghost sm" @click.stop="gotoSkipBlock(item)">
+                  去设成不判
+                </button>
               </div>
 
               <!-- 题干：空容器 + 函数 ref，内容由 renderRichEl 写 innerHTML（不能有插值） -->
@@ -1693,6 +1924,18 @@ export default {
                   <span class="muted small">（（确定）能作数 /（看不清）只作疑）</span>
                 </div>
                 <div class="g-figure">{{ item.figure_note }}</div>
+              </div>
+
+              <!-- 模型报的「底部有问题」。这是「每页尾部处理不到位」的另一半：
+                   老师自己看不出末段被切掉了一角，模型说出来才知道要回去调结束线。
+                   三种情况（页脚占了 / 被页切掉 / 有邻题残字）都用同一句话提示。 -->
+              <div class="g-sec" v-if="item.tail_note">
+                <div class="g-lb">这一块的底部</div>
+                <div class="g-tail-note">{{ item.tail_note }}</div>
+                <div class="small muted" style="margin-top:4px">
+                  多半是页脚 / 页码占了地方，或者题目被页边界切断了 ——
+                  到分割模式把这一页的「末段底边」往上收一点，翻页看看下面还有没有内容。
+                </div>
               </div>
 
               <div class="g-meta" v-if="item.kp_name || (item.tags || []).length">

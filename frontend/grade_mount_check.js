@@ -75,9 +75,11 @@ const item = (o) => Object.assign({
   correct_answer: '', verdict: 'correct', score: null, full_score: null, basis: '',
   confidence: 'high', kp_name: '', tags: [], error_reason: '', flags: [],
   figure_note: '', status: 'pending', question_id: null,
+  block_kind: '', tail_note: '',
 }, o);
 
-/** 三题：① 普通代数题 ② 几何题（有新加的 figure_note）③ 框里没读到题的占位。 */
+/** 三题：① 普通代数题 ② 几何题（有新加的 figure_note + tail_note）
+ *        ③ 框里没读到题的占位（模型说这块像卷头）。 */
 const DETAIL = {
   id: 7, student_id: 5, lesson_id: 31, status: 'reviewing',
   answer_mode: 'ai', answer_text: '', rubric_text: '',
@@ -86,10 +88,13 @@ const DETAIL = {
   files: [{ id: 1, role: 'submission', name: '作业.pdf', pages: 2 }],
   items: [
     item({ id: 101, seq: 1, q_no: '1', qtype: '解答题', verdict: 'correct',
+           block_kind: 'question',
            stem: '解方程：$x^2-5x+6=0$。', student_answer: '$x=2$ 或 $x=3$',
            correct_answer: '$x=2$ 或 $x=3$', basis: '因式分解后两根都对',
            kp_name: '一元二次方程', tags: ['因式分解'] }),
     item({ id: 102, seq: 2, q_no: '2', qtype: '证明题', verdict: 'partial',
+           block_kind: 'question',
+           tail_note: '底部有邻题的残字，这一块可能把下一题的开头也读进来了',
            stem: '如图，$AB=AC$，$D$ 为 $BC$ 中点，求证 $AD\\\\perp BC$。',
            student_answer: '因为 $AB=AC$，$D$ 是中点，所以 $AD$ 垂直 $BC$',
            correct_answer: '用 SSS 证 $\\\\triangle ABD\\\\cong\\\\triangle ACD$，得 $\\\\angle ADB=\\\\angle ADC=90^\\\\circ$',
@@ -99,6 +104,7 @@ const DETAIL = {
              + '③ 记号：AD 与 BC 交点处有一个直角方框（确定）；④ 数值：无（确定）',
            flags: ['low_confidence'], confidence: 'medium' }),
     item({ id: 103, seq: 3, q_no: '3', qtype: '', verdict: 'ungradable',
+           block_kind: 'header',
            stem: '', student_answer: '', error_reason: '框里没读到任何作答内容',
            flags: ['region_empty'], confidence: '' }),
   ],
@@ -108,9 +114,10 @@ const DETAIL = {
     { id: 202, item_id: 102, page_no: 1, kind: 'text', geo: [300, 520],
       points: [], text: '缺全等', color: '#dc2626', created_by: 'teacher' },
   ],
+  skipped_pages: [],
   regions: [
-    { id: 301, page_no: 1, seq: 0, q_no: '1', label: '1', box: [40, 60, 900, 300] },
-    { id: 302, page_no: 1, seq: 1, q_no: '2', label: '2', box: [40, 340, 900, 620] },
+    { id: 301, page_no: 1, seq: 0, q_no: '1', label: '1', box: [40, 60, 900, 300], skipped: 0 },
+    { id: 302, page_no: 1, seq: 1, q_no: '2', label: '2', box: [40, 340, 900, 620], skipped: 0 },
   ],
 };
 
@@ -129,10 +136,14 @@ export const gradeApi = {
   },
   putRegions: async (gid, body) => {
     push('putRegions', [gid, body]);
-    // 真实后端是**整份替换**（page_no / seq 都在每一段上），这里照做
+    // 真实后端是**整份替换**（page_no / seq 都在每一段上），这里照做。
+    // ⚠️ skipped 必须回显：真后端会把它原样带回来（并且把同一题的几段归一），
+    //    不回来的话前端 syncRegions() 会把「不送 AI」全部读成 false ——
+    //    测试里就变成「跳过了，但一刷新又都回来了」这种假绿。
     DETAIL.regions = body.regions.map((r, i) => ({
       id: 400 + i, page_no: Number(r.page_no), seq: Number(r.seq || 0), seg: 0,
       q_no: r.q_no, label: r.q_no || String(Number(r.seq || 0) + 1), box: r.box,
+      skipped: r.skipped ? 1 : 0,
     }));
     return { regions: JSON.parse(JSON.stringify(DETAIL.regions)) };
   },
@@ -142,6 +153,18 @@ export const gradeApi = {
   },
   pageUrl: (gid, pno) => '/api/homework-grades/' + gid + '/page/' + pno,
   exportUrl: (gid, fmt, page) => '/api/homework-grades/' + gid + '/export?fmt=' + fmt + '&page=' + page,
+  /** 一块切出来的样子：**现裁、不落盘**（服务端用 page_png + Pillow 裁，多段竖拼）。
+   *  桩只负责把 URL 拼对 —— 真正的裁图在 backend，前端只是拿它当 <img src>。 */
+  regionImageUrl: (gid, spec) => {
+    push('regionImage', [gid, spec]);
+    return '/api/homework-grades/' + gid + '/region-image?spec=' + encodeURIComponent(spec);
+  },
+  /** 整页不送 AI：**整份替换**（不是增量），所以桩也整份覆盖，好断言「点一下真的改了」。 */
+  setSkippedPages: async (gid, pages) => {
+    push('skippedPages', [gid, pages]);
+    DETAIL.skipped_pages = (pages || []).map(Number).slice().sort((a, b) => a - b);
+    return { skipped_pages: DETAIL.skipped_pages.slice() };
+  },
   patchItem: async (iid, body) => { push('patchItem', [iid, body]); return { ok: 1 }; },
   rerunItem: async (iid) => { push('rerunItem', [iid]); return { ok: 1 }; },
   toBank: async (iid, body) => { push('toBank', [iid, body]); return { ok: 1 }; },
@@ -668,6 +691,152 @@ async function main() {
     check('★ 有一条真跨页题（1 题 2 段）', crossBlocks.length, 1);
     check('★ 跨页的两段落在不同页上', crossBlocks.length ? crossBlocks[0].pages : [], [1, 2]);
 
+    /* ============ 17b. 看得见图 / 能不送 AI / 每页尾部 ============
+     * 用户 2026-10-19 原话：「分割截图完后看不到图，没办法指定哪些图不传给ai，
+     * 每页尾部处理也不到位」。三件事都发生在**点保存之前** ——
+     * 以前右栏只有「第 1 页 / 跨第 1+2 页」两句话，切歪了得等模型判完才知道。
+     * 所以这一节刻意留在「还没保存分割」的状态里断言。 */
+    checkTrue('★ 每一块都有缩略图（以前这里只有一行字 —— 切歪了看不出来）',
+      vm.regionBlocks.length > 0
+      && D.querySelectorAll('.gr-thumb img').length === vm.regionBlocks.length,
+      D.querySelectorAll('.gr-thumb img').length + ' / ' + vm.regionBlocks.length);
+    const thumbSrcs = Array.from(D.querySelectorAll('.gr-thumb img'))
+      .map((el) => String(el.getAttribute('src')));
+    checkTrue('★ 缩略图走 /region-image 现裁（不是先把图存下来再引用）',
+      thumbSrcs.length > 0 && thumbSrcs.every((u) => u.includes('/region-image?spec=')), thumbSrcs);
+    checkTrue('缩略图懒加载（一页七八十块不能一起裁）',
+      Array.from(D.querySelectorAll('.gr-thumb img'))
+        .every((el) => el.getAttribute('loading') === 'lazy'));
+
+    // `spec` 是前后端唯一的契约：`页号:x0,y0,x1,y1`，多段用 `;` 连（后端按它裁图 + 竖拼）
+    const specOf = (b) => decodeURIComponent(String(vm.blockPreview(b)).split('spec=')[1] || '');
+    const b0 = vm.regionBlocks[0];
+    check('★ spec 拼对了（页号:框，跨页用 ; 连）—— 后端就按这个裁',
+      specOf(b0), b0.segs.map((s) => s.page_no + ':' + s.box.join(',')).join(';'));
+    const crossB = vm.regionBlocks.find((b) => b.segs.length > 1);
+    checkTrue('★ 跨页块的 spec 是两段（后端靠它竖拼成一张图）',
+      !!crossB && specOf(crossB).split(';').length === crossB.segs.length,
+      crossB ? specOf(crossB) : '没有跨页块');
+
+    // 点缩略图看大图：不引弹窗库，新开页签看原尺寸
+    const opened = [];
+    W.open = (u) => { opened.push(String(u)); return null; };
+    D.querySelectorAll('.gr-thumb img')[0].click();
+    await sleep(150);
+    check('★ 点缩略图能看大图', opened.length, 1);
+    check('看的就是这一块（与缩略图同一个 URL）',
+      opened[0], String(D.querySelectorAll('.gr-thumb img')[0].getAttribute('src')));
+
+    /* ---- 按块不送 AI ----
+     * ⚠️ 只改草稿、**不删框**：老师常是先怀疑「这块判错了」，回头又想要 ——
+     *    删了框就得从头再切一遍。
+     * ⚠️ 跨页题必须**两段一起跳**：只跳上半段等于只批半道题（下半段照样送）。
+     * ⚠️ 必须验到「上传的 body 里有它」，只在界面上标着不算。 */
+    const segN = vm.draftSegCount;
+    if (crossB) {
+      vm.toggleBlockSkip(crossB);
+      await sleep(180);
+      const now = vm.regionBlocks.find((b) => b.seq === crossB.seq) || {};
+      check('★ 跨页块点一下 → 整块标跳过', !!now.skipped, true);
+      check('★ 两段都标了（只跳上半段等于只批半道题）',
+        (now.segs || []).map((s) => !!s.skipped), [true, true]);
+      check('★ 跳过**不删框**（框还在，随时能恢复）', vm.draftSegCount, segN);
+      check('别的块不受影响（一次只跳这一块）',
+        vm.regionBlocks.filter((b) => b.skipped).length, 1);
+      check('界面上标出「不送 AI」（老师看得见哪块没送）',
+        D.querySelectorAll('.gr-off-tag').length, 1);
+      checkTrue('按钮变成「不判 · 恢复」（点完得看出成功了）',
+        body().includes('不判 · 恢复'), body().includes('这块不判'));
+
+      // 保存时随框一起上传 —— 否则「跳过了」只活到下一次刷新
+      const nPut = calls2.filter((c) => c.name === 'putRegions').length;
+      await vm.saveRegions();
+      await sleep(320);
+      const puts = calls2.filter((c) => c.name === 'putRegions');
+      check('保存分割 → 走 putRegions', puts.length, nPut + 1);
+      check('★ 跳过状态随框一起上传（不是只在界面上标着）',
+        puts[puts.length - 1].args[1].regions.filter((r) => r.skipped).length,
+        crossB.segs.length);
+      check('★ 后端回包带着 skipped，刷新后还认（没被静默清成 false）',
+        vm.regionBlocks.filter((b) => b.skipped).length, 1);
+
+      // 撤回来：恢复之后这一块要真的回到「要判」
+      const back = vm.regionBlocks.find((b) => b.seq === crossB.seq) || {};
+      vm.toggleBlockSkip(back);
+      await sleep(180);
+      check('★ 再点一下 → 两段都恢复（这块重新送去批改）',
+        (vm.regionBlocks.find((b) => b.seq === crossB.seq) || {}).segs.map((s) => !!s.skipped),
+        [false, false]);
+      check('恢复后「不送 AI」标签消失', D.querySelectorAll('.gr-off-tag').length, 0);
+    }
+
+    /* ---- 按页不送 AI（整页）----
+     * 与按块的区别是**粒度**：封页、空白作答页、重复扫描页没必要一题题去框。
+     * 它走独立接口、**立即落库**，不跟着还没保存的框草稿走 ——
+     * 老师说「这页不看」的那一刻就该生效，混在草稿里很容易漏。 */
+    vm.goPage(2);
+    await sleep(240);
+    check('第 2 页默认要判', vm.pageSkipped, false);
+    const nSk = () => calls2.filter((c) => c.name === 'skippedPages').length;
+    const skBefore = nSk();
+    await vm.togglePageSkip();
+    await sleep(220);
+    check('★ 点「本页不判」→ 打独立接口（不跟着「保存分割」走）', nSk(), skBefore + 1);
+    const skCalls = calls2.filter((c) => c.name === 'skippedPages');
+    check('★ 传的是这一页的页号', skCalls[skCalls.length - 1].args[1], [2]);
+    check('★ 接口一回来就生效（不用等保存）', vm.pageSkipped, true);
+    checkTrue('按钮变成「本页不判 · 恢复」', body().includes('本页不判 · 恢复'));
+
+    await vm.togglePageSkip();
+    await sleep(220);
+    const skCalls2 = calls2.filter((c) => c.name === 'skippedPages');
+    check('★ 再点一次 → 整份替换成空（不是又追加一遍）',
+      skCalls2[skCalls2.length - 1].args[1], []);
+    check('恢复后这页又要判了', vm.pageSkipped, false);
+
+    /* ---- 每页尾部：结束线 ----
+     * 「每页尾部处理也不到位」的现场：最后一题一直写到页底，而页底还有
+     * 页脚 / 页码 / 条形码 —— 末段把它们一起裁进去送模型。
+     * 结束线就是「这页切到哪儿为止」这唯一一个旋钮，**不新增任何数据形态**
+     * （最后一段的底边就是它）。 */
+    vm.goPage(1);
+    await sleep(240);
+    check('默认切到页底（老行为，老数据零变化）', vm.pageEnd, 1000);
+    check('默认不画页脚斜纹带', vm.pageTail, null);
+
+    vm.setPageEnd(960);
+    await sleep(240);
+    check('★ 拖到 96% → 结束线记下了', vm.pageEnd, 960);
+    const p1lines = vm.editRegions.filter((s) => s.src === 'line');
+    check('★ 末段底边真的缩到 960（下面 4% 不进任何块、不送 AI）',
+      Math.max(...p1lines.map((s) => s.box[3])), 960);
+    check('★ 页脚斜纹带上屏（老师看得见哪一截被排除了）',
+      D.querySelectorAll('.gl-tail').length, 1);
+    check('滑块旁边写的是 96%（单位是百分比，不是 0~1000）',
+      body().includes('96%'), true);
+    check('说明了下面多少不进任何块', body().includes('不进任何块'), true);
+    /* ★★ 这条是这轮最容易漏的：`resliceOne` 会把这一页的线段**全部重建**，
+     *    跨页题靠 `seq` 分组 —— 不继承的话，老师「并好跨页题 → 顺手拖一下尾部滑块」
+     *    就把题拆成两道（一道只有上半页、一道只有下半页），而界面上只表现为
+     *    「题数多了一题」。 */
+    check('★ 拖结束线**不会把跨页题拆开**（上半段继承原来的题号）',
+      vm.regionBlocks.filter((b) => b.pages.length > 1).length, 1);
+
+    // 太靠上必须拦住：第 1 页最后一条线在 600，切到 610 只剩 10 单位 → 后端直接 422
+    vm.setPageEnd(610);
+    await sleep(180);
+    check('★ 结束线贴到最后一条线上 → 拦住，不改（否则切出 10 单位高的段，后端 422）',
+      vm.pageEnd, 960);
+    check('末段底边也没跟着变',
+      Math.max(...vm.editRegions.filter((s) => s.src === 'line').map((s) => s.box[3])), 960);
+
+    vm.resetPageEnd();
+    await sleep(240);
+    check('★ 点「到页底」→ 回到 1000', vm.pageEnd, 1000);
+    check('斜纹带跟着消失（不留一条永远在的灰带）',
+      D.querySelectorAll('.gl-tail').length, 0);
+
+
     /* ============ 18. 判定依据：Ctrl+V 粘贴一张图 ============
      * 用户的需求原文是「上传图片也可是缓存中的图片」—— 截图之后直接粘，
      * 不用先存成文件再找。剪贴板里的图常常**没有文件名**，所以顺带验一下补名。
@@ -790,6 +959,45 @@ async function main() {
     check('也没有发请求出去', calls3.filter((c) => c.name === 'addMarks').length, batch2);
     check('★ 那条重复的从队列里清掉了（不是永远躺在那里反复重试）',
       vm.pendingMarks.length, 0);
+
+    /* ============ 21. 模型回的两个信号得上屏（block_kind / tail_note） ============
+     * 这两个字段是本轮给模型新加的**输出要求**（见 grade_ai._REGION_BLOCK）。
+     * 加了字段却不在界面上显示，等于白加 —— 模型说「这块像卷头」「底部被切了」，
+     * 老师看不见就不可能据此改分割。所以这里要证的是「真的渲染出来了」。
+     *
+     * ⚠️ 同时要证**它不会自动改任何状态**：模型说「像卷头」只是提示，
+     *    绝不替老师把这块设成不判（它也可能读错，而老师根本不知道它跳了）。 */
+    const oddBoxes = D.querySelectorAll('.g-odd');
+    check('★ block_kind ≠ question 的题有一行提示（其余两题没有空壳）', oddBoxes.length, 1);
+    checkTrue('提示里写清是哪一种（header → 卷头 / 页眉）',
+      oddBoxes.length === 1 && oddBoxes[0].textContent.includes('卷头'),
+      oddBoxes.length ? oddBoxes[0].textContent.trim().slice(0, 60) : '没有');
+    checkTrue('提示说的是「模型认为」+「判出来多半是噪音」（讲清依据，不是命令）',
+      oddBoxes.length === 1 && oddBoxes[0].textContent.includes('模型认为')
+      && oddBoxes[0].textContent.includes('噪音'),
+      oddBoxes.length ? oddBoxes[0].textContent.trim().slice(0, 80) : '没有');
+    check('★ 有框 → 给一个「去设成不判」的跳转（决定权在老师）',
+      oddBoxes.length === 1 ? oddBoxes[0].querySelectorAll('button').length : 0, 1);
+
+    const tailNotes = D.querySelectorAll('.g-tail-note');
+    check('★ tail_note 上屏了（只有那一题有，其余没有空壳）', tailNotes.length, 1);
+    checkTrue('原样显示模型的话（不加工成「疑似」这种含糊词）',
+      tailNotes.length === 1 && tailNotes[0].textContent.includes('邻题的残字'),
+      tailNotes.length ? tailNotes[0].textContent.trim().slice(0, 60) : '没有');
+    checkTrue('旁边告诉老师该怎么办（去调末段底边 / 翻页看下面）',
+      body().includes('末段底边') && body().includes('翻页'), true);
+
+    // 点「去设成不判」：跳到那一页 + 进框题/分割模式（不替老师点跳过）
+    const oddBtn = oddBoxes.length === 1 ? oddBoxes[0].querySelector('button') : null;
+    const skipBefore = vm.regionBlocks.filter((b) => b.skipped).length;
+    if (oddBtn) {
+      oddBtn.click();
+      await sleep(260);
+    }
+    checkTrue('★ 点「去设成不判」→ 切到框题/分割模式',
+      ['region', 'line'].includes(vm.tool), vm.tool + ' / 第 ' + vm.pageNo + ' 页');
+    check('★ 只跳过去，**不自动把这块设成不判**（模型说像卷头也可能读错）',
+      vm.regionBlocks.filter((b) => b.skipped).length, skipBefore);
   } finally {
     try { fs.rmSync(tmp, { recursive: true, force: true }); } catch (e) { /* 删不掉留着也无妨 */ }
   }

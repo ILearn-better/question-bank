@@ -393,6 +393,13 @@ export const gradeApi = {
   /** 沿用同一节课另一份的框（一套卷只画一次）。跨课时会 422。 */
   copyRegions: (gid, fromGradeId) =>
     api.post(`/api/homework-grades/${gid}/regions/copy`, { from_grade_id: fromGradeId }),
+  /** 一块切出来的样子（现裁、不落盘）。**保存前就能看**，切歪了当场发现。
+   *  spec 形如 `1:40,540,1000,800`，跨页多段用 `;` 连接（与 /documents 那个同名接口同一套语法）。 */
+  regionImageUrl: (gid, spec) =>
+    `/api/homework-grades/${gid}/region-image?spec=${encodeURIComponent(spec)}`,
+  /** 整页不送 AI（**整份替换**，与框同一套口径）。只存页号，不动框。 */
+  setSkippedPages: (gid, pages) =>
+    api.patch(`/api/homework-grades/${gid}/skipped-pages`, { pages }),
 
   /** 改一题的判定 / 学生作答 / 错因 / 考点 / 核对状态。
    *  ⚠️ 改 student_answer 会**作废这一题的判定并重跑**（旧的 evidence 引用已经不存在了）。 */

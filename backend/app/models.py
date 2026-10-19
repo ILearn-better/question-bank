@@ -1187,6 +1187,10 @@ class HomeworkGrade(Base):
     full_score: Mapped[float | None] = mapped_column(REAL)
 
     error: Mapped[str] = mapped_column(Text, default="", server_default="")
+    # 整页不送 AI 的页号（0030），JSON 数组文本："[]" / "[2,5]"。
+    # 存文本而不是另开一张表的理由见迁移 0030：它永远「整份一次读写」，
+    # 行数不超过页数，多一张表只多一次 join。
+    skipped_pages: Mapped[str] = mapped_column(Text, default="[]", server_default="[]")
     dir_rel: Mapped[str] = mapped_column(Text, default="", server_default="")
     created_at: Mapped[str] = mapped_column(Text, default=_now, server_default=NOW)
     finished_at: Mapped[str | None] = mapped_column(Text)
@@ -1283,6 +1287,14 @@ class HomeworkGradeItem(Base):
     node_id: Mapped[int | None] = mapped_column(ForeignKey("nodes.id"))
     tags: Mapped[str] = mapped_column(Text, default="[]", server_default="[]")      # 错题标签
     error_reason: Mapped[str] = mapped_column(Text, default="", server_default="")
+    # 模型对「这一块是什么」的判断（0030）：question / header / section / footer /
+    # blank / other。**只当提示用，绝不自动跳过** —— 判错一块等于丢一道题，
+    # 而多问老师一句的代价是零。界面拿它在卡片上说「模型说这块像卷头，可以设不判」。
+    block_kind: Mapped[str] = mapped_column(String, default="", server_default="")
+    # 这一块**底部**的情况（0030）：底部被页脚占了 / 底部疑似被页切掉 / 底部有别题残字。
+    # 为什么值得单列：这是「每页尾部处理不到位」缺的那条信息 —— 以前模型看到了也不说，
+    # 老师只能从判定结果反推「最后一题怎么判错了」。
+    tail_note: Mapped[str] = mapped_column(Text, default="", server_default="")
     flags: Mapped[str] = mapped_column(Text, default="[]", server_default="[]")     # transcription_conflict / insufficient_evidence …
     raw: Mapped[str] = mapped_column(Text, default="{}", server_default="{}")       # 模型原始输出（供复核与重放）
     transcription_version: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
@@ -1387,6 +1399,9 @@ class HomeworkGradeRegion(Base):
     # 卷面题号。老师填了就一定用它（不采信模型认的题号）；空着才回落到模型的 q_no。
     q_no: Mapped[str] = mapped_column(String, default="", server_default="")
     box: Mapped[str] = mapped_column(Text, default="[]", server_default="[]")     # [x0,y0,x1,y1]，0~1000
+    # 「这一段不送 AI」（0030）：卷头段、纯结构说明段（「四、解答题；共 77 分」）、
+    # 重复页上的段。**不删框** —— 删了下次想恢复就得重画；这只是「别送模型」。
+    skipped: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     created_at: Mapped[str] = mapped_column(Text, default=_now, server_default=NOW)
 
     __table_args__ = (Index("idx_hwregions_grade", "grade_id", "seq", "seg"),)

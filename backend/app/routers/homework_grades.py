@@ -15,7 +15,7 @@ docs/AI批改作业-实现计划.md §5：前端已经在照这个写。
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from sqlalchemy.orm import Session
 
 from ..db import get_db
@@ -26,6 +26,7 @@ from ..schemas import (
     GradeMarkIn,
     GradeMarkPatch,
     GradeMarksIn,
+    GradePageSkipsIn,
     GradeRegionsCopy,
     GradeRegionsPut,
     GradeSetupPatch,
@@ -272,3 +273,41 @@ def copy_regions(gid: int, payload: GradeRegionsCopy, db: Session = Depends(get_
     except store.GradeError as e:
         raise _fail(e) from e
     return {"regions": regions}
+
+
+@router.get("/homework-grades/{gid}/region-image")
+def grade_region_image(gid: int, spec: str, zoom: float = Query(1.6, ge=0.5, le=3.0),
+                       db: Session = Depends(get_db)):
+    """把一块（可跨页多段）现裁成 PNG **直接返回、不落盘** —— 给「切出来的到底是什么」做即时预览。
+
+    这是「分割截图完后看不到图」那一问的正解：**保存前**就要能看（所以按坐标 spec
+    而不是按 region id），老师才能当场发现「这一刀切歪了」。
+
+    `spec` 形如 `1:40,540,1000,800`，跨页用 `;` 连接（与 documents 的同名接口同一套语法，
+    量纲同为 0~1000）。
+    """
+    try:
+        png = store.region_preview_png(db, gid, spec, zoom)
+    except store.GradeError as e:
+        raise _fail(e) from e
+    return Response(
+        content=png,
+        media_type="image/png",
+        # 同一份卷子的同一块切出来是确定的 → 让浏览器别重复问。
+        # private：这是学生卷子，不进中间缓存。
+        headers={"Cache-Control": "private, max-age=600"},
+    )
+
+
+@router.patch("/homework-grades/{gid}/skipped-pages")
+def patch_skipped_pages(gid: int, payload: GradePageSkipsIn, db: Session = Depends(get_db)):
+    """整页不送 AI（0030）：封页、空白作答页、草稿页。
+
+    **整份替换**，与框同一套口径 —— 前端手上就有完整集合，
+    发一次替换不会出现「删了第 2 页、第 5 页却被旧值带回来」。
+    只存页号、**不动框**：取消跳过后框还在，不用重画。
+    """
+    try:
+        return store.set_page_skips(db, gid, payload.pages)
+    except store.GradeError as e:
+        raise _fail(e) from e

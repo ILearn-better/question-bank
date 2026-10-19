@@ -172,6 +172,23 @@ def _confidence(v) -> str:
     return v if v in taxonomy.CONFIDENCES else "low"
 
 
+# 「这一块是什么」（0030）。**空字符串是合法值**：整页口径不产这个字段，
+# 老记录也没有 —— 界面见到空就什么都不显示。
+BLOCK_KINDS = ("question", "header", "section", "footer", "blank", "other")
+
+
+def _block_kind(v) -> str:
+    """模型说的「这块是什么」。**不认识就归空，不猜**。
+
+    为什么不像 `_verdict` 那样给个兜底值：
+      · 猜成 `question` → 「这块像页脚」的提示消失，老师又看不到线索了；
+      · 猜成 `header` / `section` → 界面会建议跳过，正好丢掉一道真题。
+    空值在界面上等于「模型没说」，这才是诚实的表达。
+    """
+    v = str(v or "").strip().lower()
+    return v if v in BLOCK_KINDS else ""
+
+
 # ---------------------------------------------------------------- 序列化
 def brief(grade: HomeworkGrade) -> dict:
     """列表用的简报：**不含 items**（一节课几十条批改，带 items 会把响应撑成几 MB）。"""
@@ -226,6 +243,10 @@ def item_dict(it: HomeworkGradeItem) -> dict:
         # 图上读到的东西。**必须给前端**：没有它，老师无法核对「模型说有直角符号」
         # 到底是不是真有，而这条已经从「一律不采信」改成「可作判定依据」了。
         "figure_note": it.figure_note or "",
+        # 模型对「这块是什么」的判断 + 尾部情况（0030）。
+        # 界面上是两句提示，不参与判定 —— 判错一块等于丢一道题，宁可让老师自己点。
+        "block_kind": it.block_kind or "",
+        "tail_note": it.tail_note or "",
         "status": it.status,
         "question_id": it.question_id,
     }
@@ -267,6 +288,9 @@ def detail(db: Session, grade: HomeworkGrade) -> dict:
     out["marks"] = [mark_dict(m) for m in marks]
     # 老师画的「一题一区域」框。有框的页按框逐题批，没框的页保持整页一次判。
     out["regions"] = list_regions(db, grade.id)
+    # 整页不送 AI 的页号（0030）。界面上要能一眼看到「这几页不看」，
+    # 否则老师会以为漏批了 —— 与「按块跳过」放在同一个返回里，前端一处对齐。
+    out["skipped_pages"] = skipped_pages_of(grade)
     # pages 是 total 的别名：前端按 1..pages 逐张去取 /page/{pno}。
     # 不另立第二套"总页数"概念 —— 两个字段各存一份，迟早有一个忘更新。
     out["pages"] = grade.total
@@ -544,6 +568,8 @@ def region_dict(r: HomeworkGradeRegion) -> dict:
         # 同一个 seq 的几段 label 相同 —— 它们本来就是同一道题。
         "label": q or str(int(r.seq or 0) + 1),
         "box": _json_list(r.box),
+        # 这一段「不送 AI」。只是别送模型，框还留着（0030）。
+        "skipped": bool(int(r.skipped or 0)),
     }
 
 
@@ -603,6 +629,9 @@ def blocks_of(db: Session, gid: int) -> list[dict]:
             "segments": [{**s, "seg": i} for i, s in enumerate(segs)],
             "pages": pages,
             "cross_page": len(set(pages)) > 1,
+            # 「这一题不送 AI」。`put_regions` 已经把同一题的几段写成一致的值，
+            # 这里用 all() 是为了绝不因为一半的标记而漏批一整题。
+            "skipped": all(bool(s.get("skipped")) for s in segs),
         })
     return out
 
@@ -626,6 +655,150 @@ def regions_by_page(db: Session, gid: int) -> dict[int, list[dict]]:
     for r in _regions_of(db, gid):
         out.setdefault(int(r.page_no or 1), []).append(region_dict(r))
     return out
+
+
+def _apply_skips(by_page: dict[int, list[dict]], skip_pages: set[int]) -> tuple[dict, set]:
+    """把「不送 AI」从块表里摘掉，返回 (还要批的块, 不许再批的页)。
+
+    返回值里那个**页面集合**是这条逻辑的关键，不是顺手带的：
+
+      · 某页的块全被标了跳过 → 这一页不能再走「没块 = 整页一次判」的老口径，
+        否则「我把这页所有块都设成不判」的结果是**整页送给模型**，正好相反。
+      · 整页跳过的页也不能走那条路。
+    所以两者都要单独记下来，由调用方提交一个空结果占住 done 计数
+    （不占的话 done 永远追不上 total，任务卡在 running）。
+
+    ⚠️ 页跳过只影响「**从这一页开始**」的块。一道跨页题从第 2 页开始、下半段在第 3 页，
+       把第 3 页设为不看**不会**拦住它 —— 那半段是这道题的一部分，只批一半更糟。
+       界面上「页不看」的说明也是这么写的。
+    """
+    out: dict[int, list[dict]] = {}
+    noop: set[int] = set()
+    for pno, blocks in (by_page or {}).items():
+        pno = int(pno)
+        if pno in skip_pages:
+            continue
+        kept = [b for b in blocks if not b.get("skipped")]
+        if kept:
+            out[pno] = kept
+        elif blocks:
+            noop.add(pno)
+    return out, noop
+
+
+# ---------------------------------------------------------------- 不送 AI（0030）
+def skipped_pages_of(grade: HomeworkGrade) -> list[int]:
+    """整页跳过的页号，**永远返回排好序的 int 列表**。
+
+    存的是 JSON 文本，坏数据/空值一律当「一页都不跳」—— 这个字段读错的后果是
+    「以为跳过了一页、其实批了」，或者更糟「以为批了、其实跳了」，两种都别猜。
+    """
+    raw = _json_list(grade.skipped_pages)
+    out = []
+    for v in raw:
+        try:
+            n = int(v)
+        except (TypeError, ValueError):
+            continue
+        if n >= 1:
+            out.append(n)
+    return sorted(set(out))
+
+
+def set_page_skips(db: Session, gid: int, pages) -> dict:
+    """整页不送 AI：**整份替换**（与框一样，"屏幕上的样子"才是真值）。
+
+    为什么不按页增删：老师说的是「这几页别看」，前端手上就有完整集合，
+    发一次替换不会出现「删了第 2 页、第 5 页却被旧值带回来」。
+    ⚠️ 只存页号，**不动框** —— 取消跳过后框还在，不用重画。
+    """
+    grade = get_grade(db, gid)
+    if grade.status == "running":
+        raise GradeError(409, "正在批改，等这一遍跑完再改「不送 AI」的页")
+    total = max(1, int(grade.total or 1))
+    clean: list[int] = []
+    for v in pages or []:
+        try:
+            n = int(v)
+        except (TypeError, ValueError):
+            continue
+        if n < 1 or n > total:
+            raise GradeError(422, f"第 {n} 页不存在 —— 这份作业只有 {total} 页")
+        clean.append(n)
+    grade.skipped_pages = json.dumps(sorted(set(clean)))
+    db.commit()
+    return {"skipped_pages": skipped_pages_of(grade)}
+
+
+def region_preview_png(db: Session, gid: int, spec: str, zoom: float = 1.6) -> bytes:
+    """把「一块（可跨页多段）」现裁成 PNG **直接返回、不落盘**。
+
+    这是「分割截图完后看不到图」那一问的正解：老师画完线、框完题，右栏每一行
+    都能立刻看到这块到底切成了什么，**保存前就能看**（所以走 spec 而不是 rid）。
+    与录题页 `/documents/{id}/region-image` 同一套做法与同一套理由：
+
+      · 不落盘 —— `data/uploads/crops/` 里的每张图都有数据库行引用它，
+        靠引用计数回收。预览图没有行引用，攒多了就是纯垃圾（实测踩过：
+        题库 0 行、盘上 92 张图）。
+      · GET + 查询串 —— 要能直接当 `<img src>` 用，浏览器才会替我们做缓存、
+        懒加载与并发控制。
+
+    `spec` 形如 `1:40,540,1000,800`，跨页用 `;` 连接
+    （与 documents 那个接口的语法一致，量纲同为 0~1000）。
+    """
+    import io
+
+    from PIL import Image
+
+    segs = []
+    for part in str(spec or "").split(";"):
+        part = part.strip()
+        if not part:
+            continue
+        if ":" not in part:
+            raise GradeError(422, f"区域写法不对：{part}（应为 页号:x0,y0,x1,y1）")
+        head, tail = part.split(":", 1)
+        try:
+            pno = int(head)
+            nums = [float(x) for x in tail.split(",")]
+        except ValueError as e:
+            raise GradeError(422, f"区域写法不对：{part}") from e
+        box = _region_box(nums)
+        if box is None:
+            raise GradeError(422, f"这一块太小或位置不对：{part}")
+        segs.append((pno, box))
+    if not segs:
+        raise GradeError(422, "没有给出要预览的区域")
+
+    tiles = []
+    for pno, box in segs:
+        try:
+            png = page_png(db, gid, pno)
+        except GradeError:
+            raise
+        with Image.open(png) as im:
+            im = im.convert("RGB")
+            w, h = im.size
+            px0 = int(w * box[0] / 1000.0)
+            py0 = int(h * box[1] / 1000.0)
+            px1 = max(px0 + 2, min(w, int(w * box[2] / 1000.0)))
+            py1 = max(py0 + 2, min(h, int(h * box[3] / 1000.0)))
+            tile = im.crop((px0, py0, px1, py1)).copy()
+        # 预览图不看细节，只让老师确认「切的是不是这一块」——
+        # 按 zoom 放大到长边 ≈ 900 就够，太大反而让右栏一排卡片拉不动。
+        tiles.append(tile)
+
+    canvas = tiles[0] if len(tiles) == 1 else _stack_images(tiles)
+    if canvas is None:
+        raise GradeError(422, "这块裁不出内容")
+    edge = max(canvas.size)
+    scale = float(zoom) * 900.0 / float(edge or 1)
+    if abs(scale - 1.0) > 0.06:
+        w, h = canvas.size
+        canvas = canvas.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
+    buf = io.BytesIO()
+    canvas.save(buf, "PNG", optimize=True)
+    return buf.getvalue()
 
 
 def _region_box(values) -> list[int] | None:
@@ -691,6 +864,7 @@ def put_regions(db: Session, gid: int, payload: GradeRegionsPut) -> list[dict]:
             "seq": seqs[i],
             "q_no": str(reg.q_no or "").strip()[:16],
             "box": box,
+            "skipped": bool(getattr(reg, "skipped", False)),
         })
 
     # 同一题内的拼接顺序：几何位置说了算，前端给的 seg 只当没有返回值时的兜底
@@ -701,6 +875,12 @@ def put_regions(db: Session, gid: int, payload: GradeRegionsPut) -> list[dict]:
         segs.sort(key=_seg_key)
         for i, row in enumerate(segs):
             row["seg"] = i
+        # 「不送 AI」按**整块**算：跨页题只跳过上半段没有意义 —— 只批半道题比不批更糟。
+        # 所以只要有一段标了跳过，这一题的每一段都当跳过（库里也写成一致的值，
+        # 免得下次读出来是一半一半）。
+        if any(r["skipped"] for r in segs):
+            for r in segs:
+                r["skipped"] = True
 
     db.execute(delete(HomeworkGradeRegion).where(HomeworkGradeRegion.grade_id == grade.id))
     for row in sorted(keep, key=lambda x: (x["seq"], x["seg"])):
@@ -712,6 +892,7 @@ def put_regions(db: Session, gid: int, payload: GradeRegionsPut) -> list[dict]:
             seg=row["seg"],
             q_no=row["q_no"],
             box=json.dumps(row["box"]),
+            skipped=int(bool(row.get("skipped"))),
             created_at=_now(),
         ))
     db.commit()
@@ -747,6 +928,7 @@ def copy_regions(db: Session, gid: int, from_gid: int) -> list[dict]:
             seg=int(r.seg or 0),
             q_no=r.q_no or "",
             box=r.box or "[]",
+            skipped=int(r.skipped or 0),
             created_at=_now(),
         ))
     db.commit()
@@ -1197,6 +1379,10 @@ def _item_row(r: dict, gid: int, pno: int, seq: int) -> HomeworkGradeItem:
         kp_name=str(r.get("kp_name") or "").strip(),
         tags=json.dumps(knowledge.clean_tags(r.get("tags")), ensure_ascii=False),
         error_reason=str(r.get("error_reason") or ""),
+        # 两个结构信号（0030）。**不认识的值一律归空**，不猜 —— 猜成 question 会让
+        # 「这块像页脚」的提示消失，猜成 header 又会诱导老师跳过一道真题。
+        block_kind=_block_kind(r.get("block_kind")),
+        tail_note=str(r.get("tail_note") or "").strip()[:200],
         flags=json.dumps(flags, ensure_ascii=False),
         raw=raw_txt,
         transcription_version=1,
@@ -1364,6 +1550,10 @@ def _run_grade(gid: int) -> None:
         # 空 dict = 一页都没画框 = 整条流程退回老口径（整页一次判）。
         # 这里读成**块**（一题可多段），跨页题的几段由起始页那个线程一起处理。
         by_page = blocks_by_page(db, gid)
+        # 「不送 AI」的两级（0030）。在这里就过滤掉，线程里不再判断 ——
+        # 线程里判断的话，模型调用和裁图都已经发生了，跳过等于没跳过。
+        skip_pages = set(skipped_pages_of(grade))
+        by_page, noop_pages = _apply_skips(by_page, skip_pages)
     finally:
         db.close()
 
@@ -1372,12 +1562,16 @@ def _run_grade(gid: int) -> None:
     first_err = ""
     try:
         with ThreadPoolExecutor(max_workers=WORKERS) as pool:
-            futures = {
-                pool.submit(_run_one_page, slot, base_ctx,
-                            by_page.get(int(slot["pno"])), slots_by_pno):
-                    slot["pno"]
-                for slot in slots
-            }
+            futures = {}
+            for slot in slots:
+                pno = int(slot["pno"])
+                if pno in skip_pages or pno in noop_pages:
+                    # 「这一页不看」也要占一个 future：否则 done 永远追不上 total，
+                    # 任务就卡在 running 里出不来。返回空结果 = 读完但没批（0 题）。
+                    futures[pool.submit(lambda: ([], ""))] = slot["pno"]
+                    continue
+                futures[pool.submit(_run_one_page, slot, base_ctx,
+                                    by_page.get(pno), slots_by_pno)] = slot["pno"]
             for fut in as_completed(futures):
                 pno = futures[fut]
                 try:
