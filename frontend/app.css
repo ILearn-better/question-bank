@@ -879,6 +879,16 @@ table.tbl td.pending { color: var(--warning); font-weight: 600; }
 /* 判定依据里的「传照片」：file input 与「已附 N 张」同一行，别把设置区撑高 */
 .grade-ansfile { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 4px; }
 .grade-ansfile input[type="file"] { font-size: 12px; max-width: 100%; }
+/* 拖拽区：虚线框住整行，拖上去要看得见「可以放这里」。
+   ⚠️ 它包的输入框仍然是普通文件选择 —— 拖拽只是多一条路，不是唯一的路。 */
+.grade-drop { padding: 8px; border: 1px dashed var(--line, #d7dce3); border-radius: 8px;
+              background: rgba(37, 99, 235, .02); }
+.grade-drop.off { border-color: var(--line, #e5e7eb); background: transparent; opacity: .7; }
+
+/* 本机草稿里还有没送上去的笔迹 —— 这条必须看得见（老师会以为丢了而重画）。 */
+.grade-draft-tip { display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+                   margin-top: 6px; padding: 5px 8px; border-radius: 6px; font-size: 12px;
+                   background: rgba(217, 119, 6, .1); color: #92400e; }
 
 /* ⚠️ 画/擦/放标记时整层接事件；同时让**已有标注**失去指针 ——
    否则笔一落就被某条标注吃掉（<g> 默认 pointer-events:auto），画不出线。 */
@@ -914,6 +924,34 @@ table.tbl td.pending { color: var(--warning); font-weight: 600; }
                 cursor: pointer; font-size: 11px; line-height: 1.5; padding: 0 6px;
                 border-radius: 4px; white-space: nowrap; background: #2563eb; color: #fff; }
 .gmark-rlabel:hover { background: #b91c1c; }
+
+/* ---------------- 分割线（逐题切）----------------
+   与框选同一件事的另一种画法：线切出来的是**整页宽**的段，落到库里与框一模一样。
+   所以后端零改动 —— 裁切 / 跨页竖拼 / 逐题批改全都走已有的那套。
+   颜色用琥珀（不是红、不是蓝）：它既不是老师的批语，也不是 AI 的框，是「刀」。 */
+.gmark-layer.mode-line { pointer-events: auto; touch-action: none; cursor: crosshair; }
+/* 切出来的段是**整页宽**的，这里必须让它失去指针 —— 否则整页都成了「段」，
+   老师点哪里都在点段，一条新线也画不出来。段的删除走右栏面板。 */
+.gmark-layer.mode-line .gmark,
+.gmark-layer.mode-line .gmark-label,
+.gmark-layer.mode-line .rg-rect,
+.gmark-layer.mode-line .gl-band { pointer-events: none; }
+.gl-band { fill: rgba(217, 119, 6, .045); }
+.gl-band:nth-child(even) { fill: rgba(217, 119, 6, .085); }
+.gl-line { stroke: #d97706; stroke-width: 2; stroke-dasharray: 10 6;
+           vector-effect: non-scaling-stroke; }
+.gl-band-no { position: absolute; right: 6px; transform: translate(0, -100%);
+              font-size: 11px; line-height: 1.5; padding: 0 5px; border-radius: 4px;
+              background: rgba(217, 119, 6, .16); color: #b45309; pointer-events: none; }
+.gl-line-x { position: absolute; right: 2px; transform: translate(0, -50%);
+             width: 20px; height: 20px; line-height: 18px; text-align: center;
+             border-radius: 50%; font-size: 13px; cursor: pointer; z-index: 2;
+             background: #d97706; color: #fff; border: 1px solid #fff;
+             box-shadow: 0 1px 4px rgba(0, 0, 0, .25); }
+.gl-line-x:hover { background: #b91c1c; }
+.gl-tip { position: absolute; left: 8px; transform: translate(0, -50%);
+          font-size: 11px; line-height: 1.5; padding: 0 5px; border-radius: 4px;
+          background: #b45309; color: #fff; pointer-events: none; }
 
 /* 老师笔迹：比 AI 的框更活泼一点（粗、圆头、圆角），一眼能分出「这是我画的」 */
 .gmark .shape.ink { stroke-width: 3; }

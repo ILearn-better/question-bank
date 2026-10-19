@@ -741,6 +741,22 @@ class GradeMarkIn(BaseModel):
     item_id: Optional[str] = None
 
 
+class GradeMarksIn(BaseModel):
+    """一次补发**多条**标注。给批改页的本地草稿队列用。
+
+    为什么需要这一条：老师画完一笔就关页面时，那一个 POST 会被浏览器取消。
+    前端把没送出去的笔迹攒在本机（见 `frontend/src/gradeDraft.js`），
+    下次打开再补发 —— 一笔一个请求的话，画了三十笔就要发三十次，
+    在「刚打开页面、还在拉详情」的那几秒里很容易又断掉。
+
+    ⚠️ **要顺序**：数组顺序就是落库顺序（同一位置后画的盖在上面）。
+    ⚠️ **不做去重**：补发方自己保证「只发服务端还没有的」。
+       服务端要是猜「这条是不是已经有了」，猜错的方向是**把老师的两笔并成一笔**。
+    """
+
+    marks: List[GradeMarkIn] = Field(default_factory=list)
+
+
 class GradeMarkPatch(BaseModel):
     """拖 / 改 / 改颜色。同样「没传 = 不改」。"""
 

@@ -75,6 +75,7 @@ from app.schemas import (                              # noqa: E402
     GradeItemPatch,
     GradeMarkIn,
     GradeMarkPatch,
+    GradeMarksIn,
     GradeRegionIn,
     GradeRegionsPut,
     GradeSetupPatch,
@@ -249,6 +250,7 @@ def t_contract() -> None:
         ("/api/homework-grades/{gid}/run", ("POST",)),
         ("/api/homework-grades/{gid}/confirm", ("POST",)),
         ("/api/homework-grades/{gid}/marks", ("POST",)),
+        ("/api/homework-grades/{gid}/marks/batch", ("POST",)),   # 本机草稿队列补发
         ("/api/homework-grades/{gid}/page/{pno}", ("GET",)),
         ("/api/grade-items/{iid}", ("PATCH",)),
         ("/api/grade-items/{iid}/rerun", ("POST",)),
@@ -526,6 +528,99 @@ def t_marks() -> None:
 
         G.delete_mark(db, m.id)
         check("删标注成功", db.get(HomeworkGradeMark, m.id) is None)
+    finally:
+        db.close()
+
+
+# ================================================== ⑤b 批量补发标注（退出再回来的出口）
+def t_marks_batch() -> None:
+    """「画了一笔就退出，记录就没了」那条的正解里，服务端这一半。
+
+    前端做法是**先落本机草稿、再补发**（见 `frontend/src/gradeDraft.js` 文件头），
+    所以这个接口必须满足三件事，缺一条就等于白做：
+
+      · **顺序即落库顺序** —— 同一位置后画的要盖在上面。乱序落库会让老师看到
+        「后画的那一笔被先画的盖住」，还以为是丢笔了。
+      · **原子** —— 一批里有一条不合法（比如挂的题已经被重批掉了），
+        必须**一条都不写**。半批写进去 = 界面上出现「一半的笔迹」，
+        下一轮 `reconcile` 又会把整批再发一次，越滚越乱。
+      · **有上限** —— 本地草稿攒了几百条时不能一口气塞进一次请求/一次事务。
+    """
+    print("\n=== ⑤b 批量补发标注：顺序 / 原子 / 上限 ===")
+    db = SessionLocal()
+    try:
+        stu = mk_student(db, "补发测试学生")
+        ls = mk_lesson(db, stu)
+        s1 = mk_submission(db, ls, "补发.png")
+        db.commit()
+        g = G.create_grade(db, GradeIn(lesson_id=ls.id, file_ids=[s1.id], answer_mode="ai"))
+        db.commit()
+
+        # 落一道题，测「挂错题」那条（item_id 属于别的作业）
+        it = G._item_row(item_payload(), g.id, 1, 0)
+        db.add(it)
+        stu2 = mk_student(db, "补发测试学生2")
+        ls2 = mk_lesson(db, stu2)
+        s2 = mk_submission(db, ls2, "别人的.png")
+        db.commit()
+        g2 = G.create_grade(db, GradeIn(lesson_id=ls2.id, file_ids=[s2.id], answer_mode="ai"))
+        db.commit()
+        other = G._item_row(item_payload(), g2.id, 1, 0)
+        db.add(other)
+        db.commit()
+
+        before = len(G.detail(db, g)["marks"])
+        made = G.add_marks(db, g.id, GradeMarksIn(marks=[
+            GradeMarkIn(page_no=1, kind="check", geo=[100, 100, 30, 30]),
+            GradeMarkIn(page_no=1, kind="cross", geo=[200, 200, 30, 30]),
+            GradeMarkIn(page_no=1, kind="text", geo=[300, 300], text="步骤跳了"),
+        ]))
+        check("三条一次补发成功", len(made) == 3, len(made))
+        check("库里的标注多了三条", len(G.detail(db, g)["marks"]) == before + 3,
+              len(G.detail(db, g)["marks"]))
+
+        # 顺序：id 递增 == 传入顺序（同秒写入，created_at 分不出来，只能看自增 id）
+        ids = [m.id for m in made]
+        check("★ 补发的顺序就是落库顺序（后画的盖在上面）", ids == sorted(ids), ids)
+        got = {json.loads(m.geo)[0]: m.kind for m in made}
+        check("★ 三笔的坐标没串位", got.get(100) == "check" and got.get(200) == "cross"
+              and got.get(300) == "text", got)
+
+        # 共用 `_mark_row`：批量补发的坐标同样要夹在 0~1000
+        one = G.add_marks(db, g.id, GradeMarksIn(marks=[
+            GradeMarkIn(page_no=1, kind="box", geo=[-9, 1200, 40, 80]),
+        ]))[0]
+        geo = json.loads(one.geo or "[]")
+        check("★ 批量走的也是同一个构造器（越界坐标一样夹住）",
+              all(0 <= v <= 1000 for v in geo), geo)
+
+        # 空批：前端 `reconcile` 每轮都会调用，绝不能炸
+        check("空批直接返回 []（前端每轮都会调，不许抛）",
+              G.add_marks(db, g.id, GradeMarksIn(marks=[])) == [])
+
+        # 原子性：混进一条挂别人题的 → 422，且**一条都不许落库**
+        n_before = len(G.detail(db, g)["marks"])
+        code, msg = expect_err(G.add_marks, db, g.id, GradeMarksIn(marks=[
+            GradeMarkIn(page_no=1, kind="check", geo=[10, 10, 20, 20]),
+            GradeMarkIn(page_no=1, kind="check", geo=[20, 20, 20, 20], item_id=other.id),
+        ]))
+        check("挂到别的作业的题上 → 422", code == 422, code)
+        check("错误话说清了（不是一句 Internal Server Error）", "不属于这份" in msg, msg)
+        check("★ 整批被拒 → 一条都没落库（半批写进去会让笔迹越滚越多）",
+              len(G.detail(db, g)["marks"]) == n_before, len(G.detail(db, g)["marks"]))
+
+        # 上限：MAX_MARKS_PER_BATCH 之上要拒
+        cap = G.MAX_MARKS_PER_BATCH
+        code2, _ = expect_err(G.add_marks, db, g.id, GradeMarksIn(marks=[
+            GradeMarkIn(page_no=1, kind="check", geo=[1, 1, 2, 2])
+            for _ in range(cap + 1)
+        ]))
+        check(f"超过 {cap} 条一次补发 → 422", code2 == 422, code2)
+        check("恰好到上限就放行（边界别多拦一条）",
+              len(G.add_marks(db, g.id, GradeMarksIn(marks=[
+                  GradeMarkIn(page_no=1, kind="check", geo=[1, 1, 2, 2])
+                  for _ in range(cap)
+              ]))) == cap)
     finally:
         db.close()
 
@@ -1607,6 +1702,7 @@ def main() -> int:
     t_setup()
     t_items()
     t_marks()
+    t_marks_batch()
     t_run_with_stub()
     t_frontend()
     t_ink_export()

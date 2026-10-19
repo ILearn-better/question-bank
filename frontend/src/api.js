@@ -403,7 +403,12 @@ export const gradeApi = {
   toBank: (iid, body) => api.post(`/api/grade-items/${iid}/to-bank`, body),
 
   /** 原件上的标注：新增 / 改 / 删。 */
-  addMark: (gid, body) => api.post(`/api/homework-grades/${gid}/marks`, body),  patchMark: (mid, body) => api.patch(`/api/grade-marks/${mid}`, body),
+  addMark: (gid, body) => api.post(`/api/homework-grades/${gid}/marks`, body),
+  /** **一次补发多条**。给批改页的本地草稿队列用：老师画完立刻关页面时，
+   *  那些没送出去的笔迹会攒在本机，下次打开一次性补上（见 src/gradeDraft.js）。
+   *  ⚠️ 服务端**不去重** —— 调用方要保证只发「服务端还没有的」。 */
+  addMarks: (gid, marks) => api.post(`/api/homework-grades/${gid}/marks/batch`, { marks }),
+  patchMark: (mid, body) => api.patch(`/api/grade-marks/${mid}`, body),
   removeMark: (mid) => api.del(`/api/grade-marks/${mid}`),
 };
 

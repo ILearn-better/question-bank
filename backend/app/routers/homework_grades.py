@@ -25,6 +25,7 @@ from ..schemas import (
     GradeItemPatch,
     GradeMarkIn,
     GradeMarkPatch,
+    GradeMarksIn,
     GradeRegionsCopy,
     GradeRegionsPut,
     GradeSetupPatch,
@@ -195,6 +196,21 @@ def add_mark(gid: int, payload: GradeMarkIn, db: Session = Depends(get_db)):
     except store.GradeError as e:
         raise _fail(e) from e
     return store.mark_dict(m)
+
+
+@router.post("/homework-grades/{gid}/marks/batch")
+def add_marks(gid: int, payload: GradeMarksIn, db: Session = Depends(get_db)):
+    """一次补发多条标注 —— 给批改页的**本地草稿队列**用。
+
+    为什么有这一条：老师画完一笔就关页面时，那一个 POST 会被浏览器取消。
+    前端把没送出去的存在本机（`frontend/src/gradeDraft.js`），下次打开再补发；
+    攒了三十笔就发三十次的话，在「刚打开、还在拉详情」的那几秒里很容易又断。
+    """
+    try:
+        rows = store.add_marks(db, gid, payload)
+    except store.GradeError as e:
+        raise _fail(e) from e
+    return {"marks": [store.mark_dict(m) for m in rows]}
 
 
 @router.patch("/grade-marks/{mid}")

@@ -78,6 +78,10 @@ REGION_MIN_SIDE = 20
 # 单页最多几个框。与 MAX_ITEMS_PER_PAGE 同量级：正常一页 10~40 题。
 MAX_REGIONS_PER_PAGE = 60
 
+# 一次补发多少条标注（批改页本地草稿队列的上限，与前端 gradeDraft.MAX_MARKS 同值）。
+# 设上限不是怕模型，是怕「本机攒了三个月没发出去的东西」一次性灌进来。
+MAX_MARKS_PER_BATCH = 200
+
 # 裁出来的小块放大上限。放太大只是把 JPEG 噪声一起放大、还更贵；
 # 4 倍足够把 300px 宽的一小块提到 1200px（模型实际吃的是 GRADE_MAX_EDGE）。
 REGION_MAX_ZOOM = 4.0
@@ -1684,13 +1688,10 @@ def _norm_geo(values) -> list[int]:
     return out
 
 
-def add_mark(db: Session, gid: int, payload: GradeMarkIn, created_by: str = "teacher") -> HomeworkGradeMark:
-    grade = get_grade(db, gid)
-    if payload.item_id:
-        it = db.get(HomeworkGradeItem, payload.item_id)
-        if it is None or it.grade_id != grade.id:
-            raise GradeError(422, "这条标注挂的题不属于这份作业")
-    m = HomeworkGradeMark(
+def _mark_row(grade: HomeworkGrade, payload: GradeMarkIn, created_by: str) -> HomeworkGradeMark:
+    """一条标注的**构造**（不 commit）。单条与批量走同一个构造器 ——
+    两份各写一遍的话，`_norm_geo` 早晚只有一处被改到，表现是「批量补发的坐标夹不住」。"""
+    return HomeworkGradeMark(
         owner_id=config.OWNER_ID,
         grade_id=grade.id,
         item_id=payload.item_id or None,
@@ -1706,9 +1707,61 @@ def add_mark(db: Session, gid: int, payload: GradeMarkIn, created_by: str = "tea
         flags="[]",
         created_at=_now(),
     )
+
+
+def add_mark(db: Session, gid: int, payload: GradeMarkIn, created_by: str = "teacher") -> HomeworkGradeMark:
+    grade = get_grade(db, gid)
+    if payload.item_id:
+        it = db.get(HomeworkGradeItem, payload.item_id)
+        if it is None or it.grade_id != grade.id:
+            raise GradeError(422, "这条标注挂的题不属于这份作业")
+    m = _mark_row(grade, payload, created_by)
     db.add(m)
     db.commit()
     return m
+
+
+def add_marks(db: Session, gid: int, payload, created_by: str = "teacher") -> list[HomeworkGradeMark]:
+    """一次补发多条标注（批改页本地草稿队列的出口）。**一次 commit**。
+
+    ⚠️ **不去重**：补发方（前端 `reconcile`）负责只发「服务端还没有的」。
+       服务端要是自己猜「这条是不是已经有了」，猜错的方向是把老师的两笔
+       并成一笔 —— 而重一点的代价只是多一条，重一笔的代价是**少一笔批注**。
+    ⚠️ 顺序即落库顺序：同一位置后画的要盖在上面，所以按传入顺序 add。
+    """
+    grade = get_grade(db, gid)
+    rows = list(getattr(payload, "marks", None) or [])
+    if not rows:
+        return []
+    if len(rows) > MAX_MARKS_PER_BATCH:
+        raise GradeError(
+            422,
+            f"一次最多补发 {MAX_MARKS_PER_BATCH} 条标注，这次有 {len(rows)} 条"
+            "（本地草稿攒太多了，先分两次补）",
+        )
+
+    # item_id 一次查完：逐条 db.get 在补发几十条时会变成几十次往返
+    ids = {str(p.item_id) for p in rows if p.item_id}
+    if ids:
+        alive = {
+            str(it.id) for it in db.scalars(
+                select(HomeworkGradeItem).where(
+                    HomeworkGradeItem.grade_id == grade.id,
+                    HomeworkGradeItem.id.in_(ids),
+                )
+            ).all()
+        }
+        missing = ids - alive
+        if missing:
+            raise GradeError(422, "有标注挂的题不属于这份作业（可能这一遍已经重批过了）")
+
+    made = []
+    for p in rows:
+        m = _mark_row(grade, p, created_by)
+        db.add(m)
+        made.append(m)
+    db.commit()
+    return made
 
 
 def _mark_or_404(db: Session, mid: int) -> HomeworkGradeMark:

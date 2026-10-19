@@ -66,6 +66,10 @@ export const push = (name, args) => { CALLS.push({ name, args }); return name; }
 const API_STUB = `
 import { CALLS, push } from './calls.js';
 
+/** 让某些调用**故意失败**的开关（模拟「网断了 / 页面被关掉，请求被浏览器取消」）。
+ *  只在测试里改它 —— 这就是第 20 节要复现的现象。 */
+export const CTL = { failMark: false };
+
 const item = (o) => Object.assign({
   id: 0, seq: 1, page_no: 1, q_no: '', qtype: '', stem: '', student_answer: '',
   correct_answer: '', verdict: 'correct', score: null, full_score: null, basis: '',
@@ -144,7 +148,12 @@ export const gradeApi = {
   patchSetup: async (gid, body) => { push('patchSetup', [gid, body]); return JSON.parse(JSON.stringify(DETAIL)); },
   run: async (gid) => { push('run', [gid]); return JSON.parse(JSON.stringify(DETAIL)); },
   confirm: async (gid, note) => { push('confirm', [gid, note]); return JSON.parse(JSON.stringify(DETAIL)); },
-  addMark: async (gid, body) => { push('addMark', [gid, body]); return { id: 999 }; },
+  addMark: async (gid, body) => {
+    push('addMark', [gid, body]);
+    if (CTL.failMark) throw new Error('网络断了');
+    return { id: 999 };
+  },
+  addMarks: async (gid, marks) => { push('addMarks', [gid, marks]); return { marks: [] }; },
   patchMark: async (mid, body) => { push('patchMark', [mid, body]); return { ok: 1 }; },
   removeMark: async (mid) => { push('removeMark', [mid]); return { ok: 1 }; },
 };
@@ -242,6 +251,10 @@ async function main() {
     // 坐标换算与渲染都走真代码 —— 框画在哪儿、公式渲不渲染，全靠这两个
     copy('src/markGeom.js');
     copy('src/mathRender.js');
+    // 本机草稿与分割线几何也走真代码：它们是这轮新加的两块，
+    // 桩掉就等于「只验了有没有调用，没验算得对不对」。
+    copy('src/gradeDraft.js');
+    copy('src/gradeLines.js');
     fs.writeFileSync(path.join(tmp, 'src', 'calls.js'), CALLS_STUB);
     fs.writeFileSync(path.join(tmp, 'src', 'api.js'), API_STUB);
     fs.writeFileSync(path.join(tmp, 'src', 'store.js'), STORE_STUB);
@@ -260,8 +273,15 @@ async function main() {
     global.window = W;
     global.document = W.document;
     global.navigator = W.navigator;
-    // 视图里用 new FormData() 传答案照片（见 uploadAnswerImage）—— jsdom 有，全局没有
+    /* 视图里用 new FormData() 传答案照片（见 uploadAnswerFile）—— jsdom 有，全局没有。
+     * ⚠️ `File` / `Blob` 也必须搬成 **jsdom 那一套**：node 22 自己有全局 File，
+     *    不搬的话视图里 `new File([剪贴板文件], 'paste-….png')` 会拿到 node 的构造器，
+     *    而 `FormData` 是 jsdom 的 —— 两个 realm 的 Blob 互不认，append 时被转成字符串，
+     *    `fd.get('file')` 变成 "[object File]"，`.name` 直接 undefined
+     *    （2026-10-19 就是这么红的：产品代码是对的，测试跨了两个 realm）。 */
     global.FormData = W.FormData;
+    global.File = W.File;
+    global.Blob = W.Blob;
     for (const f of VENDOR) {
       const p = path.join(ROOT, f);
       checkTrue('vendor 存在：' + f, fs.existsSync(p));
@@ -269,6 +289,12 @@ async function main() {
       W.eval(fs.readFileSync(p, 'utf8'));
     }
     global.__VUE__ = W.Vue;
+    /* ⚠️ localStorage 必须显式搬过来。浏览器里 `globalThis.localStorage` 就是
+     * `window.localStorage`，所以生产代码写 globalThis 是对的；但这里视图模块是
+     * **在 node 里 import** 的，node 的 globalThis 上没有 localStorage ——
+     * 不搬的话 gradeDraft 会走「环境不支持」的降级分支，草稿断言永远红
+     * （2026-10-19 就是这么红的，一开始还以为是草稿没写进去）。 */
+    global.localStorage = W.localStorage;
     checkTrue('Vue / marked / katex 都进了 window',
       !!(W.Vue && W.marked && W.katex && W.renderMathInElement),
       ['Vue', 'marked', 'katex', 'renderMathInElement'].filter((k) => !W[k]).join(', ') || '齐全');
@@ -406,10 +432,11 @@ async function main() {
     check('改了题号，图上标签跟着变',
       (D.querySelectorAll('.gmark-rlabel')[0].textContent || '').trim(), '7 ×');
 
-    /* ============ 9. 保存框：整页替换，发的是这一页的完整列表 ============ */
+    /* ============ 9. 保存：整页替换，发的是这一份的完整列表 ============ */
+    // 按钮文案是「保存分割」（框选与分割线共用同一块面板，2026-10-19 起）。
     const saveBtn = Array.from(D.querySelectorAll('.grade-regions button'))
-      .find((b) => (b.textContent || '').trim() === '保存框');
-    checkTrue('面板上有「保存框」按钮', !!saveBtn);
+      .find((b) => /保存(框|分割)/.test((b.textContent || '').trim()));
+    checkTrue('面板上有保存按钮（框选/分割线共用）', !!saveBtn);
     saveBtn.click();
     await sleep(300);
     const puts = (await import(pathToFileURL(path.join(tmp, 'src', 'calls.js')).href)).CALLS
@@ -482,7 +509,9 @@ async function main() {
     vm.setTool('view');
     await sleep(120);
     check('★ 有未保存的框，离开框题模式必须问一句', asked.length, 1);
-    checkTrue('问的是「框还没保存」', /框还没保存/.test(asked[0] || ''), asked[0]);
+    // 文案 2026-10-19 起是「这些框/分割线还没保存…（不急：已经存在本机）」
+    checkTrue('问的是「还没保存」且说清「本机还在」',
+      /还没保存/.test(asked[0] || '') && /本机/.test(asked[0] || ''), asked[0]);
     check('选了「不放弃」→ 还留在框题模式', vm.tool, 'region');
     check('还留在框题模式时框还画着（4 个已存 + 刚画的 1 个）',
       D.querySelectorAll('.rg-rect').length, 5);
@@ -564,6 +593,203 @@ async function main() {
     const lastPatch = ps.length ? ps[ps.length - 1].args[1] : {};
     check('★ 上传完立刻把文件 id 挂进判定依据（不是等老师再点保存）',
       lastPatch.answer_file_ids || [], [555]);
+
+    /* ============ 16. 逐题分割：画线切开 ============
+     * 用户 2026-10-19 原话：「借鉴录题代码，在此处实现：逐题分割（当前是框选，
+     * 我还要分割线分割）」。这里要证的三件事，静态断言一个都看不出来：
+     *   ① 线真的上了屏（`.gl-line` 在不在）；
+     *   ② 两条线切出的是 **3 段**（不是 2 段 —— 全切语义，第一条线以上也算）；
+     *   ③ 切出来的段是**整页宽**的（x0=0 / x1=1000）—— 后端零改动的全部理由就在这。
+     * 先清空：前面几节攒了一堆框，混在一起算不清是「线切的」还是「框选的」。 */
+    vm.clearRegions();
+    await sleep(150);
+    check('清空后一段不剩（线也要一起清，否则重切会长回来）', vm.draftSegCount, 0);
+
+    // 显式回到第 2 页 —— 前面几节翻过页，别赌当前页是哪个
+    vm.goPage(2);
+    await sleep(200);
+    check('当前在第 2 页', vm.pageNo, 2);
+
+    vm.setTool('line');
+    await sleep(160);
+    check('工具条上切到「逐题分割」', vm.tool, 'line');
+    checkTrue('分割线面板出现（与框题共用一块）', !!D.querySelector('.grade-regions'));
+    checkTrue('面板文案说了「逐题点一下」', body().includes('逐题点一下'));
+    check('还没画线 → 一条线都没有', D.querySelectorAll('.gl-line').length, 0);
+    check('还没画线 → 也不该凭空出现段（幽灵段 bug 的现场）', vm.draftSegCount, 0);
+
+    vm.addLine(300);
+    await sleep(120);
+    vm.addLine(700);
+    await sleep(150);
+    check('★ 两条线 → 3 段（全切，第一条线以上也算一段）', vm.regionBlocks.length, 3);
+    check('★ 线真的画上屏了', D.querySelectorAll('.gl-line').length, 2);
+    check('段带也上屏了（让老师数得清切成了几题）', D.querySelectorAll('.gl-band').length, 3);
+    check('★ 切出来的段是整页宽（x0=0、x1=1000）—— 后端一个字都不用改',
+      vm.editRegions.filter((s) => s.src === 'line').map((s) => [s.box[0], s.box[2]]),
+      [[0, 1000], [0, 1000], [0, 1000]]);
+    check('段的上下边界就是两条线',
+      vm.editRegions.filter((s) => s.src === 'line').map((s) => [s.box[1], s.box[3]]),
+      [[0, 300], [300, 700], [700, 1000]]);
+
+    // 离已有线太近必须拦住：切出来的段会比后端 REGION_MIN_SIDE 还薄 → 422
+    const lineN = vm.pageLines.length;
+    vm.addLine(305);
+    await sleep(100);
+    check('★ 离已有的线太近 → 不加（否则切出 5 单位高的段，后端 422）',
+      vm.pageLines.length, lineN);
+
+    // 点线上的 × 删一条
+    const lineXs = D.querySelectorAll('.gl-line-x');
+    check('线上有删除按钮（点击线本身不删，见标注层文件头 ⑦）', lineXs.length, 2);
+    lineXs[0].click();
+    await sleep(180);
+    check('★ 点 × 删掉一条线 → 回到 2 段', vm.draftSegCount, 2);
+    check('线的数量跟着少了', D.querySelectorAll('.gl-line').length, 1);
+
+    /* ============ 17. 分割线也能跨页合并 ============
+     * 用户的第二问：「跨页分割的题目合并」。第 1 页末尾切一段、第 2 页顶上切一段，
+     * 点「并入上一题」之后必须变成 **1 题 2 段**（后端靠同一个 seq 竖拼成一张图）。
+     * 此时第 2 页已有 2 段（上面那节剩的），再到第 1 页切 2 段。 */
+    vm.goPage(1);
+    await sleep(220);
+    vm.addLine(600);
+    await sleep(200);
+    check('第 1 页切开 → 整份 4 段（第 2 页 2 段 + 第 1 页 2 段）', vm.draftSegCount, 4);
+    const p2Blocks = vm.regionBlocks.filter((b) => b.pages[0] === 2);
+    checkTrue('第 2 页有可合并的段', p2Blocks.length > 0, p2Blocks.length);
+    const beforeCross = vm.regionBlocks.length;
+    if (p2Blocks.length) {
+      vm.mergeRegion(p2Blocks[0]);
+      await sleep(250);
+    }
+    check('★ 合并后题数少一题', vm.regionBlocks.length, beforeCross - 1);
+    const crossBlocks = vm.regionBlocks.filter((b) => b.pages.length > 1);
+    check('★ 有一条真跨页题（1 题 2 段）', crossBlocks.length, 1);
+    check('★ 跨页的两段落在不同页上', crossBlocks.length ? crossBlocks[0].pages : [], [1, 2]);
+
+    /* ============ 18. 判定依据：Ctrl+V 粘贴一张图 ============
+     * 用户的需求原文是「上传图片也可是缓存中的图片」—— 截图之后直接粘，
+     * 不用先存成文件再找。剪贴板里的图常常**没有文件名**，所以顺带验一下补名。
+     *
+     * ⚠️ 这里**直接调 `onPaste`**，不 dispatch 真事件：jsdom 的 ClipboardEvent
+     *    不允许给 `clipboardData` 赋值（只读、永远 null），造出来的事件里根本没有图 ——
+     *    那样测的是「jsdom 能不能造剪贴板」，不是我们的解析逻辑。
+     *    「监听确实绑上了 window」由 onMounted 里那行 addEventListener 保证（静态可查）。 */
+    /* ⚠️ 这里必须**重新把状态掰回「还没开批」**，否则 `onPaste` 会在第一行就 return。
+     *    原因不在产品代码：桩里的 `patchSetup` 一律返回一份 DETAIL 克隆（status 写死
+     *    'reviewing'），而第 15 节的上传成功后会 `detail.value = await patchSetup(...)`
+     *    —— 于是「可编辑」被这份假回包冲掉了。真后端此时返回的仍是 queued
+     *    （没跑过的任务哪儿来的 reviewing）。所以这行是**桩的补丁，不是产品的补丁**。 */
+    vm.detail.status = 'queued';
+    vm.detail.done = 0;
+    vm.setupMode = 'key';
+    await sleep(120);
+
+    const upsBefore = calls2.filter((c) => c.name === 'uploadFile').length;
+    const pasteFile = new W.File([new W.Blob(['x'], { type: 'image/png' })], '',
+      { type: 'image/png' });                 // 空文件名 = 剪贴板的真实样子
+    let prevented = false;
+    vm.onPaste({
+      clipboardData: {
+        items: [{ kind: 'file', type: 'image/png', getAsFile: () => pasteFile }],
+        files: [],
+      },
+      preventDefault: () => { prevented = true; },
+    });
+    await sleep(500);
+    const calls3 = (await import(pathToFileURL(path.join(tmp, 'src', 'calls.js')).href)).CALLS;
+    const ups3 = calls3.filter((c) => c.name === 'uploadFile');
+    check('★ 粘贴的图也走了上传（不用先存成文件）', ups3.length, upsBefore + 1);
+    check('★ 粘到图才 preventDefault（贴文字必须放行给输入框）', prevented, true);
+    checkTrue('★ 剪贴板里的图没有文件名 → 自动补一个 png（否则后端按扩展名判不出来）',
+      ups3.length > upsBefore && /\.png$/.test(String(ups3[ups3.length - 1].args[2])),
+      ups3.length ? ups3[ups3.length - 1].args[2] : '');
+
+    // 贴的是**文字**时必须原样放行 —— 这是往答案框里贴题目的最常见操作
+    let preventedText = false;
+    vm.onPaste({
+      clipboardData: { items: [{ kind: 'string', type: 'text/plain', getAsFile: () => null }], files: [] },
+      preventDefault: () => { preventedText = true; },
+    });
+    await sleep(120);
+    check('★ 贴文字不拦（老师往答案框里贴题目是常规操作）', preventedText, false);
+
+    /* ============ 19. 本机草稿：画过的东西真的落盘了 ============
+     * 这是「不小心退出，记录就没了」这条的正解。挂了这么久都没丢过，
+     * 就是因为 step 16~18 的每一次 addLine / mergeRegion 都会 touch 一次草稿。 */
+    const dkey = 'shike:grade-draft:7';
+    const rawDraft = W.localStorage.getItem(dkey);
+    checkTrue('★ 本机草稿存在（退出再回来能捡回来）', !!rawDraft);
+    if (rawDraft) {
+      let d = null;
+      try { d = JSON.parse(rawDraft); } catch (e) { d = null; }
+      checkTrue('草稿里存了分割线（不是只存了框）',
+        !!(d && d.regions && Object.keys(d.regions.lines || {}).length), d && d.regions);
+      checkTrue('草稿带版本号（结构变了能识别旧数据）', !!(d && d.v === 1), d && d.v);
+    }
+
+    /* ============ 20. 「画了一笔就退出」→ 那一笔不能丢 ============
+     * 用户的第一个问题原话：「我用笔画批改作业时，不小心退出，记录就没了，得重新批改」。
+     * 现场是这样没的：每画一笔立刻 `POST /marks`，关页面时请求被浏览器取消；
+     * 或者请求失败只弹一个 toast —— 下一轮 `settle()` 一刷，屏上那一笔就消失了。
+     *
+     * 正解的顺序**不能反**：先落本机 → 乐观显示 → 再 POST。这里就按这个顺序验：
+     *   ① 断网时画一笔：屏上还在、本机队列里有、页面顶上看得见「还没传上去」；
+     *   ② 网好了：一次**批量**补发（不是一笔一个请求），补完队列清空；
+     *   ③ 库里已经有一模一样的一笔时**不重复补发**（否则每开一次页面多一笔）。 */
+    const API = await import(pathToFileURL(path.join(tmp, 'src', 'api.js')).href);
+    API.CTL.failMark = true;                  // 断网
+    const nBefore = vm.pageMarks.length;
+    const qBefore = vm.pendingMarks.length;
+    await vm.addMark({ kind: 'cross', geo: [150, 620, 70, 70] });
+    await sleep(250);
+    check('★ 传不上去的那一笔：屏上还画着（乐观显示，不是等服务器回话）',
+      vm.pageMarks.length, nBefore + 1);
+    check('★ 它在本机队列里等着', vm.pendingMarks.length, qBefore + 1);
+    check('★ 队列里那条带 local: 前缀（界面上认得出它还没落库）',
+      vm.pageMarks.filter((m) => String(m.id || '').startsWith('local:')).length, 1);
+    checkTrue('★ 页头提示「还没传上去」（老师知道不是白画了）',
+      !!D.querySelector('.grade-draft-tip')
+      && /1 笔/.test(D.querySelector('.grade-draft-tip').textContent || ''),
+      (D.querySelector('.grade-draft-tip') || {}).textContent);
+
+    API.CTL.failMark = false;                 // 网络回来了
+    const batchBefore = calls3.filter((c) => c.name === 'addMarks').length;
+    const singleBefore = calls3.filter((c) => c.name === 'addMark').length;
+    const flushed = await vm.flushPending(true);
+    await sleep(250);
+    check('★ 网络恢复后把那一笔补上去了', flushed, 1);
+    check('★ 走的是批量接口（刚打开页面那几秒最不稳，不能一笔一个请求）',
+      calls3.filter((c) => c.name === 'addMarks').length, batchBefore + 1);
+    check('补发没有再造一条单笔请求（否则同一笔会落两次）',
+      calls3.filter((c) => c.name === 'addMark').length, singleBefore);
+    check('★ 补发成功后本机队列清空', vm.pendingMarks.length, 0);
+    check('队列空了 → 页头那条提示也就不再挂着（不留一条永远在的红字）',
+      D.querySelectorAll('.grade-draft-tip').length, 0);
+    const sentBody = calls3.filter((c) => c.name === 'addMarks').pop();
+    checkTrue('★ 补发的正文带着坐标和工具类型（不是只发个空壳）',
+      !!(sentBody && sentBody.args[1] && sentBody.args[1][0]
+         && String(sentBody.args[1][0].kind) === 'cross'
+         && (sentBody.args[1][0].geo || []).length === 4),
+      sentBody && sentBody.args[1]);
+
+    /* 库里已经有一模一样的一笔 → 不许重复补发。
+     * 现场是「POST 其实成功了，但 `settle()` 还没回来页面就关了」——
+     * 本机队列里留着一条，服务端也有一条。要是照发不误，每开一次页面就多一笔。 */
+    API.CTL.failMark = true;
+    await vm.addMark({ kind: 'check', geo: [120, 300, 40, 40] });   // 与库里 201 号同形状
+    await sleep(250);
+    checkTrue('又攒下一条（这次与库里那条完全一样）', vm.pendingMarks.length === 1,
+      vm.pendingMarks.length);
+    API.CTL.failMark = false;
+    const batch2 = calls3.filter((c) => c.name === 'addMarks').length;
+    const flushed2 = await vm.flushPending(true);
+    await sleep(200);
+    check('★ 库里已经有一模一样的一笔 → 不再补发（否则每开一次页面多一笔）', flushed2, 0);
+    check('也没有发请求出去', calls3.filter((c) => c.name === 'addMarks').length, batch2);
+    check('★ 那条重复的从队列里清掉了（不是永远躺在那里反复重试）',
+      vm.pendingMarks.length, 0);
   } finally {
     try { fs.rmSync(tmp, { recursive: true, force: true }); } catch (e) { /* 删不掉留着也无妨 */ }
   }
