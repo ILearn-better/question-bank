@@ -141,6 +141,8 @@ const BAD_METHOD = [];
 /** 极简 fetch 桩。`region-image` / `page` 是 <img src>，不走这里。 */
 const CALLS = [];
 let LAST_DETAIL = null;
+/** 桩里新建标注的自增 id（900+，与 DETAIL 里手写的那些不撞）。 */
+let LAST_MARK_ID = 900;
 /** 下一回 /run 故意失败一次 —— 用来验「没开起来，按钮要能恢复」。 */
 let FAIL_RUN_ONCE = false;
 function makeFetch() {
@@ -168,7 +170,16 @@ function makeFetch() {
       return reply([{ id: 7, status: 'reviewing', total: 3, done: 3, created_at: '2026-10-19T10:00:00' }]);
     }
     if (u === '/api/homework-grades/7' && method === 'GET') {
+      const prev = LAST_DETAIL;
       LAST_DETAIL = DETAIL();
+      /* ⚠️ 详情是可以反复取的（`settle()` 每次画完一笔就要取一次）。
+       *  服务端那边标注与批改结果是**累积**的 —— 每次都返回一份全新 DETAIL() 的话，
+       *  「画完一笔 → settle 之后那一笔不见了」，于是所有「存进去了」的断言
+       *  都变成假的（只是验了「发过请求」）。 */
+      if (prev) {
+        LAST_DETAIL.marks = prev.marks;
+        LAST_DETAIL.items = prev.items;
+      }
       return reply(LAST_DETAIL);
     }
     if (u === '/api/homework-grades/7/regions' && method === 'PUT') {
@@ -200,6 +211,32 @@ function makeFetch() {
       if (FAIL_RUN_ONCE) { FAIL_RUN_ONCE = false; return reply({ detail: 'AI 服务 502' }, 502); }
       LAST_DETAIL.status = 'queued'; LAST_DETAIL.done = 0;
       return reply(LAST_DETAIL);
+    }
+    /* ---- 手写批改的标注 ----
+     *  ⚠️ 与真实 store.mark_dict 同形状（id / item_id / page_no / kind / geo /
+     *     points / text / color / created_by），否则「画完存进去了」是假的。 */
+    if (u === '/api/homework-grades/7/marks' && method === 'POST') {
+      const m = Object.assign({ id: 900 + (LAST_MARK_ID += 1), item_id: null, created_by: 'teacher' },
+        body || {});
+      LAST_DETAIL.marks.push(m);
+      return reply(m);
+    }
+    if (u === '/api/homework-grades/7/marks/batch' && method === 'POST') {
+      const rows = ((body && body.marks) || []).map((b) => Object.assign(
+        { id: 900 + (LAST_MARK_ID += 1), item_id: null, created_by: 'teacher' }, b));
+      LAST_DETAIL.marks = LAST_DETAIL.marks.concat(rows);
+      return reply({ marks: rows });
+    }
+    if (/^\/api\/grade-marks\/\d+$/.test(u) && method === 'PATCH') {
+      const id = Number(u.split('/').pop());
+      const m = LAST_DETAIL.marks.find((x) => x.id === id);
+      if (m && body) Object.assign(m, body);
+      return reply(m || {});
+    }
+    if (/^\/api\/grade-marks\/\d+$/.test(u) && method === 'DELETE') {
+      const id = Number(u.split('/').pop());
+      LAST_DETAIL.marks = LAST_DETAIL.marks.filter((x) => x.id !== id);
+      return reply({ ok: true });
     }
     if (/^\/api\/grade-items\/[0-9a-zA-Z_-]+$/.test(u) && method === 'PATCH') {
       const id = Number(u.split('/').pop());
@@ -239,6 +276,59 @@ const VENDOR = [
   'vendor/katex/auto-render.min.js',
 ];
 
+/* ====================== 从 node 侧 import 真模块 ====================== */
+
+/** `vue` 在浏览器里靠 import map 解析；在 node 里得有个同名包，
+ *  而这个包的导出**直接转发 globalThis.__VUE__** —— 也就是 jsdom window 上那份，
+ *  与页面主脚本用的是同一个实例（与 vendor/vue-from-global.js 同一个道理）。 */
+const VUE_PKG = JSON.stringify({
+  name: 'vue', version: '0.0.0-stub', type: 'module',
+  main: 'index.js', exports: { '.': './index.js' },
+}, null, 2);
+const VUE_SHIM = [
+  "const V = globalThis.__VUE__;",
+  "if (!V) throw new Error('jsdom window 上没有 Vue —— vendor 没喂进去');",
+  "export const computed = (...a) => V.computed(...a);",
+  "export const nextTick = (...a) => V.nextTick(...a);",
+  "export const ref = (...a) => V.ref(...a);",
+  "export const watch = (...a) => V.watch(...a);",
+  "export const reactive = (...a) => V.reactive(...a);",
+  "export const onMounted = (...a) => V.onMounted(...a);",
+  "export const onBeforeUnmount = (...a) => V.onBeforeUnmount(...a);",
+  "export default V;",
+].join('\n');
+
+/** 搭一个临时骨架，把 workbench.html 动态 import 的那两个模块**原样** import 进来。
+ *  返回 null 表示这一步没成（页面会走「没有手写功能」的降级，其余断言照跑）。 */
+async function loadLayerModules(root, W) {
+  try {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'wb_layer_'));
+    const copy = (rel) => {
+      fs.mkdirSync(path.dirname(path.join(tmp, rel)), { recursive: true });
+      fs.copyFileSync(path.join(root, rel), path.join(tmp, rel));
+    };
+    copy('src/components/GradeMarkLayer.js');
+    copy('src/markGeom.js');       // 坐标几何：标注层靠它算包围盒与命中
+    copy('src/gradeDraft.js');     // 本机草稿队列（画到一半退出不丢笔迹）
+    fs.mkdirSync(path.join(tmp, 'node_modules', 'vue'), { recursive: true });
+    fs.writeFileSync(path.join(tmp, 'node_modules', 'vue', 'package.json'), VUE_PKG);
+    fs.writeFileSync(path.join(tmp, 'node_modules', 'vue', 'index.js'), VUE_SHIM);
+
+    global.__VUE__ = W.Vue;
+    global.window = W;
+    global.document = W.document;
+    global.localStorage = W.localStorage;
+    const { pathToFileURL } = require('url');
+    const layer = await import(
+      pathToFileURL(path.join(tmp, 'src', 'components', 'GradeMarkLayer.js')).href);
+    const draft = await import(pathToFileURL(path.join(tmp, 'src', 'gradeDraft.js')).href);
+    return { layer: layer.default, draft };
+  } catch (e) {
+    console.log('  [WARN] 标注层模块没 import 进来（' + e.message + '）—— 手写相关断言会跳过');
+    return null;
+  }
+}
+
 /* ============================== main ============================== */
 
 async function main() {
@@ -261,12 +351,34 @@ async function main() {
   /* 内联脚本用正则抽出来自己 eval —— 不依赖 jsdom 执行 <script>：
    * runScripts:'outside-only' 下它不会跑，而 'dangerously' 又会让所有 src 脚本
    * 真的去磁盘取（路径是 /vendor/...，取不到）。 */
-  const blocks = html.match(/<script(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/g) || [];
+  /* ⚠️ 排除 `<script type="importmap">`：那不是要执行的 JS，是给模块解析用的表。
+   *    留在 blocks 里会变成 2 段 → 下面「正好 1 段」的断言红，而且 eval 一段
+   *    JSON 会直接抛错，看起来像「页面脚本写坏了」，其实只是没过滤。 */
+  const blocks = (html.match(/<script(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/g) || [])
+    .filter((b) => !/\btype\s*=\s*["']?importmap/i.test(b));
   if (blocks.length !== 1) {
     console.log('  [FAIL] 期望正好 1 段内联脚本，实际 ' + blocks.length);
     return 1;
   }
   const inline = blocks[0].replace(/^<script[^>]*>/, '').replace(/<\/script>$/, '');
+
+  /* ★ import map：标注层（ESM）里写的是 `import { ref } from 'vue'`，裸模块名
+   *   在浏览器里只能靠 import map 解析。两个都要对，少一个就是「按钮都在、画不出笔迹」：
+   *     ① 有 import map，且把 vue 指向 **vue-from-global.js**（不是 esm-browser ——
+   *        那样页面上是两份 Vue，响应式全废，还不报红）
+   *     ② 它必须出现在**第一个 module 脚本之前**（这里是页面主脚本之前）
+   *     ③ vendor 里真有这个文件 */
+  checkTrue('★ 有 import map，且 vue 指向 vue-from-global.js（不能出现两份 Vue）',
+    /<script\s+type="importmap">[\s\S]*?"vue"\s*:\s*"\/vendor\/vue-from-global\.js"/.test(html),
+    (html.match(/<script\s+type="importmap">[\s\S]{0,160}/) || [''])[0].replace(/\s+/g, ' '));
+  /* ⚠️ 用正则而不是 `indexOf('<script>\nconst ...')`：那个写法把行尾一起钉死了，
+   *   文件一变成 CRLF 就红 —— 而它红的理由跟「import map 的位置」毫无关系。 */
+  checkTrue('★ import map 排在主脚本之前（否则裸模块名解析不了）',
+    html.indexOf('type="importmap"') > 0
+    && html.indexOf('type="importmap"') < html.search(/<script>\s*const \{ createApp \}/),
+    html.indexOf('type="importmap"') + ' < ' + html.search(/<script>\s*const \{ createApp \}/));
+  checkTrue('★ vendor/vue-from-global.js 真的存在',
+    fs.existsSync(path.join(ROOT, 'vendor', 'vue-from-global.js')));
 
   const dom = new JSDOM(html, {
     url: 'http://127.0.0.1:8000/workbench.html?gid=7',
@@ -322,10 +434,13 @@ async function main() {
   const MSGS = [];
   if (W.ElementPlus && W.ElementPlus.ElMessage) {
     W.ElementPlus.ElMessage = {
-      error: (m) => MSGS.push({ type: 'error', text: String(m) }),
-      success: (m) => MSGS.push({ type: 'success', text: String(m) }),
-      warning: (m) => MSGS.push({ type: 'warning', text: String(m) }),
-      info: (m) => MSGS.push({ type: 'info', text: String(m) }),
+      /* ⚠️ 两种入参都要接：`error('一句话')` 与 `error({ message, duration })`。
+       *   只按字符串处理的话，传对象的那些提示在 MSGS 里是 `[object Object]`，
+       *   「到底提示了什么」这类断言就变成对着一串废话匹配。 */
+      error: (m) => MSGS.push({ type: 'error', text: String((m && m.message) || m) }),
+      success: (m) => MSGS.push({ type: 'success', text: String((m && m.message) || m) }),
+      warning: (m) => MSGS.push({ type: 'warning', text: String((m && m.message) || m) }),
+      info: (m) => MSGS.push({ type: 'info', text: String((m && m.message) || m) }),
     };
   }
   if (W.ElementPlus && W.ElementPlus.ElMessageBox) {
@@ -334,6 +449,21 @@ async function main() {
       return true;
     };
   }
+  /* ★ 手写标注层是**动态 import** 的 ES 模块。jsdom 的 vm 上下文不支持它，
+   *   所以这里从 node 侧把两个真模块 import 进来，再从
+   *   `window.__SHIKE_LAYER_MODULES__` 递给页面（页面上有这个缝，生产走真 import）。
+   *
+   *   ⚠️ 一定要用**真模块**：自己写个假组件的话，「笔迹画在哪儿 / 草稿有没有存住」
+   *      全变成「有没有调用」，而这个页面踩过的坑恰恰是「算得对不对」。
+   *   ⚠️ `global.localStorage` 必须搬过来：gradeDraft 在 node 的 globalThis 上
+   *      找不到 localStorage 会走降级分支，草稿断言就永远红
+   *      （grade_mount_check 2026-10-19 就是这么红的）。 */
+  const layerModules = await loadLayerModules(ROOT, W);
+  checkTrue('★ 标注层与草稿队列两个真模块都 import 进来了',
+    !!(layerModules && layerModules.layer && layerModules.draft),
+    layerModules ? Object.keys(layerModules).join(',') : 'null');
+  if (layerModules) W.__SHIKE_LAYER_MODULES__ = layerModules;
+
   try {
     W.eval(inline);
   } catch (e) {
@@ -754,6 +884,230 @@ async function main() {
     /没在批改/.test((MSGS[MSGS.length - 1] || {}).text || ''),
     (MSGS[MSGS.length - 1] || {}).text);
   vm.stopPoll();
+
+  /* ============ 18. 手写批改（笔 / 橡皮 / 文字 / √× / 导出） ============ */
+  /* 用户 2026-10-20 原话：「文件上也要能够笔画，橡皮，插入文本框，导出批改」。
+   * 这一段最要紧的不是「按钮在不在」，而是三件容易做错的事：
+   *   ① **先落本机再发请求** —— 画到一半退出不能丢（用户 10-19 的原话）
+   *   ② **line / rect 模式下标注层不能抢指针** —— 分割那套交互已经调好并测过
+   *   ③ **清空只清老师自己画的** —— 把 AI 判的框一起删了，老师得重新批一遍 */
+  const toolBtns = (txt) => Array.prototype.slice.call(D.querySelectorAll('.el-radio-button'))
+    .filter((b) => b.textContent.trim() === txt);
+  check('★ 工具条上有「笔」', toolBtns('✏️ 笔').length, 1);
+  check('★ 工具条上有「橡皮」', toolBtns('🧽 橡皮').length, 1);
+  check('★ 工具条上有「文字」', toolBtns('🔤 文字').length, 1);
+  check('★ 工具条上有 √ / × 快放（判对错是最高频的动作）',
+    toolBtns('✔').length + toolBtns('✘').length, 2);
+
+  /* ★ 模式归一化：只有手写类工具才把指针交给标注层，其余一律 view。
+   *   不改这条的话，切到「画横线」时标注层会整层 pointer-events:auto，
+   *   把工作台的画线/拖线全吃掉 —— 分割直接画不动。 */
+  vm.tool = 'ink'; await sleep(30);
+  check('★ 切到「笔」→ 标注层进 ink 模式', vm.layerMode, 'ink');
+  vm.tool = 'erase'; await sleep(30);
+  check('切到「橡皮」→ erase 模式', vm.layerMode, 'erase');
+  vm.tool = 'line'; await sleep(30);
+  check('★★ 切到「画横线」→ 标注层退回 view（不能抢分割的指针）', vm.layerMode, 'view');
+  vm.tool = 'rect'; await sleep(30);
+  check('★★ 切到「框选」→ 标注层退回 view', vm.layerMode, 'view');
+
+  checkTrue('★ 标注层加载完了才挂（marksReady）', vm.marksReady === true, String(vm.marksReady));
+  /* ⚠️ 卷面只在「分割」页签里渲染（批改页签是逐题卡）—— 前面的小节把 tab 停在 review 了，
+   *   不切回来数到的就是 0，看着像「标注层没挂上」。 */
+  vm.tab = 'blocks';
+  await sleep(120);
+  check('★ 3 页 → 挂了 3 个标注层（每页一份，各自只认自己那页）',
+    D.querySelectorAll('.gmark-layer').length, 3);
+  check('★ 标注层用的是 0~1000 的 viewBox（不存像素）',
+    (D.querySelector('.gmark-svg') || {}).getAttribute
+      ? D.querySelector('.gmark-svg').getAttribute('viewBox') : '', '0 0 1000 1000');
+
+  /* ---- 画一笔 ---- */
+  vm.tool = 'ink'; await sleep(30);
+  const nMarkPost = () => CALLS.filter((c) => c.url === '/api/homework-grades/7/marks').length;
+  const m0 = nMarkPost();
+  await vm.addMark(2, { kind: 'ink', geo: [100, 200, 300, 400], points: [100, 200, 300, 400],
+    color: '#dc2626' });
+  await sleep(120);
+  check('★ 画一笔 → POST /marks', nMarkPost(), m0 + 1);
+  const lastMark = CALLS.filter((c) => c.url === '/api/homework-grades/7/marks').pop();
+  check('★ 带上页号（多页卷子上落错页就是画到别人卷子上）',
+    lastMark ? lastMark.body.page_no : 0, 2);
+  check('★ 坐标原样发出去（0~1000，不折算成像素）',
+    lastMark ? lastMark.body.geo : [], [100, 200, 300, 400]);
+  check('★ 存下来之后本机草稿出队了（不重复画一遍）',
+    vm.localMarks.filter((m) => Number(m.page_no) === 2).length, 0);
+  check('★ 服务端那边真的多了一条（不只是发过请求）',
+    (vm.g.marks || []).filter((m) => Number(m.page_no) === 2).length, 1);
+
+  /* ---- √ 快放 ---- */
+  await vm.addMark(2, { kind: 'check', geo: [300, 400, 344, 444], color: '#16a34a' });
+  await sleep(120);
+  check('★ √ 快放也是同一条通道（kind 不同而已）',
+    (vm.g.marks || []).filter((m) => m.kind === 'check').length, 1);
+
+  /* ---- ★ 断网时笔迹不能丢 ---- */
+  const FAIL_MARK_ONCE = () => { W.__failMarkOnce = true; };
+  const origFetch = W.fetch;
+  FAIL_MARK_ONCE();
+  W.fetch = async (u, o) => {
+    if (String(u) === '/api/homework-grades/7/marks' && String((o || {}).method) === 'POST'
+      && W.__failMarkOnce) {
+      W.__failMarkOnce = false;
+      return { ok: false, status: 500, json: async () => ({ detail: '网络断了' }) };
+    }
+    return origFetch(u, o);
+  };
+  await vm.addMark(1, { kind: 'ink', geo: [10, 10, 60, 60], points: [10, 10, 60, 60] });
+  await sleep(150);
+  W.fetch = origFetch;
+  check('★★ 传不上去时那一笔**留在本机**（不是消失了）',
+    vm.localMarks.filter((m) => Number(m.page_no) === 1).length, 1);
+  checkTrue('★★ 并且告诉老师「已经存在本机」（不然他以为画上了）',
+    /存在本机/.test((MSGS[MSGS.length - 1] || {}).text || ''),
+    (MSGS[MSGS.length - 1] || {}).text);
+  /* 补发：批量一次发，不是一笔一个请求 */
+  const nBatch = CALLS.filter((c) => c.url === '/api/homework-grades/7/marks/batch').length;
+  const flushed = await vm.flushPending();
+  await sleep(150);
+  check('★★ 下次补发时把那一笔送上去', flushed, 1);
+  check('★ 补发走**批量**接口（画了三十笔不会发三十次）',
+    CALLS.filter((c) => c.url === '/api/homework-grades/7/marks/batch').length, nBatch + 1);
+  check('★ 补发成功后本机队列清空', vm.localMarks.length, 0);
+
+  /* ---- 橡皮：本地的与服务器的分开处理 ---- */
+  const remoteIds = (vm.g.marks || []).filter((m) => Number(m.page_no) === 2).map((m) => m.id);
+  checkTrue('页 2 上服务端有 2 条', remoteIds.length === 2, JSON.stringify(remoteIds));
+  const nDel = () => CALLS.filter((c) => /^\/api\/grade-marks\/\d+$/.test(c.url)
+    && c.method === 'DELETE').length;
+  const d0 = nDel();
+  /* ⚠️ `local:` 开头的还没传上去，**只能从本机队列里删** —— 发给服务端会 404，
+   *   而且那条笔迹还留在界面上，老师会以为橡皮坏了。 */
+  await vm.eraseMarks(['local:abc123'].concat(remoteIds.map(String)));
+  await sleep(200);
+  check('★★ 橡皮：只有服务端那几条发了 DELETE（local: 的不发）', nDel(), d0 + remoteIds.length);
+  check('★★ 擦完之后服务端那两条没了',
+    (vm.g.marks || []).filter((m) => Number(m.page_no) === 2).length, 0);
+
+  /* ---- 文字框 ---- */
+  vm.onTextAt(3, { x: 420, y: 260 });
+  await sleep(60);
+  checkTrue('★ 在卷面上点一下 → 弹出文字框', vm.textOpen === true, String(vm.textOpen));
+  check('★ 文字框记住了点的位置（放上去就在那儿）',
+    [vm.textDraft.page, vm.textDraft.x, vm.textDraft.y], [3, 420, 260]);
+  vm.textDraft.text = '这一步漏了讨论 x=0';
+  await vm.saveText();
+  await sleep(150);
+  check('★ 文字框内容存上去了（kind=text）',
+    (vm.g.marks || []).filter((m) => m.kind === 'text' && m.text === '这一步漏了讨论 x=0').length, 1);
+  checkTrue('★ 存完弹框关掉', vm.textOpen === false, String(vm.textOpen));
+  /* 空内容不放一个空框上去 */
+  vm.onTextAt(3, { x: 10, y: 10 });
+  vm.textDraft.text = '   ';
+  const nText = (vm.g.marks || []).length;
+  await vm.saveText();
+  await sleep(120);
+  check('★ 评语是空的 → 不放一个空框上去', (vm.g.marks || []).length, nText);
+
+  /* ---- 清空本页：只清老师自己画的 ---- */
+  /* AI 画的框 created_by 不是 teacher —— 一起删了老师就得重新批一遍。 */
+  LAST_DETAIL.marks.push({
+    id: 901 + (LAST_MARK_ID += 1), page_no: 3, kind: 'box', geo: [0, 0, 1000, 1000],
+    points: [], text: '', color: '#2563eb', created_by: 'ai', item_id: 'a1b2c3d4e5f6',
+  });
+  await vm.settle();
+  await sleep(80);
+  const p3 = vm.marksOf(3);
+  checkTrue('页 3 上既有老师画的也有 AI 画的',
+    p3.some((m) => m.created_by === 'teacher') && p3.some((m) => m.created_by === 'ai'),
+    p3.map((m) => m.created_by).join(','));
+  check('★ 但「清空本页」只数老师画的', vm.teacherMarksOf(3).length, 1);
+  const c0 = CONFIRMS.length;
+  await vm.clearPageMarks(3);
+  await sleep(250);
+  check('★ 清空之前先问一句（不是点了就没了）', CONFIRMS.length, c0 + 1);
+  checkTrue('★ 确认框里写清了「AI 的框不动」',
+    /AI 的框不动/.test((CONFIRMS[CONFIRMS.length - 1] || {}).msg || ''),
+    (CONFIRMS[CONFIRMS.length - 1] || {}).msg);
+  check('★★ 清空之后：老师画的没了，(vm 侧) AI 的框还在',
+    vm.marksOf(3).filter((m) => m.created_by === 'teacher').length, 0);
+  checkTrue('★★ AI 画的框真的还在（重新批一遍的代价太大）',
+    vm.marksOf(3).some((m) => m.created_by === 'ai'),
+    vm.marksOf(3).map((m) => m.created_by).join(','));
+
+  /* ---- 拖动 ---- */
+  const mv = vm.marksOf(3).find((m) => m.created_by === 'ai');
+  const nPatch = () => CALLS.filter((c) => /^\/api\/grade-marks\/\d+$/.test(c.url)
+    && c.method === 'PATCH').length;
+  const p0 = nPatch();
+  await vm.moveMark({ mark: mv, geo: [0, 10, 1000, 20] });
+  await sleep(150);
+  check('★ 拖动 → PATCH 一次（松手才发，不是跟着手一直发）', nPatch(), p0 + 1);
+  check('★ 发的是拖到的新位置',
+    (CALLS.filter((c) => /^\/api\/grade-marks\/\d+$/.test(c.url) && c.method === 'PATCH')
+      .pop() || {}).body.geo, [0, 10, 1000, 20]);
+
+  /* ---- 点标注跳到它所属的题 ---- */
+  vm.tab = 'blocks';
+  await sleep(30);
+  vm.onPickMark({ item_id: 'a1b2c3d4e5f6' });
+  await sleep(80);
+  check('★ 点 AI 画的框 → 跳到它所属那道题', vm.selItem, 'a1b2c3d4e5f6');
+  check('★ 并且切到「批改」页签（不然跳过去看不见）', vm.tab, 'review');
+  vm.selItem = null;
+  vm.onPickMark({ item_id: null });
+  await sleep(60);
+  check('★ 老师自己画的（没有 item_id）点了不跳', vm.selItem, null);
+
+  /* ---- 导出 ---- */
+  /* ⚠️ 导出走 `<a>` 点击下载，**不经过 fetch**：几十页的 PDF 走 fetch 会先在内存里
+   *  攒一遍再组装 blob，慢机器上直接卡住。所以这里断言的是 `<a href>` 而不是请求。 */
+  const clicked = [];
+  const origCreateA = D.createElement.bind(D);
+  D.createElement = (tag) => {
+    const el = origCreateA(tag);
+    if (String(tag).toLowerCase() === 'a') {
+      const origClick = el.click.bind(el);
+      el.click = () => { clicked.push(String(el.getAttribute('href'))); return origClick(); };
+    }
+    return el;
+  };
+  await vm.exportFile('pdf');
+  await sleep(150);
+  D.createElement = origCreateA;
+  check('★★ 导出 → 拼出 /export?fmt=pdf（原件不动，笔迹烧在副本上）',
+    clicked.length ? clicked[clicked.length - 1] : '', '/api/homework-grades/7/export?fmt=pdf');
+  checkTrue('★★ 导出前先把本机队列补发一次（老师刚画的不能漏在 PDF 外）',
+    /async exportFile[\s\S]{0,400}await this\.flushPending\(\)/.test(html), true);
+  checkTrue('★ 导出按钮在顶栏上', /导出 PDF/.test(html), true);
+  checkTrue('★ 没有页图时先拦一句（点了没反应最难受）',
+    /还没有页图/.test(html), true);
+
+  /* ---- 兜底：标注层没加载起来时，其余功能照常 ---- */
+  checkTrue('★★ 标注层加载失败只是没有手写功能（页面其余部分照常挂）',
+    /catch \(e\) \{\s*console\.error\('\[workbench\] 手写标注层没加载起来/.test(html), true);
+  checkTrue('★ 模板里组件是成对写的（零构建里自闭合会吞掉后面的节点）',
+    /<grade-mark-layer[\s\S]{0,600}>\s*<\/grade-mark-layer>/.test(html), true);
+
+  /* ★★ 自证：**组件注册必须排在 mount 之前**。
+   *
+   *   运行时编译器把 `<grade-mark-layer>` 编成渲染函数顶部的一句
+   *   `const _component_grade_mark_layer = _resolveComponent("grade-mark-layer")`；
+   *   而它所在的 `<el-card>` 默认插槽被标了 `_: 1`（SlotFlags.STABLE）——
+   *   **稳定插槽更新时不会被替换**，于是 `el-card` 一直调用第一次渲染那个闭包，
+   *   而闭包是把这个 const **按值**捕获的（`blocks` / `dividers` 那些是调用时才从
+   *   `_ctx` 读，所以它们会更新，唯独组件不会）。
+   *
+   *   先 mount 再注册 → 捕获到的永远是字符串 → 页面上出现一个空的同名标签，
+   *   笔迹一条画不上，控制台一声不响（2026-10-20 排查了两个小时）。
+   *   这条断言就是守住这个顺序 —— 换回去会立刻变红。 */
+  checkTrue('★★★ 组件注册排在 mount 之前（晚了就永远是个空标签，且不报错）',
+    html.indexOf("app.component('grade-mark-layer'") > 0
+    && html.indexOf("app.component('grade-mark-layer'") < html.indexOf("app.mount('#app')"),
+    html.indexOf("app.component('grade-mark-layer'") + ' < ' + html.indexOf("app.mount('#app')"));
+  checkTrue('★★★ import 失败也要 mount（只是没有手写功能）',
+    /\} catch \(e\) \{\s*console\.error\('\[workbench\] 手写标注层没加载起来[\s\S]{0,80}\}\s*const root = app\.mount/.test(html),
+    true);
 
   console.log('\n共 ' + total + ' 项，失败 ' + fails.length + ' 项');
   if (fails.length) {

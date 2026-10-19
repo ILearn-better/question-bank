@@ -39,6 +39,314 @@
 <link rel="stylesheet" href="/vendor/katex/katex.min.css">
 <style>
   * { box-sizing: border-box; }
+  /* 下面「标注层」那一大段是从 app.css 拷来的，它依赖这些变量。
+     工作台本身用的是硬编码颜色，所以这里补一份最小集合 ——
+     不整份 @import app.css：那里面是整个 SPA 的样式，会与工作台自己这批
+     .page-wrap / .blk-card（抄自录题页）撞车。 */
+  :root {
+    --bg: #f4f5f7; --panel: #ffffff; --panel-2: #fafbfc;
+    --border: #e4e7ec; --border-strong: #d0d5dd; --line: #e4e7ec;
+    --text: #1f2329; --text-2: #5b6472; --text-3: #98a2b3;
+    --primary: #2563eb; --primary-weak: #eff4ff;
+    --success: #16a34a; --success-weak: #ecfdf3;
+    --warning: #d97706; --warning-weak: #fffaeb;
+    --danger: #dc2626; --danger-weak: #fef3f2;
+    --radius: 10px; --radius-sm: 6px;
+    --bg-2: #fafbfc;
+  }
+
+  /* ===== 手写标注层（与 app.css 里「作业批改台」那段同一份） =====
+     ⚠️ 这里是**拷贝**：零构建项目里 entry.html 与后端导出各有一份渲染管线拷贝，
+        同一个道理。改样式时两处一起改（本段与 app.css 的 .gmark-* 区块）。 */
+   根节点不吃鼠标 —— 没标注的地方要能穿透到图片上。 */
+.gmark-layer { position: absolute; inset: 0; pointer-events: none; }
+.gmark-svg { display: block; width: 100%; height: 100%; }
+.gmark { pointer-events: auto; cursor: pointer; }
+.gmark-hit { fill: transparent; }
+.gmark .shape { stroke-width: 2.2; vector-effect: non-scaling-stroke; }
+/* AI 给的框只准到「哪一带」（实测偏高约 1/8 页）→ 虚线就是在说「这个框是估的」 */
+.gmark.rough .shape { stroke-dasharray: 7 5; opacity: .9; }
+.gmark:hover .gmark-hit { fill: rgba(37, 99, 235, .06); }
+.gmark.sel .shape { stroke-width: 3.4; stroke-dasharray: none; }
+.gmark.sel .gmark-hit { fill: rgba(37, 99, 235, .1); }
+/* 可拖的标注（框类）给「抓手」光标 —— 用户得先知道这东西能拖，否则永远发现不了 */
+.gmark.mv { cursor: grab; }
+.gmark.mv.drag { cursor: grabbing; }
+/* 文字标注走 HTML：SVG 的 <text> 在非等比 viewBox 里会被横向压扁 */
+.gmark-label { position: absolute; transform: translate(0, -100%); max-width: 46%;
+               pointer-events: auto; cursor: grab; font-size: 11px; line-height: 1.4;
+               padding: 0 5px; border: 1px solid currentColor; border-radius: 4px;
+               background: rgba(255, 255, 255, .92); white-space: nowrap;
+               overflow: hidden; text-overflow: ellipsis;
+               /* 拖动时别让浏览器顺手选中文字 / 触发滚动，否则一按就变成框选 */
+               user-select: none; touch-action: none; }
+.gmark-label.sel { font-weight: 600; box-shadow: 0 0 0 2px var(--primary-weak); }
+.gmark-label.drag { cursor: grabbing; box-shadow: 0 3px 12px rgba(0, 0, 0, .2); z-index: 3; }
+
+.grade-right { min-width: 0; }
+.grade-side-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+                   padding-bottom: 8px; border-bottom: 1px solid var(--border); margin-bottom: 10px; }
+.grade-side-head .spacer { flex: 1; }
+
+.g-item { border: 1px solid var(--border); border-radius: var(--radius-sm);
+          padding: 10px 12px; background: var(--panel); }
+.g-item + .g-item { margin-top: 10px; }
+/* 选中态 = 从标注点过来落在这里的那一题。只用边框和一圈淡色，不闪动画。 */
+.g-item.sel { border-color: var(--primary); box-shadow: 0 0 0 3px var(--primary-weak); }
+.g-head { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.g-head .spacer { flex: 1; }
+.g-no { font-size: 14px; }
+
+.g-verdict { display: inline-block; padding: 1px 9px; border-radius: 999px;
+             font-size: 11px; font-weight: 600; border: 1px solid transparent; }
+.g-verdict.v-correct { background: var(--success-weak); color: var(--success); border-color: #bbf7d0; }
+.g-verdict.v-partial { background: var(--warning-weak); color: var(--warning); border-color: #fedf89; }
+.g-verdict.v-wrong { background: var(--danger-weak); color: var(--danger); border-color: #fecaca; }
+.g-verdict.v-blank { background: var(--panel-2); color: var(--text-2); border-color: var(--border); }
+.g-verdict.v-ungradable { background: #f5f3ff; color: #6d28d9; border-color: #ddd6fe; }
+
+.g-sec { margin-top: 8px; }
+.g-lb { font-size: 11px; color: var(--text-3); }
+/* 题干 / 学生作答 / 参考答案：容器由 JS 写 innerHTML（KaTeX 要求空容器），
+   所以排版规则落在这里，与 .q-rich / .plan-rich 同一套行距。 */
+.g-rich { font-size: 13.5px; line-height: 1.75; word-break: break-word; }
+.g-rich > :first-child { margin-top: 0; }
+.g-rich > :last-child { margin-bottom: 0; }
+.g-rich p { margin: 0 0 6px; }
+.g-rich ul, .g-rich ol { margin: 4px 0 6px; padding-left: 22px; }
+.g-rich img { max-width: 100%; height: auto; }
+.g-rich code { background: var(--panel-2); padding: 1px 4px; border-radius: 3px; font-size: 12px; }
+.g-rich .katex { font-size: 1.02em; }
+.g-rich .katex-display { margin: 6px 0; overflow-x: auto; }
+/* 参考答案只是对照用的，压一压，别抢学生作答的位置 */
+.g-rich-sm { color: var(--text-2); max-height: 120px; overflow: auto; }
+
+/* 判不了必须把原因写在脸上 */
+.g-ungradable { margin-top: 6px; padding: 6px 8px; font-size: 12px; color: #6d28d9;
+                background: #f5f3ff; border-left: 3px solid #a78bfa; border-radius: 4px; }
+
+.g-line { font-size: 13px; }
+.g-line b { font-size: 11px; color: var(--text-3); font-weight: 500; margin-right: 6px; }
+.g-basis { font-size: 12.5px; color: var(--text-2); margin-top: 2px; white-space: pre-wrap; }
+.g-meta { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+
+.g-verdicts { display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+              margin-top: 10px; padding-top: 8px; border-top: 1px dashed var(--border); }
+.g-vbtn { border: 1px solid var(--border-strong); background: var(--panel); color: var(--text-2);
+          border-radius: 999px; padding: 2px 10px; font-size: 12px; cursor: pointer;
+          font-family: inherit; }
+.g-vbtn:hover { border-color: currentColor; }
+.g-vbtn.ok { color: var(--success); border-color: #bbf7d0; }
+.g-vbtn.part { color: var(--warning); border-color: #fedf89; }
+.g-vbtn.bad { color: var(--danger); border-color: #fecaca; }
+.g-vbtn.blank { color: var(--text-2); }
+.g-vbtn.na { color: #6d28d9; border-color: #ddd6fe; }
+.g-vbtn.on { color: #fff; border-color: transparent; font-weight: 600; }
+.g-vbtn.ok.on { background: var(--success); }
+.g-vbtn.part.on { background: var(--warning); }
+.g-vbtn.bad.on { background: var(--danger); }
+.g-vbtn.blank.on { background: var(--text-3); }
+.g-vbtn.na.on { background: #7c3aed; }
+
+.g-foot { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+.g-foot .spacer { flex: 1; }
+.g-check { display: inline-flex; align-items: center; gap: 5px; font-size: 12px;
+           color: var(--text-2); cursor: pointer; }
+.g-check input { width: auto; }
+
+.g-bank { margin-top: 8px; padding: 8px 10px; background: var(--panel-2);
+          border: 1px dashed var(--border-strong); border-radius: var(--radius-sm); }
+
+@media (max-width: 1180px) {
+  .grade-wrap { grid-template-columns: 1fr; }
+  .grade-left { position: static; max-height: none; overflow: visible; }
+}
+
+/* 判定依据（A1：答案由老师给）。开批前可改，开批后锁住 —— 锁住这件事要在界面上说清楚，
+   不然老师会以为是按钮坏了。 */
+.grade-setup { margin-bottom: 12px; }
+.grade-setup-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.grade-setup-modes { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+.grade-setup-modes label {
+  display: inline-flex; align-items: center; gap: 5px; cursor: pointer;
+  padding: 4px 10px; border: 1px solid var(--border); border-radius: 999px; font-size: 13px;
+}
+.grade-setup-modes label.on { border-color: var(--primary); color: var(--primary); background: var(--panel-2); }
+.grade-setup-modes input { margin: 0; }
+.grade-setup textarea { width: 100%; }
+
+/* ==================== 手写批改（画 / 擦 / 文字框 / √× / 导出） ==================== */
+.grade-tools { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin: 2px 0 8px; }
+.g-tool {
+  border: 1px solid var(--border); background: var(--panel, #fff); color: var(--text-2);
+  border-radius: 7px; padding: 4px 10px; font-size: 12.5px; line-height: 1.5; cursor: pointer;
+}
+.g-tool:hover { border-color: var(--primary); color: var(--primary); }
+.g-tool.on { background: var(--primary); border-color: var(--primary); color: #fff; }
+.g-tool.g-mark { min-width: 30px; padding: 2px 8px; font-size: 15px; font-weight: 700; }
+.g-sep { width: 1px; height: 18px; background: var(--border); margin: 0 2px; }
+.g-color {
+  width: 18px; height: 18px; padding: 0; border: 2px solid var(--panel, #fff);
+  border-radius: 50%; box-shadow: 0 0 0 1px var(--border-strong); cursor: pointer;
+}
+.g-color.on { box-shadow: 0 0 0 2px var(--primary); }
+.grade-toolhint { margin: -2px 0 8px; }
+
+/* ---------------- 框题面板（一题一区域）----------------
+   只在「框题」模式下出现：它改的是**批改口径**（有框就一框一次判），
+   不是批注，所以不跟画笔那排混在一起占视觉。 */
+.grade-regions { border: 1px dashed var(--border); border-radius: 8px;
+                 padding: 8px 10px; margin: 0 0 8px; background: var(--bg-2, #fafafa); }
+.gr-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.gr-list { margin-top: 6px; max-height: 300px; overflow: auto; }
+.gr-row { padding: 6px 0; border-top: 1px solid var(--border); }
+.gr-row-top { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+/* 「这块不判」：整行淡掉 + 缩略图去色，一眼与要送的块区分开（与录题页 .skipped 同一套视觉）。
+   ⚠️ 只淡、不禁用：还得能点回来。 */
+.gr-row.off { opacity: .62; }
+.gr-row.off .gr-thumb img { filter: grayscale(1); }
+.gr-no { display: inline-flex; align-items: center; justify-content: center;
+         min-width: 20px; height: 20px; border-radius: 4px; background: #2563eb;
+         color: #fff; font-size: 11px; }
+.gr-q { width: 84px; padding: 2px 6px; font-size: 12.5px;
+        border: 1px solid var(--border); border-radius: 5px; background: #fff; }
+/* 跨页题：这一题由几段拼的。要显眼 —— 老师得一眼看出「这两段会拼成一张图」。 */
+.gr-span { font-size: 11.5px; color: #b45309; background: #fef3c7;
+           border: 1px solid #fcd34d; border-radius: 4px; padding: 1px 6px; }
+/* 块缩略图：**「到底切成了什么」的唯一凭据**。
+   以前这一行只有「第 1 页 / 跨第 1+2 页」两句话，切歪了要等模型判完才知道。 */
+.gr-thumb { position: relative; margin-top: 5px; }
+.gr-thumb img { display: block; max-width: 100%; max-height: 118px; cursor: zoom-in;
+                border: 1px solid var(--border); border-radius: 6px; background: #fff; }
+.gr-off-tag { position: absolute; left: 6px; top: 6px; font-size: 11px; line-height: 1;
+              padding: 3px 7px; border-radius: 10px; background: #6b7280; color: #fff; }
+/* 每页尾部：末段底边的滑块。它是「每页尾部处理」那个旋钮，别藏进弹窗。 */
+.gr-tail { display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+           margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--border); }
+.gr-tail input[type="range"] { width: 140px; }
+
+/* 图的读数：等宽、可换行，像一张小表；不自作主张渲染 LaTeX（这里没有 $ 包裹） */
+.g-figure { white-space: pre-wrap; font-size: 12.5px; line-height: 1.6;
+            background: var(--bg-2, #fafafa); border: 1px solid var(--border);
+            border-radius: 6px; padding: 5px 7px; color: var(--text-2); }
+
+/* 模型给的分类标签（0031）：学段 / 体系 / 知识点 / 考法。
+   挤在一行、可换行 —— 四个标签各占一行的话，一份 10 题的作业光标签就占掉半屏。 */
+.g-labels { display: flex; flex-wrap: wrap; gap: 4px; margin: 4px 0 2px; }
+.g-label { font-size: 11.5px; line-height: 1.6; padding: 1px 6px; border-radius: 3px;
+           background: var(--bg-2, #f4f4f5); color: var(--text-2);
+           border: 1px solid var(--border); }
+/* 「学段」单独给个颜色：它是**唯一能拿来筛**的（枚举值），
+   老师在列表里扫一眼就能找到「这份全是初中的题」。 */
+.g-label.lb-stage { background: #ecf5ff; color: #409eff; border-color: #d9ecff; }
+
+/* 模型说「这块不像一道题」（block_kind ≠ question）。
+   ⚠️ 是**提示条**，不是自动跳过 —— 所以用橙色描边警告，而不是直接把它灰掉。 */
+.g-odd { display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+         margin: 6px 0 2px; padding: 5px 8px; border-radius: 6px; font-size: 12px;
+         background: #fff7ed; border: 1px solid #fdba74; color: #9a3412; }
+/* 模型说「底部有问题」（tail_note）。与上面同理：只提示，不改任何状态。 */
+.g-tail-note { white-space: pre-wrap; font-size: 12.5px; line-height: 1.6;
+               background: #fff7ed; border: 1px solid #fcd34d;
+               border-radius: 6px; padding: 5px 7px; color: #92400e; }
+
+/* 判定依据里的「传照片」：file input 与「已附 N 张」同一行，别把设置区撑高 */
+.grade-ansfile { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 4px; }
+.grade-ansfile input[type="file"] { font-size: 12px; max-width: 100%; }
+/* 拖拽区：虚线框住整行，拖上去要看得见「可以放这里」。
+   ⚠️ 它包的输入框仍然是普通文件选择 —— 拖拽只是多一条路，不是唯一的路。 */
+.grade-drop { padding: 8px; border: 1px dashed var(--line, #d7dce3); border-radius: 8px;
+              background: rgba(37, 99, 235, .02); }
+.grade-drop.off { border-color: var(--line, #e5e7eb); background: transparent; opacity: .7; }
+
+/* 本机草稿里还有没送上去的笔迹 —— 这条必须看得见（老师会以为丢了而重画）。 */
+.grade-draft-tip { display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+                   margin-top: 6px; padding: 5px 8px; border-radius: 6px; font-size: 12px;
+                   background: rgba(217, 119, 6, .1); color: #92400e; }
+
+/* ⚠️ 画/擦/放标记时整层接事件；同时让**已有标注**失去指针 ——
+   否则笔一落就被某条标注吃掉（<g> 默认 pointer-events:auto），画不出线。 */
+.gmark-layer.mode-ink, .gmark-layer.mode-erase,
+.gmark-layer.mode-text, .gmark-layer.mode-check, .gmark-layer.mode-cross {
+  pointer-events: auto; touch-action: none;
+}
+.gmark-layer.mode-ink { cursor: crosshair; }
+.gmark-layer.mode-erase { cursor: cell; }
+.gmark-layer.mode-text { cursor: text; }
+.gmark-layer.mode-check, .gmark-layer.mode-cross { cursor: copy; }.gmark-layer.mode-ink .gmark, .gmark-layer.mode-erase .gmark,
+.gmark-layer.mode-text .gmark, .gmark-layer.mode-check .gmark,
+.gmark-layer.mode-cross .gmark,
+.gmark-layer.mode-ink .gmark-label, .gmark-layer.mode-erase .gmark-label,
+.gmark-layer.mode-text .gmark-label, .gmark-layer.mode-check .gmark-label,
+.gmark-layer.mode-cross .gmark-label { pointer-events: none; }
+
+/* ---------------- 一题一区域（框题）----------------
+   与标注同一条 svg、同一套 0~1000 坐标，但语义不同：
+   标注是「老师批的话」，框是「批改单元」—— 有框的页一框一次模型调用。
+   框只用蓝虚线，不与红笔标注抢眼；编号是白字蓝底的小标签，点一下就删。 */
+.gmark-layer.mode-region { pointer-events: auto; touch-action: none; cursor: crosshair; }
+/* 画框时已有标注必须失去指针，否则起手那一下就被某条标注吃掉（同画笔那条坑） */
+.gmark-layer.mode-region .gmark,
+.gmark-layer.mode-region .gmark-label { pointer-events: none; }
+.gmark-region { pointer-events: auto; cursor: pointer; }
+.rg-rect { fill: rgba(37, 99, 235, .05); stroke: #2563eb; stroke-width: 1.8;
+           stroke-dasharray: 8 6; vector-effect: non-scaling-stroke; }
+.rg-rect:hover { fill: rgba(37, 99, 235, .14); }
+.rg-draft { fill: rgba(37, 99, 235, .1); stroke: #2563eb; stroke-width: 2;
+            vector-effect: non-scaling-stroke; pointer-events: none; }
+.gmark-rlabel { position: absolute; transform: translate(0, -100%); pointer-events: auto;
+                cursor: pointer; font-size: 11px; line-height: 1.5; padding: 0 6px;
+                border-radius: 4px; white-space: nowrap; background: #2563eb; color: #fff; }
+.gmark-rlabel:hover { background: #b91c1c; }
+
+/* ---------------- 分割线（逐题切）----------------
+   与框选同一件事的另一种画法：线切出来的是**整页宽**的段，落到库里与框一模一样。
+   所以后端零改动 —— 裁切 / 跨页竖拼 / 逐题批改全都走已有的那套。
+   颜色用琥珀（不是红、不是蓝）：它既不是老师的批语，也不是 AI 的框，是「刀」。 */
+.gmark-layer.mode-line { pointer-events: auto; touch-action: none; cursor: crosshair; }
+/* 切出来的段是**整页宽**的，这里必须让它失去指针 —— 否则整页都成了「段」，
+   老师点哪里都在点段，一条新线也画不出来。段的删除走右栏面板。 */
+.gmark-layer.mode-line .gmark,
+.gmark-layer.mode-line .gmark-label,
+.gmark-layer.mode-line .rg-rect,
+.gmark-layer.mode-line .gl-band { pointer-events: none; }
+.gl-band { fill: rgba(217, 119, 6, .045); }
+.gl-band:nth-child(even) { fill: rgba(217, 119, 6, .085); }
+.gl-line { stroke: #d97706; stroke-width: 2; stroke-dasharray: 10 6;
+           vector-effect: non-scaling-stroke; }
+.gl-band-no { position: absolute; right: 6px; transform: translate(0, -100%);
+              font-size: 11px; line-height: 1.5; padding: 0 5px; border-radius: 4px;
+              background: rgba(217, 119, 6, .16); color: #b45309; pointer-events: none; }
+.gl-line-x { position: absolute; right: 2px; transform: translate(0, -50%);
+             width: 20px; height: 20px; line-height: 18px; text-align: center;
+             border-radius: 50%; font-size: 13px; cursor: pointer; z-index: 2;
+             background: #d97706; color: #fff; border: 1px solid #fff;
+             box-shadow: 0 1px 4px rgba(0, 0, 0, .25); }
+.gl-line-x:hover { background: #b91c1c; }
+.gl-tip { position: absolute; left: 8px; transform: translate(0, -50%);
+          font-size: 11px; line-height: 1.5; padding: 0 5px; border-radius: 4px;
+          background: #b45309; color: #fff; pointer-events: none; }
+/* 末段以下（页脚带）：斜纹灰底 + 虚线边。**必须看得见** —— 否则老师不知道
+   「下面那 4% 去哪了」，会以为漏了一题。与录题页的 .tail-hint 同一套视觉语言。 */
+.gl-tail { fill: rgba(148, 163, 184, .22); stroke: #94a3b8; stroke-width: 1;
+           stroke-dasharray: 6 5; pointer-events: none; }
+
+/* 老师笔迹：比 AI 的框更活泼一点（粗、圆头、圆角），一眼能分出「这是我画的」 */
+.gmark .shape.ink { stroke-width: 3; }
+.gmark-draft {
+  stroke-width: 3; stroke-linecap: round; stroke-linejoin: round; opacity: .85;
+  pointer-events: none;
+}
+
+  /* ⚠️ 这里**刻意不写**「某工具下标注层吃不吃事件」—— 组件自己用
+     `.gmark-layer.mode-xxx` 管了（mode prop 直接进 class）。工作台给组件传的是
+     归一化后的 `layerMode`：line/rect/view 一律传 `view`，整层本来就不吃事件。
+     在这儿再抄一份，改了组件那份也不会跟着变。 */
+  /* 笔的颜色：与 A 同一套（红笔批改为默认） */
+  .ink-pick { display: inline-flex; gap: 4px; align-items: center; }
+  .ink-dot { width: 16px; height: 16px; border-radius: 50%; border: 2px solid transparent;
+             cursor: pointer; box-shadow: inset 0 0 0 1px rgba(0,0,0,.12); }
+  .ink-dot.on { border-color: #303133; }
   body { margin: 0; background: #f0f2f5; font-family: "PingFang SC", "Microsoft YaHei", sans-serif; }
   .topbar {
     display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
@@ -211,6 +519,13 @@
             border: 1px solid #dcdfe6; background: #fff; color: #606266; }
   .g-vbtn.on { border-color: #409eff; background: #ecf5ff; color: #409eff; font-weight: 700; }
 </style>
+<!-- ⚠️ import map 必须出现在**第一个 module 脚本之前**，否则裸模块名 `vue`
+       解析不了，标注层直接加载失败（表现为「按钮都在，画不出笔迹」）。
+       它指向 vue-from-global.js 而不是 vue.esm-browser.prod.js ——
+       为了让 ESM 组件与页面主脚本共用**同一个** Vue 实例（两份实例 = 响应式全废）。 -->
+<script type="importmap">
+{ "imports": { "vue": "/vendor/vue-from-global.js" } }
+</script>
 </head>
 <body>
 <div id="app">
@@ -253,6 +568,20 @@
                 <el-radio-button value="rect">📷 框选</el-radio-button>
                 <el-radio-button value="view">👁 只看</el-radio-button>
               </el-radio-group>
+              <span class="tool-sep"></span>
+              <!-- 手写批改（与 A 同一套工具）。**只在卷面上生效**，不动分割。 -->
+              <el-radio-group v-model="tool" size="small">
+                <el-radio-button value="ink">✏️ 笔</el-radio-button>
+                <el-radio-button value="erase">🧽 橡皮</el-radio-button>
+                <el-radio-button value="text">🔤 文字</el-radio-button>
+                <el-radio-button value="check">✔</el-radio-button>
+                <el-radio-button value="cross">✘</el-radio-button>
+              </el-radio-group>
+              <span class="ink-pick" v-if="INK_TOOLS.includes(tool)">
+                <span v-for="c in INK_COLORS" :key="c" class="ink-dot" :class="{ on: inkColor === c }"
+                      :style="{ background: c }" :title="'笔的颜色：' + c"
+                      @click="inkColor = c"></span>
+              </span>
             </div>
           </template>
 
@@ -266,8 +595,20 @@
               <span>在页面上<b>拖拽矩形</b>框住一道题 —— 双栏排版、图形题、或者只想框住某一小段时用。</span>
               <span class="muted-hint">框住的地方若与某条线切出的段重叠，那个段就不再单独成块。</span>
             </template>
+            <template v-else-if="tool === 'ink'">
+              <span><b>按住拖拽</b>就能在卷面上写字 —— 与学生手写笔迹一样落在原图上（<b>原件不动</b>，导出时才合成副本）。</span>
+            </template>
+            <template v-else-if="tool === 'erase'">
+              <span>划过要擦掉的笔迹 —— <b>松手才真删</b>。只擦<b>你自己画的</b>，AI 判的框一个字不碰。</span>
+            </template>
+            <template v-else-if="tool === 'text'">
+              <span>在卷面上<b>点一下</b>，弹框里写评语 —— 位置就是点的那一点。</span>
+            </template>
+            <template v-else-if="tool === 'check' || tool === 'cross'">
+              <span>在卷面上<b>点一下</b>放一个 {{ tool === 'check' ? '√' : '×' }} —— 判对错是最高频的动作。</span>
+            </template>
             <template v-else>
-              <span>只看不画。想改分割就切到<b>画横线</b>或<b>框选</b>。</span>
+              <span>只看不画。想改分割就切到<b>画横线</b>或<b>框选</b>；想手写批改就切到<b>笔</b>。</span>
             </template>
           </div>
 
@@ -295,6 +636,11 @@
                            title="页脚 / 页码通常在底部 4% 内">截掉页脚</el-button>
                 <el-button v-if="endOf(pno) < 1000" size="small" text
                            @click="setEndOf(pno, 1000)">到页底</el-button>
+                <el-button v-if="teacherMarksOf(pno).length" size="small" text type="danger"
+                           @click="clearPageMarks(pno)"
+                           :title="'清掉第 ' + pno + ' 页上你画的 ' + teacherMarksOf(pno).length + ' 笔（AI 判的框不动）'">
+                  清空本页笔迹
+                </el-button>
               </div>
               <div class="page-box" :id="'pg' + pno"
                    :class="['tool-' + tool, { 'page-off': pageSkipped(pno) }]"
@@ -326,6 +672,17 @@
                 </div>
                 <div v-if="draft && draft.page === pno" class="crop-rect"
                      :style="rectStyle(draftBox)"></div>
+                <!-- ★ 手写标注层。**每页一个**：工作台是一次性把所有页竖排出来的，
+                     而标注层只认「当前页」，所以按页各挂一份、各传各的标注。
+                     ⚠️ 成对写，别写成自闭合（零构建模板里自闭合会吞掉后面的节点）。
+                     ⚠️ 只传 marks：线/框/带子工作台自己画了（抄录题页那套），
+                        再传一遍会同一样东西画两遍。 -->
+                <grade-mark-layer v-if="marksReady" :marks="marksOf(pno)" :mode="layerMode"
+                                  :color="inkColor" :selected-item-id="selItem"
+                                  @create="(p) => addMark(pno, p)" @stamp="(p) => addMark(pno, p)"
+                                  @erase="eraseMarks" @move="moveMark"
+                                  @text-at="(p) => onTextAt(pno, p)" @pick="onPickMark">
+                </grade-mark-layer>
               </div>
             </div>
           </div>
@@ -349,6 +706,9 @@
                    「正在收尾」的反馈，不然老师会以为又点了没反应。 -->
               <el-button v-if="g && running" size="small" type="danger" plain
                          :loading="canceling" @click="cancelGrade">终止</el-button>
+              <!-- 导出**带批改痕迹的副本**。⚠️ 原件一个字不动 —— 学生真迹要留档。 -->
+              <el-button v-if="g" size="small" plain @click="exportFile('pdf')"
+                         title="整份导出成 PDF（笔迹烧在副本上，原件不动）">导出 PDF</el-button>
             </div>
           </template>
 
@@ -529,6 +889,17 @@
         </el-card>
       </el-col>
     </el-row>
+  <!-- 文字框：在卷面上点一下 → 这里收内容。位置跟着点的那一点走。
+       ⚠️ 用 Element Plus 的对话框而不是 window.prompt：prompt 在部分浏览器里
+          被禁、而且不能换行，老师写一句长评语很不顺。 -->
+  <el-dialog v-model="textOpen" title="写一句评语" width="420px" append-to-body>
+    <el-input v-model="textDraft.text" type="textarea" :rows="3"
+              placeholder="例如：这一步漏了讨论 x=0" @keyup.enter.ctrl="saveText"></el-input>
+    <template #footer>
+      <el-button @click="textOpen = false">取消</el-button>
+      <el-button type="primary" @click="saveText">放上去</el-button>
+    </template>
+  </el-dialog>
   </div>
 </div>
 
@@ -540,6 +911,12 @@
 <script src="/vendor/katex/auto-render.min.js"></script>
 <script>
 const { createApp } = Vue;
+
+/* 动态 import 到的两个模块（加载完成前是 null，用到它们的地方都要先判空）。
+ * 为什么是动态的：主脚本是**普通脚本**（classic script），写不了静态 `import`；
+ * 而标注层（src/components/GradeMarkLayer.js）是 ES 模块。 */
+let LAYER = null;
+let DRAFT = null;
 
 /** 一个块的最小高度（0~1000 制）。**与后端 grade_store.REGION_MIN_SIDE 同值**：
  *  比这更薄的段裁出来只是一条糊字，送模型等于花钱买一句「读不清」，后端还会直接 422。
@@ -575,6 +952,13 @@ const LABEL_ORDER = [
   { k: 'kp', name: '知识点' },
   { k: 'exam', name: '考法' },
 ];
+
+/** 手写类工具。**只有这五个**会把指针交给标注层。
+ *  `line` / `rect` / `view` 由工作台自己处理（分割那套交互已经调好并测过，不换）。 */
+const INK_TOOLS = ['ink', 'erase', 'text', 'check', 'cross'];
+
+/** 笔的颜色。红笔批改为默认 —— 老师就是这个习惯，别让人先去调色。 */
+const INK_COLORS = ['#dc2626', '#2563eb', '#111827', '#16a34a'];
 
 const num = (v, d = 0) => { const n = Number(v); return Number.isFinite(n) ? n : d; };
 const clampUnit = (v) => Math.min(1000, Math.max(0, num(v)));
@@ -616,6 +1000,20 @@ const app = createApp({
          某一块的坐标算出界 → 只有那一块 404，别的块照常显示。
          换了记录 / 重存分割要清掉（见 loadGrade / saveRegions）。 */
       thumbBroken: {},
+      // ---- 手写批改 ----
+      inkColor: INK_COLORS[0],
+      textOpen: false,
+      textDraft: { page: 1, x: 0, y: 0, text: '' },
+      /** 标注层是**动态 import** 的 ESM 组件，加载完才挂。
+       *  挂早了 <grade-mark-layer> 是「未知元素」，Vue 只当普通标签渲染 ——
+       *  按钮都在、笔迹画不出来，控制台一声不响。 */
+      marksReady: false,
+      /** 本机还没传上去的笔迹。与 A 共用 `src/gradeDraft.js`：
+       *  「画到一半退出就没了」是老师点名的问题，两条路线必须是同一个答案。 */
+      localMarks: [],
+      _draft: null,
+      exporting: false,
+      INK_TOOLS, INK_COLORS,
       VERDICTS,
       _poll: null,
       // DOM 元素不参与响应式：markRaw 一下，否则每次 setRich 都触发一轮 patch
@@ -691,6 +1089,34 @@ const app = createApp({
       return [Math.min(d.x0, d.x1), Math.min(d.y0, d.y1),
         Math.max(d.x0, d.x1), Math.max(d.y0, d.y1)];
     },
+    /** 传给标注层的模式。**只有手写类工具**才进对应模式；其余一律 `view`。
+     *
+     *  为什么不整个交给标注层：它在 region / line 模式下会整层接管指针，
+     *  与工作台已有的画线 / 拖线 / 删线直接打架 —— 那套交互已经调好并测过 124 项，
+     *  换掉等于把验证过的东西再验一遍。归一化成 `view` 之后，
+     *  那三种模式下标注层连子元素一起 `pointer-events:none`（见 CSS），指针照旧归工作台。 */
+    layerMode() { return INK_TOOLS.indexOf(this.tool) >= 0 ? this.tool : 'view'; },
+    /** 某页的标注 = 服务端库里的 + 本机还没传上去的。
+     *
+     *  ⚠️ 本机那份**必须一起画出来**：等一个来回才看到，手感是断的
+     *     （画一笔 → 空白 → 突然出现，老师只会以为没画上）。
+     *  ⚠️ 返回的是函数：页面一次把所有页竖排出来，标注层是「一页一份」。 */
+    marksOf() {
+      return (pno) => {
+        const p = num(pno, 1);
+        const remote = ((this.g && this.g.marks) || []).filter((m) => num(m.page_no, 1) === p);
+        const local = this.localMarks
+          .filter((m) => num(m.page_no, 1) === p)
+          .map((m) => (DRAFT ? DRAFT.localMark(m)
+            : Object.assign({ id: 'local:' + m.lid, created_by: 'teacher' }, m)));
+        return remote.concat(local);
+      };
+    },
+    /** 这一页上**老师自己画的**（AI 的框 created_by 不是 teacher）。
+     *  「清空本页」只认这些 —— 把 AI 判的框一起删了，老师就得重新批一遍。 */
+    teacherMarksOf() {
+      return (pno) => this.marksOf(pno).filter((m) => m.created_by === 'teacher');
+    },
   },
   watch: {
     // 卡片是在 `tab === 'review'` 里渲染的 —— 切过去那一下 ref 才存在，得重画一遍。
@@ -698,8 +1124,12 @@ const app = createApp({
     // 轮询把 results 刷新后，题干/作答的文本可能变了（比如单题重批）
     items() { this.$nextTick(() => this.paintAll()); },
   },
-  mounted() { this.boot(); },
-  beforeUnmount() { this.stopPoll(); this.teardownLazy(); },
+  /* ⚠️ 把 boot 的 Promise 存下来（**不放进 data**：它是控制流不是界面状态，
+   *  进了 data 每次 resolve 都会白触发一轮 patch）。bootLayer 要等它 ——
+   *  否则标注层模块比首页数据先到时，`setupDraft()` 拿到的 gid 还是空的，
+   *  本机草稿队列就再也不会初始化，表现是「画了一堆、关掉页面全没了」。 */
+  mounted() { this._bootPromise = this.boot(); },
+  beforeUnmount() { this.stopPoll(); this.teardownLazy(); this.teardownDraft(); },
   methods: {
     /* ============================ 基础 ============================ */
     async api(url, opt) {
@@ -755,7 +1185,185 @@ const app = createApp({
     clampUnit(v) { return Math.round(clampUnit(v)); },
     unitPct(y) { return (clampUnit(y) / 10) + '%'; },
 
+    /* ============================ 手写批改 ============================ */
+    /* ⚠️ 这一段的**时序是整个功能的命门**，动之前先读：
+     *
+     *   ① `pushLocal` 落本机（localStorage，防抖写）→ 这一笔从此不会丢
+     *   ② 乐观显示：`marksOf` 会把它和服务端的画在一起
+     *   ③ POST
+     *   ④ `settle()` 拉回服务端数据 → **对上了才出队**
+     *
+     *   反过来（先 POST 再落本机）就是老师踩过的那个坑：画完立刻关页面，
+     *   那一个请求被浏览器取消 —— 界面上「画过」、库里没有，回来一看全没了。 */
+    async addMark(pno, payload) {
+      const body = Object.assign({ page_no: num(pno, 1) }, payload);
+      const lid = this.pushLocal(body);
+      try {
+        await this.api('/api/homework-grades/' + this.gid + '/marks', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        await this.settle();          // 取回服务端数据之后才出队，中间不留空白
+        this.dropLocal([lid]);
+      } catch (e) {
+        ElementPlus.ElMessage.error({
+          message: e.message + ' —— 这一笔已经存在本机，下次打开会自动补发',
+          duration: 6000,
+        });
+      }
+    },
+    /** 松手时一次交上来一批 id。**串行删**：SQLite 单写者，并发删会撞锁。
+     *  ⚠️ `local:` 开头的是本机还没传上去的，从队列里删就行 —— 发给服务端只会 404。 */
+    async eraseMarks(ids) {
+      const list = (ids || []).map((x) => String(x));
+      if (!list.length) return;
+      const locals = list.filter((x) => DRAFT && DRAFT.isLocalMarkId(x)).map((x) => String(x).slice(6));
+      const remotes = list.filter((x) => !DRAFT || !DRAFT.isLocalMarkId(x));
+      if (locals.length) this.dropLocal(locals);
+      if (!remotes.length) return;
+      try {
+        for (const mid of remotes) {
+          await this.api('/api/grade-marks/' + mid, { method: 'DELETE' });
+        }
+        await this.settle();
+      } catch (e) { ElementPlus.ElMessage.error(e.message); }
+    },
+    /** 拖动标注改位置（文字框 / √×）。后端只认 geo 四个数，这里什么都不用算 ——
+     *  子组件已经把平移算好了，再算一遍就是「屏幕上是准的、导出时跑位」。 */
+    async moveMark(payload) {
+      const mark = payload && payload.mark;
+      const geo = payload && payload.geo;
+      if (!mark || !mark.id || !geo || geo.length < 4) return;
+      if (DRAFT && DRAFT.isLocalMarkId(mark.id)) return;   // 还没传上去的没处 PATCH
+      try {
+        await this.api('/api/grade-marks/' + mark.id, {
+          method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ geo }),
+        });
+        await this.settle();
+      } catch (e) { ElementPlus.ElMessage.error(e.message); }
+    },
+    /** 在卷面上点一下 → 弹框收内容。位置就是点的那一点。 */
+    onTextAt(pno, p) {
+      this.textDraft = {
+        page: num(pno, 1), x: clampUnit(p && p.x), y: clampUnit(p && p.y), text: '',
+      };
+      this.textOpen = true;
+    },
+    async saveText() {
+      const d = this.textDraft;
+      const text = String((d && d.text) || '').trim();
+      this.textOpen = false;
+      if (!text) return;
+      await this.addMark(d.page, {
+        kind: 'text', geo: [d.x, d.y, d.x, d.y], text, color: this.inkColor,
+      });
+    },
+    async clearPageMarks(pno) {
+      const mine = this.teacherMarksOf(pno);
+      if (!mine.length) return;
+      try {
+        await ElementPlus.ElMessageBox.confirm(
+          '把第 ' + pno + ' 页上你画的 ' + mine.length + ' 处批改全删掉？（AI 的框不动）',
+          '清空本页笔迹', { type: 'warning' });
+      } catch (e) { return; }   // 老师点了取消
+      await this.eraseMarks(mine.map((m) => m.id));
+    },
+    /** 点在标注上 → 跳到它所属的题。AI 画的框带 item_id，老师自己画的不带。 */
+    onPickMark(m) {
+      const iid = m && m.item_id;
+      if (!iid) return;
+      this.selItem = iid;
+      this.tab = 'review';
+      this.$nextTick(() => this.paintAll());
+    },
+    /** 导出**带批改痕迹的副本**。⚠️ 原件一个字不动 —— 学生真迹要留档。
+     *  ⚠️ 导出前先把本机没传上去的补发一次：后端画的是库里的标注，
+     *     老师刚画的还在队列里 → 不补就是「我刚画的没出现在 PDF 里」。 */
+    async exportFile(fmt) {
+      if (!this.g || !this.g.total) {
+        ElementPlus.ElMessage.warning('还没有页图 —— 先点一次「开始批改」才能导出');
+        return;
+      }
+      this.exporting = true;
+      try { await this.flushPending(); } catch (e) { /* 补发失败也照导，别把人堵死 */ }
+      const a = document.createElement('a');
+      a.href = '/api/homework-grades/' + this.gid + '/export?fmt=' + encodeURIComponent(fmt);
+      a.rel = 'noopener';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => { this.exporting = false; }, 1200);
+    },
+    /* ---- 本机草稿队列 ---- */
+    setupDraft() {
+      if (!DRAFT || !this.gid) return;
+      this.teardownDraft();
+      this._draft = DRAFT.createDraft(this.gid);
+      this.localMarks = this._draft.marks().slice();
+    },
+    teardownDraft() {
+      if (this._draft) { this._draft.flush(); this._draft = null; }
+      this.localMarks = [];
+    },
+    pushLocal(body) {
+      if (!this._draft) return '';
+      const lid = this._draft.pushMark(body);
+      this.localMarks = this._draft.marks().slice();
+      return lid;
+    },
+    dropLocal(lids) {
+      if (!this._draft) return;
+      this._draft.dropMarks(lids);
+      this.localMarks = this._draft.marks().slice();
+    },
+    /** 把本机队列里服务端还没有的补发上去。返回补了几笔。
+     *  ⚠️ **只发服务端没有的**：比的是形状+坐标（`sameMark`），不是 id ——
+     *     换台设备 / 清过缓存之后 id 根本对不上。
+     *  ⚠️ 一次批量发，不是一笔一个请求：刚打开那几秒网络最不稳，
+     *     三十笔连发很容易断在半路（A 路线就是这么踩的）。 */
+    async flushPending() {
+      if (!DRAFT || !this._draft) return 0;
+      const queue = this._draft.marks();
+      if (!queue.length) return 0;
+      const server = (this.g && this.g.marks) || [];
+      const missing = queue.filter((m) => !server.some((x) => DRAFT.sameMark(x, m)));
+      if (!missing.length) {
+        // 全都在库里了（上次其实发成功了，只是没来得及对账）
+        this.dropLocal(queue.map((m) => m.lid));
+        return 0;
+      }
+      try {
+        await this.api('/api/homework-grades/' + this.gid + '/marks/batch', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            marks: missing.map((m) => ({
+              page_no: m.page_no, kind: m.kind, geo: m.geo, points: m.points,
+              text: m.text, color: m.color,
+            })),
+          }),
+        });
+        this.dropLocal(missing.map((m) => m.lid));
+        await this.settle();
+        ElementPlus.ElMessage.success('补发了 ' + missing.length + ' 笔上次没传上去的批改');
+        return missing.length;
+      } catch (e) {
+        // 留在本机，下次自动重试 —— 不刷屏，老师看不到也不影响继续画
+        return 0;
+      }
+    },
+    /** 重取详情。⚠️ 必须**保住未保存的分割草稿**：老师改了线还没保存时，
+     *  一次 settle 就会把它冲掉 —— 与 `startPoll()` 里同一个坑。 */
+    async settle() {
+      const d = await this.api('/api/homework-grades/' + this.gid);
+      const keep = { regions: this.g && this.g.regions, skipped_pages: this.g && this.g.skipped_pages };
+      this.g = Object.assign({}, this.g, d, this.dirty ? keep : {});
+    },
+
     /* ============================ 载入 ============================ */
+    /** 首页数据（作业列表 + 默认打开那一份）落地的 Promise。
+     *  标注层加载完要先等它：见 `mounted` 里的说明。 */
+    booted() { return this._bootPromise || Promise.resolve(); },
     async boot() {
       try {
         this.grades = await this.api('/api/homework-grades');
@@ -785,6 +1393,7 @@ const app = createApp({
       this.dirty = false;
       this.selItem = null;
       this.thumbBroken = {};      // 上一份记的「图挂了」不能带过来
+      this.teardownDraft();       // 上一份的本机笔迹队列（它们属于上一份 gid）
       this.canceling = false;
       // ⚠️ 「点过开批」的旗必须跟着记录走。不重置的话，切到另一份 queued 的记录时
       //    会被上一份的旗顶成「批改中」→ 按钮又是灰的。
@@ -793,6 +1402,9 @@ const app = createApp({
       try {
         const d = await this.api('/api/homework-grades/' + id);
         this.applyDetail(d);
+        this.setupDraft();
+        // 上次画到一半退出的那些笔迹，趁这次打开补上去
+        await this.flushPending();
       } catch (e) {
         ElementPlus.ElMessage.error({ message: '打不开这份作业：' + e.message, duration: 6000 });
         return;
@@ -1487,7 +2099,67 @@ window.addEventListener('unhandledrejection', (ev) => {
   console.error('[workbench] 未处理的 Promise 异常', ev.reason);
 });
 
-app.mount('#app');
+/* ⚠️⚠️ **手写标注层必须在 mount 之前注册完** —— 这是本页最容易踩的一个坑，
+ *   改之前先读，它不报错，只是「笔迹一条都画不上」。
+ *
+ * 运行时编译器把模板里的 `<grade-mark-layer>` 编译成渲染函数顶部的一句
+ *     const _component_grade_mark_layer = _resolveComponent("grade-mark-layer")
+ * 而它所在的 `<el-card>` 默认插槽被标了 `_: 1`（`SlotFlags.STABLE`）——
+ * **稳定的插槽在后续更新时不会被替换**（`updateSlots` 里 `type === STABLE`
+ * 直接跳过 `extend`），于是 `el-card` 一直调用**第一次渲染**创建的那个插槽闭包。
+ *
+ * 那个闭包里的 `_component_grade_mark_layer` 是渲染函数作用域里的 `const`，
+ * 是**按值**捕获的（不像 `blocks` / `dividers` 那些是每次调用时从 `_ctx` 读）。
+ * 组件没注册时它是字符串 `"grade-mark-layer"`，之后就永远是字符串 ——
+ * 页面上出现一个空的同名标签，笔迹画不上，控制台一声不响。
+ *
+ * 所以顺序固定：**先 import → 注册组件 → 再 mount**。
+ * 反过来（先 mount 再注册）在「组件不带连字符 / 不在稳定插槽里」时可能侥幸能用，
+ * 但这里两个条件都踩中了。
+ *
+ * ⚠️ import 失败**也要 mount**：标注层挂了只是不能手写批改，
+ *    分割、开批、复核全都得照常能用。所以整段包 try/catch，
+ *    jsdom（自动化测试）与不支持 dynamic import 的老浏览器会走到 catch 里。 */
+async function loadLayerModules() {
+  /* ⚠️ `window.__SHIKE_LAYER_MODULES__` 是**自动化测试**塞进来的替身。
+   *    jsdom 不支持动态 import（Node 的 vm 上下文里没有 importModuleDynamically），
+   *    而「标注层没加载起来时页面其余部分还得能用」本就是要验的一件事，
+   *    所以留这个缝：测试把两个真模块从 node 侧 import 进来再递进来。
+   *    生产上它永远是 undefined，只走下面这条。 */
+  if (window.__SHIKE_LAYER_MODULES__) return window.__SHIKE_LAYER_MODULES__;
+  const [layerMod, draftMod] = await Promise.all([
+    import('/src/components/GradeMarkLayer.js'),
+    import('/src/gradeDraft.js'),
+  ]);
+  return { layer: layerMod.default, draft: draftMod };
+}
+
+async function bootLayer() {
+  try {
+    const mods = await loadLayerModules();
+    LAYER = mods.layer;
+    DRAFT = mods.draft;
+    app.component('grade-mark-layer', LAYER);
+  } catch (e) {
+    console.error('[workbench] 手写标注层没加载起来（只是不能手写批改，其余功能不受影响）', e);
+  }
+  const root = app.mount('#app');
+  root.marksReady = !!LAYER;
+  /* ⚠️ 草稿队列要等首页数据落地：`gid` 是 `boot()` 里才赋上的，
+   *   模块加载比那第一个 fetch 还快时 `setupDraft()` 会白跑一趟，
+   *   而且**没有第二次机会**（只有切换记录才会再调）——
+   *   表现是「画了一堆、关掉页面全没了」，报错一个都没有。 */
+  root.booted().then(async () => {
+    try {
+      root.setupDraft();
+      root.marksReady = !!LAYER;
+      await root.flushPending();
+    } catch (e) {
+      console.error('[workbench] 本机笔迹队列初始化失败', e);
+    }
+  });
+}
+bootLayer();
 </script>
 </body>
 </html>

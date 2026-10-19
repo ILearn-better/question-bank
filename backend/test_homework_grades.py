@@ -1647,6 +1647,16 @@ def t_cancel() -> None:
         g = G.create_grade(db, GradeIn(lesson_id=ls.id, file_ids=[lf.id], answer_mode="ai"))
         gid = g.id
         db.commit()
+        # ⚠️ 这里会**真的起一个后台线程**。两件事必须做，少一件它就会污染后面的测试：
+        #   ① 换成桩 —— 不然这个线程会去调真的模型（测试不该联网，也不该花钱）
+        #   ② 等它真的退出（看 `G._running` 里还有没有它）
+        #
+        #   少了 ② 的后果：孤儿线程一直活着，等 `t_run_with_stub` 把
+        #   `G._recognize_page` 换成它自己的计数桩之后，这个线程还在调 ——
+        #   于是「1 页只调了 1 次 AI」随机变成 3 次（2 页的卷子多 2 次），
+        #   断言条数也从 420 跳到 422。跑了三遍挂一遍，排查方向完全被带偏。
+        orig_rec = G._recognize_page
+        G._recognize_page = lambda png, ctx: ([item_payload(q_no="1")], "")
         G.launch(db, g)
         # ⚠️ launch 必须把上一次残留的「终止」旗清掉。不清的话老师下次点开始，
         #    第一个页还没提交就被 is_canceled 拦下 → 「一秒钟就失败」。
@@ -1656,6 +1666,22 @@ def t_cancel() -> None:
         # ③ 在跑 → 受理
         check(G.request_cancel(gid) is True, "★ 真的在跑 → 受理终止")
         check(G.is_canceled(gid) is True, "★ 受理后旗立起来了")
+
+        # ③b ★ 等后台线程真的收工再往下走。
+        #    终止是「受理」不是「立刻停」：在跑的那一次模型调用掐不断，
+        #    只能等它自己回来、然后 _finalize 把自己从 _running 里摘掉。
+        #    不等的话后面的 _finalize 断言是在跟线程**抢**那行记录。
+        over = False
+        for _ in range(150):                       # 最多等 15 秒
+            with G._run_lock:
+                if gid not in G._running:
+                    over = True
+                    break
+            time.sleep(0.1)
+        G._recognize_page = orig_rec
+        check(over, "★ 点了终止之后后台线程真的退出了（没有留下孤儿线程）")
+        check(G.is_canceled(gid) is False,
+              "★ 线程收尾时把旗清掉了（不带到下一次开批）")
 
         # ④ 收尾：批了几页 → reviewing（保留结果，不是 failed）
         g.total = 3
