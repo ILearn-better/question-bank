@@ -342,7 +342,11 @@ export default {
                 {{ r.student || '—' }}
                 <span v-if="r.student_exists === false" class="tag orange" style="margin-left:4px">新学生</span>
               </td>
-              <td class="small">{{ r.duration_min }}′</td>
+              <td class="small">
+                {{ r.duration_min }}′
+                <span v-if="r.duration_defaulted" class="muted" style="font-size:11px"
+                      title="表里没读到时长，按默认 60 分钟算">默认</span>
+              </td>
               <td class="small" style="width:96px">
                 <template v-if="r.rate_effective === null || r.rate_effective === undefined">
                   <span style="color:var(--warning)">没有单价</span>

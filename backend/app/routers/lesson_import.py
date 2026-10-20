@@ -172,6 +172,9 @@ async def preview(file: UploadFile = File(...), db: Session = Depends(get_db)):
         "unknown_student": sum(1 for x in rows if not x["student_exists"] and not x["errors"]),
         "no_rate": len(no_rate),
         "ready": sum(1 for x in rows if x["action"] == "import"),
+        # 时长是按 60 兜底的（表里没写 / 列没认出来）—— 预览里要标出来，
+        # 不能让老师以为 60 是他自己填的
+        "duration_defaulted": sum(1 for x in rows if x.get("duration_defaulted")),
     }
     result["unknown_students"] = sorted(unknown, key=lambda k: -unknown[k])
     result["months"] = sorted(months)
