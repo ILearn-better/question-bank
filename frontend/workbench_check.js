@@ -1647,6 +1647,99 @@ async function main() {
     vm.archiving === false, String(vm.archiving));
   FAIL_ARCHIVE = false;
 
+  /* ============ 24. 样式表必须能过 CSS 词法（2026-10-20 第二次报障的真因）=====
+   *
+   *  上面 19b 那三条 z-index 断言为什么没拦住？因为它们是**在源码文本里正则搜索**：
+   *  `/\.gmark-layer\s*\{[^}]*z-index/` 只要求「这几个字符相邻出现」，
+   *  而浏览器要的是「这行文字落在一条**有效**规则里」。两者不是一回事。
+   *
+   *  真因：上一条注释多留了一个注释结束符成了注释外的野文本 → 解析器把
+   *  「野文本 + 后面那段注释 + `.gmark-layer`」并成**一条永远匹配不上的规则**
+   *  整条吃掉 → position/inset/z-index 全部消失，层退回普通流里的方块。
+   *  **源码一个字没变、控制台一声不响、旧断言照样绿**，只有真浏览器量
+   *  getComputedStyle 才看得见（实测 layer: position static / z-index auto /
+   *  678×678；修好后同一条量值是 absolute / 20 / 678×960）。
+   *
+   *  所以这里改成**词法扫描**：注释严格配平 + 关键规则必须真的独立成条。 */
+  function cssIssues(css) {
+    const bad = [];
+    let i = 0;
+    let inComment = false;
+    while (i < css.length) {
+      if (!inComment && css.startsWith('/*', i)) { inComment = true; i += 2; continue; }
+      if (inComment && css.startsWith('*/', i)) { inComment = false; i += 2; continue; }
+      if (!inComment && css.startsWith('*/', i)) {
+        // 注释外的结束符 = 野文本，会把下一条规则整条吞掉
+        const at = css.slice(Math.max(0, i - 70), i).replace(/\s+/g, ' ');
+        bad.push('注释外多出一个结束符 @' + i + '：「…' + at + '」');
+        i += 2;
+        continue;
+      }
+      i += 1;
+    }
+    if (inComment) bad.push('注释到块尾都没闭合（少一个结束符）');
+    return bad;
+  }
+
+  function stripCssComments(css) {
+    return css.replace(/\/\*[\s\S]*?\*\//g, ' ');
+  }
+
+  /** 去注释后的**顶层选择器**清单。零构建这几个页面的 CSS 都是扁平的，够用。 */
+  function topSelectors(css) {
+    const body = stripCssComments(css);
+    const out = [];
+    let depth = 0;
+    let buf = '';
+    for (const ch of body) {
+      if (ch === '{') {
+        if (depth === 0) { out.push(buf.split(/\s+/).join(' ').trim()); buf = ''; }
+        depth += 1;
+      } else if (ch === '}') {
+        depth -= 1;
+        if (depth === 0) buf = '';
+      } else if (depth === 0 && ch === ';') {
+        buf = '';
+      } else if (depth === 0) {
+        buf += ch;
+      }
+    }
+    return out;
+  }
+
+  const wbCss = (html.match(/<style[^>]*>([\s\S]*?)<\/style>/) || ['', ''])[1];
+  const wbIssues = cssIssues(wbCss);
+  checkTrue('★★★ workbench.html 样式表注释配平（多一个结束符会吃掉下一条规则）',
+    wbIssues.length === 0, wbIssues.join(' | '));
+
+  const wbSels = topSelectors(wbCss);
+  checkTrue('★★★ .gmark-layer 是一条**独立规则**（被野文本并掉就成了垃圾选择器）',
+    wbSels.indexOf('.gmark-layer') >= 0,
+    '前 6 条选择器：' + wbSels.slice(0, 6).join(' / '));
+
+  const layerRule = (stripCssComments(wbCss).match(/\.gmark-layer\s*\{([^}]*)\}/) || ['', ''])[1];
+  checkTrue('★★★ 规则里真的有 position:absolute（static = 普通方块，笔迹被挤到左上角）',
+    /position:\s*absolute/.test(layerRule), layerRule.slice(0, 90));
+  checkTrue('★★★ 有 inset:0（铺满整页，而不是跟着内容走）',
+    /inset:\s*0/.test(layerRule), '');
+  checkTrue('★★★ 有 z-index:20（配合 19b 的数值比较才有意义）',
+    /z-index:\s*20/.test(layerRule), '');
+
+  /* 同一类毛病在别的零构建页面上一模一样地会发生 —— 一律扫一遍。 */
+  ['workbench.html', 'entry.html', 'batch.html'].forEach((f) => {
+    const p = path.join(ROOT, f);
+    if (!fs.existsSync(p)) return;
+    const src = fs.readFileSync(p, 'utf8');
+    const blocks = [...src.matchAll(/<style[^>]*>([\s\S]*?)<\/style>/g)].map((m) => m[1]);
+    const issues = blocks.reduce((acc, b) => acc.concat(cssIssues(b)), []);
+    checkTrue('★★ ' + f + ' 的 <style> 注释配平', issues.length === 0, issues.join(' | '));
+  });
+  const appCssPath = path.join(ROOT, 'app.css');
+  if (fs.existsSync(appCssPath)) {
+    const issues = cssIssues(fs.readFileSync(appCssPath, 'utf8'));
+    checkTrue('★★ app.css 注释配平', issues.length === 0, issues.join(' | '));
+  }
+
   console.log('\n共 ' + total + ' 项，失败 ' + fails.length + ' 项');
   if (fails.length) {
     fails.forEach((f) => console.log('  - ' + f));
