@@ -41,6 +41,9 @@ export default {
         <a href="/entry.html">题库录题</a>
         <a href="/batch.html">批量入库</a>
         <router-link to="/papers">出卷</router-link>
+        <!-- 批改工作台：零构建的独立页（与题库录题 / 批量入库同一层），
+             自己做卷面分割与手写批改，不进 router 是为了随手甩给别人一个直链。 -->
+        <a href="/workbench.html">批改工作台</a>
         <router-link to="/notes">笔记</router-link>
         <router-link to="/settings">设置</router-link>
       </nav>

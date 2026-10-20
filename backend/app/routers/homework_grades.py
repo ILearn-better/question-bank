@@ -123,11 +123,16 @@ def cancel_grade(gid: int, db: Session = Depends(get_db)):
         grade = store.get_grade(db, gid)
     except store.GradeError as e:
         raise _fail(e) from e
-    if not store.request_cancel(gid):
-        raise HTTPException(
-            status_code=409,
-            detail=f"这份作业现在没在批改（当前状态：{grade.status}）—— 不用终止")
-    return {"ok": True, "gid": gid, "status": grade.status}
+    if store.request_cancel(gid):
+        return {"ok": True, "gid": gid, "canceling": True}
+    # ⚠️ 走到这儿**不等于失败**：最常见的是「这一批刚好在这一瞬间跑完了」。
+    #    老师的目的是「别再跑了」，目的已经达成 —— 弹一个红字错误只会让他
+    #    以为按钮坏了，于是反复点（每一次都是同一个错）。
+    if grade.status not in ("running", "queued"):
+        return {"ok": True, "gid": gid, "canceling": False, "already_stopped": True}
+    raise HTTPException(
+        status_code=409,
+        detail=f"这份作业现在没在批改（当前状态：{grade.status}）—— 不用终止")
 
 
 @router.post("/homework-grades/{gid}/confirm")

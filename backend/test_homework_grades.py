@@ -2141,6 +2141,106 @@ def t_answer_images() -> None:
 
 
 # ================================================================ main
+def t_cancel_points() -> None:
+    """终止旗的检查粒度（2026-10-20）：从「页」下到「块」。
+
+    用户反馈「开始批改后终止无法顺利进行」。后端这边的根因是检查点太稀：
+    主循环只在「提交页之前」和「收下一个结果时」看旗 —— 已经在跑的那一页要
+    **整页跑完**才看得到。一页 14 个块 ≈ 2.5 分钟（模型给的数字），
+    老师点完终止要干等这么久，很容易以为没点到。
+
+    把检查点下到 `_run_one_page` 内部：页入口一次、每个块之前一次。
+    最坏等待 = 一个块的 AI 调用（几十秒），而不是一整页。
+    """
+    print("\n-- ⑨d 终止旗的检查粒度 --")
+
+    import inspect
+
+    # ⚠️ 签名这条必须先钉死：以后有人加参数忘了传 gid，「终止」会静默退化成
+    #    「整页批完才停」，而全套测试照样是绿的。
+    sig = list(inspect.signature(G._run_one_page).parameters)
+    check(sig[0] == "gid",
+          "★★ _run_one_page 第一个参数是 gid（检查点挪进页里之前它是 slot）", sig[0])
+    check(len(sig) >= 5, "★ 其余参数没被挤掉（slot/ctx/blocks/slots_by_pno）", sig)
+
+    gid = 987654
+    calls = {"page": 0, "region": 0}
+    src = TMP / "cancel_point.pdf"
+    src.write_bytes(b"%PDF-1.4\n%%EOF\n")
+    slot = {"pno": 1, "local": 0, "path": str(src), "cache_dir": str(TMP)}
+
+    # ⚠️ 打桩打到 `G.pdf_adapter` 上，别 import 一个不存在的模块名
+    orig_render = G.pdf_adapter.render_page
+    orig_page = G._recognize_page
+    orig_region = G._recognize_region
+    orig_crop = G._crop_block
+    try:
+        G.pdf_adapter.render_page = lambda *a, **k: str(src)
+
+        def fake_page(png, ctx):
+            calls["page"] += 1
+            return ([dict(item_payload(q_no="1"))], "")
+
+        def fake_region(tile, ctx):
+            calls["region"] += 1
+            return ([dict(item_payload(q_no="1"))], "")
+
+        G._recognize_page = fake_page
+        G._recognize_region = fake_region
+        G._crop_block = lambda block, lookup, cache: str(src)
+
+        # ---- ① 没立旗：整页口径会真的调一次 AI ----
+        calls["page"] = 0
+        items, err = G._run_one_page(gid, slot, {"page_no": 1}, None, {1: slot})
+        check(len(items) == 1 and err == "",
+              "（对照）没立旗 → 整页照常批（证明下面那条不是在偷懒）")
+        check(calls["page"] == 1, "（对照）整页口径确实调了一次 AI")
+
+        # ---- ② 立旗后就不该再花一次 AI 调用 ----
+        with G._run_lock:
+            G._cancel.add(gid)
+        try:
+            calls["page"] = 0
+            items, err = G._run_one_page(gid, slot, {"page_no": 1}, None, {1: slot})
+            check(items == [] and err == "",
+                  "★★ 立了旗 → 整页口径一次 AI 都不调（直接空手回来）",
+                  f"{items}/{err}")
+            check(calls["page"] == 0, "★★ 立了旗 → 一次 AI 都不再调（省下的是几十秒）")
+
+            # ---- ③ 按块口径：每个块之前都要看一眼旗 ----
+            # 三个块，在跑完第 1 块之后才点终止 —— 应该只调了 1 次。
+            blocks = [{"seq": 0, "label": "1", "segments": [{"page_no": 1}]},
+                      {"seq": 1, "label": "2", "segments": [{"page_no": 1}]},
+                      {"seq": 2, "label": "3", "segments": [{"page_no": 1}]}]
+            calls["region"] = 0
+
+            def region_then_cancel(tile, ctx):
+                calls["region"] += 1
+                if calls["region"] == 1:
+                    with G._run_lock:
+                        G._cancel.add(gid)      # 第一块回来时老师点了终止
+                return ([dict(item_payload(q_no=str(calls["region"])))], "")
+
+            G._recognize_region = region_then_cancel
+            with G._run_lock:
+                G._cancel.discard(gid)
+            items, err = G._run_one_page(gid, slot, {"page_no": 1}, blocks, {1: slot})
+            check(calls["region"] == 1,
+                  "★★ 第 1 块判完就停了，没继续判第 2、3 个块")
+            check(items == [] and err == "",
+                  "★★ 中途被终止 → 返回空（半截结果留着只会让口径变复杂）",
+                  f"{items}/{err}")
+            check(G.is_canceled(gid) is True, "★ 旗还在（收尾的人还要读它）")
+        finally:
+            with G._run_lock:
+                G._cancel.discard(gid)
+    finally:
+        G.pdf_adapter.render_page = orig_render
+        G._recognize_page = orig_page
+        G._recognize_region = orig_region
+        G._crop_block = orig_crop
+
+
 def main() -> int:
     Base.metadata.create_all(engine)
     print("=" * 72)
@@ -2154,6 +2254,7 @@ def main() -> int:
     t_marks_batch()
     t_skips_and_signals()
     t_cancel()
+    t_cancel_points()
     t_labels()
     t_run_with_stub()
     t_frontend()

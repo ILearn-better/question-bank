@@ -1662,7 +1662,7 @@ def _run_grade(gid: int) -> None:
                 # 任务就卡在 running 里出不来。返回空结果 = 读完但没批（0 题）。
                 futures[pool.submit(lambda: ([], ""))] = slot["pno"]
                 continue
-            futures[pool.submit(_run_one_page, slot, base_ctx,
+            futures[pool.submit(_run_one_page, gid, slot, base_ctx,
                                 by_page.get(pno), slots_by_pno)] = slot["pno"]
         for fut in as_completed(futures):
             # ★ 终止：跳出收集循环。**已经在跑的那几个线程没法掐断**（一次 AI 调用
@@ -1702,10 +1702,19 @@ def _run_grade(gid: int) -> None:
     _finalize(gid, done, first_err)
 
 
-def _run_one_page(slot: dict, ctx_base: dict,
+def _run_one_page(gid: int, slot: dict, ctx_base: dict,
                   blocks: list[dict] | None = None,
                   slots_by_pno: dict | None = None) -> tuple[list[dict], str]:
     """在一个工作线程里处理一页：渲染页图 + 调 AI。**不碰数据库**，纯 I/O。
+
+    ⚠️⚠️ 到处都是 `is_canceled(gid)` 的检查点 —— 这不是啰嗦，是「终止」能不能用的关键。
+    只在主循环的两个地方检查是不够的：排队的页虽然会被 cancel_futures 作废，
+    但**已经在跑的那一页**要跑完才会走到下一个检查点（一页 14 个块 ≈ 2.5 分钟）。
+    所以真正的检查粒度得下到这里：**块与块之间**。老师点终止，最坏只等一个块
+    的 AI 调用（几十秒），而不是一整页。
+
+    ⚠️ 被终止时返回 `([], "")` 而不是半截结果：主循环已经决定 break，这部分结果
+       不会写库，留个半截只会让 `_finalize` 的口径变复杂。
 
     两种口径：
       · **有块**（`blocks` 非空）→ 一块一裁一切。有效分辨率翻几倍、
@@ -1722,6 +1731,8 @@ def _run_one_page(slot: dict, ctx_base: dict,
     path = slot["path"]
     if path is None or not Path(path).exists():
         return [], "原件不在了（可能已被删除）"
+    if is_canceled(gid):
+        return [], ""
     try:
         # 页图走适配层（AGPL 的 pymupdf 只准在 adapters/pdf.py 里 import）。
         # 缓存目录按 gid + 文件分，见 grade_dir 的注释。
@@ -1730,6 +1741,8 @@ def _run_one_page(slot: dict, ctx_base: dict,
         return [], f"页图渲染不出来（{type(e).__name__}: {e}）"
 
     pno = int(slot["pno"])
+    if is_canceled(gid):
+        return [], ""
     if not blocks:
         return _recognize_page(png, {**ctx_base, "page_no": pno})
 
@@ -1740,6 +1753,8 @@ def _run_one_page(slot: dict, ctx_base: dict,
     good = 0
     first_err = ""
     for block in blocks:
+        if is_canceled(gid):
+            return [], ""
         label = str(block.get("label") or (int(block.get("seq") or 0) + 1))
         tile = _crop_block(block, lookup, Path(slot["cache_dir"]))
         if tile is None:
@@ -1755,6 +1770,9 @@ def _run_one_page(slot: dict, ctx_base: dict,
             got, err = _recognize_region(str(tile), ctx)
         except Exception as e:                       # noqa: BLE001
             got, err = [], f"{type(e).__name__}: {e}"
+        # 一块判完立刻再看一眼终止旗：一堆积一块地等，才是「点了没反应」的来源。
+        if is_canceled(gid):
+            return [], ""
         if err:
             first_err = first_err or err
             items.append(_region_placeholder(block, err))
@@ -1894,7 +1912,7 @@ def rerun_item(db: Session, iid: str) -> HomeworkGradeItem:
                 slot = next((s for s in slots if s["pno"] == pno), slot)
                 ctx = {**ctx, "page_no": int(pno)}
                 break
-    items, err = _run_one_page(slot, ctx, blocks or [],
+    items, err = _run_one_page(grade.id, slot, ctx, blocks or [],
                                {int(s["pno"]): s for s in slots})
     if err:
         raise GradeError(422, f"这页没批成：{err}")

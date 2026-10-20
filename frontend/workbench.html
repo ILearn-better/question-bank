@@ -518,6 +518,26 @@
   .g-vbtn { font-size: 12px; padding: 3px 10px; border-radius: 12px; cursor: pointer;
             border: 1px solid #dcdfe6; background: #fff; color: #606266; }
   .g-vbtn.on { border-color: #409eff; background: #ecf5ff; color: #409eff; font-weight: 700; }
+
+  /* ===== 新建批改（上传作业）===== */
+  .nw-step { margin-bottom: 18px; }
+  .nw-step:last-child { margin-bottom: 0; }
+  .nw-h { font-size: 13px; font-weight: 600; color: #303133; margin-bottom: 8px; }
+  /* 拖拽落点。做成虚线框 + 整块可点：一个「拖到这里」的空框看着不像能点，
+     老师会去找按钮 —— 于是压根没发现这里能传文件。 */
+  .nw-drop {
+    border: 2px dashed #c0c4cc; border-radius: 8px; padding: 18px 14px;
+    text-align: center; color: #606266; font-size: 13px; line-height: 1.9;
+    cursor: pointer; background: #fafafa;
+  }
+  .nw-drop:hover, .nw-drop.hot { border-color: #409eff; background: #ecf5ff; color: #409eff; }
+  .nw-file {
+    display: flex; align-items: center; gap: 8px; padding: 6px 10px; margin-top: 6px;
+    border: 1px solid #ebeef5; border-radius: 6px; font-size: 13px; cursor: pointer;
+  }
+  .nw-file:hover { border-color: #c0c4cc; }
+  .nw-file.on { border-color: #409eff; background: #ecf5ff; }
+  .nw-tick { width: 16px; text-align: center; color: #409eff; font-weight: 700; }
 </style>
 <!-- ⚠️ import map 必须出现在**第一个 module 脚本之前**，否则裸模块名 `vue`
        解析不了，标注层直接加载失败（表现为「按钮都在，画不出笔迹」）。
@@ -529,6 +549,52 @@
 </head>
 <body>
 <div id="app">
+  <!-- ===================== 新建批改（上传作业）=====================
+       ⚠️⭐ 零构建模板里自定义组件**必须成对写**：`<el-dialog ... />` 的 `/` 会被
+       浏览器解析器忽略，剩下的 `<el-dialog ...>` 会吞掉后面的 `</template>`，
+       整页白屏而接口一切正常（这个坑本项目踩过多次，别再加一个自闭合回来）。 -->
+  <el-dialog v-model="newOpen" title="新建批改" width="680px" append-to-body
+             :close-on-click-modal="false">
+    <div class="nw-step">
+      <div class="nw-h">1 · 这是哪节课的作业</div>
+      <el-select v-model="newLessonId" filterable placeholder="搜学生名或日期" style="width:100%"
+                 @change="pickLesson">
+        <el-option v-for="l in lessons" :key="l.id" :value="l.id"
+                   :label="lessonLabel(l)"></el-option>
+      </el-select>
+      <div class="muted-hint" style="margin-top:6px">只列最近 90 天的课时（更早的请从课时详情页进）。</div>
+    </div>
+
+    <div v-if="newLessonId" class="nw-step">
+      <div class="nw-h">2 · 学生作业原件</div>
+      <div class="nw-drop" :class="{ hot: dragHot }"
+           @dragover.prevent="dragHot = true" @dragleave.prevent="dragHot = false"
+           @drop.prevent="onDropFile" @click="$refs.fileInput.click()">
+        把照片 / PDF 拖到这里，或<b>点一下选择文件</b>
+        <div class="muted-hint">一次可以选多个。传上去会作为「作业」归档到这节课。
+          <b>⚠️ input 上刻意不设 accept</b> —— 设了会把文件选择器里一半的东西藏起来。</div>
+      </div>
+      <input ref="fileInput" type="file" multiple style="display:none" @change="onPickFile">
+      <div v-if="upBusy" class="muted-hint" style="margin-top:6px">正在上传…</div>
+      <div v-for="f in newFiles" :key="f.id" class="nw-file"
+           :class="{ on: newPick.indexOf(f.id) >= 0 }" @click="toggleNewFile(f.id)">
+        <span class="nw-tick">{{ newPick.indexOf(f.id) >= 0 ? '✔' : '' }}</span>
+        <span>{{ f.name }}</span>
+        <span class="muted-hint">{{ f.kind_cn || f.kind }}<template v-if="f.pages"> · {{ f.pages }} 页</template></span>
+      </div>
+      <div v-if="newLessonId && !newFiles.length && !upBusy" class="muted-hint" style="margin-top:8px">
+        这节课还没有作业原件。
+      </div>
+    </div>
+
+    <template #footer>
+      <el-button @click="newOpen = false">取消</el-button>
+      <el-button type="primary" :loading="newBusy" :disabled="!newPick.length" @click="createGrade">
+        建批改任务并打开<template v-if="newPick.length">（{{ newPick.length }} 个文件）</template>
+      </el-button>
+    </template>
+  </el-dialog>
+
   <!-- ===================== 顶栏 ===================== -->
   <div class="topbar">
     <h1>批改工作台</h1>
@@ -536,12 +602,15 @@
     <a class="back-link" :href="backUrl">← 旧版批改台</a>
     <a class="back-link" href="/">回到工作台</a>
     <div style="flex:1"></div>
+    <!-- ★ 页内新建。以前要「先去课时页点 AI 批改作业」，工作台自己打不开 ——
+         老师的动线是「拿到照片就想批」，多跳一层就断在这儿了。 -->
+    <el-button size="small" type="primary" plain @click="openNew">＋ 新建批改</el-button>
     <el-select v-if="grades.length" v-model="gid" placeholder="选择一份作业" style="width: 300px"
                filterable @change="loadGrade">
       <el-option v-for="x in grades" :key="x.id" :value="x.id"
                  :label="optLabel(x)"></el-option>
     </el-select>
-    <span v-if="!grades.length" class="muted-hint">还没有批改记录 —— 先在课时里点「AI 批改作业」</span>
+    <span v-if="!grades.length && !newOpen" class="muted-hint">还没有批改记录 —— 点右边「＋ 新建批改」直接传照片</span>
   </div>
 
   <div class="main">
@@ -619,7 +688,16 @@
             <el-tag v-if="unsplitPageCount" size="small" type="warning" effect="plain">
               {{ unsplitPageCount }} 页整页未分割
             </el-tag>
-            <div style="flex:1"></div>
+            <span style="flex:1"></span>
+            <!-- ★ 一键清理分割。老师画歪了 / 想换个切法时的「重来」入口 ——
+                 没有它，只能一条条点线右上角的 ×（14 页的卷子能点到手酸）。
+                 ⚠️ 清的是**分割**（线 + 框），**不动笔迹**：手写批改是老师的劳动成果，
+                    重切卷子没理由把它一起抹掉。 -->
+            <el-button size="small" text type="danger"
+                       :disabled="!sliceCount" @click="askClearSlices()"
+                       :title="'清掉所有页的 ' + dividerCount + ' 条线与 ' + rects.length + ' 个框（你画的笔迹会留下）'">
+              🧹 清空分割<template v-if="sliceCount">（{{ sliceCount }}）</template>
+            </el-button>
             <span class="muted-hint">共 {{ pageList.length }} 页 · 已载入 {{ loadedCount }} 页</span>
           </div>
 
@@ -641,6 +719,9 @@
                            :title="'清掉第 ' + pno + ' 页上你画的 ' + teacherMarksOf(pno).length + ' 笔（AI 判的框不动）'">
                   清空本页笔迹
                 </el-button>
+                <!-- 只清本页：画线常常是某一页画坏了，没必要把全部都推倒 -->
+                <el-button v-if="(dividers[pno] || []).length || rects.some((r) => r.page === pno)"
+                           size="small" text @click="clearSlices(pno)">清空本页分割</el-button>
               </div>
               <div class="page-box" :id="'pg' + pno"
                    :class="['tool-' + tool, { 'page-off': pageSkipped(pno) }]"
@@ -968,6 +1049,9 @@ const app = createApp({
   data() {
     return {
       grades: [], gid: null, g: null,
+      /* ---- 新建批改（上传作业）---- */
+      newOpen: false, lessons: [], newLessonId: null,
+      newFiles: [], newPick: [], upBusy: false, newBusy: false, dragHot: false,
       // 分割
       tool: 'line',
       loadedPages: {},
@@ -987,6 +1071,10 @@ const app = createApp({
       /* 「已请求终止、等后端收尾」。与 `submitting` 分开：前者是开批，后者是终止，
          混在一起会让「点终止」那一下loading 跑到「开始批改」按钮上。 */
       canceling: false,
+      /* 「老师点过终止、还在等收尾」。与 canceling 分开是为了**防连点**：成功受理后
+         canceling 一直为真直到轮询看到状态落地，这段时间按钮必须保持不可点，
+         再发一次请求只会收到 409（后端已经开始收尾了）。 */
+      cancelAsked: false,
       /** 「这次会话里老师真的点过开始批改」。**只认它，不认 status==='queued'** ——
        *  queued 有两个来源：①新建之后还没人开批（保存并批改只建档、唯一开批处是
        *  这个页面的 run）②刚点开批、服务端线程还来不及写 running。
@@ -1034,6 +1122,13 @@ const app = createApp({
     items() { return (this.g && this.g.items) || []; },
     blocks() { return this.buildBlocks(); },
     skippedCount() { return this.blocks.filter((b) => b.skipped).length; },
+    /** 手工分割的总数（线 + 框）—— 「清空分割」按钮的开关与计数。没有就禁用，
+     *  免得老师对着空白卷子点按钮得到一句「没什么可清」。 */
+    dividerCount() {
+      return Object.keys(this.dividers)
+        .reduce((n, k) => n + (this.dividers[k] || []).length, 0);
+    },
+    sliceCount() { return this.dividerCount + this.rects.length; },
     /** 还没画线、也没框选过的页 —— 它们会「整页作为一块」。多页卷子上这个数字要显眼。 */
     unsplitPageCount() {
       if (this.pageList.length <= 1) return 0;
@@ -1269,6 +1364,66 @@ const app = createApp({
       } catch (e) { return; }   // 老师点了取消
       await this.eraseMarks(mine.map((m) => m.id));
     },
+    /** ★ 清空分割。`pno` 传 0（或省略）= 全清；传页号 = 只清那一页。
+     *
+     *  ⚠️ 清完**立刻落库**（不是只标 dirty）：重补课 分钟前的事，老师很可能
+     *    接下去就点「开始批改」—— 只标 dirty 的话 `runGrade` 里的自动保存会把
+     *    「刚才清空的」当成「改动」再 PUT 一次，结果虽然对，但多绕一圈；更糟的是
+     *    老师清完关掉页面，回来发现分割还在。
+     *  ⚠️ 失败要回滚内存里的状态 —— 不然界面显示清了、库里还在，下一次批改
+     *    用的就是旧分割（这正是「为什么不听我的」那类最难查的错）。 */
+    /** ★ 「清空分割」的确认。**只在这一层问**，`clearSlices` 本身不问 ——
+     *  按页清（传 pno）是局部操作、重画便宜，不该再弹一次。
+     *  ⚠️ 全清是把整卷十几页的切法一起抹掉，而 `saveRegions` 一旦成功就写库、
+     *     没有撤销 —— 误点一次，老师得从第一条线重画。
+     */
+    async askClearSlices() {
+      const n = this.dividerCount;
+      const b = this.rects.length;
+      if (!n && !b) return;
+      try {
+        await ElementPlus.ElMessageBox.confirm(
+          '会清掉 ' + this.pageList.length + ' 页上的 ' + n + ' 条分割线和 ' + b + ' 个框。\n'
+          + '你画的笔迹会保留，但分割得重画。',
+          '清空分割', { confirmButtonText: '清空', cancelButtonText: '算了',
+            type: 'warning' });
+      } catch (e) { return; }                 // 老师点了「算了」
+      await this.clearSlices(0);
+    },
+    async clearSlices(pno) {
+      const all = !pno;
+      const lines = all ? this.dividerCount
+        : (this.dividers[pno] || []).length;
+      const boxes = all ? this.rects.length
+        : this.rects.filter((r) => r.page === pno).length;
+      if (!lines && !boxes) return;
+      /* busy 不用设 —— saveRegions 自己管；外层再设一份会互相踩。 */
+      const oldDividers = this.dividers;
+      const oldRects = this.rects;
+      const oldDirty = this.dirty;
+      if (all) {
+        this.dividers = {};
+        this.rects = [];
+      } else {
+        const next = Object.assign({}, this.dividers);
+        delete next[pno];
+        this.dividers = next;
+        this.rects = this.rects.filter((r) => r.page !== pno);
+      }
+      try {
+        const saved = await this.saveRegions(true);
+        if (!saved) throw new Error('没存上');
+        ElementPlus.ElMessage.success(
+          (all ? '已清空全部分割' : '已清空第 ' + pno + ' 页的分割')
+          + '（' + lines + ' 条线、' + boxes + ' 个框）—— 你画的笔迹留着');
+      } catch (e) {
+        this.dividers = oldDividers;
+        this.rects = oldRects;
+        this.dirty = oldDirty;
+        this.syncGroups();
+        ElementPlus.ElMessage.error('清空分割失败：' + e.message);
+      }
+    },
     /** 点在标注上 → 跳到它所属的题。AI 画的框带 item_id，老师自己画的不带。 */
     onPickMark(m) {
       const iid = m && m.item_id;
@@ -1360,6 +1515,120 @@ const app = createApp({
       this.g = Object.assign({}, this.g, d, this.dirty ? keep : {});
     },
 
+    /* ==================== 新建批改（上传作业）====================
+     *  以前这条动线是「去课时页 → 点 AI 批改作业 → 再回到工作台」，跨两个页面。
+     *  老师手里拿着学生发来的照片时，实际想要的就一件事：**把图丢进去开始批**。 */
+    async openNew() {
+      this.newOpen = true;
+      if (this.lessons.length) return;
+      const today = new Date();
+      const ago = new Date(today.getTime() - 90 * 86400000);
+      const iso = (d) => d.toISOString().slice(0, 10);
+      try {
+        const rows = await this.api('/api/lessons'
+          + '?start=' + iso(ago) + '&end=' + iso(today));
+        // 倒序：老师找的是**最近**那节课，不是三个月前那节。
+        this.lessons = (rows || []).slice().reverse();
+      } catch (e) {
+        ElementPlus.ElMessage.error('课时列表取不到：' + e.message);
+      }
+    },
+    lessonLabel(l) {
+      const s = String(l.start_at || '').replace('T', ' ').slice(0, 16);
+      return s + ' · ' + (l.student_name || '#' + l.student_id)
+        + (l.topic ? ' · ' + l.topic : '');
+    },
+    /** 选完课时：把这节课的作业原件列出来。默认**全选** —— 一次作业通常就是那一两张图，
+     *  让他勾反而是多一步；要去掉再点一下就行。 */
+    async pickLesson(lid) {
+      /* ⚠️ 自己记一遍 newLessonId，别指望 `<el-select v-model>` 已经替refreshed
+       *  赋值过了：那是「先赋值再触发 change」的顺序约定，一旦有人直调这个方法
+       *  （或者未来把 select 换成别的选择器），后面的上传就会因为 lid 为空而
+       *  一个字都传不上去 —— 而且**不报错**，只是「传了没反应」。 */
+      this.newLessonId = lid || null;
+      this.newFiles = [];
+      this.newPick = [];
+      if (!lid) return;
+      try {
+        const r = await this.api('/api/lessons/' + lid + '/files?role=homework');
+        this.newFiles = (r && r.items) || [];
+        this.newPick = this.newFiles.map((f) => f.id);
+      } catch (e) {
+        ElementPlus.ElMessage.error('这份作业的原件清单取不到：' + e.message);
+      }
+    },
+    toggleNewFile(id) {
+      const i = this.newPick.indexOf(id);
+      if (i >= 0) this.newPick.splice(i, 1); else this.newPick.push(id);
+    },
+    onDropFile(e) {
+      this.dragHot = false;
+      const fs = e.dataTransfer && e.dataTransfer.files;
+      if (fs && fs.length) this.uploadNew(Array.prototype.slice.call(fs));
+    },
+    onPickFile(e) {
+      const el = e.target;
+      if (el && el.files && el.files.length) {
+        this.uploadNew(Array.prototype.slice.call(el.files));
+      }
+      if (el) el.value = '';      // 清掉 value：同一个文件再选一次也能触发
+    },
+    /** 逐张上传。**一张失败不中断后面的** —— 三张里成功两张，也比「一张坏了全白传」好。
+     *  ⚠️ role 必须是 homework：这是学生的作业原件，回到课时页也能看到它，
+     *     写成别的 role 就变成一份没人认领的孤儿文件。 */
+    async uploadNew(files) {
+      if (!this.newLessonId || !files.length) return;
+      this.upBusy = true;
+      let good = 0;
+      let badMsg = '';
+      for (const f of files) {
+        try {
+          const fd = new FormData();
+          // 拖出来的 / 截图工具给的 Blob 常常没名字，补一个 —— 后端按扩展名判格式。
+          const name = f.name || ('pasted-' + Date.now() + '.png');
+          fd.append('file', f, name);
+          await this.api('/api/lessons/' + this.newLessonId + '/files?role=homework',
+            { method: 'POST', body: fd });
+          good += 1;
+        } catch (e) {
+          badMsg = e.message;
+        }
+      }
+      this.upBusy = false;
+      if (good) await this.pickLesson(this.newLessonId);
+      if (badMsg) ElementPlus.ElMessage.error('有 ' + (files.length - good) + ' 个没传上去：' + badMsg);
+      if (good) ElementPlus.ElMessage.success('传好了 ' + good + ' 个文件');
+    },
+    /** 建批改任务。**只建档不开批** —— 老师还没画线，立刻开批等于批一堆整页。
+     *  与保存批改那条约定一致：批改按钮在工作台本体上。 */
+    async createGrade() {
+      if (!this.newLessonId || !this.newPick.length) return;
+      this.newBusy = true;
+      try {
+        const d = await this.api('/api/homework-grades', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          // answer_mode 默认 ai：老师手上通常没有标准答案，让模型自己解。
+          // 要做给出题 modes 的工作台后面再加，这里不给没法提交。
+          body: JSON.stringify({
+            lesson_id: this.newLessonId,
+            file_ids: this.newPick.slice(),
+            answer_mode: 'ai',
+          }),
+        });
+        this.newOpen = false;
+        this.grades = await this.api('/api/homework-grades');
+        this.gid = d.id;
+        await this.loadGrade(d.id);
+        // 把 gid 写进地址栏：老师随手刷新 / 甩链接给别人，打开的还是这一份。
+        try {
+          history.replaceState(null, '', '?gid=' + d.id);
+        } catch (e) { /* file:// 下没有 replaceState，忽略 */ }
+        ElementPlus.ElMessage.success('批改任务建好了 —— 先在卷面上画线，再点「开始批改」');
+      } catch (e) {
+        ElementPlus.ElMessage.error('没建成：' + e.message);
+      } finally { this.newBusy = false; }
+    },
+
     /* ============================ 载入 ============================ */
     /** 首页数据（作业列表 + 默认打开那一份）落地的 Promise。
      *  标注层加载完要先等它：见 `mounted` 里的说明。 */
@@ -1395,6 +1664,7 @@ const app = createApp({
       this.thumbBroken = {};      // 上一份记的「图挂了」不能带过来
       this.teardownDraft();       // 上一份的本机笔迹队列（它们属于上一份 gid）
       this.canceling = false;
+      this.cancelAsked = false;   // 换一份作业时必须清，否则新作业的终止按钮点不动
       // ⚠️ 「点过开批」的旗必须跟着记录走。不重置的话，切到另一份 queued 的记录时
       //    会被上一份的旗顶成「批改中」→ 按钮又是灰的。
       this.runAsked = false;
@@ -1660,6 +1930,14 @@ const app = createApp({
     /** 页面上按下：横线模式 = 加一条线；框选模式 = 开始拖一个框。 */
     onPageDown(pno, ev) {
       if (this.tool === 'view') return;
+      /* ★★ 手写类工具必须**原样放行**，让事件落到覆盖在上面的 <grade-mark-layer>。
+       *
+       *   这里不放行，下面的框选分支会把 pointerdown 吃掉 —— 表现就是用户说的
+       *   「点了笔画/橡皮/文本框，在文件上画出来的还是框」。只判 `view` 是不够的：
+       *   `line` 之后直接 fall through 到框选，笔也不例外。
+       *
+       *   ⚠️ 别在这里再顺手改 this.tool —— 工具是老师选的，动了就回不来了。 */
+      if (INK_TOOLS.indexOf(this.tool) >= 0) return;
       const box = ev.currentTarget.getBoundingClientRect();
       if (!box.width || !box.height) return;
       const rel = (e) => ({
@@ -1927,24 +2205,37 @@ const app = createApp({
     /* ============================ 批改 ============================ */
     /* ★ 终止批改。⚠️ 后端是「受理」，不是「立刻停」—— 在跑的 AI 调用掐不断，
      *   所以这里**不能**停轮询，要继续等状态落到 reviewing。
-     *   ⚠️ 也**不要**在这里把 running 置 false（自欺欺人地显示「已停」）：
-     *   真停了轮询自己会看到，提前改会出现「状态说停了、题还在一条条冒出来」。 */
+     *
+     *  ⚠️ 也**不要**在这里把 running 置 false（自欺欺人地显示「已停」）：
+     *    真停了轮询自己会看到，提前改会出现「状态说停了、题还在一条条冒出来」。
+     *
+     *  ★★ 刻意**不做二次确认弹窗**：终止多半是因为批得太慢，那一刻老师最不想做的事
+     *    就是再读一个对话框。而且损失可控（已批的页保留），反复确认换来的只是
+     *    「点了没反应」的印象。误按的代价远小于用不了的代价。 */
     async cancelGrade() {
-      if (!this.g || !this.gid || this.canceling) return;
-      try {
-        await ElementPlus.ElMessageBox.confirm(
-          '终止后，已经批完的页会保留，没批的页就不批了。\n要现在停吗？',
-          '终止批改', { confirmButtonText: '终止', cancelButtonText: '继续批',
-            type: 'warning' });
-      } catch (e) { return; }                 // 老师选了「继续批」
+      if (!this.g || !this.gid || this.cancelAsked) return;
+      this.cancelAsked = true;
       this.canceling = true;
       try {
-        await this.api('/api/homework-grades/' + this.gid + '/cancel', { method: 'POST' });
-        ElementPlus.ElMessage.success('已请求终止，正在收尾…');
+        const r = await this.api('/api/homework-grades/' + this.gid + '/cancel',
+          { method: 'POST' });
+        /* ⚠️ 后端会在「这一批刚好在这一瞬间跑完了」时给 already_stopped。
+         *    那是成功不是失败 —— 目的已经达到了，别弹红字。 */
+        if (r && r.already_stopped) {
+          ElementPlus.ElMessage.info('这份已经停了');
+        } else {
+          ElementPlus.ElMessage.success('已请求终止，正在收尾…');
+        }
         this.startPoll();                     // 确保轮询还活着，好看到状态落地
       } catch (e) {
+        // 没受理成功就把状态收回来 —— 否则按钮永远转圈，老师只能刷新页面。
+        this.cancelAsked = false;
+        this.canceling = false;
         ElementPlus.ElMessage.error(e.message);
-      } finally { this.canceling = false; }
+      }
+      /* ⚠️ 成功路径**不清 canceling**：要一直转到轮询看到状态落到 reviewing。
+       *   立刻清掉的话按钮马上变回可点，老师会再点 → 后端已经在收尾 → 409
+       *   甚至更糟的错误提示 —— 这就是「终止不顺畅」最直观的样子。 */
     },
     async runGrade() {
       /* ★ 有没保存的分割就先存。老师画完线直接点「开始批改」是最自然的顺序，
@@ -1979,7 +2270,14 @@ const app = createApp({
     startPoll() {
       this.stopPoll();
       this._queuedTicks = 0;
-      this._poll = setInterval(async () => {
+      this._poll = setInterval(() => { this.tick(); }, 2000);
+    },
+    stopPoll() { if (this._poll) { clearInterval(this._poll); this._poll = null; } },
+    /** 一轮轮询。**刻意从 setInterval 的匿名函数里抽出来**：
+     *  ① 新建 / 静默刷新时能单独调一次，不用干等 2 秒
+     *  ② 测试可以直调 —— 「点了终止之后按钮什么时候放开」这种逻辑，
+     *     塞在匿名函数里就只能靠人眼复核（要等好几轮），最后一定漏。 */
+    async tick() {
         try {
           const d = await this.api('/api/homework-grades/' + this.gid);
           if (!this.g) return;
@@ -1992,6 +2290,8 @@ const app = createApp({
             this._queuedTicks = (this._queuedTicks || 0) + 1;
             if (this._queuedTicks >= 45) {
               this.runAsked = false;
+              this.cancelAsked = false;
+              this.canceling = false;
               this.stopPoll();
               ElementPlus.ElMessage.warning({
                 message: '批改没开起来（服务端一直没接手），可以再点一次「开始批改」',
@@ -2002,13 +2302,14 @@ const app = createApp({
           }
           this._queuedTicks = 0;
           if (d.status !== 'running') {
-            this.runAsked = false;   // 跑完 / 失败，旗的使命结束
+            // 跑完 / 失败 / 已终止，两个旗的使命都结束了。
+            this.runAsked = false;
+            this.cancelAsked = false;
+            this.canceling = false;
             this.stopPoll();
           }
         } catch (e) { /* 轮询失败不打扰（下一轮再来） */ }
-      }, 2000);
     },
-    stopPoll() { if (this._poll) { clearInterval(this._poll); this._poll = null; } },
     async setVerdict(it, v) {
       try {
         const r = await this.api('/api/grade-items/' + it.id,

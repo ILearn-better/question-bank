@@ -140,7 +140,24 @@ const BAD_METHOD = [];
 
 /** 极简 fetch 桩。`region-image` / `page` 是 <img src>，不走这里。 */
 const CALLS = [];
+/** 让某一轮的 /cancel 走「刚好跑完了」这条分支 —— 后端这时返回 200，不是 409。 */
+let CANCEL_MODE = '';
 let LAST_DETAIL = null;
+/* ---- 新建批改那一节的桩状态 ---- */
+let NEW_GRADE_BODY = null;
+let UPLOADED_FILES = [];
+let UPLOAD_FAILS = false;
+let FAIL_REGIONS = false;
+const LESSONS = () => ([
+  { id: 1, student_id: 11, student_name: '张三', start_at: '2026-10-18T19:00:00',
+    topic: '二次函数', duration_min: 90 },
+  { id: 2, student_id: 12, student_name: '李四', start_at: '2026-10-19T19:00:00',
+    topic: '', duration_min: 60 },
+]);
+const LSN_FILES = () => ([
+  { id: 501, name: '张三_01.jpg', kind: 'image', kind_cn: '图片', pages: 1 },
+  { id: 502, name: '张三_02.jpg', kind: 'image', kind_cn: '图片', pages: 1 },
+].concat(UPLOADED_FILES));
 /** 桩里新建标注的自增 id（900+，与 DETAIL 里手写的那些不撞）。 */
 let LAST_MARK_ID = 900;
 /** 下一回 /run 故意失败一次 —— 用来验「没开起来，按钮要能恢复」。 */
@@ -183,6 +200,7 @@ function makeFetch() {
       return reply(LAST_DETAIL);
     }
     if (u === '/api/homework-grades/7/regions' && method === 'PUT') {
+      if (FAIL_REGIONS) return reply({ detail: '（测试造的失败）' }, 500);
       // 真后端是「整份替换」，且会把同一题的几段归一成一致的 skipped
       const rows = (body && body.regions) || [];
       const skip = {};
@@ -198,8 +216,32 @@ function makeFetch() {
       LAST_DETAIL.skipped_pages = (body && body.pages) || [];
       return reply({ skipped_pages: LAST_DETAIL.skipped_pages });
     }
-    /* 终止：只在「真的在跑」时受理（后端是 409）。这里靠 LAST_DETAIL.status 判。 */
+    /* ---- 新建批改：课时列表 / 作业原件清单 / 上传 / 建档 ---- */
+    if (u.indexOf('/api/lessons?') === 0 && method === 'GET') {
+      return reply(LESSONS());
+    }
+    if (/^\/api\/lessons\/\d+\/files\?role=homework$/.test(u) && method === 'GET') {
+      return reply({ items: LSN_FILES(), rel_dir: 'x/y', accept: [] });
+    }
+    if (/^\/api\/lessons\/\d+\/files\?role=homework$/.test(u) && method === 'POST') {
+      if (UPLOAD_FAILS) {
+        return reply({ detail: '不支持这种格式：目前只认 PDF / Word / 图片' }, 415);
+      }
+      const fid = 600 + (UPLOADED_FILES.length || 0);
+      UPLOADED_FILES.push({ id: fid, name: 'up-' + fid + '.png' });
+      return reply({ id: fid, name: 'up-' + fid + '.png', kind: 'image', pages: 1 });
+    }
+    if (u === '/api/homework-grades' && method === 'POST') {
+      NEW_GRADE_BODY = body;
+      return reply(Object.assign({}, DETAIL(), { id: 8, status: 'queued', done: 0 }));
+    }
+    /* 终止：只在「真的在跑」时受理（后端是 409）。这里靠 LAST_DETAIL.status 判。
+       CANCEL_MODE='stopped' 用来模拟「这一批刚好在这一瞬间跑完了」—— 后端这时
+       给的是 200 + already_stopped，**不是** 409（详见 cancel 路由的注释）。 */
     if (u === '/api/homework-grades/7/cancel' && method === 'POST') {
+      if (CANCEL_MODE === 'stopped') {
+        return reply({ ok: true, gid: 7, canceling: false, already_stopped: true });
+      }
       if (LAST_DETAIL.status !== 'running' && LAST_DETAIL.status !== 'queued') {
         return reply({ detail: '这份作业现在没在批改' }, 409);
       }
@@ -347,6 +389,9 @@ async function main() {
     return 1;
   }
   const html = fs.readFileSync(file, 'utf8');
+  /* 主界面源码。工作台要在侧栏有入口 —— 这条必须对着**真源码**断言，
+     否则「加了入口」这件事永远是口头验收（加错了一样绿）。 */
+  const APP_SRC = fs.readFileSync(path.join(ROOT, 'src', 'App.js'), 'utf8');
 
   /* 内联脚本用正则抽出来自己 eval —— 不依赖 jsdom 执行 <script>：
    * runScripts:'outside-only' 下它不会跑，而 'dangerously' 又会让所有 src 脚本
@@ -834,8 +879,9 @@ async function main() {
    * 模型配置不对）却没有「停」，只能刷新页面 —— 而刷新之后线程还在跑。
    * 三个必须守住的点：
    *   ① 只在跑批时出现（其他时候摆个按钮是噪音）
-   *   ② 要二次确认（终止会丢掉没批的页）
-   *   ③ 后端是「受理」不是「立刻停」—— 所以**不能**自己把 running 置 false */
+   *   ② 点一下就停（**不做二次确认**：太慢时按终止，那一刻最不想读的是对话框）
+   *   ③ 后端是「受理」不是「立刻停」—— 所以既不能自己把 running 置 false，
+   *      也不能点完立刻把按钮放开（放开了老师会再点 → 后端 409） */
   vm.g = Object.assign({}, vm.g, { status: 'reviewing' });
   vm.runAsked = false;
   await sleep(80);
@@ -845,34 +891,67 @@ async function main() {
 
   vm.runAsked = true;
   vm.g = Object.assign({}, vm.g, { status: 'running' });
+  // ⚠️ 桩判「是不是真的在跑」读的是 LAST_DETAIL，只改 vm.g 的话 /cancel 照样回 409
+  LAST_DETAIL.status = 'running';
   await sleep(120);
   check('★ 批改中 → 出现「终止」按钮', cancelBtns().length, 1);
 
-  const nConf = CONFIRMS.length;
+  const nConfBefore = CONFIRMS.length;
+  const nMsgBefore = MSGS.length;
   const cancelBefore = CALLS.filter((c) => c.url === '/api/homework-grades/7/cancel').length;
   cancelBtns()[0].click();
   await sleep(300);
-  check('★ 点「终止」→ 先问一句（二次确认，不是点了就停）',
-    CONFIRMS.length, nConf + 1);
-  checkTrue('★ 确认框写清了后果（已批的保留 / 没批的不批）',
-    /保留/.test((CONFIRMS[CONFIRMS.length - 1] || {}).msg || ''),
-    (CONFIRMS[CONFIRMS.length - 1] || {}).msg);
-  /* 提示里的换行必须是**真的换行**。历史教训：bash heredoc 把 \\n 吃掉一层之后，
-     产品代码里留下的是字面量 \\n，提示框上会直接显示两个字符「\n」。 */
-  checkTrue('★ 确认框的换行是真的换行（不是显示出 "\\n" 两个字）',
-    !((CONFIRMS[CONFIRMS.length - 1] || {}).msg || '').includes('\\n'),
-    JSON.stringify((CONFIRMS[CONFIRMS.length - 1] || {}).msg || ''));
-  check('★ 确认后 → POST /cancel', CALLS.filter((c) =>
+  /* ★★ 终止**刻意不做二次确认**：批改太慢时按下终止，那一刻最不想做的事就是
+   *   再读一个对话框。损失可控（已批的页保留），而每多一层弹窗就多一分
+   *   「点了没反应」的错觉 —— 用户说的「无法顺利进行」正是这个。 */
+  check('★★ 点「终止」→ 不弹确认框，直接发请求', CONFIRMS.length, nConfBefore);
+  check('★ 只发了一个 /cancel', CALLS.filter((c) =>
     c.url === '/api/homework-grades/7/cancel').length, cancelBefore + 1);
-  /* ⚠️ 关键：终止**不能**自己把 running 置 false。后端只是受理，在跑的 AI 调用
-     掐不断；提前改会出现「状态说停了、题还在一条条冒出来」。要靠轮询等真状态。 */
-  checkTrue('★ 终止期间给一句「正在收尾」（不然老师以为又点了没反应）',
+  checkTrue('★ 受理了要给一句明确反馈（不然老师以为没点到）',
+    /已请求终止/.test((MSGS[MSGS.length - 1] || {}).text || ''),
+    (MSGS[MSGS.length - 1] || {}).text);
+  check('★ 反馈是 success 不是 error', (MSGS[MSGS.length - 1] || {}).type, 'success');
+
+  /* ★★ 受理之后必须把按钮「锁住」。立刻放开的话老师会再点一次，
+   *   而后端已经在收尾了 —— 第二次只会收到 409 甚至更糟的提示。 */
+  cancelBtns()[0].click();
+  await sleep(250);
+  check('★★ 受理后再点同一按钮 → 不再发第二个请求（cancelAsked 挡住）',
+    CALLS.filter((c) => c.url === '/api/homework-grades/7/cancel').length, cancelBefore + 1);
+  checkTrue('★ 受理后按钮一直在 loading，不是点完就恢复',
+    vm.canceling === true, String(vm.canceling));
+  checkTrue('★ 页面写着「正在收尾」（等到真停，不是假装停了）',
     html.includes('正在收尾'), true);
+
+  /* ★★ 只有轮询看到状态真的落地了才放开（桩已经把 status 写成 reviewing）。
+   *   tick() 从 setInterval 的匿名函数里抽出来就是为了能在这儿直调 ——
+   *   否则要等好几轮 2 秒，测试里根本复现不了。 */
+  await vm.tick();
+  await sleep(60);
+  checkTrue('★★ 轮询看到 reviewing → 才放开终止按钮',
+    vm.canceling === false && vm.cancelAsked === false,
+    'canceling=' + vm.canceling + ' cancelAsked=' + vm.cancelAsked);
   vm.stopPoll();
 
-  /* ★ 后端说「没在跑」→ 409，前端要把 detail 里的理由说给老师听。 */
+  /* ★★ 批改刚好在这一瞬间跑完了 → 后端给 200 + already_stopped。那是**成功**
+   *   不是失败：老师的目的是「别再跑了」，目的达到了；弹红字只会让他以为按钮坏了。 */
+  vm.cancelAsked = false;
+  vm.canceling = false;
+  CANCEL_MODE = 'stopped';
+  const nMsg2 = MSGS.length;
+  await vm.cancelGrade();
+  await sleep(250);
+  check('★ 已经停了 → 也给反馈（没有静默失败）', MSGS.length, nMsg2 + 1);
+  checkTrue('★★ 已经停了 → 不弹红色错误（type 不是 error）',
+    (MSGS[MSGS.length - 1] || {}).type !== 'error',
+    (MSGS[MSGS.length - 1] || {}).type + ' / ' + (MSGS[MSGS.length - 1] || {}).text);
+  CANCEL_MODE = '';
+  vm.stopPoll();
+
+  /* ★ 后端说「真没在跑」→ 409，前端要把 detail 里的理由说给老师听。 */
   vm.g = Object.assign({}, vm.g, { status: 'reviewing' });
   vm.runAsked = false;
+  vm.cancelAsked = false;
   await sleep(80);
   const nMsg = MSGS.length;
   await vm.cancelGrade();
@@ -1108,6 +1187,197 @@ async function main() {
   checkTrue('★★★ import 失败也要 mount（只是没有手写功能）',
     /\} catch \(e\) \{\s*console\.error\('\[workbench\] 手写标注层没加载起来[\s\S]{0,80}\}\s*const root = app\.mount/.test(html),
     true);
+
+  /* ============ 19. ★★ 手写工具必须落在卷面上（用户原话）============
+   *  用户 2026-10-20：「笔画、橡皮、文本框等功能点击后只能在文件上画框，
+   *  我想要的是在文件上做笔记和人工批改」。
+   *
+   *  根因：.page-box 上挂了 @pointerdown="onPageDown"，而 onPageDown 里只有
+   *  `line` 分支 return，其余工具**一路 fall through 到框选** —— 于是选了笔，
+   *  画出来的还是框：标注层压根没收到过事件。
+   *  单靠「看代码觉得对」是守不住的（这次就是这么漏掉的），所以要真的派发一次。 */
+  vm.tool = 'view';
+  const pg1 = D.querySelector('#pg1');
+  checkTrue('（准备）卷面容器找得到', !!pg1, String(!!pg1));
+  /* jsdom 里所有盒子都是 0 尺寸，而 ohne 尺寸的代码会直接 return —— 必须先把
+     盒子撑起来，否则下面两条都会「因为没走到」而假绿。 */
+  pg1.getBoundingClientRect = () => ({ left: 0, top: 0, width: 800, height: 1131 });
+
+  function press(el, tool) {
+    vm.tool = tool;
+    vm.draft = null;
+    const ev = new W.Event('pointerdown');
+    Object.defineProperty(ev, 'clientX', { value: 120 });
+    Object.defineProperty(ev, 'clientY', { value: 260 });
+    el.dispatchEvent(ev);
+    return ev;
+  }
+
+  press(pg1, 'rect');
+  checkTrue('（对照）选「框选」按下 → 确实开始拖框了', !!vm.draft, String(!!vm.draft));
+  vm.draft = null;
+
+  press(pg1, 'ink');
+  checkTrue('★★ 选「笔」按下 → **不会**开始拖框（事件要让给标注层）',
+    vm.draft === null, String(vm.draft));
+  press(pg1, 'erase');
+  checkTrue('★★ 选「橡皮」按下 → 不会开始拖框', vm.draft === null, String(vm.draft));
+  press(pg1, 'text');
+  checkTrue('★★ 选「文字」按下 → 不会开始拖框', vm.draft === null, String(vm.draft));
+  press(pg1, 'check');
+  checkTrue('★★ 选「√」按下 → 不会开始拖框', vm.draft === null, String(vm.draft));
+  vm.tool = 'view';
+  vm.draft = null;
+  /* ★ 反面自证：把那道放行删掉，「笔」会立刻退化成画框 —— 这条断言的意义就在这。
+     不能只写正面断言（上面几条只要 fall through 被删也会绿，但它们删了才是错）。 */
+  checkTrue('★★ 源码里确实写了「手写类工具放行」（不是靠运气）',
+    /if \(INK_TOOLS\.indexOf\(this\.tool\) >= 0\) return;/.test(html), true);
+  checkTrue('★ 放行写在 line 分支**之前**（顺序错了 line 也照样躺枪）',
+    html.indexOf("if (INK_TOOLS.indexOf(this.tool) >= 0) return;")
+      < html.indexOf("if (this.tool === 'line') {"), true);
+  checkTrue('★ 每个页容器都传了 layerMode（手写时才进对应模式，其余 view 不吃事件）',
+    /<grade-mark-layer[\s\S]{0,200}mode="layerMode"/.test(html)
+      || /:mode="layerMode"/.test(html), true);
+
+  /* ============ 20. 一键清理分割 ============ */
+  /* 14 页的卷子画歪一条线，以前只能去点那一页线上的 × —— 重来的成本高到
+     老师宁愿将就着批。「清空分割」就是给这个场景一个出口。 */
+  vm.dividers = { 1: [300, 620], 2: [410] };
+  vm.rects = [{ n: 1, page: 1, box: [0, 0, 500, 300] }];
+  await sleep(30);
+  check('（准备）确认清理前有两页有线', Object.keys(vm.dividers).length, 2);
+  check('★ 统计条上能数出有多少处分割（线 + 框一起算）', vm.sliceCount, 4);
+
+  const putBefore2 = CALLS.filter((c) => c.url === '/api/homework-grades/7/regions'
+    && c.method === 'PUT').length;
+  await vm.clearSlices(0);
+  await sleep(120);
+  check('★★ 一键清空 → 所有页的线都没了', Object.keys(vm.dividers).length, 0);
+  check('★★ 一键清空 → 框也没了（线与框是同一件事的两种画法）', vm.rects.length, 0);
+  check('★★ 清空后**立刻落库**（不是只标 dirty，关掉页面还得回来重画）',
+    CALLS.filter((c) => c.url === '/api/homework-grades/7/regions'
+      && c.method === 'PUT').length, putBefore2 + 1);
+  checkTrue('★ 清空后给了一句「已清空」（并且说明了清了些什么）',
+    /已清空/.test((MSGS[MSGS.length - 1] || {}).text || ''),
+    (MSGS[MSGS.length - 1] || {}).text);
+
+  /* ★ 只清本页：某一页画坏了没必要推倒全部。 */
+  vm.dividers = { 1: [300], 2: [410], 3: [200] };
+  await sleep(30);
+  await vm.clearSlices(2);
+  await sleep(120);
+  check('★★ 只清第 2 页 → 别的页不动', Object.keys(vm.dividers).slice().sort(), ['1', '3']);
+
+  /* ★★ 存不上必须**回滚**：界面显示清了、库里还在，下次批改用的就是旧分割 ——
+     这属于「为什么它不听我的」那一类最难查的错。 */
+  FAIL_REGIONS = true;
+  vm.dividers = { 1: [300] };
+  const backup = JSON.stringify(vm.dividers);
+  await vm.clearSlices(0);
+  await sleep(120);
+  FAIL_REGIONS = false;
+  checkTrue('★★ 保存失败 → 内存里的分割**恢复了**（界面与库不会分叉）',
+    JSON.stringify(vm.dividers) === backup, JSON.stringify(vm.dividers));
+  checkTrue('★ 保存失败要给红字（不能静默）',
+    (MSGS[MSGS.length - 1] || {}).type === 'error', (MSGS[MSGS.length - 1] || {}).type);
+
+  /* ★★ 全清是**不可逆**的：`saveRegions` 一成功就写库、没有撤销，误点一次
+     老师得从第一条线重画整卷。所以按钮那一层要问一句。
+     ⚠️ 只在该层问 —— 按页清（clearSlices(pno)）是局部操作、重画便宜，
+        再弹一次只会变成「怎么老是弹窗」。 */
+  vm.dividers = { 1: [300, 620], 2: [410] };
+  vm.rects = [{ n: 1, page: 1, box: [0, 0, 500, 300] }];
+  await sleep(30);
+  const nConfirm0 = CONFIRMS.length;
+  await vm.askClearSlices();
+  await sleep(120);
+  check('★★ 一键清空前问了一句（不可逆，误点要重画整卷）',
+    CONFIRMS.length, nConfirm0 + 1);
+  /* 静态钉住：按钮必须接**确认那一层**。直接 `@click="clearSlices(0)"` 的话，
+     上面的运行时断言全还是绿的（它们直接调 askClearSlices），而老师误点照样一把清光。 */
+  checkTrue('★★ 按钮接的是 askClearSlices（不是绕过确认直接 clearSlices）',
+    /@click="askClearSlices\(\)"/.test(html)
+      && !/@click="clearSlices\(0\)"/.test(html), true);
+  const lastConfirm = CONFIRMS[CONFIRMS.length - 1] || {};
+  checkTrue('★★ 确认框里写清了「清多少」和「笔迹留不留」',
+    /3 条分割线/.test(lastConfirm.msg || '') && /1 个框/.test(lastConfirm.msg || '')
+      && /笔迹会保留/.test(lastConfirm.msg || ''), lastConfirm.msg);
+  check('★ 确认之后才真清', Object.keys(vm.dividers).length, 0);
+
+  /* 点「算了」→ 一个字都不许动。确认框不是装饰。 */
+  vm.dividers = { 1: [300, 620], 2: [410] };
+  vm.rects = [{ n: 1, page: 1, box: [0, 0, 500, 300] }];
+  await sleep(30);
+  const origConfirm = W.ElementPlus.ElMessageBox.confirm;
+  W.ElementPlus.ElMessageBox.confirm = () => Promise.reject(new Error('cancel'));
+  try {
+    await vm.askClearSlices();
+    await sleep(80);
+  } finally {
+    W.ElementPlus.ElMessageBox.confirm = origConfirm;
+  }
+  check('★★ 点了「算了」→ 线一条不少', Object.keys(vm.dividers).length, 2);
+  check('★★ 点了「算了」→ 框也还在', vm.rects.length, 1);
+  vm.dividers = {};
+  vm.rects = [];
+  await sleep(20);
+
+  /* ============ 21. 页内新建：上传作业（工作台独立出来）============ */
+  /* 用户 2026-10-20：「后续将该工作台添加到主控制侧栏，并增加上传文件功能，独立出来」。
+   * 以前必须「先去课时页点 AI 批改作业」才能拿到一份 —— 老师手里拿着照片时，
+   * 实际想要的就一件事：把图丢进去开始批。 */
+  checkTrue('★★ 顶栏有「＋ 新建批改」入口（不用先去课时页）',
+    /＋ 新建批改/.test(html), true);
+  checkTrue('★ 主控制侧栏有批改工作台的入口',
+    /workbench\.html/.test(APP_SRC) && /批改工作台/.test(APP_SRC), true);
+
+  NEW_GRADE_BODY = null;
+  UPLOADED_FILES = [];
+  await vm.openNew();
+  await sleep(120);
+  checkTrue('★ 打开「新建批改」→ 拉到课时列表', vm.lessons.length >= 2, String(vm.lessons.length));
+  checkTrue('★ 课时列表**倒序**（最近那节课在最上面，老师找的是它）',
+    vm.lessons[0].id === 2, String(vm.lessons[0].id));
+  checkTrue('★ 课时标签写清了「日期 · 学生」，挑的时候不用猜',
+    /19:00 · 张三/.test(vm.lessonLabel(vm.lessons[1])),
+    vm.lessonLabel(vm.lessons[1]));
+
+  await vm.pickLesson(1);
+  await sleep(120);
+  check('★ 选完课时 → 列出这节课的作业原件', vm.newFiles.length, 2);
+  check('★ 默认**全选**（一次作业通常就是那两张图，不用再勾一次）', vm.newPick.length, 2);
+  vm.toggleNewFile(501);
+  check('★ 点一下取消勾选', vm.newPick.length, 1);
+  vm.toggleNewFile(501);
+  check('★ 再点一下勾回来', vm.newPick.length, 2);
+
+  /* 上传。用真的 FormData —— 记忆里的教训：File/Blob/FormData 必须一起搬成
+     jsdom 那一套，跨 realm 的 Blob 互不认，.name 会变 undefined。 */
+  UPLOAD_FAILS = false;
+  await vm.uploadNew([new W.File(['x'], 'a.png', { type: 'image/png' })]);
+  await sleep(150);
+  check('★★ 上传成功 → 清单里多了一个文件', vm.newFiles.length, 3);
+  UPLOAD_FAILS = true;
+  await vm.uploadNew([new W.File(['x'], 'b.exe', { type: 'application/octet-stream' })]);
+  await sleep(150);
+  UPLOAD_FAILS = false;
+  check('★ 上传失败要说清楚失败了（不许静默）',
+    (MSGS[MSGS.length - 1] || {}).type, 'error');
+  check('★ 一次失败不影响已经传好的那些', vm.newFiles.length, 3);
+
+  /* 建档。 */
+  await vm.createGrade();
+  await sleep(200);
+  check('★★ 建档时**按勾选**带上 file_ids（上传的那个也自动选上了）',
+    (NEW_GRADE_BODY && NEW_GRADE_BODY.file_ids || []).length, 3);
+  check('★★ 建档后自动打开这份（gid 切过去了）', vm.gid, 8);
+  checkTrue('★ 地址栏写进了 gid（刷新 / 甩链接给别人还是这一份）',
+    /replaceState/.test(html) && /gid=/.test(html), true);
+  /* ★ 默认 answer_mode='ai'：老师手上多半没有标准答案，这一步不该问他要。 */
+  checkTrue('★ 建档默认 answer_mode=ai（没答案也能开始批）',
+    !!NEW_GRADE_BODY && NEW_GRADE_BODY.answer_mode === 'ai',
+    NEW_GRADE_BODY && NEW_GRADE_BODY.answer_mode);
+  vm.newOpen = false;
 
   console.log('\n共 ' + total + ' 项，失败 ' + fails.length + ' 项');
   if (fails.length) {
