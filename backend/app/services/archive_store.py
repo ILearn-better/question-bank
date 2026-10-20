@@ -276,13 +276,19 @@ def abs_path(rec: GradeArchive) -> Path | None:
     return storage.safe_join(rec.rel_path)
 
 
-def brief(rec: GradeArchive, topic: str = "") -> dict:
-    """一条存档的摘要（列表用）—— 不带任何二进制，也不去猜预览能力之外的东西。"""
+def brief(rec: GradeArchive, topic: str = "", lesson_at: str = "") -> dict:
+    """一条存档的摘要（列表用）—— 不带任何二进制，也不去猜预览能力之外的东西。
+
+    `lesson_at` 是**上课那天**（不是 `archived_on`）：老师今天可以把上周的卷子存进来，
+        两个日期能差好几天。列表上要能说清「这是哪节课的作业」，
+        光给主题不够 —— 主题常常是空的。
+    """
     return {
         "id": rec.id,
         "student_id": rec.student_id,
         "grade_id": rec.grade_id,
         "lesson_id": rec.lesson_id,
+        "lesson_start_at": lesson_at,
         "archived_on": rec.archived_on,
         "name": rec.name,
         "stored_name": rec.stored_name,
@@ -315,17 +321,17 @@ def list_for_student(db: Session, sid: int, limit: int = 200) -> dict:
         .limit(max(1, min(limit, 1000)))
     ).all())
 
-    # 课时主题一次查完（列表里要显示「哪节课的作业」）。逐条 db.get 是 N+1，
+    # 课时信息一次查完（列表里要显示「哪节课的作业」）。逐条 db.get 是 N+1，
     # 一个学生攒够一年有两三百条存档，那会明显卡。
     lids = {r.lesson_id for r in rows if r.lesson_id}
-    topics: dict[int, str] = {}
+    meta: dict[int, tuple[str, str]] = {}
     if lids:
-        for lid, topic in db.execute(
-            select(Lesson.id, Lesson.topic).where(Lesson.id.in_(lids))
+        for lid, topic, start_at in db.execute(
+            select(Lesson.id, Lesson.topic, Lesson.start_at).where(Lesson.id.in_(lids))
         ).all():
-            topics[lid] = topic or ""
+            meta[lid] = (topic or "", start_at or "")
 
-    items = [brief(r, topics.get(r.lesson_id or 0, "")) for r in rows]
+    items = [brief(r, *meta.get(r.lesson_id or 0, ("", ""))) for r in rows]
     return {"items": items, "total": len(items)}
 
 
@@ -337,7 +343,8 @@ def detail(db: Session, aid: int) -> dict:
     """
     rec = get_or_404(db, aid)
     lesson = db.get(Lesson, rec.lesson_id) if rec.lesson_id else None
-    out = brief(rec, (lesson.topic or "") if lesson else "")
+    out = brief(rec, (lesson.topic or "") if lesson else "",
+                (lesson.start_at or "") if lesson else "")
     out["exists"] = bool((p := abs_path(rec)) and p.is_file())
 
     if rec.grade_id:

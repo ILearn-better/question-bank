@@ -383,6 +383,26 @@ def t_list_detail() -> None:
               str(d.get("verdicts")))
         check("详情带 inline 地址（预览用）", "inline=1" in d["inline_url"], d["inline_url"])
 
+        # 「作业存档要放到对应课下」（用户 2026-10-21）——
+        # 前端按 lesson_id 分组，所以列表必须把课时信息带全：
+        # lesson_id 决定「挂到哪节课」，lesson_start_at 让人在总览里认得出是哪节课。
+        check("★★ 详情带上课日期（不是归档日期：今天可以补存上周的卷子）",
+              d.get("lesson_start_at") == "2026-10-20T19:00", str(d.get("lesson_start_at")))
+
+        ra2 = AS.list_for_student(db, a.id)
+        by_id = {x["id"]: x for x in ra2["items"]}
+        check("★★ 导出得到的存档带 lesson_id（前端按它挂到课下）",
+              by_id[rec.id]["lesson_id"] == la.id, str(by_id[rec.id].get("lesson_id")))
+        check("★★ 列表也带上课日期（总览里要认得出哪节课）",
+              by_id[rec.id]["lesson_start_at"] == "2026-10-20T19:00",
+              str(by_id[rec.id].get("lesson_start_at")))
+        # 手传的两条（「甲的1/2.pdf」）没有 grade → lesson_id 空 → 不进任何一节课下。
+        # 这是用户 2026-10-21 明确要的：「手传一律不挂课」。
+        hand = [x for x in ra2["items"] if x["id"] != rec.id]
+        check("★★ 手传的存档 lesson_id 为空（不进任何课下）",
+              hand and all(x["lesson_id"] is None for x in hand),
+              str([(x["name"], x["lesson_id"]) for x in hand]))
+
         w = AS.create(db, student=a, filename="卷.docx", data=b"PK\x03\x04", on="2026-10-22")
         dw = AS.detail(db, w.id)
         check("★ Word 不能内嵌预览（拖进 iframe 只会白屏）",
@@ -608,6 +628,26 @@ def t_frontend() -> None:
 
     check("★ app.css 有存档行样式", ".archive-row" in (FE / "app.css").read_text(encoding="utf-8"),
           "没找到 .archive-row")
+
+    # ---- 「作业存档要放到对应课下」（用户 2026-10-21）----
+    # 前端按 lesson_id 把 archives 分组，再在「上课记录」每节课里取这节课那组。
+    check("★★ 存档按课时分组（computed archivesByLesson）",
+          "const archivesByLesson = computed(" in sd, "没找到分组")
+    check("★★ 没挂课的存档不进任何课下（手传一律不挂课）",
+          "if (!a.lesson_id) continue;" in sd, "没找到过滤")
+    check("★★ 每节课下引用这节课的存档",
+          "archivesByLesson[item.lesson.id]" in sd, "模板里没引用")
+    # ⚠️ 只查字符串在不在不够：`archivesByLesson` 在 computed 定义里也出现。
+    #    要比位置 —— 引用必须落在「上课记录」时间轴那条 v-for 之后。
+    tl = sd.find('v-for="item in timeline"')
+    ax = sd.find("archivesByLesson[item.lesson.id]")
+    check("★★ 引用在「上课记录」时间轴内部（不是拼到别处去了）",
+          tl != -1 and ax != -1 and ax > tl, f"timeline@{tl} archive@{ax}")
+    check("★★ 总览卡片保留（全部存档还能一次看完）",
+          sd.count("openArchive(a)") >= 2, f"只有 {sd.count('openArchive(a)')} 处入口")
+    check("★ 课下行有独立样式（.archive-line，比总览的卡片轻一档）",
+          'class="archive-line"' in sd and
+          ".archive-line" in (FE / "app.css").read_text(encoding="utf-8"), "没找到")
 
 
 # ================================================================ main

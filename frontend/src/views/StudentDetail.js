@@ -270,6 +270,24 @@ export default {
     const archiveIsImg = computed(
       () => IMG_KINDS.includes((archiveOpen.value && archiveOpen.value.kind) || ''));
 
+    /** 存档按课时分组 —— 「上课记录」里每节课下面要显示**这节课的**存档。
+     *
+     *  口径就一个：`lesson_id`。有课时的进那节课，没有的（手传的、或课被删了
+     *  变成 SET NULL 的）不进任何课，只留在「改作业」总览里。
+     *  ⚠️ 为什么不问后端要「按课过滤」的接口：一个学生一年也就几百条，
+     *     列表本来就一次全取（`list_for_student` 已带 lesson_id），
+     *     在前端分一次组比多一次请求更快，也不用再维护两套口径。
+     *  ⚠️ 不去拿 `archives` 之外的来源拼：这节课「有没有存档」必须与总览一致，
+     *     两处各算一遍迟早出现「课下有、总览没有」。 */
+    const archivesByLesson = computed(() => {
+      const m = {};
+      for (const a of archives.value) {
+        if (!a.lesson_id) continue;
+        (m[a.lesson_id] || (m[a.lesson_id] = [])).push(a);
+      }
+      return m;
+    });
+
     /* 判定分布：只在详情里出现（列表不查 items，那是几十行 × 一堆字段）。 */
     const verdictRows = [
       { key: 'correct', label: '对', cls: 'green' },
@@ -427,6 +445,7 @@ export default {
       plans, planDialog, openPlan, editPlan, onPlanSaved, removePlan,
       // 改作业：批改存档（学生资料 → 改作业）
       archives, archiveOpen, archiveBusy, archiveFile, archiveIsImg, verdictRows,
+      archivesByLesson,
       openArchive, closeArchive, removeArchive, pickArchiveFile, onArchiveFile,
       archiveRawUrl: archiveApi.rawUrl,
       filledSections, analysisPreview, analysisStats,
@@ -592,7 +611,12 @@ export default {
                 <span v-else class="tag">手传</span>
               </div>
               <div class="small muted" style="margin-top:3px">
-                <template v-if="a.lesson_topic">作业：{{ a.lesson_topic }} · </template>
+                <!-- 对应课显示**上课那天**，不是归档日期：老师今天可以补存上周的卷子，
+                     两个日期能差好几天；只给日期不给主题，是因为主题常常是空的。 -->
+                <template v-if="a.lesson_start_at">
+                  对应课：{{ a.lesson_start_at.replace('T', ' ').slice(0, 16) }} ·
+                </template>
+                <template v-else-if="a.lesson_topic">作业：{{ a.lesson_topic }} · </template>
                 <template v-if="a.grader">批改人：{{ a.grader }} · </template>
                 {{ fmtBytes(a.size_bytes) }}
                 <template v-if="!a.can_preview"> · 这类文件只能下载</template>
@@ -776,6 +800,28 @@ export default {
               <div v-if="item.homework.note" class="small" style="margin-top:4px">批改备注：{{ item.homework.note }}</div>
             </div>
             <div v-else class="small muted" style="margin-top:6px">这次作业还没记</div>
+
+            <!-- 作业存档：这节课的卷子批完归档下来的副本，**挂在这节课下面**。
+                 与上面「作业」并列、各自独立 —— 只记了交没交还没批、或者批完存档了
+                 但忘了记交没交，两种都常见，谁也不能当谁的前提。
+                 ⚠️ 只列 lesson_id 命中这节课的（computed archivesByLesson）；
+                    手传的存档不带课时，只出现在「改作业」总览里，这里不重复列。 -->
+            <div v-if="(archivesByLesson[item.lesson.id] || []).length" style="margin-top:8px">
+              <div class="small muted" style="margin-bottom:4px">
+                作业存档（{{ archivesByLesson[item.lesson.id].length }}）
+              </div>
+              <div v-for="a in archivesByLesson[item.lesson.id]" :key="a.id" class="archive-line">
+                <span class="tag green" style="flex:none">批改存档</span>
+                <a class="archive-name" @click="openArchive(a)"
+                   :title="a.can_preview ? '点开看这次作业的批改情况' : '这类文件不能在线看，点「下载」'">{{ a.name }}</a>
+                <span class="small muted">存档于 {{ a.archived_on }} · {{ fmtBytes(a.size_bytes) }}</span>
+                <span v-if="a.grader" class="small muted">· 批改人 {{ a.grader }}</span>
+                <span v-if="!a.can_preview" class="small muted">· 只能下载</span>
+                <div class="spacer"></div>
+                <button class="btn ghost sm" @click="openArchive(a)">查看</button>
+                <a class="btn ghost sm" :href="archiveRawUrl(a.id)" :download="a.name">下载</a>
+              </div>
+            </div>
 
             <!-- 课后补充：与作业方向相反（那边是收，这边是发），所以分两块 ---->
             <div v-for="b in (supsByLesson[item.lesson.id] || [])" :key="b.id" class="sup-row">
