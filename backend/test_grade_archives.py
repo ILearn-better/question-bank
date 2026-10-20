@@ -36,6 +36,7 @@ from __future__ import annotations
 import asyncio
 import io
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -76,6 +77,15 @@ FE = ROOT / "frontend"
 
 total = 0
 fails: list[str] = []
+
+
+def _css_code(src: str) -> str:
+    """去掉 CSS 注释 —— 反面断言（「样式不许再有 X」）必须看规则、不看注释。
+
+    ⚠️ 这个项目踩过：解释某个坑的那句注释会把「不许出现 X」的断言弄红
+       （test_homework_grades.code_only 同一个道理）。
+    """
+    return re.sub(r"(?s)/\*.*?\*/", "", src)
 
 
 def check(name: str, ok: bool, detail: str = "") -> None:
@@ -607,15 +617,18 @@ def t_frontend() -> None:
           "archive: (gid, body)" in api or "archive: (gid" in api, "没找到")
     check("★ inline 地址拼对了（预览用）", "inline=1" in api, "没找到")
 
-    check("★ 学生资料页有「改作业」卡片", "改作业" in sd, "没找到")
+    # ---- 存档的显示（2026-10-21 起：只挂在对应课下，不再有平铺总览）----
     check("★★ 点开用 iframe 看 PDF", "<iframe" in sd and "archiveOpen.kind === 'pdf'" in sd,
           "没找到 iframe 分支")
     check("★ 图片走 <img>", "archiveIsImg" in sd, "没找到")
     check("★★ 不能预览的类型给下载（不是白屏）",
           "不能在页面里看" in sd and "下载下来看" in sd, "没找到降级提示")
     check("★ 存档列表来自 archiveApi.list", "archiveApi.list" in sd, "没找到")
-    check("★ 手传存档的入口在（接口不能是死的）",
-          "pickArchiveFile" in sd and "archiveApi.upload" in sd, "没找到上传")
+    check("★★ 「改作业」总览卡片已去掉（用户 2026-10-21）",
+          'class="archive-row"' not in sd and "archiveApi.upload" not in sd,
+          "平铺列表或上传入口还在")
+    check("★★ 没有第三份平铺列表（v-for=\"a in archives\" 已经没了）",
+          'v-for="a in archives"' not in sd, "还有平铺列表")
     check("★ 删存档会问一句（不可恢复）", "window.confirm" in sd, "没找到确认")
 
     # 模板字面量里不许出现反引号（会把模板提前截断，只有真挂载才炸）
@@ -626,8 +639,12 @@ def t_frontend() -> None:
     check("★★ HomeworkGrade 模板里反引号正好 2 个", hg[i2:].count("`") == 2,
           str(hg[i2:].count("`")))
 
-    check("★ app.css 有存档行样式", ".archive-row" in (FE / "app.css").read_text(encoding="utf-8"),
-          "没找到 .archive-row")
+    css_code = _css_code((FE / "app.css").read_text(encoding="utf-8"))
+    check("★ app.css 有存档行样式（.archive-line）", ".archive-line" in css_code,
+          "没找到 .archive-line")
+    check("★★ 总览卡片那套样式已清掉（.archive-row / -main / -head 都没了）",
+          ".archive-row" not in css_code and ".archive-main" not in css_code
+          and ".archive-head" not in css_code, "样式还有残留")
 
     # ---- 「作业存档要放到对应课下」（用户 2026-10-21）----
     # 前端按 lesson_id 把 archives 分组，再在「上课记录」每节课里取这节课那组。
@@ -643,9 +660,13 @@ def t_frontend() -> None:
     ax = sd.find("archivesByLesson[item.lesson.id]")
     check("★★ 引用在「上课记录」时间轴内部（不是拼到别处去了）",
           tl != -1 and ax != -1 and ax > tl, f"timeline@{tl} archive@{ax}")
-    check("★★ 总览卡片保留（全部存档还能一次看完）",
-          sd.count("openArchive(a)") >= 2, f"只有 {sd.count('openArchive(a)')} 处入口")
-    check("★ 课下行有独立样式（.archive-line，比总览的卡片轻一档）",
+    check("★★ 没挂课的存档有兜底入口（删过课的卷子不会在页面上凭空消失）",
+          "orphanArchives" in sd and "未挂到具体课时的存档" in sd, "没找到孤儿行")
+    # 孤儿行与课下行是同一套 .archive-line，页面上一共只有这两处（2 次）——
+    # 多出来就说明又有人加了一份平铺列表。
+    check("★★ 存档只出现两处：课下行 + 孤儿行（没有第三份列表）",
+          sd.count('class="archive-line"') == 2, f"{sd.count('class=\"archive-line\"')} 处")
+    check("★ 课下行有独立样式（.archive-line，虚线分隔不撑散时间轴）",
           'class="archive-line"' in sd and
           ".archive-line" in (FE / "app.css").read_text(encoding="utf-8"), "没找到")
 

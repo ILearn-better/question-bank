@@ -59,8 +59,7 @@ export default {
     // 列表只拿摘要，**点开某条才取详情** —— 一条记录可能挂着 20MB 的 PDF。
     const archives = ref([]);
     const archiveOpen = ref(null);     // 正在预览的那条（详情对象）
-    const archiveBusy = ref('');       // 'open' / 'upload' / 'remove'，按钮置灰用
-    const archiveFile = ref(null);     // 隐藏的 <input type=file>（上传存档用）
+    const archiveBusy = ref('');       // 'open' / 'remove'，按钮置灰用
 
     async function loadSupplements() {
       const map = {};
@@ -144,30 +143,9 @@ export default {
       }
     }
 
-    /** 「＋ 上传存档」：线下批好的卷子、别处拿到的答案，直接存进这个学生的资料。
-     *  与批改页的「导出到作业存档」走**同一个接口层**（落盘、避重、校验只有一套）。 */
-    function pickArchiveFile() {
-      if (archiveFile.value) archiveFile.value.click();
-    }
-
-    async function onArchiveFile(ev) {
-      const f = ev.target.files && ev.target.files[0];
-      ev.target.value = '';            // 清空，否则选同一个文件第二次不触发 change
-      if (!f) return;
-      const fd = new FormData();
-      fd.append('file', f);
-      fd.append('student_id', String(id));
-      archiveBusy.value = 'upload';
-      try {
-        const r = await archiveApi.upload(fd);
-        ok('已存进学生资料：' + (r.rel_path || r.name));
-        await loadArchives();
-      } catch (e) {
-        fail(e.message);
-      } finally {
-        archiveBusy.value = '';
-      }
-    }
+    /** 「＋ 上传存档」那一套（hidden input + pickArchiveFile/onArchiveFile）
+     *  已随「改作业」总览卡片一起去掉（2026-10-21）。后端 upload 接口保留，
+     *  页面不再有入口 —— 线下卷子走批改台「上传文件」→ 批完导出的路。 */
 
     async function loadPlans() {
       try {
@@ -272,13 +250,14 @@ export default {
 
     /** 存档按课时分组 —— 「上课记录」里每节课下面要显示**这节课的**存档。
      *
-     *  口径就一个：`lesson_id`。有课时的进那节课，没有的（手传的、或课被删了
-     *  变成 SET NULL 的）不进任何课，只留在「改作业」总览里。
+     *  口径就一个：`lesson_id`。有课时的进那节课；没有的（课被删了 SET NULL 的、
+     *  或历史上手传不带课时的）进 orphanArchives，只在真出现时在「上课记录」顶部
+     *  提示一行 —— 不能因为分组了就让某份存档变成「存了但找不到」。
      *  ⚠️ 为什么不问后端要「按课过滤」的接口：一个学生一年也就几百条，
      *     列表本来就一次全取（`list_for_student` 已带 lesson_id），
      *     在前端分一次组比多一次请求更快，也不用再维护两套口径。
-     *  ⚠️ 不去拿 `archives` 之外的来源拼：这节课「有没有存档」必须与总览一致，
-     *     两处各算一遍迟早出现「课下有、总览没有」。 */
+     *  ⚠️ 分组与孤儿行都只从 `archives` 这一份数据来：两处各算一遍，
+     *     迟早出现「课下有、孤儿行也有」或者反过来。 */
     const archivesByLesson = computed(() => {
       const m = {};
       for (const a of archives.value) {
@@ -287,6 +266,9 @@ export default {
       }
       return m;
     });
+
+    /* 没挂到具体课时的存档（课记录被删 → lesson_id 变成 NULL）。正常为 0 条。 */
+    const orphanArchives = computed(() => archives.value.filter((a) => !a.lesson_id));
 
     /* 判定分布：只在详情里出现（列表不查 items，那是几十行 × 一堆字段）。 */
     const verdictRows = [
@@ -443,10 +425,10 @@ export default {
       openExam, onExamSaved, toggleExam, removeExam,
       examRawUrl, isImg, examHasScore, scoreRatePct,
       plans, planDialog, openPlan, editPlan, onPlanSaved, removePlan,
-      // 改作业：批改存档（学生资料 → 改作业）
-      archives, archiveOpen, archiveBusy, archiveFile, archiveIsImg, verdictRows,
-      archivesByLesson,
-      openArchive, closeArchive, removeArchive, pickArchiveFile, onArchiveFile,
+      // 改作业：批改存档（挂在上课记录每节课下面）
+      archives, archiveOpen, archiveBusy, archiveIsImg, verdictRows,
+      archivesByLesson, orphanArchives,
+      openArchive, closeArchive, removeArchive,
       archiveRawUrl: archiveApi.rawUrl,
       filledSections, analysisPreview, analysisStats,
     };
@@ -577,59 +559,11 @@ export default {
         </div>
       </div>
 
-      <!-- 改作业：批改完成后归档下来的副本（目标流程的最后一步）。
-           与上面「作业情况」是一回事的两面 —— 那边是分数与维度，这边是**卷子本身**。
-           ⚠️ 列表只给摘要；点开某条才取详情（一条记录可能挂着 20MB 的 PDF）。 -->
-      <div class="card">
-        <h2>
-          改作业
-          <span v-if="archives.length" class="small muted" style="font-weight:400">
-            （共 {{ archives.length }} 份批改存档）
-          </span>
-          <div class="spacer"></div>
-          <button class="btn sm primary" :disabled="archiveBusy === 'upload'"
-                  title="线下批好的卷子、别处拿到的答案，直接存进这个学生的资料"
-                  @click="pickArchiveFile">
-            {{ archiveBusy === 'upload' ? '上传中…' : '＋ 上传存档' }}
-          </button>
-        </h2>
-        <input ref="archiveFile" type="file" style="display:none" @change="onArchiveFile">
-        <div v-if="!archives.length" class="empty">
-          还没有批改存档
-          <div class="small" style="margin-top:6px">
-            在批改台批完之后点「导出到作业存档」，批好的卷子就会出现在这里
-          </div>
-        </div>
-        <div v-else>
-          <div v-for="a in archives" :key="a.id" class="archive-row">
-            <div class="archive-main" @click="openArchive(a)"
-                 :title="a.can_preview ? '点开看这次作业的批改情况' : '这类文件不能在线看，点「下载」'">
-              <div class="archive-head">
-                <span class="tag blue">{{ a.archived_on }}</span>
-                <b class="archive-name">{{ a.name }}</b>
-                <span v-if="a.source === 'grade'" class="tag green">批改导出</span>
-                <span v-else class="tag">手传</span>
-              </div>
-              <div class="small muted" style="margin-top:3px">
-                <!-- 对应课显示**上课那天**，不是归档日期：老师今天可以补存上周的卷子，
-                     两个日期能差好几天；只给日期不给主题，是因为主题常常是空的。 -->
-                <template v-if="a.lesson_start_at">
-                  对应课：{{ a.lesson_start_at.replace('T', ' ').slice(0, 16) }} ·
-                </template>
-                <template v-else-if="a.lesson_topic">作业：{{ a.lesson_topic }} · </template>
-                <template v-if="a.grader">批改人：{{ a.grader }} · </template>
-                {{ fmtBytes(a.size_bytes) }}
-                <template v-if="!a.can_preview"> · 这类文件只能下载</template>
-              </div>
-            </div>
-            <div class="spacer"></div>
-            <button class="btn ghost sm" @click="openArchive(a)">查看</button>
-            <a class="btn ghost sm" :href="archiveRawUrl(a.id)" :download="a.name">下载</a>
-            <button class="btn ghost sm" style="color:var(--danger)"
-                    @click="removeArchive(a)">删</button>
-          </div>
-        </div>
-      </div>
+      <!-- ⚠️ 这里原本有一张「改作业」总览卡片（全部存档平铺 + 「＋ 上传存档」）。
+           2026-10-21 用户点名去掉：存档已经挂到「上课记录」每节课下面，
+           再留一份平铺的总览只是同一批数据出现两次，改一处对不上另一处。
+           手传那条路没丢 —— 线下批好的卷子走批改台「上传文件」→ 批完导出，
+           照样落进对应那节课下（后端的 upload 接口也还在，只是没有页面入口了）。 -->
 
       <!-- 整体规划：**学生级**的一份文档（正文本体存库，可打字、也可由 Word/Markdown
            文件转成）。列表只给标题 + 摘要，**点开某条才渲染正文** ——
@@ -751,6 +685,30 @@ export default {
 
       <div class="card">
         <h2>上课记录 <span class="small muted" style="font-weight:400">（从新到旧，共 {{ timeline.length }} 条）</span></h2>
+
+        <!-- 没挂到具体课时的存档（删过课 → lesson_id 变 NULL；历史上手传的也不带课时）。
+             正常是 0 条、完全不出现；一旦有就必须显示出来，否则这份卷子在页面上就
+             「不存在」了（磁盘上还在）。⚠️ 这不是 2026-10-21 去掉的那张「改作业」
+             总览卡片：没有上传入口、不单独占一张卡，空的时候连标题都没有。 -->
+        <div v-if="orphanArchives.length" style="margin-bottom:10px">
+          <div class="small muted" style="margin-bottom:4px">
+            未挂到具体课时的存档（{{ orphanArchives.length }}）
+          </div>
+          <div v-for="a in orphanArchives" :key="a.id" class="archive-line">
+            <span class="tag green" style="flex:none">批改存档</span>
+            <a class="archive-name" @click="openArchive(a)"
+               :title="a.can_preview ? '点开看这次作业的批改情况' : '这类文件不能在线看，点「下载」'">{{ a.name }}</a>
+            <span class="small muted">存档于 {{ a.archived_on }} · {{ fmtBytes(a.size_bytes) }}</span>
+            <span v-if="a.grader" class="small muted">· 批改人 {{ a.grader }}</span>
+            <span v-if="!a.can_preview" class="small muted">· 只能下载</span>
+            <div class="spacer"></div>
+            <button class="btn ghost sm" @click="openArchive(a)">查看</button>
+            <a class="btn ghost sm" :href="archiveRawUrl(a.id)" :download="a.name">下载</a>
+            <button class="btn ghost sm" style="color:var(--danger)"
+                    @click="removeArchive(a)">删</button>
+          </div>
+        </div>
+
         <div v-if="!timeline.length" class="empty">
           还没有课时记录
           <div class="small" style="margin-top:6px">去「课表」给他排一节课</div>
@@ -805,7 +763,7 @@ export default {
                  与上面「作业」并列、各自独立 —— 只记了交没交还没批、或者批完存档了
                  但忘了记交没交，两种都常见，谁也不能当谁的前提。
                  ⚠️ 只列 lesson_id 命中这节课的（computed archivesByLesson）；
-                    手传的存档不带课时，只出现在「改作业」总览里，这里不重复列。 -->
+                    没挂课的（删过课、或历史上手传的）在「上课记录」顶部单独提示一行。 -->
             <div v-if="(archivesByLesson[item.lesson.id] || []).length" style="margin-top:8px">
               <div class="small muted" style="margin-bottom:4px">
                 作业存档（{{ archivesByLesson[item.lesson.id].length }}）
