@@ -59,7 +59,18 @@
      ⚠️ 这里是**拷贝**：零构建项目里 entry.html 与后端导出各有一份渲染管线拷贝，
         同一个道理。改样式时两处一起改（本段与 app.css 的 .gmark-* 区块）。 */
    根节点不吃鼠标 —— 没标注的地方要能穿透到图片上。 */
-.gmark-layer { position: absolute; inset: 0; pointer-events: none; }
+/* ★★ z-index 必须有，而且必须比辅助层高。
+ *
+ *   这条是用户 2026-10-20 报「画笔没有在文件上画、我看不到笔画」的真因：
+ *   层本身没问题（DOM 在、stroke 在、points 也在 —— 实测过），但它 z-index: auto，
+ *   而同一页里 `.blk-band` 是 2、`.divider` 5、`.rect-rect` 6、`.crop-rect` 7 ——
+ *   **所有辅助层都盖在笔迹上面**。块带是半透明色块（而且是奇偶蓝橙交替），
+ *   红笔迹被大片色块染掉之后，看起来就跟没画一样。
+ *
+ *   20 是刻意挑的：高于页内所有权分割/块带元素，低于顶栏（sticky，10 但在另一个
+ *   容器里，不冲突）。这些辅助层全是 `pointer-events: none`，所以「谁在上」
+ *   只影响看得见看不见，不影响谁接事件 —— 抬高不会有副作用。 */
+.gmark-layer { position: absolute; inset: 0; pointer-events: none; z-index: 20; }
 .gmark-svg { display: block; width: 100%; height: 100%; }
 .gmark { pointer-events: auto; cursor: pointer; }
 .gmark-hit { fill: transparent; }
@@ -279,6 +290,11 @@
 .gmark-layer.mode-ink .gmark-label, .gmark-layer.mode-erase .gmark-label,
 .gmark-layer.mode-text .gmark-label, .gmark-layer.mode-check .gmark-label,
 .gmark-layer.mode-cross .gmark-label { pointer-events: none; }
+/* ★ 但**文字模式下，已有的文本框要能拖**（用户 2026-10-20：「我还需要文本框可以移动」）。
+ *   只放开 label，SVG 那堆图形仍是 pointer-events:none —— 否则在文字模式下
+ *   想把框挪一下，点下去反而又插了一个新框。
+ *   位置必须在这组「手写模式让标注失指针」的规则**之后**：同权重，后写的胜。 */
+.gmark-layer.mode-text .gmark-label { pointer-events: auto; cursor: grab; }
 
 /* ---------------- 一题一区域（框题）----------------
    与标注同一条 svg、同一套 0~1000 坐标，但语义不同：
@@ -651,6 +667,14 @@
                       :style="{ background: c }" :title="'笔的颜色：' + c"
                       @click="inkColor = c"></span>
               </span>
+              <span class="tool-sep"></span>
+              <!-- ★ 撤销（Ctrl+Z）。按钮是给「想不起来快捷键」的时候用的；
+                   真正的入口是键盘 —— 画错一笔的手是停在纸上的，不该先去点按钮。 -->
+              <el-button size="small" plain :disabled="!undoStack.length || undoBusy"
+                         :loading="undoBusy" @click="undoLast"
+                         :title="undoStack.length ? '撤销上一步（Ctrl+Z）' : '没有可撤销的操作'">
+                ↶ 撤销<template v-if="undoStack.length">（{{ undoStack.length }}）</template>
+              </el-button>
             </div>
           </template>
 
@@ -1100,6 +1124,12 @@ const app = createApp({
        *  「画到一半退出就没了」是老师点名的问题，两条路线必须是同一个答案。 */
       localMarks: [],
       _draft: null,
+      /** ★ Ctrl+Z 的撤销栈（2026-10-20 用户点名要）。栈里只放**改批注**的操作：
+       *  `{type:'add', id, lid}` 或 `{type:'erase', marks:[...]}`。
+       *  ⚠️ 擦除那条必须把**原数据整条存下来**：撤销时它已经不在库里了，
+       *     想「再查一次」是查不到的。 */
+      undoStack: [],
+      undoBusy: false,
       exporting: false,
       INK_TOOLS, INK_COLORS,
       VERDICTS,
@@ -1223,8 +1253,16 @@ const app = createApp({
    *  进了 data 每次 resolve 都会白触发一轮 patch）。bootLayer 要等它 ——
    *  否则标注层模块比首页数据先到时，`setupDraft()` 拿到的 gid 还是空的，
    *  本机草稿队列就再也不会初始化，表现是「画了一堆、关掉页面全没了」。 */
-  mounted() { this._bootPromise = this.boot(); },
-  beforeUnmount() { this.stopPoll(); this.teardownLazy(); this.teardownDraft(); },
+  mounted() {
+    this._bootPromise = this.boot();
+    /* Ctrl+Z 挂在 window 上而不是某个容器上：老师画完一笔时，
+     * 焦点可能在任意地方（工具按钮、页面空白），绑容器上会有「有时灵有时不灵」。 */
+    window.addEventListener('keydown', this.onKeyDown);
+  },
+  beforeUnmount() {
+    window.removeEventListener('keydown', this.onKeyDown);
+    this.stopPoll(); this.teardownLazy(); this.teardownDraft();
+  },
   methods: {
     /* ============================ 基础 ============================ */
     async api(url, opt) {
@@ -1290,17 +1328,74 @@ const app = createApp({
      *
      *   反过来（先 POST 再落本机）就是老师踩过的那个坑：画完立刻关页面，
      *   那一个请求被浏览器取消 —— 界面上「画过」、库里没有，回来一看全没了。 */
+    /* ==================== 撤销（Ctrl+Z）==================== */
+    /** 压栈。**只保留最近 50 步** —— 再往上撤没什么意义，
+     *  而无上限的栈会把几十条笔迹的原数据一直攒在内存里。 */
+    pushUndo(entry) {
+      if (!entry) return;
+      this.undoStack.push(entry);
+      if (this.undoStack.length > 50) this.undoStack.shift();
+    },
+    /** 键盘入口。⚠️ 输入框里的 Ctrl+Z 必须留给浏览器 ——
+     *  老师在文字框里打错字，按 Ctrl+Z 却把卷面上那一笔撤了，会莫名其妙。 */
+    onKeyDown(e) {
+      const t = e.target || {};
+      const tag = String(t.tagName || '').toUpperCase();
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || t.isContentEditable) return;
+      if (!(e.ctrlKey || e.metaKey)) return;
+      if (String(e.key || '').toLowerCase() !== 'z') return;
+      if (e.shiftKey) return;              // Ctrl+Shift+Z（重做）还没做，别假装支持
+      if (!this.gid || !this.undoStack.length) return;
+      e.preventDefault();
+      this.undoLast();
+    },
+    async undoLast() {
+      if (this.undoBusy) return;
+      const e = this.undoStack.pop();
+      if (!e) return;
+      this.undoBusy = true;
+      try {
+        if (e.type === 'add') {
+          /* 还没传上去的那一笔：撤掉本机队列里的就行，服务端什么都不知道。
+           * ⚠️ 两条都要走 —— POST 可能成功失败之间，id 与 lid 有一个为空。 */
+          if (e.lid) this.dropLocal([e.lid]);
+          if (e.id) await this.api('/api/grade-marks/' + e.id, { method: 'DELETE' });
+          await this.settle();
+          ElementPlus.ElMessage.info('已撤销刚才那一笔');
+        } else if (e.type === 'erase') {
+          /* 把被擦掉的**原样**补回去。走 batch 接口：一次请求，
+           * 顺序也保住（同一位置后画的盖在上面，擦除前的相对次序不能乱）。 */
+          await this.api('/api/homework-grades/' + this.gid + '/marks/batch', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ marks: e.marks }),
+          });
+          await this.settle();
+          ElementPlus.ElMessage.info('已恢复被擦掉的 ' + e.marks.length + ' 处');
+        }
+      } catch (err) {
+        /* ⚠️ 撤不成就**退栈**：留着这一条老师还能再试一次；
+         *    悄悄吞掉的话，界面上「撤销（N）」的数字会一直骗人。 */
+        this.undoStack.push(e);
+        ElementPlus.ElMessage.error('撤销失败：' + err.message);
+      } finally {
+        this.undoBusy = false;
+      }
+    },
     async addMark(pno, payload) {
       const body = Object.assign({ page_no: num(pno, 1) }, payload);
       const lid = this.pushLocal(body);
       try {
-        await this.api('/api/homework-grades/' + this.gid + '/marks', {
+        const r = await this.api('/api/homework-grades/' + this.gid + '/marks', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(body),
         });
         await this.settle();          // 取回服务端数据之后才出队，中间不留空白
         this.dropLocal([lid]);
+        this.pushUndo({ type: 'add', id: (r && r.id) || null, lid });
       } catch (e) {
+        /* 没传上去不代表「没画」—— 它还在本机队列里、界面上也看得见，
+         * 所以**照样要能撤**（撤 = 从本机队列删掉）。 */
+        this.pushUndo({ type: 'add', id: null, lid });
         ElementPlus.ElMessage.error({
           message: e.message + ' —— 这一笔已经存在本机，下次打开会自动补发',
           duration: 6000,
@@ -1314,6 +1409,17 @@ const app = createApp({
       if (!list.length) return;
       const locals = list.filter((x) => DRAFT && DRAFT.isLocalMarkId(x)).map((x) => String(x).slice(6));
       const remotes = list.filter((x) => !DRAFT || !DRAFT.isLocalMarkId(x));
+      /* ★ 擦除前先快照原数据 —— 撤销要靠它把整条 POST 回去。
+       *   ⚠️ 不能在撤销时现查：那时已经被删了，查回来只剩空气。
+       *   ⚠️ 只挑要删的那几条，别把整页的 marks 都存进栈里。 */
+      const snapshot = ((this.g && this.g.marks) || [])
+        .filter((m) => remotes.indexOf(String(m.id)) >= 0)
+        .map((m) => ({
+          page_no: m.page_no, kind: m.kind,
+          geo: m.geo || [], points: m.points || [],
+          text: m.text || '', color: m.color || '',
+          item_id: m.item_id || null,
+        }));
       if (locals.length) this.dropLocal(locals);
       if (!remotes.length) return;
       try {
@@ -1321,6 +1427,7 @@ const app = createApp({
           await this.api('/api/grade-marks/' + mid, { method: 'DELETE' });
         }
         await this.settle();
+        if (snapshot.length) this.pushUndo({ type: 'erase', marks: snapshot });
       } catch (e) { ElementPlus.ElMessage.error(e.message); }
     },
     /** 拖动标注改位置（文字框 / √×）。后端只认 geo 四个数，这里什么都不用算 ——
@@ -1663,6 +1770,9 @@ const app = createApp({
       this.selItem = null;
       this.thumbBroken = {};      // 上一份记的「图挂了」不能带过来
       this.teardownDraft();       // 上一份的本机笔迹队列（它们属于上一份 gid）
+      /* 撤销栈也不属于新的这一份 —— 留着的话 Ctrl+Z 会去删上一份的标注。 */
+      this.undoStack = [];
+      this.undoBusy = false;
       this.canceling = false;
       this.cancelAsked = false;   // 换一份作业时必须清，否则新作业的终止按钮点不动
       // ⚠️ 「点过开批」的旗必须跟着记录走。不重置的话，切到另一份 queued 的记录时

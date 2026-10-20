@@ -259,7 +259,14 @@ export default {
     const isPicked = (s) => same(s.itemId, props.selectedItemId);
     const isLinked = (s) => s.itemId !== null && s.itemId !== undefined;
     const isGone = (s) => erasing.value.includes(String(s.mark.id));
-    const canMove = (s) => props.mode === 'view'
+    /* 哪些模式下已有的标注可以按住拖走。
+     * `view` 是原来的口径；**text 也放开**（2026-10-20 用户：「我还需要文本框可以
+     * 移动」）—— 文字模式下点空白处是新建，点在**已有文本框**上就是挪它，
+     * 这是最朴素的直觉；不放开的话老师得先切回「只看」再拖回来，两次多余的点击。
+     * ⚠️ 画笔/橡皮必须保持纯画/纯擦：那两个模式下按住标注是「落笔」，不是「抓东西」，
+     *    混在一起会变成「想写一笔，结果把上一笔拖跑了」。 */
+    const MOVE_MODES = ['view', 'text'];
+    const canMove = (s) => MOVE_MODES.indexOf(props.mode) >= 0
       && MOVE_KINDS.includes(s.kind)
       && s.mark.id !== null && s.mark.id !== undefined;
     const isDragging = (s) => !!dragState.value && dragState.value.id === String(s.mark.id);

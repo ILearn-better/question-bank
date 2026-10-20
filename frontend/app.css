@@ -720,6 +720,10 @@ table.tbl td.pending { color: var(--warning); font-weight: 600; }
                    line-height: 1.6; color: var(--text-3); text-align: center; padding: 20px; }
 /* 标注层：绝对铺满图片，SVG 用 0~1000 的归一化坐标（preserveAspectRatio="none"）。
    根节点不吃鼠标 —— 没标注的地方要能穿透到图片上。 */
+/* ⚠️ workbench.html 里那份拷贝多一个 `z-index: 20`，**这不是漂移**：
+ *   工作台的卷面上还有块带（z-index 2）、分割线（5）、框选（6）、草框（7）压着，
+ *   不抬高层的话红笔迹会被半透明色块染掉 —— 用户就是这么报的「看不到笔画」。
+ *   本页（A 路线）没有那些辅助层，不需要。 */
 .gmark-layer { position: absolute; inset: 0; pointer-events: none; }
 .gmark-svg { display: block; width: 100%; height: 100%; }
 .gmark { pointer-events: auto; cursor: pointer; }

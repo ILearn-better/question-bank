@@ -1239,6 +1239,95 @@ async function main() {
     /<grade-mark-layer[\s\S]{0,200}mode="layerMode"/.test(html)
       || /:mode="layerMode"/.test(html), true);
 
+  /* ============ 19b. ★★★ 笔迹真的落在卷面上（用户原话）============
+   *  用户 2026-10-20：「批改台上画笔没有在文件上画，我没看到笔画」。
+   *
+   *  这一节以前只验了「按下不会画框」—— 那是「不画错的」，不是「画得出来」。
+   *  所以测试全绿、用户却什么都没看到。现在真的派发一次指针事件，
+   *  并且**把 DOM 里那条笔迹原样查一遍**（有 stroke 才算看得见）。
+   *
+   *  当时查出的真因：层的 z-index 是 auto，而 .blk-band 是 2、.divider 5、
+   *  .rect-rect 6、.crop-rect 7 —— 半透明色块全压在笔迹上面，红笔迹被染掉，
+   *  看起来就跟没画一样。逻辑（DOM / stroke / points）其实一直是好的。 */
+  const svgEl = D.querySelectorAll('.gmark-svg')[0];
+  checkTrue('（准备）卷面上有标注层的 svg', !!svgEl, String(!!svgEl));
+  if (svgEl) {
+    svgEl.getBoundingClientRect = () => ({ left: 0, top: 0, width: 800, height: 1131 });
+    vm.tool = 'ink';
+    await sleep(80);
+    check('★ 选了笔 → 层进 ink 模式', vm.layerMode, 'ink');
+    checkTrue('★ 层的 class 真带上了 mode-ink（CSS 靠它开 pointer-events）',
+      /mode-ink/.test(svgEl.parentElement.className), svgEl.parentElement.className);
+    checkTrue('★★ svg 的 viewBox / preserveAspectRatio 没丢（丢了坐标就全跑出纸外）',
+      svgEl.getAttribute('viewBox') === '0 0 1000 1000'
+        && svgEl.getAttribute('preserveAspectRatio') === 'none',
+      svgEl.getAttribute('viewBox') + ' / ' + svgEl.getAttribute('preserveAspectRatio'));
+
+    const nG = D.querySelectorAll('.gmark').length;
+    const pev = (type, x, y) => {
+      const e = new W.Event(type, { bubbles: true });
+      Object.defineProperty(e, 'clientX', { value: x });
+      Object.defineProperty(e, 'clientY', { value: y });
+      Object.defineProperty(e, 'pointerId', { value: 1 });
+      Object.defineProperty(e, 'pointerType', { value: 'mouse' });
+      return e;
+    };
+    svgEl.dispatchEvent(pev('pointerdown', 100, 200));
+    for (let i = 1; i <= 5; i += 1) {
+      svgEl.dispatchEvent(pev('pointermove', 100 + i * 15, 200 + i * 12));
+    }
+    svgEl.dispatchEvent(pev('pointerup', 175, 260));
+    await sleep(220);
+
+    check('★★★ 拖一笔 → DOM 里真的多了一条标注', D.querySelectorAll('.gmark').length, nG + 1);
+    const inkPoly = [...D.querySelectorAll('polyline')]
+      .filter((p) => /ink/.test(p.getAttribute('class') || '')).pop();
+    checkTrue('★★★ 那条笔迹是 <polyline class="shape ink">', !!inkPoly,
+      inkPoly ? inkPoly.getAttribute('class') : '没找到');
+    checkTrue('★★★ 并且**有 stroke 颜色**（SVG 默认 stroke:none，缺色就等于隐形）',
+      !!inkPoly && !!inkPoly.getAttribute('stroke'),
+      inkPoly ? inkPoly.getAttribute('stroke') : '');
+    checkTrue('★★★ 点的坐标是 0~1000 归一化（不是屏幕像素）',
+      !!inkPoly && (() => {
+        const nums = String(inkPoly.getAttribute('points') || '')
+          .split(/[\s,]+/).filter(Boolean).map(Number);
+        return nums.length >= 4 && nums.every((v) => v >= 0 && v <= 1000);
+      })(), inkPoly ? inkPoly.getAttribute('points') : '');
+    vm.tool = 'view';
+    await sleep(40);
+  }
+
+  /* ---- ★★★ 层叠顺序：笔迹必须盖在所有辅助层之上 ----
+   *  这条守的就是上面那个真因。半透明块带（10~16%）压在 2.2px 的红线上，
+   *  在缩略图大小的预览里就等于「什么都没画」。 */
+  const zOf = (sel) => {
+    const re = new RegExp('\\' + sel + '\\s*\\{[^}]*z-index:\\s*(\\d+)');
+    const m = re.exec(html);
+    return m ? Number(m[1]) : 0;
+  };
+  const layerZ = zOf('.gmark-layer');
+  checkTrue('★★★ 标注层显式设了 z-index（不设 = auto，被块带/分割线/框全盖住）',
+    layerZ > 0, String(layerZ));
+  checkTrue('★★★ 比块带高（' + layerZ + ' > ' + zOf('.blk-band') + '）',
+    layerZ > zOf('.blk-band'), '');
+  checkTrue('★★★ 比分割线 / 框选 / 草框都高（2 / 5 / 6 / 7）',
+    layerZ > Math.max(zOf('.divider'), zOf('.rect-rect'), zOf('.crop-rect')),
+    String(layerZ));
+
+  /* ============ 19c. 文本框要能移动 ============ */
+  /* 用户 2026-10-20：「我还需要文本框可以移动」。
+     组件原来只在 view 模式下允许拖，而文字模式下 .gmark-label 还是
+     pointer-events:none —— 于是「加了文本框想挪一下」只能先切「只看」，
+     或者在文字模式下再点一下（结果又插了一个新框，越点越多）。 */
+  checkTrue('★★ 文字模式下已有的文本框能拖（CSS 放开了 label 的指针）',
+    /\.gmark-layer\.mode-text \.gmark-label\s*\{[^}]*pointer-events:\s*auto/.test(html), true);
+  const uGML = fs.readFileSync('src/components/GradeMarkLayer.js', 'utf8');
+  checkTrue('★★ 组件的可拖模式里包含 text',
+    /MOVE_MODES\s*=\s*\[\s*'view'\s*,\s*'text'\s*\]/.test(uGML),
+    (uGML.match(/MOVE_MODES\s*=\s*\[[^\]]*\]/) || [''])[0]);
+  checkTrue('★★ 画笔/橡皮**不**在可拖模式里（那两个模式下按住是落笔，不是抓东西）',
+    !/MOVE_MODES\s*=\s*\[[^\]]*'ink'/.test(uGML) && !/MOVE_MODES\s*=\s*\[[^\]]*'erase'/.test(uGML), true);
+
   /* ============ 20. 一键清理分割 ============ */
   /* 14 页的卷子画歪一条线，以前只能去点那一页线上的 × —— 重来的成本高到
      老师宁愿将就着批。「清空分割」就是给这个场景一个出口。 */
@@ -1378,6 +1467,97 @@ async function main() {
     !!NEW_GRADE_BODY && NEW_GRADE_BODY.answer_mode === 'ai',
     NEW_GRADE_BODY && NEW_GRADE_BODY.answer_mode);
   vm.newOpen = false;
+
+  /* ============ 22. ★★★ 撤销（Ctrl+Z）============
+   *  用户 2026-10-20：「可以撤销画笔笔记和文本框，要求能用快捷键撤销（ctrl+z）」。
+   *
+   *  口径：
+   *   · 只记「改批注」的两类操作（新增 / 擦除）。拖动不单独记。
+   *   · add  → 反向就是 DELETE 那一条；
+   *   · erase→ 反向是把**擦之前存下来的原数据**整条 POST 回去（/marks/batch）。
+   *   · 输入框里的 Ctrl+Z 必须留给浏览器（老师文字写错要能撤自己打的字）。
+   */
+  const nPostMark = () => CALLS.filter(
+    (c) => c.url === '/api/homework-grades/7/marks' && c.method === 'POST').length;  const nDelMark = () => CALLS.filter(
+    (c) => /^\/api\/grade-marks\/\d+$/.test(c.url) && c.method === 'DELETE').length;
+  const nBatch2 = () => CALLS.filter(
+    (c) => c.url === '/api/homework-grades/7/marks/batch' && c.method === 'POST').length;
+
+  /* ---- ① 新增一笔 → 撤销把它删掉 ---- */
+  /* ⚠️ 第 21 节「页内新建」把 gid 换成了刚建的那一份，这里必须拉回 7 ——
+   *    否则 addMark 发到 /homework-grades/<新id>/marks，桩不认识那条路由，
+   *    回一个 {ok:1}（没有 id），撤销就退化成「只能撤本机队列里那些」。 */
+  vm.gid = 7;
+  vm.undoStack = [];
+  await vm.addMark(1, { kind: 'ink', geo: [10, 20, 60, 70], points: [10, 20, 60, 70], color: '#dc2626' });
+  await sleep(150);
+  check('★★ 画一笔 → 撤销栈 +1', vm.undoStack.length, 1);
+  checkTrue('★★ 栈里记下了服务端 id（撤销靠它定位）',
+    !!vm.undoStack[0] && vm.undoStack[0].id !== null && vm.undoStack[0].id !== undefined,
+    JSON.stringify(vm.undoStack[0]));
+  const uD0 = nDelMark();
+  await vm.undoLast();
+  await sleep(180);
+  check('★★★ Ctrl+Z 撤「新增」→ 真的发了 DELETE', nDelMark(), uD0 + 1);
+  check('★★★ 撤完栈空了（按钮跟着变灰）', vm.undoStack.length, 0);
+
+  /* ---- ② 擦掉一笔 → 撤销把它**原样**补回去 ---- */
+  vm.g.marks = [{
+    id: 501, page_no: 1, kind: 'ink', geo: [11, 22, 33, 44],
+    points: [11, 22, 33, 44], text: '', color: '#2563eb',
+    item_id: null, created_by: 'teacher',
+  }];
+  await sleep(30);
+  await vm.eraseMarks([501]);
+  await sleep(150);
+  check('★★ 擦掉一笔 → 撤销栈 +1', vm.undoStack.length, 1);
+  checkTrue('★★★ 栈里存的是**原数据**（撤销时它已经不在库里了，现查是查不到的）',
+    !!vm.undoStack[0] && vm.undoStack[0].type === 'erase'
+      && (vm.undoStack[0].marks || []).length === 1
+      && vm.undoStack[0].marks[0].kind === 'ink'
+      && vm.undoStack[0].marks[0].color === '#2563eb',
+    JSON.stringify(vm.undoStack[0]));
+  const uB0 = nBatch2();
+  await vm.undoLast();
+  await sleep(180);
+  check('★★★ Ctrl+Z 撤「擦除」→ 走 /marks/batch 把整条补回去', nBatch2(), uB0 + 1);
+  const uLast = CALLS.filter(
+    (c) => c.url === '/api/homework-grades/7/marks/batch' && c.method === 'POST').pop();
+  checkTrue('★★ 补回去的就是原来那条（points / color 都对得上）',
+    !!uLast && !!uLast.body && !!uLast.body.marks
+      && uLast.body.marks[0].color === '#2563eb'
+      && JSON.stringify(uLast.body.marks[0].points) === JSON.stringify([11, 22, 33, 44]),
+    JSON.stringify(uLast && uLast.body));
+
+  /* ---- ③ 输入框里按 Ctrl+Z：必须交给浏览器 ---- */
+  const uTa = D.createElement('textarea');
+  D.body.appendChild(uTa);
+  vm.undoStack = [{ type: 'add', id: 999001, lid: '' }];
+  const uD1 = nDelMark();
+  uTa.dispatchEvent(new W.KeyboardEvent('keydown', { key: 'z', ctrlKey: true, bubbles: true }));
+  await sleep(150);
+  check('★★ 在 textarea 里按 Ctrl+Z → 不去删卷面标注（那是撤自己打的字）',
+    nDelMark(), uD1);
+  check('★ 栈也没被吃掉', vm.undoStack.length, 1);
+  uTa.remove();
+
+  /* ---- ④ 页面上按 Ctrl+Z：真的撤 ---- */
+  const uD2 = nDelMark();
+  D.body.dispatchEvent(new W.KeyboardEvent('keydown', { key: 'z', ctrlKey: true, bubbles: true }));
+  await sleep(200);
+  check('★★★ 页面上按 Ctrl+Z → 真的撤销了', nDelMark(), uD2 + 1);
+
+  /* ---- ⑤ 空栈时不发请求 ---- */
+  const uD3 = nDelMark();
+  D.body.dispatchEvent(new W.KeyboardEvent('keydown', { key: 'z', ctrlKey: true, bubbles: true }));
+  await sleep(120);
+  check('★★ 没东西可撤时按 Ctrl+Z → 一个请求都不发（也不能报错）', nDelMark(), uD3);
+
+  /* ---- ⑥ 撤销失败要退栈，不能骗人 ---- */
+  checkTrue('★★★ 撤销失败会把这一条放回栈（否则「撤销（1）」的数字一直骗人）',
+    /catch \(err\) \{[\s\S]{0,400}?this\.undoStack\.push\(e\)/.test(html), true);
+  checkTrue('★ 换一份作业时撤销栈清空（否则 Ctrl+Z 会去删上一份的标注）',
+    /this\.undoStack = \[\];\s*\n\s*this\.undoBusy = false;/.test(html), true);
 
   console.log('\n共 ' + total + ' 项，失败 ' + fails.length + ' 项');
   if (fails.length) {
