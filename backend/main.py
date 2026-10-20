@@ -34,6 +34,7 @@ from app.routers import (                                   # noqa: E402
     documents,
     exams,
     feedbacks,
+    grade_archives,
     homeworks,
     homework_grades,
     lesson_files,
@@ -177,6 +178,10 @@ app.include_router(feedbacks.router)
 app.include_router(lesson_files.router)
 app.include_router(homeworks.router)
 app.include_router(homework_grades.router)
+# 批改文件留存：/api/grade-archives/...（生成 / 上传 / 列表 / 详情 / 原件 / 删除）。
+# 放在 homework_grades 之后：它的 `/api/students/{sid}/grade-archives` 与学生的
+# 其它子资源并列，而 `/api/grade-archives/{aid}` 是独立前缀，两边不撞。
+app.include_router(grade_archives.router)
 app.include_router(supplements.router)
 app.include_router(preps.router)
 app.include_router(curriculum.router)

@@ -655,6 +655,18 @@ table.tbl td.pending { color: var(--warning); font-weight: 600; }
 .plan-preview { font-size: 13px; color: var(--text-2); overflow: hidden;
                 text-overflow: ellipsis; white-space: nowrap; margin-top: 3px; }
 
+/* ---------------- 改作业（批改存档） ---------------- */
+/* 一行一条存档：整块可点 = 点开预览。视觉与 .plan-row 同一套（都是「列表里可点开的条目」），
+   但类名分开 —— 将来一边要改（比如存档行加缩略图）不必牵动另一边。 */
+.archive-row { display: flex; gap: 8px; align-items: center;
+               border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 10px 12px; }
+.archive-row + .archive-row { margin-top: 8px; }
+.archive-main { flex: 1; min-width: 0; cursor: pointer; }
+.archive-main:hover .archive-name { color: var(--primary); }
+.archive-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+/* 文件名可能很长（「批改_李芹旭_20261020_3.pdf」），允许断行但别撑破那一行 */
+.archive-name { font-size: 14px; word-break: break-all; }
+
 /* 「看」那一面渲染出来的正文。容器由 JS 写 innerHTML（KaTeX 要求），
    所以排版规则全落在这里 —— 与 .q-rich 同一套行距，但**不设高度上限**：
    这里是专门点开来看的，限高就等于把内容藏起来。 */

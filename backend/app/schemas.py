@@ -846,3 +846,17 @@ class GradeConfirmIn(BaseModel):
     """老师确认整份批改。确认之后，统计口径（掌握度 / 家长稿）才会读它。"""
 
     note: str = ""
+
+
+# ============================================================ 批改文件留存
+class ArchiveGenerateIn(BaseModel):
+    """把一份批改**导出成带笔迹的 PDF** 并归档到学生资料。
+
+    `archived_on` 不填时取**批改那天**（不是今天）—— 目录是给人翻的，
+    按作业日期分才找得到「10 月 20 号那节课的卷子」（见 services/archive_store.py）。
+    """
+
+    grade_id: int
+    archived_on: Optional[str] = None
+    grader: str = ""
+    note: str = ""

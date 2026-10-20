@@ -1410,3 +1410,60 @@ class HomeworkGradeRegion(Base):
     created_at: Mapped[str] = mapped_column(Text, default=_now, server_default=NOW)
 
     __table_args__ = (Index("idx_hwregions_grade", "grade_id", "seq", "seg"),)
+
+
+class GradeArchive(Base):
+    """批改文件的**存档**：一份批改完成后落进「学生资料」里的可回看副本。
+
+    目标流程（用户 2026-10-20）：
+        上交作业 → 批改作业 → 记录归档到学生资料的「改作业」→ 点开看批改情况
+
+    三条「为什么单独一张表」：
+
+    ① **列表是「按学生、按日期」的，不是「按磁盘」。** 光扫目录拿不到
+       「这是哪份批改、批改人是谁、关联哪节课、AI 判了几题」——
+       那些都在库里，而目录只有一个文件名。
+    ② **预览要能区分「可内嵌」与「只能下载」。** 这个判断按 `kind` 走，
+       不能让浏览器猜后缀：`.docx` 拖进 iframe 是白屏，比给个下载按钮糟得多。
+    ③ **删记录要连文件一起删。** 得有一条记录知道文件在哪 ——
+       而读文件**只认这条记录里的 `rel_path`**，绝不接受客户端传路径
+       （`storage.safe_join` 是唯一入口，越界一律 None）。
+
+    ⚠️ `grade_id` 可空 + SET NULL：老师也可能把一份「线下批好的卷子」直接传进存档，
+       那种没有批改任务；而批改任务被清理时，存档是**另一份工作成果**，不该跟着消失。
+    ⚠️ `lesson_id` 是冗余的（能从 grade 走两步拿到）：批改没了还要能按课时找，
+       而且「改作业」列表上要显示「哪节课的作业」，每次 join 两层没必要。
+    """
+
+    __tablename__ = "grade_archives"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    owner_id: Mapped[int] = mapped_column(Integer, nullable=False, default=OWNER_ID, server_default=str(OWNER_ID))
+    student_id: Mapped[int] = mapped_column(
+        ForeignKey("students.id", ondelete="CASCADE"), nullable=False
+    )
+    grade_id: Mapped[int | None] = mapped_column(
+        ForeignKey("homework_grades.id", ondelete="SET NULL")
+    )
+    lesson_id: Mapped[int | None] = mapped_column(ForeignKey("lessons.id", ondelete="SET NULL"))
+
+    # 存档日期（= 目录名）。与批改的 created_at 可能不同：老师可以今天把上周的卷子存进来。
+    archived_on: Mapped[str] = mapped_column(String, nullable=False, default="", server_default="")
+    name: Mapped[str] = mapped_column(String, nullable=False)                 # 老师看到的原名
+    stored_name: Mapped[str] = mapped_column(String, default="", server_default="")  # 避重后的真名
+    # 相对 UPLOAD_DIR 的正斜杠路径 —— 换机器、搬数据目录都不失效（同 storage.rel）
+    rel_path: Mapped[str] = mapped_column(Text, default="", server_default="")
+    kind: Mapped[str] = mapped_column(String, default="", server_default="")  # pdf/png/docx…
+    size_bytes: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    # grade = 从批改导出（带笔迹的副本）；upload = 老师手传（线下批好的卷子、答案…）
+    source: Mapped[str] = mapped_column(String, default="grade", server_default="grade")
+    # 批改人。自用单机形态没有登录体系，所以是一个可改的文本，不是 FK
+    # （将来接登录时把这里换成 user_id 即可，不用动别的表）。
+    grader: Mapped[str] = mapped_column(String, default="", server_default="")
+    note: Mapped[str] = mapped_column(Text, default="", server_default="")
+    created_at: Mapped[str] = mapped_column(Text, default=_now, server_default=NOW)
+
+    __table_args__ = (
+        Index("idx_garachive_student", "student_id", "archived_on", "id"),
+        Index("idx_garachive_grade", "grade_id"),
+    )

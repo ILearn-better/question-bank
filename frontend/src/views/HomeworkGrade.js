@@ -1330,6 +1330,30 @@ export default {
       setTimeout(() => { exporting.value = ''; }, 1200);
     }
 
+    /** ★ 导出到作业存档 —— 存进 `students/<学生>/<日期>/批改/`（学生资料「改作业」回看）。
+     *
+     *  ⚠️ 与 exportFile 的区别：那个是**下载到电脑**（发家长用），这个是**留在库里**
+     *     （以后回看用）。两个按钮并排，别合并 —— 合并之后「我只是想留个档」
+     *     也会在下载目录里多出一个文件。
+     *  ⚠️ 同样要先补发本机笔迹：导出读的是**服务端**标注，刚画的那几笔还在本机队列里。
+     */
+    async function archiveGrade() {
+      if (!detail.value || !detail.value.total) {
+        warn('还没有页图 —— 先点「开始批改」，页图渲染出来才能存档');
+        return;
+      }
+      busy.value = 'archive';
+      try {
+        if (pendingUnsent.value) await flushPending();
+        const r = await gradeApi.archive(gid);
+        ok('已存进学生资料：' + (r.rel_path || r.name));
+      } catch (e) {
+        fail('存档失败：' + e.message);
+      } finally {
+        busy.value = '';
+      }
+    }
+
     async function setVerdict(item, v) {
       if (!v || item.verdict === v) return;
       const before = item.verdict;
@@ -1552,7 +1576,7 @@ export default {
       // 手写批改
       tool, inkColor, textDraft, exporting, INK_COLORS, teacherMarks, layerEl,
       setTool, addMark, eraseMarks, onTextAt, saveText, moveMark,
-      undoLast, clearPageMarks, exportFile,
+      undoLast, clearPageMarks, exportFile, archiveGrade,
       // 本机草稿：待发笔迹 / 补发
       pendingMarks, pendingUnsent, flushPending,
       // 一题一区域（框选 + 分割线）：有段按段批，没段仍整页批
@@ -1622,6 +1646,16 @@ export default {
           <button class="btn sm ghost" :disabled="!!exporting || !detail.total"
                   title="只导出当前这一页（PNG）" @click="exportFile('png')">
             {{ exporting === 'png' ? '导出中…' : '本页图' }}
+          </button>
+          <!-- ★ 导出到**作业存档**：留在库里（不是下载到电脑）。
+               存进「学生 / 日期 / 批改」这个目录，之后在「学生资料 → 改作业」里能回看。
+               ⚠️ 这段注释里**不许出现反引号**：模板是字面量，反引号会把模板提前截断。 -->
+          <button class="btn sm" :disabled="busy === 'archive' || !detail.total"
+                  :title="detail.total
+                    ? '存进这个学生的资料（带笔迹的 PDF），以后在学生资料里能回看'
+                    : '页图还没渲染，先点开始批改'"
+                  @click="archiveGrade">
+            {{ busy === 'archive' ? '存档中…' : '导出到作业存档' }}
           </button>
         </div>
         <div class="grade-tip">AI 只判对错，不给分；核对过才算数。</div>

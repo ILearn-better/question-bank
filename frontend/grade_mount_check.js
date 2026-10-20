@@ -68,7 +68,7 @@ import { CALLS, push } from './calls.js';
 
 /** 让某些调用**故意失败**的开关（模拟「网断了 / 页面被关掉，请求被浏览器取消」）。
  *  只在测试里改它 —— 这就是第 20 节要复现的现象。 */
-export const CTL = { failMark: false };
+export const CTL = { failMark: false, failArchive: false };
 
 const item = (o) => Object.assign({
   id: 0, seq: 1, page_no: 1, q_no: '', qtype: '', stem: '', student_answer: '',
@@ -132,6 +132,14 @@ export const lessonFilesApi = {
 };
 
 export const gradeApi = {
+  /** ★ 导出到作业存档（批改文件留存，2026-10-20）。返回 detail 形状的存档记录。 */
+  archive: async (gid, body) => {
+    push('archive', [gid, body]);
+    if (CTL.failArchive) throw new Error('（测试造的失败）');
+    return { id: 61, grade_id: gid, name: '批改_张三_20261019.pdf', kind: 'pdf',
+             rel_path: 'students/u5_张三/2026-10-19/批改/批改_张三_20261019.pdf',
+             can_preview: true };
+  },
   get: async (gid) => { push('get', [gid]); return JSON.parse(JSON.stringify(DETAIL)); },
   list: async (lessonId) => {
     push('list', [lessonId]);
@@ -1022,6 +1030,49 @@ async function main() {
     lbs.every((t) => !/中档|difficulty/.test(t)), lbs);
   checkTrue('★ 「学段」有单独样式（它是唯一能拿来筛的枚举值）',
     !!D.querySelector('.g-item .g-label.lb-stage'), true);
+
+    /* ============ 22. ★ 导出到作业存档（批改文件留存） ============
+       用户 2026-10-20：「在批改作业完成后，页面新增「导出到作业存档」按钮」。
+
+       与工作台那一节同一组口径（两个批改界面都要有，规则不能各走各的）：
+         · 按钮在、页图没渲染时禁用
+         · ★★ 调接口**之前**先补发本机笔迹 —— 否则后端导出读不到刚画的几笔
+         · 失败要报错，且 busy 归位（否则按钮永远转圈）
+    */
+    const gTpl = vm.$options.template || '';
+    checkTrue('★ 顶栏有「导出到作业存档」按钮', /导出到作业存档/.test(gTpl), '没找到');
+    checkTrue('★ 没页图时按钮禁用（存一份空卷没意义）',
+      /:disabled="busy === 'archive' \|\| !detail\.total"/.test(gTpl), '没找到 disabled');
+    checkTrue('★ 按钮转圈文案是「存档中…」', /存档中…/.test(gTpl), '没找到');
+    const arSrc = String(vm.archiveGrade);
+    checkTrue('★★ 存档读的是**服务端**标注，所以要先 flushPending（且在发请求之前）',
+      arSrc.includes('flushPending()')
+      /* ⚠️ 比的是 `gradeApi.archive`（"archive" 这个词在函数名 `archiveGrade` 里就有，
+         只比 'archive' 会永远命中第一行） */
+      && arSrc.indexOf('flushPending()') < arSrc.indexOf('gradeApi.archive'),
+      arSrc.slice(0, 150));
+
+    const calls4 = (await import(pathToFileURL(path.join(tmp, 'src', 'calls.js')).href)).CALLS;
+    API.CTL.failArchive = false;
+    const nArch = calls4.filter((c) => c.name === 'archive').length;
+    await vm.archiveGrade();
+    await sleep(60);
+    const archCalls = calls4.filter((c) => c.name === 'archive');
+    check('★★ 点一下调了存档接口', archCalls.length - nArch, 1);
+    check('★★ 带的是这份作业的 gid',
+      Number(((archCalls[archCalls.length - 1] || {}).args || [])[0]), 7);
+    checkTrue('★ 存完 busy 归位（按钮不能一直转）', vm.busy === '', String(vm.busy));
+
+    /* 失败：必须报错并归位 —— 只是 console 的话，老师以为存上了。 */
+    API.CTL.failArchive = true;
+    const nArchErr = calls4.filter((c) => c.name === 'archive').length;
+    await vm.archiveGrade();
+    await sleep(60);
+    check('★ 失败时也真的发过请求（不是被前置判断挡回去的）',
+      calls4.filter((c) => c.name === 'archive').length - nArchErr, 1);
+    checkTrue('★★ 失败后 busy 也归位（否则按钮永远转圈，再点没反应）',
+      vm.busy === '', String(vm.busy));
+    API.CTL.failArchive = false;
 
   } finally {
     try { fs.rmSync(tmp, { recursive: true, force: true }); } catch (e) { /* 删不掉留着也无妨 */ }

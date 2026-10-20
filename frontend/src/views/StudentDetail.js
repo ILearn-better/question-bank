@@ -2,7 +2,7 @@
 // 设计目标：打开这个人的页面，从上到下就能看完他发生了什么，不用在多个页面之间跳。
 import { computed, onMounted, ref } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
-import { studentsApi, homeworkApi, supplementsApi, prepApi, examsApi, plansApi, gradeApi } from '../api.js';
+import { studentsApi, homeworkApi, supplementsApi, prepApi, examsApi, plansApi, gradeApi, archiveApi } from '../api.js';
 import AbilityRadar from '../components/AbilityRadar.js';
 import FeedbackDialog from '../components/FeedbackDialog.js';
 import HomeworkDialog from '../components/HomeworkDialog.js';
@@ -10,6 +10,7 @@ import SupplementDialog from '../components/SupplementDialog.js';
 import PrepDialog from '../components/PrepDialog.js';
 import ExamDialog from '../components/ExamDialog.js';
 import PlanDialog from '../components/PlanDialog.js';
+import Modal from '../components/Modal.js';
 import { filledSections, analysisPreview, analysisStats } from '../examAnalysis.js';
 import { fail, fmtBytes, hhmm, loadCurricula, money, ok, shortDate, STATUS_LABEL, STATUS_TAG } from '../store.js';
 
@@ -20,7 +21,7 @@ const SUP_TAG = { todo: 'orange', given: 'blue', returned: 'green' };
 
 export default {
   name: 'StudentDetail',
-  components: { AbilityRadar, FeedbackDialog, HomeworkDialog, SupplementDialog, PrepDialog, ExamDialog, PlanDialog },
+  components: { AbilityRadar, FeedbackDialog, HomeworkDialog, SupplementDialog, PrepDialog, ExamDialog, PlanDialog, Modal },
   setup() {
     const route = useRoute();
     const router = useRouter();
@@ -54,6 +55,12 @@ export default {
     // 列表只拿标题 + 摘要，点开某条才去取完整正文（list 不带正文，见 routers/plans.py 设计⑤）。
     const plans = ref([]);
     const planDialog = ref(null);      // { plan: 简要对象或 null, startEdit: bool }
+    // 改作业：批改完成后归档下来的副本（一份批改 = 一份带笔迹的 PDF）。
+    // 列表只拿摘要，**点开某条才取详情** —— 一条记录可能挂着 20MB 的 PDF。
+    const archives = ref([]);
+    const archiveOpen = ref(null);     // 正在预览的那条（详情对象）
+    const archiveBusy = ref('');       // 'open' / 'upload' / 'remove'，按钮置灰用
+    const archiveFile = ref(null);     // 隐藏的 <input type=file>（上传存档用）
 
     async function loadSupplements() {
       const map = {};
@@ -93,6 +100,75 @@ export default {
       }
     }
 
+    async function loadArchives() {
+      try {
+        const r = await archiveApi.list(id);
+        archives.value = r.items || [];
+      } catch (e) {
+        archives.value = [];
+      }
+    }
+
+    /** 点开一条存档：先弹窗（文件名/大小立刻可见），详情随后补上。
+     *  ⚠️ 详情取不到时**不能关弹窗** —— 那时至少还能点「下载」把文件拿出来，
+     *     关掉等于让人看着列表干瞪眼。 */
+    async function openArchive(a) {
+      archiveOpen.value = a;
+      archiveBusy.value = 'open';
+      try {
+        archiveOpen.value = await archiveApi.get(a.id);
+      } catch (e) {
+        fail(e.message);
+      } finally {
+        archiveBusy.value = '';
+      }
+    }
+
+    function closeArchive() {
+      archiveOpen.value = null;
+    }
+
+    async function removeArchive(a) {
+      if (!a) return;
+      if (!window.confirm(`删掉「${a.name}」这份存档？（磁盘上的文件也一起删，不可恢复）`)) return;
+      archiveBusy.value = 'remove';
+      try {
+        await archiveApi.remove(a.id);
+        ok('这份存档已删掉');
+        if (archiveOpen.value && archiveOpen.value.id === a.id) archiveOpen.value = null;
+        await loadArchives();
+      } catch (e) {
+        fail(e.message);
+      } finally {
+        archiveBusy.value = '';
+      }
+    }
+
+    /** 「＋ 上传存档」：线下批好的卷子、别处拿到的答案，直接存进这个学生的资料。
+     *  与批改页的「导出到作业存档」走**同一个接口层**（落盘、避重、校验只有一套）。 */
+    function pickArchiveFile() {
+      if (archiveFile.value) archiveFile.value.click();
+    }
+
+    async function onArchiveFile(ev) {
+      const f = ev.target.files && ev.target.files[0];
+      ev.target.value = '';            // 清空，否则选同一个文件第二次不触发 change
+      if (!f) return;
+      const fd = new FormData();
+      fd.append('file', f);
+      fd.append('student_id', String(id));
+      archiveBusy.value = 'upload';
+      try {
+        const r = await archiveApi.upload(fd);
+        ok('已存进学生资料：' + (r.rel_path || r.name));
+        await loadArchives();
+      } catch (e) {
+        fail(e.message);
+      } finally {
+        archiveBusy.value = '';
+      }
+    }
+
     async function loadPlans() {
       try {
         const r = await plansApi.list(id);
@@ -113,6 +189,7 @@ export default {
         await loadPreps();
         await loadExams();
         await loadPlans();
+        await loadArchives();
       } catch (e) {
         fail(e.message);
       } finally {
@@ -184,6 +261,23 @@ export default {
         openingFolder.value = false;
       }
     }
+
+    /* 哪些 kind 能直接 <img>。PDF 走 <iframe>（浏览器内置阅读器），
+       Word/Excel/压缩包一律只给下载 —— 拖进 iframe 只会是白屏。
+       ⚠️ 这套判断的**权威版本在后端**（archive_store.PREVIEW_KINDS），
+          这里只是「怎么显示」，can_preview 仍然是后端给的那个字段。 */
+    const IMG_KINDS = ['png', 'jpg', 'webp', 'gif', 'bmp'];
+    const archiveIsImg = computed(
+      () => IMG_KINDS.includes((archiveOpen.value && archiveOpen.value.kind) || ''));
+
+    /* 判定分布：只在详情里出现（列表不查 items，那是几十行 × 一堆字段）。 */
+    const verdictRows = [
+      { key: 'correct', label: '对', cls: 'green' },
+      { key: 'partial', label: '部分对', cls: 'orange' },
+      { key: 'wrong', label: '错', cls: 'red' },
+      { key: 'blank', label: '空白', cls: '' },
+      { key: 'ungradable', label: '判不了', cls: '' },
+    ];
 
     const pendingCount = computed(() => stu.value?.stats?.feedback_pending || 0);
     const abilityDims = computed(() => (stu.value && stu.value.ability && stu.value.ability.dims) || []);
@@ -331,6 +425,10 @@ export default {
       openExam, onExamSaved, toggleExam, removeExam,
       examRawUrl, isImg, examHasScore, scoreRatePct,
       plans, planDialog, openPlan, editPlan, onPlanSaved, removePlan,
+      // 改作业：批改存档（学生资料 → 改作业）
+      archives, archiveOpen, archiveBusy, archiveFile, archiveIsImg, verdictRows,
+      openArchive, closeArchive, removeArchive, pickArchiveFile, onArchiveFile,
+      archiveRawUrl: archiveApi.rawUrl,
       filledSections, analysisPreview, analysisStats,
     };
   },
@@ -456,6 +554,55 @@ export default {
                 </tr>
               </tbody>
             </table>
+          </div>
+        </div>
+      </div>
+
+      <!-- 改作业：批改完成后归档下来的副本（目标流程的最后一步）。
+           与上面「作业情况」是一回事的两面 —— 那边是分数与维度，这边是**卷子本身**。
+           ⚠️ 列表只给摘要；点开某条才取详情（一条记录可能挂着 20MB 的 PDF）。 -->
+      <div class="card">
+        <h2>
+          改作业
+          <span v-if="archives.length" class="small muted" style="font-weight:400">
+            （共 {{ archives.length }} 份批改存档）
+          </span>
+          <div class="spacer"></div>
+          <button class="btn sm primary" :disabled="archiveBusy === 'upload'"
+                  title="线下批好的卷子、别处拿到的答案，直接存进这个学生的资料"
+                  @click="pickArchiveFile">
+            {{ archiveBusy === 'upload' ? '上传中…' : '＋ 上传存档' }}
+          </button>
+        </h2>
+        <input ref="archiveFile" type="file" style="display:none" @change="onArchiveFile">
+        <div v-if="!archives.length" class="empty">
+          还没有批改存档
+          <div class="small" style="margin-top:6px">
+            在批改台批完之后点「导出到作业存档」，批好的卷子就会出现在这里
+          </div>
+        </div>
+        <div v-else>
+          <div v-for="a in archives" :key="a.id" class="archive-row">
+            <div class="archive-main" @click="openArchive(a)"
+                 :title="a.can_preview ? '点开看这次作业的批改情况' : '这类文件不能在线看，点「下载」'">
+              <div class="archive-head">
+                <span class="tag blue">{{ a.archived_on }}</span>
+                <b class="archive-name">{{ a.name }}</b>
+                <span v-if="a.source === 'grade'" class="tag green">批改导出</span>
+                <span v-else class="tag">手传</span>
+              </div>
+              <div class="small muted" style="margin-top:3px">
+                <template v-if="a.lesson_topic">作业：{{ a.lesson_topic }} · </template>
+                <template v-if="a.grader">批改人：{{ a.grader }} · </template>
+                {{ fmtBytes(a.size_bytes) }}
+                <template v-if="!a.can_preview"> · 这类文件只能下载</template>
+              </div>
+            </div>
+            <div class="spacer"></div>
+            <button class="btn ghost sm" @click="openArchive(a)">查看</button>
+            <a class="btn ghost sm" :href="archiveRawUrl(a.id)" :download="a.name">下载</a>
+            <button class="btn ghost sm" style="color:var(--danger)"
+                    @click="removeArchive(a)">删</button>
           </div>
         </div>
       </div>
@@ -668,6 +815,51 @@ export default {
         </div>
       </div>
     </template>
+
+    <!-- 预览一份批改存档：图片 / PDF 就地看，其它类型给下载。
+         ⚠️ wide 是给 PDF 用的 —— 860px 以下的阅读器里，一页卷子要横着拖才能看完。 -->
+    <Modal v-if="archiveOpen" :title="archiveOpen.name || '批改存档'" wide @close="closeArchive">
+      <div v-if="archiveBusy === 'open'" class="empty">加载中…</div>
+      <template v-else>
+        <div class="small" style="margin-bottom:8px">
+          <span class="tag blue">{{ archiveOpen.archived_on }}</span>
+          <span v-if="archiveOpen.grader" class="tag">批改人 {{ archiveOpen.grader }}</span>
+          <span class="tag">{{ fmtBytes(archiveOpen.size_bytes) }}</span>
+          <span v-if="archiveOpen.item_count" class="tag">AI 判了 {{ archiveOpen.item_count }} 题</span>
+          <span v-for="v in verdictRows" :key="v.key"
+                v-show="archiveOpen.verdicts && archiveOpen.verdicts[v.key]"
+                class="tag" :class="v.cls">
+            {{ v.label }} {{ archiveOpen.verdicts && archiveOpen.verdicts[v.key] }}
+          </span>
+          <div v-if="archiveOpen.note" class="muted" style="margin-top:4px">
+            备注：{{ archiveOpen.note }}
+          </div>
+        </div>
+        <img v-if="archiveIsImg" :src="archiveRawUrl(archiveOpen.id, true)" alt=""
+             style="max-width:100%;display:block;margin:0 auto">
+        <iframe v-else-if="archiveOpen.kind === 'pdf'"
+                :src="archiveRawUrl(archiveOpen.id, true)"
+                title="批改后的卷子"
+                style="width:100%;height:72vh;border:1px solid var(--border);border-radius:6px"></iframe>
+        <div v-else class="empty">
+          这类文件（{{ (archiveOpen.kind || '文件').toUpperCase() }}）不能在页面里看
+          <div style="margin-top:10px">
+            <a class="btn sm primary" :href="archiveRawUrl(archiveOpen.id)"
+               :download="archiveOpen.name">下载下来看</a>
+          </div>
+        </div>
+        <div v-if="archiveOpen.exists === false" class="small" style="color:var(--danger);margin-top:8px">
+          磁盘上找不到这个文件了（可能被手动删掉了）—— 这条记录可以删掉。
+        </div>
+      </template>
+      <template #foot>
+        <a class="btn sm" :href="archiveRawUrl(archiveOpen.id)" :download="archiveOpen.name">下载</a>
+        <button class="btn sm ghost" style="color:var(--danger)"
+                :disabled="archiveBusy === 'remove'"
+                @click="removeArchive(archiveOpen)">删掉这份存档</button>
+        <button class="btn sm" @click="closeArchive">关闭</button>
+      </template>
+    </Modal>
 
     <FeedbackDialog v-if="feedbackLesson" :lesson="feedbackLesson"
                     @close="feedbackLesson = null" @saved="onSaved" />

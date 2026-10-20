@@ -162,6 +162,8 @@ const LSN_FILES = () => ([
 let LAST_MARK_ID = 900;
 /** 下一回 /run 故意失败一次 —— 用来验「没开起来，按钮要能恢复」。 */
 let FAIL_RUN_ONCE = false;
+/** 下一回存档故意失败一次 —— 验「失败要说人话 + 按钮要归位」。 */
+let FAIL_ARCHIVE = false;
 function makeFetch() {
   const reply = (obj, status) => ({
     ok: (status || 200) < 400,
@@ -198,6 +200,20 @@ function makeFetch() {
         LAST_DETAIL.items = prev.items;
       }
       return reply(LAST_DETAIL);
+    }
+    /* 批改文件留存：批改台点「导出到作业存档」→ 后端出 PDF 并归档。
+       返回形状照真接口（detail 对象，含 rel_path / url / can_preview）。 */
+    if (u === '/api/grade-archives/generate' && method === 'POST') {
+      if (FAIL_ARCHIVE) return reply({ detail: '（测试造的失败）' }, 500);
+      return reply({
+        id: 61, student_id: 11, grade_id: (body && body.grade_id) || 0,
+        archived_on: '2026-10-20', name: '批改_张三_20261020.pdf',
+        rel_path: 'students/u11_张三/2026-10-20/批改/批改_张三_20261020.pdf',
+        kind: 'pdf', size_bytes: 20480, source: 'grade', grader: '', note: '',
+        can_preview: true, exists: true,
+        url: '/api/grade-archives/61/raw',
+        inline_url: '/api/grade-archives/61/raw?inline=1',
+      });
     }
     if (u === '/api/homework-grades/7/regions' && method === 'PUT') {
       if (FAIL_REGIONS) return reply({ detail: '（测试造的失败）' }, 500);
@@ -1568,6 +1584,68 @@ async function main() {
     /catch \(err\) \{[\s\S]{0,400}?this\.undoStack\.push\(e\)/.test(html), true);
   checkTrue('★ 换一份作业时撤销栈清空（否则 Ctrl+Z 会去删上一份的标注）',
     /this\.undoStack = \[\];\s*\n\s*this\.undoBusy = false;/.test(html), true);
+
+  /* ============ 23. ★★ 导出到作业存档（批改文件留存）============
+     用户 2026-10-20：「在批改作业完成后，页面新增「导出到作业存档」按钮，
+     点击后调用上传接口，将本次批改后的文件保存到对应目录下。」
+
+     守三件事：
+       · 按钮只在有记录时出现，且**有 loading**（防重复点 → 存出两份一样的）
+       · ★★ 调接口**之前**必须 flushPending —— 否则后端导出读不到刚画的几笔，
+         存出来的 PDF 少了那些笔迹，而屏幕上看着是完整的（本模块最大的坑）
+       · 失败要说人话，且按钮要归位
+  */
+  const arBtn = (html.match(/<el-button[^>]*archiveGrade[^>]*>[\s\S]{0,90}?<\/el-button>/) || [''])[0];
+  checkTrue('★ 顶栏有「导出到作业存档」按钮',
+    /导出到作业存档/.test(arBtn), arBtn.slice(0, 70));
+  checkTrue('★ 按钮只在有记录时出现（v-if="g"）',
+    /v-if="g"/.test(arBtn), arBtn.slice(0, 90));
+  checkTrue('★★ 按钮有 loading（防重复点 —— 点两下会存出两份同名副本）',
+    /:loading="archiving"/.test(arBtn), arBtn.slice(0, 90));
+
+  const arFn = (html.match(/async archiveGrade\(\) \{[\s\S]*?\n    \},/) || [''])[0];
+  checkTrue('★★★ 调接口前先冲本机笔迹（否则刚画的几笔不在 PDF 里）',
+    /await this\.flushPending\(\);/.test(arFn)
+      && arFn.indexOf('await this.flushPending();') < arFn.indexOf('grade-archives/generate'),
+    arFn.slice(0, 160));
+  checkTrue('★ 不让前端「先下载再上传」（20MB 的 PDF 不该在浏览器里过一遍）',
+    !/createObjectURL/.test(arFn), arFn.slice(0, 160));
+  checkTrue('★ 失败要说人话（不是只 console）',
+    /ElMessage\.error\('存档失败/.test(arFn), arFn.slice(0, 160));
+  checkTrue('★★ 换一份作业时重置 archiving（否则切过去按钮还在转）',
+    /this\.archiving = false;\s*\n\s*this\.cancelAsked = false;/.test(html), true);
+
+  /* ---- 真发一次 ---- */
+  vm.gid = 7;
+  vm.g = LAST_DETAIL;
+  MSGS.length = 0;
+  const nArch = () => CALLS.filter(
+    (c) => /\/api\/grade-archives\/generate$/.test(c.url) && c.method === 'POST').length;
+  const nArch0 = nArch();
+  await vm.archiveGrade();
+  await sleep(80);
+  check('★★ 点一下真的发了生成请求', nArch() - nArch0, 1);
+  const archCall = CALLS.filter(
+    (c) => /grade-archives\/generate$/.test(c.url) && c.method === 'POST').pop() || {};
+  check('★★ 请求里带的是当前这份作业的 grade_id',
+    (archCall.body || {}).grade_id, 7);
+  checkTrue('★★ 成功要说一句、并说出存到哪儿（否则老师不知道文件去哪了）',
+    MSGS.some((m) => m.type === 'success' && /学生资料/.test(m.text)
+      && /students\//.test(m.text)),
+    JSON.stringify(MSGS.slice(-2)));
+  checkTrue('★ 存完 archiving 归位（按钮不能一直转）', vm.archiving === false, String(vm.archiving));
+
+  /* ---- 失败路径 ---- */
+  FAIL_ARCHIVE = true;
+  MSGS.length = 0;
+  await vm.archiveGrade();
+  await sleep(60);
+  checkTrue('★ 失败要报红字（不能一声不响）',
+    MSGS.some((m) => m.type === 'error' && /存档失败/.test(m.text)),
+    JSON.stringify(MSGS.slice(-2)));
+  checkTrue('★★ 失败后 archiving 也归位（否则按钮永远转圈，再点也没反应）',
+    vm.archiving === false, String(vm.archiving));
+  FAIL_ARCHIVE = false;
 
   console.log('\n共 ' + total + ' 项，失败 ' + fails.length + ' 项');
   if (fails.length) {

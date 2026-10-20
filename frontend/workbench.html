@@ -814,6 +814,12 @@
               <!-- 导出**带批改痕迹的副本**。⚠️ 原件一个字不动 —— 学生真迹要留档。 -->
               <el-button v-if="g" size="small" plain @click="exportFile('pdf')"
                          title="整份导出成 PDF（笔迹烧在副本上，原件不动）">导出 PDF</el-button>
+              <!-- ★ 导出到作业存档：存进 `students/<学生>/<日期>/批改/`，
+                   之后在学生资料的「改作业」里能回看。与「导出 PDF」是两件事：
+                   那个是下载到你电脑上（发家长用），这个是留在库里（以后回看用）。 -->
+              <el-button v-if="g" size="small" type="success" plain
+                         :loading="archiving" @click="archiveGrade"
+                         title="把这份批改存进这个学生的资料（带笔迹的 PDF）">导出到作业存档</el-button>
             </div>
           </template>
 
@@ -1095,6 +1101,7 @@ const app = createApp({
       /* 「已请求终止、等后端收尾」。与 `submitting` 分开：前者是开批，后者是终止，
          混在一起会让「点终止」那一下loading 跑到「开始批改」按钮上。 */
       canceling: false,
+      archiving: false,      // 正在导出到作业存档（按钮转圈，防重复点）
       /* 「老师点过终止、还在等收尾」。与 canceling 分开是为了**防连点**：成功受理后
          canceling 一直为真直到轮询看到状态落地，这段时间按钮必须保持不可点，
          再发一次请求只会收到 409（后端已经开始收尾了）。 */
@@ -1774,6 +1781,7 @@ const app = createApp({
       this.undoStack = [];
       this.undoBusy = false;
       this.canceling = false;
+      this.archiving = false;
       this.cancelAsked = false;   // 换一份作业时必须清，否则新作业的终止按钮点不动
       // ⚠️ 「点过开批」的旗必须跟着记录走。不重置的话，切到另一份 queued 的记录时
       //    会被上一份的旗顶成「批改中」→ 按钮又是灰的。
@@ -2322,6 +2330,31 @@ const app = createApp({
      *  ★★ 刻意**不做二次确认弹窗**：终止多半是因为批得太慢，那一刻老师最不想做的事
      *    就是再读一个对话框。而且损失可控（已批的页保留），反复确认换来的只是
      *    「点了没反应」的印象。误按的代价远小于用不了的代价。 */
+    /* ★ 导出到作业存档 —— 存进 `students/<学生>/<日期>/批改/`，供学生资料「改作业」回看。
+     *
+     * ⚠️ 必须**先 flushPending()**：刚画的几笔还在本机队列里，没冲上去的话
+     *    后端导出时读不到它们 —— 存出来的 PDF 少了那几笔，而屏幕上看着是完整的
+     *    （屏幕上画的是本机数据，不是服务端的）。这与「导出 PDF」那条是同一个坑。
+     * ⚠️ 别再让前端「先下载再上传」：一份 14 页的卷子 20MB 上下，
+     *    在浏览器里过一遍要几秒，而服务端本来就会渲染。
+     */
+    async archiveGrade() {
+      if (!this.gid || this.archiving) return;
+      this.archiving = true;
+      try {
+        await this.flushPending();
+        const r = await this.api('/api/grade-archives/generate', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ grade_id: this.gid }),
+        });
+        ElementPlus.ElMessage.success('已存进学生资料：' + (r.rel_path || r.name));
+      } catch (e) {
+        ElementPlus.ElMessage.error('存档失败：' + e.message);
+      } finally {
+        this.archiving = false;
+      }
+    },
+
     async cancelGrade() {
       if (!this.g || !this.gid || this.cancelAsked) return;
       this.cancelAsked = true;

@@ -390,6 +390,13 @@ export const gradeApi = {
   exportUrl: (gid, fmt = 'pdf', page = 1) =>
     `/api/homework-grades/${gid}/export?fmt=${encodeURIComponent(fmt)}&page=${Number(page) || 1}`,
 
+  /** ★ 导出到**作业存档**：存进 `students/<学生>/<日期>/批改/`，
+   *  之后在「学生资料 → 改作业」里能回看。
+   *  ⚠️ 与上面的 exportUrl 是两件事：那个是下载到电脑上（发家长用），
+   *     这个是留在库里（以后回看用）。后端自己出 PDF，前端只发一个 grade_id。 */
+  archive: (gid, body) => api.post('/api/grade-archives/generate',
+    Object.assign({ grade_id: gid }, body || {})),
+
   /** 一题一区域：老师框出每道题的作答道在哪，一框一次判；没框的页仍整页判。 */
   listRegions: (gid) => api.get(`/api/homework-grades/${gid}/regions`),
   /** **整页替换**：传这一页的完整框列表，传空数组 = 清空这一页的框。 */
@@ -428,4 +435,19 @@ export const systemApi = {
   backup: () => api.post('/api/system/backup'),
   backups: () => api.get('/api/system/backups'),
   fkCheck: () => api.get('/api/system/foreign-key-check'),
+};
+
+/** ★ 批改文件留存：「学生资料 → 改作业」的存档。
+ *  两条写入口 —— generate（从批改出 PDF）/ upload（老师手传），读只有一套。 */
+export const archiveApi = {
+  list: (studentId) => api.get(`/api/students/${studentId}/grade-archives`),
+  get: (id) => api.get(`/api/grade-archives/${id}`),
+  /** 把一份批改导出成带笔迹的 PDF 并存进学生目录（后端出 PDF，前端只发 grade_id）。 */
+  generate: (body) => api.post('/api/grade-archives/generate', body),
+  /** 手传一份文件（线下批好的卷子、别处拿到的答案…）。
+   *  FormData 里带 student_id / archived_on / grade_id / grader / note。 */
+  upload: (formData) => api.upload('/api/grade-archives/upload', formData),
+  remove: (id) => api.del(`/api/grade-archives/${id}`),
+  /** 原件地址。inline=1 时图片与 PDF 就地显示（预览用），其它类型照样下载。 */
+  rawUrl: (id, inline) => `/api/grade-archives/${id}/raw` + (inline ? '?inline=1' : ''),
 };
