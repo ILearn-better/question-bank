@@ -1553,6 +1553,16 @@ async function main() {
   await sleep(120);
   check('★★ 没东西可撤时按 Ctrl+Z → 一个请求都不发（也不能报错）', nDelMark(), uD3);
 
+  /* ---- ⑦ 文本框 / √× 必须和笔迹走同一条路 ---- */
+  /* 用户说的是「撤销画笔笔记**和文本框**」。只要它们都走 addMark，
+   * 就自动进撤销栈 —— 所以这里守的是「别给某一种标注另写一条 POST」：
+   * 那样它画得出来、却撤不掉，而且不会有任何报错。 */
+  const uSaveText = (html.match(/async saveText\(\)[\s\S]*?\n    \},/) || [''])[0];
+  checkTrue('★★ 文本框走 addMark（于是自动进撤销栈，不用另写一套）',
+    /this\.addMark\(/.test(uSaveText), uSaveText.slice(0, 60));
+  checkTrue('★★ √ / × 也走 addMark（同一个道理）',
+    /@stamp="\(p\) => addMark\(pno, p\)"/.test(html), true);
+
   /* ---- ⑥ 撤销失败要退栈，不能骗人 ---- */
   checkTrue('★★★ 撤销失败会把这一条放回栈（否则「撤销（1）」的数字一直骗人）',
     /catch \(err\) \{[\s\S]{0,400}?this\.undoStack\.push\(e\)/.test(html), true);
