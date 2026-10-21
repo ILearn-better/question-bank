@@ -1174,7 +1174,10 @@ class HomeworkGrade(Base):
     # queued → running → reviewing → done；出错是 partial（部分题失败）/ failed（整份没起来）
     status: Mapped[str] = mapped_column(String, default="queued", server_default="queued")
     # ai = 模型自己解题后判断；key = 老师给的答案；rubric = 老师给的分步评分细则
-    answer_mode: Mapped[str] = mapped_column(String, default="key", server_default="key")
+    # 默认 ai（2026-10-21 用户点名：新建批改默认「AI 自主判定」）。
+    # ⚠️ server_default 仍是 "key"：改它要给已有库来一次 batch 迁移，而它只在
+    #    「有人手写 INSERT 不带这一列」时才起作用 —— ORM 插入一定带上 Python 默认值。
+    answer_mode: Mapped[str] = mapped_column(String, default="ai", server_default="key")
 
     # ⚠️ total 是**页数**，不是题目数 —— 同 batch_jobs 踩过的坑：
     #    混着用，进度条会出现「done 3 / total 3」而列表里 11 条。
@@ -1231,6 +1234,13 @@ class HomeworkGradeFile(Base):
     )
     name: Mapped[str] = mapped_column(String, nullable=False)
     stored: Mapped[str] = mapped_column(Text, default="", server_default="")   # 仅 answer/rubric 自落盘时用
+    # 抽出来的文字（0034）。答案/细则常常是一份 PDF / Word / Excel ——
+    # 「原件」与「给模型看的文字」必须分开：stored 指向原件（老师要能点开预览），
+    # 这里放抽出来的正文（喂给模型）。
+    # 为什么不用 lesson_files.text：那条路要求文件挂在课时下、且会出现在「交作业」
+    # 清单里 —— 一份答案 PDF 混进提交件后，下次建批改会被**默认勾上**当学生作业批。
+    # 所以依据文件落在批改自己的目录里，自带一份文字。图片恒为空串（走视觉通道）。
+    text: Mapped[str] = mapped_column(Text, default="", server_default="")
     role: Mapped[str] = mapped_column(String, default="submission", server_default="submission")
     kind: Mapped[str] = mapped_column(String, default="", server_default="")
     size_bytes: Mapped[int] = mapped_column(Integer, default=0, server_default="0")

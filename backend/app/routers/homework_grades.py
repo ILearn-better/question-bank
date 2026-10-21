@@ -14,7 +14,10 @@ docs/AI批改作业-实现计划.md §5：前端已经在照这个写。
 """
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+import mimetypes
+from urllib.parse import quote
+
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, Response
 from sqlalchemy.orm import Session
 
@@ -32,6 +35,7 @@ from ..schemas import (
     GradeSetupPatch,
     GradeToBankIn,
 )
+from ..services import grade_basis
 from ..services import grade_export
 from ..services import grade_store as store
 
@@ -99,9 +103,11 @@ def run_grade(gid: int, db: Session = Depends(get_db)):
     """
     try:
         grade = store.get_grade(db, gid)
+        # ⚠️ launch 里有一道「按我的答案判，但依据已经被删了」的校验（会抛 GradeError）。
+        #    不接住的话它会变成 500，老师看到的是一句「服务器内部错误」。
+        store.launch(db, grade)      # 已在跑时 launch 自己会什么都不做
     except store.GradeError as e:
         raise _fail(e) from e
-    store.launch(db, grade)          # 已在跑时 launch 自己会什么都不做
     return store.detail(db, grade)
 
 
@@ -176,6 +182,85 @@ def export_grade_file(gid: int, fmt: str = Query("pdf"), page: int = Query(1),
         raise _fail(e) from e
     media = "application/pdf" if path.suffix.lower() == ".pdf" else "image/png"
     return FileResponse(str(path), media_type=media, filename=name)
+
+
+# ---------------------------------------------------------------- 判定依据
+# 「按我给的答案 / 按我的评分细则」这两条模式要有依据。依据可以是图片、PDF、
+# Word、Excel、TXT —— 原件落在**批改自己的目录**，抽出来的正文进 `text` 列（0034）。
+# 刻意不走 `POST /lessons/{lid}/files`：那条路会把文件塞进「交作业」清单，
+# 下次建批改时被默认勾上当学生作业批。
+
+# 允许「就地显示」的扩展名。图片之外只放 PDF：
+# 浏览器自带的 PDF 阅读器是沙箱里的，点开就是预览、体验最好。
+# ⚠️ **绝不能放 .html / .svg** —— inline 渲染等于开一个 XSS 口子（上传者能控制内容）。
+_INLINE_OK = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".pdf"}
+
+
+@router.post("/homework-grades/{gid}/basis")
+async def upload_basis(gid: int, file: UploadFile = File(...),
+                       role: str = Query("answer", description="answer / rubric"),
+                       db: Session = Depends(get_db)):
+    """传一份判定依据。
+
+    `role`：`answer` = 答案，`rubric` = 评分细则（两条模式各用一份）。
+    格式白名单、大小、份数都在 `grade_basis` / `store.add_basis_file` 里卡。
+
+    返回里带 `note`：**非空表示收下了但抽不出文字**（扫描版 PDF 之类）。
+    界面必须显示 —— 静默收下一份模型看不见的依据，比直接拒绝更糟。
+    """
+    # 多读 1 字节用来判「超了」：读满整个文件再报错，等于让一个 500MB 的
+    # 文件先进内存。
+    data = await file.read(grade_basis.MAX_BASIS_BYTES + 1)
+    try:
+        return store.add_basis_file(db, gid, role, file.filename or "", data)
+    except store.GradeError as e:
+        raise _fail(e) from e
+
+
+@router.delete("/homework-grades/{gid}/basis/{fid}")
+def delete_basis(gid: int, fid: int, db: Session = Depends(get_db)):
+    """删一份判定依据。已批过的不能删（否则「按我的答案判」变成了没答案）。"""
+    try:
+        return store.delete_basis_file(db, gid, fid)
+    except store.GradeError as e:
+        raise _fail(e) from e
+
+
+@router.get("/homework-grades/{gid}/basis/{fid}/raw")
+def basis_raw(gid: int, fid: int,
+              inline: bool = Query(False, description="图片/PDF 可就地预览，其它一律下载"),
+              db: Session = Depends(get_db)):
+    """取回依据原件。
+
+    ⚠️ 别人的、或不属于这份批改的记录一律 **404**（不是 403）——
+    状态码不该告诉人家「这条记录存在，只是你没权限」。
+    """
+    try:
+        path, name = store.basis_raw_path(db, gid, fid)
+    except store.GradeError as e:
+        raise _fail(e) from e
+    media = mimetypes.guess_type(name)[0] or "application/octet-stream"
+    disp = "inline" if (inline and path.suffix.lower() in _INLINE_OK) else "attachment"
+    return FileResponse(str(path), media_type=media, filename=name,
+                        headers={"Content-Disposition":
+                                 f"{disp}; filename=file; filename*=UTF-8''{quote(name)}",
+                                 # 不靠浏览器猜类型：猜错一次就是一个可执行下载
+                                 "X-Content-Type-Options": "nosniff"})
+
+
+@router.get("/homework-grades/{gid}/basis/{fid}/text")
+def basis_text(gid: int, fid: int, db: Session = Depends(get_db)):
+    """依据抽出来的**正文**（预览用）。
+
+    为什么单独一条而不塞进 `detail`：10 份依据 × 两万字 = 一次轮询几百 KB，
+    而老师真正想看文字的时候只有「点开某一份」那一下。
+    """
+    try:
+        row = store.get_basis_row(db, gid, fid)
+    except store.GradeError as e:
+        raise _fail(e) from e
+    return {"text": row.text or "", "chars": len(row.text or ""),
+            "kind": row.kind or "", "name": row.name}
 
 
 # ---------------------------------------------------------------- 逐题

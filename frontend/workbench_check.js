@@ -57,12 +57,14 @@ function loadJsdom() {
  *  故意让第一页有 2 条线 → 3 段，用来验「第一条线以上也算一块」。 */
 function DETAIL() {
   return {
-    id: 7, student_id: 5, lesson_id: 31, status: 'reviewing',
-    answer_mode: 'ai', answer_text: '', rubric_text: '',
-    total: 3, done: 3, failed: 0, score: null, full_score: null, error: '',
+    id: 7, student_id: 5, lesson_id: 31, status: DETAIL_STATUS,
+    answer_mode: DETAIL_MODE, answer_text: '', rubric_text: '',
+    total: 3, done: DETAIL_STATUS === 'queued' ? 0 : 3, failed: 0,
+    score: null, full_score: null, error: '',
     created_at: '2026-10-19T10:00:00', finished_at: '2026-10-19T10:03:00',
     reviewed_at: null, skipped_pages: [],
-    files: [{ id: 1, role: 'submission', name: '作业.pdf', pages: 3 }],
+    files: [{ id: 1, role: 'submission', name: '作业.pdf', pages: 3,
+      lesson_file_id: 1, chars: 0, preview: '' }].concat(BASIS_ROWS),
     regions: [
       // 页 1：2 条线切 3 段（全切 —— 第一条线以上也是块，卷头那段老师按需点「不判」）
       { id: 301, page_no: 1, seq: 0, seg: 0, q_no: '', label: '1', box: [0, 0, 1000, 320], skipped: 0 },
@@ -164,6 +166,16 @@ let LAST_MARK_ID = 900;
 let FAIL_RUN_ONCE = false;
 /** 下一回存档故意失败一次 —— 验「失败要说人话 + 按钮要归位」。 */
 let FAIL_ARCHIVE = false;
+/* ---- 判定依据那一节的桩状态 ----
+ * 用**可变**的 status / answer_mode 而不是写死 'reviewing'：
+ * 判定依据只在「还没批出结果」时能改（与后端 `_assert_setup_editable` 同一个判据），
+ * 写死 reviewing 的话整节都在测「锁住」这一条分支。 */
+let DETAIL_STATUS = 'reviewing';
+let DETAIL_MODE = 'ai';
+/** 界面上「已传的依据」= 这个数组（真后端从 detail.files 里来）。 */
+let BASIS_ROWS = [];
+/** 下一回上传故意失败一次 —— 验「失败留在列表里可以单条重试」。 */
+let BASIS_FAIL_ONCE = false;
 function makeFetch() {
   const reply = (obj, status) => ({
     ok: (status || 200) < 400,
@@ -214,6 +226,41 @@ function makeFetch() {
         url: '/api/grade-archives/61/raw',
         inline_url: '/api/grade-archives/61/raw?inline=1',
       });
+    }
+    /* ---- 判定依据（0034）：改模式 / 上传 / 删 / 取正文 ---- */
+    if (u === '/api/homework-grades/7' && method === 'PATCH') {
+      DETAIL_MODE = (body && body.answer_mode) || DETAIL_MODE;
+      const keepMarks = (LAST_DETAIL && LAST_DETAIL.marks) || [];
+      const keepItems = (LAST_DETAIL && LAST_DETAIL.items) || [];
+      LAST_DETAIL = DETAIL();
+      LAST_DETAIL.marks = keepMarks;
+      LAST_DETAIL.items = keepItems;
+      return reply(LAST_DETAIL);
+    }
+    /* ⚠️ 上传那条 URL **带查询串**（?role=answer），不能写成 `u === '.../basis'`：
+       那样匹配不上，请求会掉进兜底分支（返回一份详情），于是「上传成功」变成假的 ——
+       列表里没有、也没有失败记录，最难查的一种。 */
+    if (/^\/api\/homework-grades\/7\/basis(\?|$)/.test(u) && method === 'POST') {
+      if (BASIS_FAIL_ONCE) {
+        BASIS_FAIL_ONCE = false;
+        return reply({ detail: '（测试造的失败）' }, 500);
+      }
+      const role = /role=rubric/.test(u) ? 'rubric' : 'answer';
+      const row = {
+        id: 700 + BASIS_ROWS.length, role: role, name: '依据' + (BASIS_ROWS.length + 1) + '.png',
+        kind: 'image', size_bytes: 2048, pages: 0, chars: 0,
+        lesson_file_id: null, preview: '', text_warn: '',
+      };
+      BASIS_ROWS.push(row);
+      return reply({ file: row, note: '' });
+    }
+    if (/^\/api\/homework-grades\/7\/basis\/\d+$/.test(u) && method === 'DELETE') {
+      const id = Number(u.split('/').pop());
+      BASIS_ROWS = BASIS_ROWS.filter((x) => x.id !== id);
+      return reply({ ok: true });
+    }
+    if (/^\/api\/homework-grades\/7\/basis\/\d+\/text$/.test(u) && method === 'GET') {
+      return reply({ text: '题1：x=2 或 x=3\n题2：42', chars: 18, kind: 'text', name: '答案.xlsx' });
     }
     if (u === '/api/homework-grades/7/regions' && method === 'PUT') {
       if (FAIL_REGIONS) return reply({ detail: '（测试造的失败）' }, 500);
@@ -1612,8 +1659,11 @@ async function main() {
     !/createObjectURL/.test(arFn), arFn.slice(0, 160));
   checkTrue('★ 失败要说人话（不是只 console）',
     /ElMessage\.error\('存档失败/.test(arFn), arFn.slice(0, 160));
+  /* ⚠️ 跨度给到 800 而不是刚好够：`loadGrade` 开头是「一份作业的复位清单」，
+     每加一类按记录走的状态就会往里插几行（判定依据就插了 7 行）。
+     断言要守的是「这两条复位在**同一段**里」，不是「相邻两行」。 */
   checkTrue('★★ 换一份作业时重置 archiving（否则切过去按钮还在转）',
-    /this\.archiving = false;[\s\S]{0,200}?this\.cancelAsked = false;/.test(html), true);
+    /this\.archiving = false;[\s\S]{0,800}?this\.cancelAsked = false;/.test(html), true);
 
   /* ---- 真发一次 ---- */
   vm.gid = 7;
@@ -1861,6 +1911,224 @@ async function main() {
   checkTrue('★★ 本机草稿里也存了 width（不然刷新一次就丢）',
     /width: Math\.max\(0, Number\(\(payload \|\| \{\}\)\.width\) \|\| 0\)/.test(
       fs.readFileSync(path.join(ROOT, 'src', 'gradeDraft.js'), 'utf8')), '');
+
+  /* ============ 26. 判定依据（模式 / 上传 / 预览 / 删除 / 开批拦截）============
+     用户 2026-10-21 四条：
+       ① 上传入口：点击 / 拖拽 / 粘贴；图片与常见文件；缩略图 + 列表 + 预览 + 删除；
+          限制类型、数量、大小。
+       ② 三种互斥模式（AI 自主 / 按我的答案 / 按我的细则），**默认 AI**，各带一句说明。
+       ③ 后两种必须至少一份依据，没有就**拦住不让提交**；依据要真的进批改。
+       ④ 沿用现有交互，补上传中的加载态、失败重试、错误提示。
+
+     ⚠️ 这一节把桩的 status 切成 queued：依据只在「还没批出结果」时能改，
+        沿用上一节的 reviewing 会让整节都在测「锁住」那一条分支。 */
+  DETAIL_STATUS = 'queued';
+  DETAIL_MODE = 'ai';
+  BASIS_ROWS = [];
+  BASIS_FAIL_ONCE = false;
+  LAST_DETAIL = null;
+  await vm.loadGrade(7);
+  await sleep(120);
+
+  check('★ 默认判定模式是 AI 自主', vm.basisMode, 'ai');
+  checkTrue('★ 默认档的说明文案不是空的（用户要求「各模式展示简洁说明」）',
+    String(vm.basisModeDesc || '').length > 10, vm.basisModeDesc.slice(0, 24));
+
+  const radioEls = [...D.querySelectorAll('.basis-modes .el-radio')];
+  check('★★ 三档模式都渲染出来了（互斥 = 单选，不是勾选框）', radioEls.length, 3);
+  const modeTxt = radioEls.map((r) => r.textContent.trim()).join('|');
+  checkTrue('★★ 三档名字对得上：AI / 答案 / 细则',
+    /AI/.test(modeTxt) && /答案/.test(modeTxt) && /细则/.test(modeTxt), modeTxt);
+  checkTrue('★ 默认选中的就是 AI 那一档',
+    radioEls.some((r) => /AI/.test(r.textContent) && /is-checked/.test(r.className)), modeTxt);
+
+  /* ---- ① 换模式要**立刻落库**（开批时服务端读的是库里那个值）---- */
+  CALLS.length = 0;
+  vm.basisMode = 'key';
+  await vm.onBasisModeChange();
+  await sleep(60);
+  const modePatch = CALLS.filter(
+    (c) => c.url === '/api/homework-grades/7' && c.method === 'PATCH').pop();
+  check('★★ 换模式立刻 PATCH answer_mode（只改界面 = 批出来的口径和选的不一样）',
+    modePatch && modePatch.body.answer_mode, 'key');
+
+  /* ---- ② 上传：类型 / 大小当场拦 ---- */
+  const mkFile = (name, type, size) => new W.File(
+    [new Uint8Array(size || 8)], name, { type: type || 'image/png' });
+  checkTrue('★ 不认识的格式当场拦（不用等后端 422）',
+    /收不了/.test(vm.basisReject(mkFile('答案.exe', 'application/x-msdownload'))), '');
+  checkTrue('★ 老式 .xls 提示去「另存为」',
+    /另存/.test(vm.basisReject(mkFile('旧.xls'))), vm.basisReject(mkFile('旧.xls')));
+  checkTrue('★ 超过单份上限当场拦（文案带 MB）',
+    /MB/.test(vm.basisReject(mkFile('大.png', 'image/png', 21 * 1024 * 1024))), '');
+  check('★ 正常的 Excel 放行', vm.basisReject(mkFile('答案.xlsx')), '');
+
+  /* ---- ③ 上传成功 → 列表里有它 ---- */
+  CALLS.length = 0;
+  MSGS.length = 0;
+  await vm.uploadBasisFiles([mkFile('答案.png')]);
+  await sleep(90);
+  check('★★ 上传走的是批改自己的依据接口（role=answer，不进「交作业」）',
+    CALLS.filter((c) => /\/homework-grades\/7\/basis\?role=answer$/.test(c.url)
+      && c.method === 'POST').length, 1);
+  check('★ 传完刷新了详情，列表里看得到', vm.basisAll.length, 1);
+  checkTrue('★★ 列表里带缩略图（图片依据）',
+    !!D.querySelector('.basis-thumb'), '没有 .basis-thumb');
+
+  /* ---- ④ 上传中要有加载态 ---- */
+  checkTrue('★★ 上传中有加载态（.basis-drop 里的 v-if="basisBusy"）',
+    /v-if="basisBusy"/.test(html), '');
+  const upSrc = html.slice(html.indexOf('async uploadBasisFiles'),
+    html.indexOf('async removeBasis'));
+  checkTrue('★★ busy 必须在发请求**之前**置位（否则转圈永远慢一拍）',
+    upSrc.indexOf('this.basisBusy = true') > -1
+    && upSrc.indexOf('this.basisBusy = true') < upSrc.indexOf("'/basis?role='"), '');
+
+  /* ---- ⑤ AI 模式下传依据：没去处，要劝住 ---- */
+  vm.basisMode = 'ai';
+  CALLS.length = 0;
+  MSGS.length = 0;
+  await vm.uploadBasisFiles([mkFile('多余.png')]);
+  check('★ AI 模式下不发上传请求（AI 自己解用不到依据）',
+    CALLS.filter((c) => /\/basis/.test(c.url)).length, 0);
+  checkTrue('★★ 而且要说明白为什么（不能点了一下什么都不发生）',
+    /先切到/.test(MSGS.map((m) => m.text).join('')), MSGS.map((m) => m.text).join('|'));
+
+  /* ---- ⑥ 上传失败 → 留在列表里 → 单条重试 ---- */
+  vm.basisMode = 'rubric';
+  await vm.onBasisModeChange();
+  await sleep(60);
+  BASIS_FAIL_ONCE = true;
+  CALLS.length = 0;
+  await vm.uploadBasisFiles([mkFile('细则.png')]);
+  await sleep(90);
+  check('★★ 失败的那份进「待重试」列表（只弹个提示就没了 = 得重挑文件）',
+    vm.basisFailed.length, 1);
+  check('★ 失败不影响已经传好的那份', vm.basisAll.length, 1);
+  checkTrue('★★ 失败要有红字（不能静默）',
+    /没传上去|失败/.test(MSGS.map((m) => m.text).join('')) || /\.basis-fail/.test(html), '');
+  await vm.retryBasis(0);
+  await sleep(90);
+  check('★★ 重试成功后「待重试」里不再留着它', vm.basisFailed.length, 0);
+  check('★★ 重试真的又发了一次（不是假装成功）',
+    CALLS.filter((c) => /\/basis\?role=rubric$/.test(c.url)).length, 2);
+  check('★★ 「细则」模式下只数细则那份（答案那份不算依据）', vm.basisRoleCount, 1);
+
+  /* ---- ⑦ 没有依据 → **拦住不让提交** ---- */
+  BASIS_ROWS = [];
+  LAST_DETAIL = null;
+  await vm.loadGrade(7);
+  await sleep(90);
+  vm.basisMode = 'rubric';
+  await vm.onBasisModeChange();
+  await sleep(60);
+  CALLS.length = 0;
+  MSGS.length = 0;
+  vm.tab = 'blocks';
+  await vm.runGrade();
+  await sleep(60);
+  check('★★★ 选了「按我的细则」却没有依据 → 一个 /run 都不发',
+    CALLS.filter((c) => /\/run$/.test(c.url)).length, 0);
+  check('★★ 而且把老师带到「判定依据」页签（提示缺什么）', vm.tab, 'basis');
+  checkTrue('★★ 提示要说清缺的是细则',
+    /细则/.test(MSGS.map((m) => m.text).join('')), MSGS.map((m) => m.text).join('|'));
+
+  /* ---- ⑧ 有依据就放行，且**先存模式再开批** ---- */
+  BASIS_ROWS = [{
+    id: 801, role: 'rubric', name: '细则.txt', kind: 'text', size_bytes: 100,
+    pages: 0, chars: 18, lesson_file_id: null, preview: '每步 2 分', text_warn: '',
+  }];
+  LAST_DETAIL = null;
+  await vm.loadGrade(7);
+  await sleep(90);
+  check('★ 依据齐了，开批按钮不再是「未配置」状态', vm.basisWarn, false);
+  CALLS.length = 0;
+  await vm.runGrade();
+  await sleep(60);
+  check('★★ 有依据时正常开批', CALLS.filter((c) => /\/run$/.test(c.url)).length, 1);
+
+  /* ---- ⑨ 预览：图片内嵌、文本取正文 ---- */
+  CALLS.length = 0;
+  await vm.previewBasis(vm.basisAll[0]);
+  await sleep(60);
+  check('★ 预览文本类依据 → 取抽出来的正文（那才是模型看到的东西）',
+    CALLS.filter((c) => /\/basis\/801\/text$/.test(c.url)).length, 1);
+  checkTrue('★ 预览框开着，正文回填了', vm.previewText.length > 0, vm.previewText.slice(0, 20));
+  checkTrue('★ 预览原件走 inline=1（图片/PDF 就地看，不弹下载）',
+    /inline=1$/.test(vm.basisRawUrl({ id: 801 }, true)), vm.basisRawUrl({ id: 801 }, true));
+
+  /* ---- ⑩ 删除：先问一句，再真删 ---- */
+  CALLS.length = 0;
+  CONFIRMS.length = 0;
+  await vm.removeBasis(vm.basisAll[0]);
+  await sleep(90);
+  check('★★ 删依据前问了老师一句（破坏性动作）', CONFIRMS.length, 1);
+  check('★★ 删的是 DELETE .../basis/{id}',
+    CALLS.filter((c) => c.method === 'DELETE'
+      && /\/homework-grades\/7\/basis\/801$/.test(c.url)).length, 1);
+  check('★ 删完列表里没了', vm.basisAll.length, 0);
+
+  /* ---- ⑪ 批过之后锁住 ---- */
+  DETAIL_STATUS = 'reviewing';
+  LAST_DETAIL = null;
+  await vm.loadGrade(7);
+  await sleep(90);
+  check('★ 批出结果之后依据锁住（与后端同一判据）', vm.basisEditable, false);
+  CALLS.length = 0;
+  MSGS.length = 0;
+  vm.basisMode = 'key';
+  await vm.uploadBasisFiles([mkFile('晚了.png')]);
+  check('★ 锁住时上传一个请求都不发',
+    CALLS.filter((c) => /\/basis/.test(c.url)).length, 0);
+  checkTrue('★ 锁住时要说清「得新建一份批改」（不然老师以为按钮坏了）',
+    /新建一份批改/.test(MSGS.map((m) => m.text).join('')), MSGS.map((m) => m.text).join('|'));
+
+  /* ---- ⑫ Ctrl+V 贴截图 ---- */
+  DETAIL_STATUS = 'queued';
+  DETAIL_MODE = 'ai';
+  BASIS_ROWS = [];
+  LAST_DETAIL = null;
+  await vm.loadGrade(7);
+  await sleep(90);
+  vm.basisMode = 'key';
+  await vm.onBasisModeChange();
+  await sleep(60);
+
+  const pasteEv = (target) => {
+    const ev = new W.Event('paste');
+    ev.clipboardData = {
+      items: [{ kind: 'file', type: 'image/png',
+        getAsFile: () => mkFile('clip.png', 'image/png') }],
+      files: [],
+    };
+    if (target) Object.defineProperty(ev, 'target', { value: target });
+    return ev;
+  };
+  CALLS.length = 0;
+  vm.onBasisPaste(pasteEv({ tagName: 'DIV' }));
+  await sleep(90);
+  check('★★ Ctrl+V 贴截图 → 真的走上传（用户点名要「从剪贴板缓存上传」）',
+    CALLS.filter((c) => /\/basis\?role=answer$/.test(c.url)).length, 1);
+
+  CALLS.length = 0;
+  vm.onBasisPaste(pasteEv({ tagName: 'TEXTAREA' }));
+  await sleep(60);
+  check('★★ 输入框里的粘贴不抢（老师要往里粘文字）',
+    CALLS.filter((c) => /\/basis/.test(c.url)).length, 0);
+
+  /* ---- ⑬ 源码层的几条硬约定 ---- */
+  const inputTag = (html.match(/<input ref="basisInput"[^>]*>/) || [''])[0];
+  checkTrue('★ file input 不带 accept（本机经验：accept 会把想选的文件藏起来）',
+    !!inputTag && !/accept=/.test(inputTag), inputTag);
+  checkTrue('★ 拖拽上传接的是 onBasisDrop（第三条路）',
+    /@drop\.prevent="onBasisDrop"/.test(html), '');
+  checkTrue('★ 点击上传接的是 pickBasis', /@click="pickBasis"/.test(html), '');
+  checkTrue('★★ 粘贴监听挂在 window 上（焦点在哪都灵）',
+    /window\.addEventListener\('paste', this\.onBasisPaste\)/.test(html), '');
+  checkTrue('★★ 卸载时摘掉监听（不然切页面后还会抢 Ctrl+V）',
+    /removeEventListener\('paste', this\.onBasisPaste\)/.test(html), '');
+  checkTrue('★★ 依据只在 key/rubric 下才上传（ai 模式下没有去处）',
+    /if \(this\.basisMode === 'ai'\)/.test(html), '');
 
   const ti = layerSrc.indexOf('template:');
   check('★★ 标注层模板里反引号正好 2 个（多一个模板就被截断、组件整个加载失败）',

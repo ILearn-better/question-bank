@@ -379,6 +379,40 @@
   .ink-w.on { border-color: #303133; }
   .save-state { font-size: 12px; color: #67c23a; white-space: nowrap; }
   .save-state.warn { color: #e6a23c; font-weight: 600; }
+  /* ==================== 判定依据（答案 / 评分细则） ==================== */
+  /* 卡片顶部那一行：当前用的是哪种判定，以及「要依据却没给」的提醒。
+     有它，老师不用切页签也知道这次按什么标准批。 */
+  .basis-line { display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+                margin: 0 0 8px; font-size: 12.5px; }
+  .basis-modes { display: flex; flex-wrap: wrap; gap: 8px; }
+  .basis-mode-desc { margin: 8px 0 10px; font-size: 12.5px; color: #606266;
+                     line-height: 1.65; }
+  /* 上传区：虚线框住一整块，拖上去要看得见「可以放这里」。
+     ⚠️ 它只是多一条路 —— 点击、拖拽、Ctrl+V 三条都必须能用。 */
+  .basis-drop { padding: 14px 12px; margin: 4px 0 10px; text-align: center;
+                border: 1px dashed #c8d0dc; border-radius: 8px; cursor: pointer;
+                background: rgba(37, 99, 235, .02); }
+  .basis-drop.hot { border-color: #2563eb; background: rgba(37, 99, 235, .08); }
+  .basis-drop.busy { opacity: .7; cursor: default; }
+  .basis-drop.off { cursor: default; background: transparent; }
+  .basis-drop-main { font-size: 13px; color: #303133; }
+  .basis-item { display: flex; align-items: center; gap: 8px; padding: 7px 0;
+                border-bottom: 1px solid #f0f0f0; }
+  .basis-thumb { width: 42px; height: 42px; object-fit: cover; border-radius: 4px;
+                 border: 1px solid #e4e7ed; cursor: zoom-in; flex: none; }
+  .basis-ico { width: 42px; height: 42px; border-radius: 4px; flex: none;
+               display: flex; align-items: center; justify-content: center;
+               font-size: 11px; background: #f4f6fa; color: #606266; }
+  .basis-main { min-width: 0; }
+  .basis-name { font-size: 13px; max-width: 250px; overflow: hidden;
+                text-overflow: ellipsis; white-space: nowrap; }
+  .basis-meta { font-size: 12px; color: #909399; }
+  .basis-warn { color: #e6a23c; }
+  .basis-fail { margin: 6px 0; padding: 6px 9px; border-radius: 6px;
+                font-size: 12px; background: #fef0f0; color: #c45656; }
+  .basis-pre { max-height: 60vh; overflow: auto; white-space: pre-wrap;
+               font-size: 12.5px; line-height: 1.7; background: #fafafa;
+               padding: 10px; border-radius: 6px; }
   body { margin: 0; background: #f0f2f5; font-family: "PingFang SC", "Microsoft YaHei", sans-serif; }
   .topbar {
     display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
@@ -885,6 +919,21 @@
               （当前 {{ blocks.length }} 题<template v-if="skippedCount">，其中 {{ skippedCount }} 题不判</template>）
             </div>
 
+            <!-- 当前判定口径。**放在页签外面**：切模式要按需上传依据，
+                 但「这次按什么标准批」是全局状态，不该藏在某个页签里。 -->
+            <div class="basis-line">
+              <span class="muted-hint">判定依据</span>
+              <el-tag size="small" effect="plain"
+                      :type="basisMode === 'ai' ? 'info' : 'warning'">{{ basisModeLabel }}</el-tag>
+              <template v-if="basisMode !== 'ai'">
+                <span v-if="basisRoleCount" class="muted-hint">· 已传 {{ basisRoleCount }} 份</span>
+                <span v-else class="basis-warn">· 还没传依据（点「开始批改」会被拦）</span>
+              </template>
+              <div style="flex:1"></div>
+              <el-button v-if="tab !== 'basis'" size="small" text type="primary"
+                         @click="tab = 'basis'">去设置</el-button>
+            </div>
+
             <el-tabs v-model="tab">
               <el-tab-pane :label="'分割 ' + blocks.length" name="blocks">
                 <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px">
@@ -967,6 +1016,103 @@
                 </div>
               </el-tab-pane>
 
+              <!-- ★ 判定依据（2026-10-21 用户要求）：三种互斥模式 + 上传依据。
+                   upload 走 **批改自己的接口**（不是「交作业」的文件上传）——
+                   依据文件落到 grades/<gid>/basis/，不会混进提交件清单里。 -->
+              <el-tab-pane :label="'判定依据' + (basisWarn ? ' ⚠' : '')" name="basis">
+                <el-radio-group v-model="basisMode" class="basis-modes"
+                                :disabled="!basisEditable || basisModeSaving"
+                                @change="onBasisModeChange">
+                  <el-radio v-for="m in BASIS_MODES" :key="'bm' + m.value"
+                            :value="m.value" border>{{ m.label }}</el-radio>
+                </el-radio-group>
+                <div class="basis-mode-desc">{{ basisModeDesc }}</div>
+
+                <div v-if="!basisEditable" class="hint" style="color:#e6a23c;margin-bottom:8px">
+                  这份已经批过了 —— 判定依据锁住了（现在的结果就是按当时那份依据批的）。
+                  要换依据得<b>新建一份批改</b>；直接改会让旧结果冒充新标准。
+                </div>
+                <div v-else-if="basisModeSaving" class="hint" style="margin-bottom:8px">
+                  正在保存判定模式…
+                </div>
+
+                <!-- ⚠️ file input **不带 accept**：本机经验，accept 会把老师想选的
+                     文件藏起来（比选错更烦）。格式不对由上传结果逐条说清楚。
+                     ⚠️ 它是拖拽区的**兄弟**而不是子节点：放在里面的话，
+                        input.click() 的事件会冒泡回父节点、再点一次，变成循环。 -->
+                <input ref="basisInput" type="file" multiple style="display:none"
+                       @change="onBasisPick">
+                <div class="basis-drop"
+                     :class="{ hot: basisHot, busy: basisBusy, off: !basisEditable }"
+                     @click="pickBasis"
+                     @dragover.prevent="basisHot = true"
+                     @dragleave="basisHot = false"
+                     @drop.prevent="onBasisDrop">
+                  <template v-if="basisBusy">
+                    <div class="basis-drop-main">⏳ 正在上传：{{ basisUploading }}</div>
+                    <div class="muted-hint">大文件要等几秒，先别关页面</div>
+                  </template>
+                  <template v-else-if="!basisEditable">
+                    <div class="basis-drop-main">这份已经批过了，不能再改依据</div>
+                  </template>
+                  <template v-else>
+                    <div class="basis-drop-main">📎 点这里选文件，或把文件拖进这个框</div>
+                    <div class="muted-hint">
+                      也能直接 Ctrl+V 贴截图 / 贴文件 ·
+                      图片 / PDF / Word / Excel / TXT ·
+                      最多 {{ BASIS_MAX_FILES }} 份 · 单份 ≤ {{ BASIS_MAX_MB }}MB
+                    </div>
+                  </template>
+                </div>
+
+                <!-- 传失败的留在列表里，可以单条重试 —— 一次网络抖动不该让老师重新挑文件 -->
+                <div v-if="basisFailed.length" class="basis-fail">
+                  <div v-for="(bf, bi) in basisFailed" :key="'bf' + bi"
+                       style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+                    <span style="flex:1;min-width:0">⚠ 「{{ bf.name }}」没传上去：{{ bf.msg }}</span>
+                    <el-button size="small" text type="primary"
+                               :loading="basisBusy" @click="retryBasis(bi)">重试</el-button>
+                    <el-button size="small" text @click="basisFailed.splice(bi, 1)">忽略</el-button>
+                  </div>
+                </div>
+
+                <div v-if="basisAll.length" class="basis-list">
+                  <div v-for="f in basisAll" :key="'bfl' + f.id" class="basis-item">
+                    <img v-if="basisIsImage(f)" class="basis-thumb" :src="basisRawUrl(f, true)"
+                         :alt="f.name" @click="previewBasis(f)">
+                    <div v-else class="basis-ico">{{ basisKindLabel(f) }}</div>
+                    <div class="basis-main">
+                      <div class="basis-name" :title="f.name">{{ f.name }}</div>
+                      <div class="basis-meta">
+                        <el-tag size="small" effect="plain"
+                                :type="f.role === 'rubric' ? 'success' : 'primary'">
+                          {{ f.role === 'rubric' ? '细则' : '答案' }}
+                        </el-tag>
+                        · {{ basisKindLabel(f) }} · {{ fmtSize(f.size_bytes) }}
+                        <template v-if="f.kind === 'image'">· 图会直接送进模型看</template>
+                        <template v-else-if="f.chars">· {{ f.chars }} 字</template>
+                        <span v-if="f.text_warn" class="basis-warn">· 没读出文字，模型看不见</span>
+                      </div>
+                    </div>
+                    <div style="flex:1"></div>
+                    <el-button size="small" text @click="previewBasis(f)">预览</el-button>
+                    <el-button size="small" text type="danger" :disabled="!basisEditable"
+                               @click="removeBasis(f)">删除</el-button>
+                  </div>
+                </div>
+                <div v-else class="empty-block" style="padding:18px 0">
+                  还没有上传判定依据<br>
+                  <span style="font-size:12px">
+                    「AI 自主判定」不需要依据；另外两种模式至少要传一份
+                  </span>
+                </div>
+                <div class="hint" style="margin-top:8px">
+                  <b>依据怎么被用上</b>：图片会<b>原样送进模型看</b>（不用先转文字）；
+                  PDF / Word / Excel / TXT 会先抽成文字一起放进提示词 ——
+                  抽不出字的（扫描版 PDF）会标出来，那等于没给模型看。
+                </div>
+              </el-tab-pane>
+
               <el-tab-pane :label="'批改 ' + items.length" name="review">
                 <div v-if="!items.length" class="empty-block" style="padding:24px 0">
                   点右上角「开始批改」，跑完这里会一题一题列出来
@@ -1039,6 +1185,21 @@
   <!-- 文字框：在卷面上点一下 → 这里收内容。位置跟着点的那一点走。
        ⚠️ 用 Element Plus 的对话框而不是 window.prompt：prompt 在部分浏览器里
           被禁、而且不能换行，老师写一句长评语很不顺。 -->
+  <!-- 判定依据的预览：图片直接看、PDF 用浏览器自带的阅读器、
+       其它格式显示**抽出来的文字**（那正是模型看到的东西）。 -->
+  <el-dialog v-model="basisPreview" :title="'预览 · ' + previewName" width="760px" append-to-body>
+    <img v-if="previewKind === 'image'" :src="previewUrl" :alt="previewName"
+         style="max-width:100%;display:block;margin:0 auto">
+    <iframe v-else-if="previewKind === 'pdf'" :src="previewUrl"
+            style="width:100%;height:64vh;border:0"></iframe>
+    <pre v-else-if="previewText" class="basis-pre">{{ previewText }}</pre>
+    <div v-else class="hint">{{ previewNote || '这份文件没有可预览的文字 —— 下载原件看吧' }}</div>
+    <template #footer>
+      <el-button @click="openBasisRaw">下载原件</el-button>
+      <el-button type="primary" @click="basisPreview = false">关闭</el-button>
+    </template>
+  </el-dialog>
+
   <el-dialog v-model="textOpen" title="写一句评语" width="420px" append-to-body>
     <el-input v-model="textDraft.text" type="textarea" :rows="3"
               placeholder="例如：这一步漏了讨论 x=0" @keyup.enter.ctrl="saveText"></el-input>
@@ -1112,6 +1273,32 @@ const INK_COLORS = ['#dc2626', '#2563eb', '#111827', '#16a34a'];
  *  用 REAL 存进库（0033），所以可以是 2.2 这种半档，不用凑整。 */
 const INK_WIDTHS = [2.2, 4.5, 7.5];
 
+/** 判定依据的三种模式（**互斥**，默认 AI）。
+ *  默认 ai 的理由：老师手上通常没有标准答案 —— 让模型自己解是成本最低、
+ *  也最不会「拿错标准」的起点；要按自己的答案/细则判，就明确选另外两个。 */
+const BASIS_MODES = [
+  { value: 'ai', label: 'AI 自主判定',
+    desc: '模型自己把题解一遍，再对照学生作答判断对错。'
+      + '手上没有标准答案时选它 —— 但它解的题没有第二个人核对过，判得对不对要你自己扫一眼。' },
+  { value: 'key', label: '按我给的答案判定',
+    desc: '按你给的标准答案判。答案可以是一段文字、几张答案照片，'
+      + '或者一份 PDF / Word / Excel —— 传上来就会一起送进批改。' },
+  { value: 'rubric', label: '按我的评分细则判定',
+    desc: '按你的分步评分细则判 —— 每一步给多少分、什么情况扣分。'
+      + '解答题只有答案往往判不准（过程对一半该怎么算），有细则时才选这个。' },
+];
+
+/** 依据的限额。**必须与后端一致**（backend/app/services/grade_basis.py 的
+ *  MAX_BASIS_FILES / MAX_BASIS_BYTES）：后端是权威，这里只是为了「选完文件
+ *  当场就能说超没超」，省掉一次注定 422 的往返。测试里有断言盯着这两个数。 */
+const BASIS_MAX_FILES = 10;
+const BASIS_MAX_MB = 20;
+
+/** 收的格式。同样与后端同一份口径（后端还多拦一个「老式 .xls 请另存为」）。 */
+const BASIS_EXTS = ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.heic', '.heif',
+  '.pdf', '.docx', '.doc', '.rtf', '.pptx', '.ppt', '.txt', '.md', '.html', '.htm',
+  '.xlsx', '.xlsm', '.csv'];
+
 const num = (v, d = 0) => { const n = Number(v); return Number.isFinite(n) ? n : d; };
 const clampUnit = (v) => Math.min(1000, Math.max(0, num(v)));
 const bodyText = (s) => String(s === null || s === undefined ? '' : s);
@@ -1171,6 +1358,20 @@ const app = createApp({
        *     真正的判据是 `_draft.marks()` 空了没有（见 saveNow）。 */
       saving: false,
       savedAt: '',
+      /* ---- 判定依据（2026-10-21 用户要求：三种互斥模式 + 上传依据）----
+       *  `basisMode` 只是**界面上**的选择；真正生效的是库里的 `grade.answer_mode`
+       *  （开批时服务端读它），所以每改一次就立刻 PATCH，存不上就退回去。
+       *  ⚠️ 只在界面上改、忘了落库 → 批出来的口径和老师选的不一样，还不报错。 */
+      basisMode: 'ai',
+      basisModeSaving: false,
+      basisBusy: false,
+      basisUploading: '',      // 加载态文案：正在传哪个文件
+      basisHot: false,         // 拖拽悬停高亮
+      /** 传失败的条目 `{name, msg, file}`。**原始 File 必须留着** ——
+       *  否则「重试」只能让老师重新挑一遍文件（那就不叫重试了）。 */
+      basisFailed: [],
+      basisPreview: false, previewId: 0, previewName: '', previewKind: '',
+      previewUrl: '', previewText: '', previewNote: '',
       textOpen: false,
       textDraft: { page: 1, x: 0, y: 0, text: '' },
       /** 标注层是**动态 import** 的 ESM 组件，加载完才挂。
@@ -1189,6 +1390,7 @@ const app = createApp({
       undoBusy: false,
       exporting: false,
       INK_TOOLS, INK_COLORS, INK_WIDTHS,
+      BASIS_MODES, BASIS_MAX_FILES, BASIS_MAX_MB,
       VERDICTS,
       _poll: null,
       // DOM 元素不参与响应式：markRaw 一下，否则每次 setRich 都触发一轮 patch
@@ -1278,6 +1480,36 @@ const app = createApp({
      *  换掉等于把验证过的东西再验一遍。归一化成 `view` 之后，
      *  那三种模式下标注层连子元素一起 `pointer-events:none`（见 CSS），指针照旧归工作台。 */
     layerMode() { return INK_TOOLS.indexOf(this.tool) >= 0 ? this.tool : 'view'; },
+    /* ---------------- 判定依据 ---------------- */
+    /** 这份批改上的**所有**判定依据（答案 + 细则）。 */
+    basisAll() {
+      return ((this.g && this.g.files) || [])
+        .filter((f) => f.role === 'answer' || f.role === 'rubric');
+    },
+    /** 当前模式对应哪一类：`key` → 答案，`rubric` → 细则。
+     *  ai 模式其实没有「依据」这个概念，但列表仍照实显示 —— 老师传过什么要看得见。 */
+    basisRole() { return this.basisMode === 'rubric' ? 'rubric' : 'answer'; },
+    /** **当前模式下**已有几份依据。「能不能开批」只看它。
+     *  切到细则却发现只有答案 → 这里会变成 0，界面上就该提醒再传。 */
+    basisRoleCount() {
+      return this.basisAll.filter((f) => f.role === this.basisRole).length;
+    },
+    basisModeLabel() {
+      const m = BASIS_MODES.filter((x) => x.value === this.basisMode)[0];
+      return m ? m.label : 'AI 自主判定';
+    },
+    basisModeDesc() {
+      const m = BASIS_MODES.filter((x) => x.value === this.basisMode)[0];
+      return m ? m.desc : '';
+    },
+    /** 选了要依据的模式，却一份都没有 —— 页签打 ⚠、顶部那行标红。 */
+    basisWarn() { return this.basisMode !== 'ai' && !this.basisRoleCount; },
+    /** 什么时候能改依据：与后端 `_assert_setup_editable` **同一个判据**
+     *  （批出结果就锁住）。两边不一致的话，界面会放任老师改一个存不进去的东西。 */
+    basisEditable() {
+      const g = this.g;
+      return !!g && !g.done && ['queued', 'failed'].indexOf(g.status) >= 0;
+    },
     /** 本机队列里还没落库的笔迹条数 —— 「未保存」标记的唯一判据。
      *  `localMarks` 由 pushLocal / dropLocal 维护，**出队只在服务端确认之后**
      *  （见 `addMark` 与 `flushPending`），所以它非空就等于「确实还没存住」。 */
@@ -1319,9 +1551,13 @@ const app = createApp({
     /* Ctrl+Z 挂在 window 上而不是某个容器上：老师画完一笔时，
      * 焦点可能在任意地方（工具按钮、页面空白），绑容器上会有「有时灵有时不灵」。 */
     window.addEventListener('keydown', this.onKeyDown);
+    /* Ctrl+V 贴截图（用户点名要「从剪贴板缓存上传」）。挂 window 而不是拖拽区：
+       老师截图的时候光标不一定在哪，绑在某个容器上会「有时灵有时不灵」。 */
+    window.addEventListener('paste', this.onBasisPaste);
   },
   beforeUnmount() {
     window.removeEventListener('keydown', this.onKeyDown);
+    window.removeEventListener('paste', this.onBasisPaste);
     this.stopPoll(); this.teardownLazy(); this.teardownDraft();
   },
   methods: {
@@ -1757,6 +1993,258 @@ const app = createApp({
     /* ==================== 新建批改（上传作业）====================
      *  以前这条动线是「去课时页 → 点 AI 批改作业 → 再回到工作台」，跨两个页面。
      *  老师手里拿着学生发来的照片时，实际想要的就一件事：**把图丢进去开始批**。 */
+    /* ============================ 判定依据 ============================ */
+    /** 页面上选了模式就立刻存库。返回值忽略 —— 结果由 `saveBasisMode` 自己提示。 */
+    onBasisModeChange() { this.saveBasisMode(); },
+    /** 把界面上选的模式写进库。返回 false = 没存上（调用方别继续）。
+     *
+     *  ⚠️ 必须真的落库：开批时服务端读的是 `homework_grades.answer_mode`，
+     *     只在界面上改，批出来的口径跟老师选的不一样 —— 而且全程不报错。
+     */
+    async saveBasisMode() {
+      if (!this.g || !this.basisEditable) return true;
+      const want = this.basisMode;
+      if ((this.g.answer_mode || 'ai') === want) return true;
+      this.basisModeSaving = true;
+      try {
+        const d = await this.api('/api/homework-grades/' + this.gid, {
+          method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ answer_mode: want }),
+        });
+        const keep = { regions: this.g.regions, skipped_pages: this.g.skipped_pages };
+        this.g = Object.assign({}, this.g, d, this.dirty ? keep : {});
+        return true;
+      } catch (e) {
+        // 存不上就退回库里那个值：界面显示的模式必须是**真的会生效**的那个
+        this.basisMode = this.g.answer_mode || 'ai';
+        ElementPlus.ElMessage.error('判定模式没改成：' + e.message);
+        return false;
+      } finally { this.basisModeSaving = false; }
+    },
+    pickBasis() {
+      if (!this.basisEditable) return;
+      const el = this.$refs.basisInput;
+      if (el) el.click();
+    },
+    onBasisPick(e) {
+      const el = e.target;
+      const files = (el && el.files) ? Array.prototype.slice.call(el.files) : [];
+      if (el) el.value = '';        // 清掉 value：同一个文件再选一次也能触发
+      this.uploadBasisFiles(files);
+    },
+    onBasisDrop(e) {
+      this.basisHot = false;
+      const dt = e && e.dataTransfer;
+      const files = (dt && dt.files) ? Array.prototype.slice.call(dt.files) : [];
+      if (!files.length) {
+        ElementPlus.ElMessage.warning('拖进来的东西里没有文件 —— 图片、PDF、Word 都行');
+        return;
+      }
+      this.uploadBasisFiles(files);
+    },
+    /** 单条重试。先把它从失败列表摘掉 —— 再失败会重新入队（不会出现两条一样的）。 */
+    async retryBasis(i) {
+      const it = this.basisFailed[i];
+      if (!it) return;
+      this.basisFailed.splice(i, 1);
+      await this.uploadBasisFiles([it.file]);
+    },
+    /** 前端预校验：类型 / 大小 / 空文件。返回一句人话，空串 = 通过。
+     *  ⚠️ 后端还会再校验一遍（它才是权威）—— 这里只是省掉一次白跑的网络往返。 */
+    basisReject(f) {
+      const name = String((f && f.name) || '');
+      const dot = name.lastIndexOf('.');
+      const ext = dot >= 0 ? name.slice(dot).toLowerCase() : '';
+      if (!ext) return '没有扩展名 —— 认不出是什么格式，改个名再传';
+      if (ext === '.xls') return '老式 .xls 读不了 —— 在 Excel 里「另存为」.xlsx 或 .csv 再传';
+      if (BASIS_EXTS.indexOf(ext) < 0) {
+        return ext + ' 这种格式收不了（图片 / PDF / Word / Excel / TXT 都行）';
+      }
+      if (!f.size) return '是个空文件 —— 重新选一次吧';
+      if (f.size > BASIS_MAX_MB * 1024 * 1024) {
+        return '超过 ' + BASIS_MAX_MB + 'MB —— 换个小一点的（答案一般没这么大）';
+      }
+      return '';
+    },
+    /** 逐份上传。**一份失败不中断后面的**：三份里成功两份，
+     *  也比「一份坏了全白传」好；失败的那份留在列表里可以单条重试。 */
+    async uploadBasisFiles(files) {
+      const list = Array.prototype.slice.call(files || []);
+      if (!list.length) return;
+      if (!this.gid) { ElementPlus.ElMessage.warning('先选一份作业'); return; }
+      if (!this.basisEditable) {
+        ElementPlus.ElMessage.warning('这份已经批过了 —— 判定依据锁住了，换依据得新建一份批改');
+        return;
+      }
+      /* 依据只在「按答案 / 按细则」下才有去处：AI 自己解的时候传上去用不到。
+         与其默默收下一堆用不上的文件，不如当场说清楚。 */
+      if (this.basisMode === 'ai') {
+        this.tab = 'basis';
+        ElementPlus.ElMessage.warning('先切到「按我给的答案判定」或「按我的评分细则判定」，文件才有去处');
+        return;
+      }
+      const role = this.basisRole;
+      let ok = 0;
+      for (const f of list) {
+        // 份数上限：前端先数一遍，别让老师一份份传完、在最后一份才被拒
+        if (this.basisRoleCount + ok >= BASIS_MAX_FILES) {
+          ElementPlus.ElMessage.warning('判定依据最多 ' + BASIS_MAX_FILES + ' 份，剩下的没传');
+          break;
+        }
+        const why = this.basisReject(f);
+        if (why) {
+          this.basisFailed.push({ name: f.name || '这个文件', msg: why, file: Vue.markRaw(f) });
+          continue;
+        }
+        this.basisBusy = true;
+        this.basisUploading = f.name || '文件';
+        try {
+          const fd = new FormData();
+          // 拖出来的 / 截图工具给的 Blob 常常没名字，补一个 —— 后端按扩展名判格式。
+          fd.append('file', f, f.name || ('basis-' + Date.now() + '.png'));
+          const r = await this.api(
+            '/api/homework-grades/' + this.gid + '/basis?role=' + role,
+            { method: 'POST', body: fd });
+          ok += 1;
+          /* note 非空 = 收下了但抽不出文字（扫描版 PDF 之类）。
+             **必须说出来**：静默收下一份模型看不见的依据，等于让老师以为已经按他的答案判了。 */
+          if (r && r.note) {
+            ElementPlus.ElMessage.warning({ message: r.note, duration: 9000 });
+          }
+        } catch (e) {
+          this.basisFailed.push({ name: f.name || '这个文件', msg: e.message, file: Vue.markRaw(f) });
+        } finally {
+          this.basisBusy = false;
+          this.basisUploading = '';
+        }
+      }
+      if (ok) {
+        await this.refreshDetail();
+        ElementPlus.ElMessage.success('传好 ' + ok + ' 份依据');
+      }
+    },
+    async removeBasis(f) {
+      if (!this.basisEditable) {
+        ElementPlus.ElMessage.warning('这份已经批过了 —— 依据锁住了，删不了');
+        return;
+      }
+      try {
+        await ElementPlus.ElMessageBox.confirm(
+          '会从这份批改里删掉「' + f.name + '」。\n'
+          + '文件本身还在磁盘上（老师能找回），但下次批改就少一份依据了。',
+          '删掉这份依据',
+          { confirmButtonText: '删掉', cancelButtonText: '算了', type: 'warning' });
+      } catch (e) { return; }                  // 老师点了「算了」
+      try {
+        await this.api('/api/homework-grades/' + this.gid + '/basis/' + f.id, { method: 'DELETE' });
+        await this.refreshDetail();
+        ElementPlus.ElMessage.success('删掉了');
+      } catch (e) {
+        ElementPlus.ElMessage.error('没删掉：' + e.message);
+      }
+    },
+    /** 只刷服务端那份详情，**不动本机的分割草稿** —— 与 tick 同一个理由：
+     *  老师可能刚画完线还没保存，整份覆盖会把线冲掉。 */
+    async refreshDetail() {
+      const d = await this.api('/api/homework-grades/' + this.gid);
+      if (!this.g) { this.g = d; return; }
+      const keep = { regions: this.g.regions, skipped_pages: this.g.skipped_pages };
+      this.g = Object.assign({}, this.g, d, this.dirty ? keep : {});
+    },
+    basisRawUrl(f, inline) {
+      return '/api/homework-grades/' + this.gid + '/basis/' + f.id + '/raw'
+        + (inline ? '?inline=1' : '');
+    },
+    basisIsImage(f) {
+      return String((f && f.kind) || '') === 'image';
+    },
+    basisKindLabel(f) {
+      const map = {
+        image: '图片', pdf: 'PDF', word: 'Word', 'word-legacy': 'DOC', rtf: 'RTF',
+        ppt: 'PPT', 'ppt-legacy': 'PPT', text: '文本', html: '网页', sheet: 'Excel',
+      };
+      return map[String((f && f.kind) || '')] || '文件';
+    },
+    fmtSize(n) {
+      const b = Number(n) || 0;
+      if (b < 1024) return b + ' B';
+      if (b < 1024 * 1024) return Math.round(b / 1024) + ' KB';
+      return (b / 1024 / 1024).toFixed(1) + ' MB';
+    },
+    /** 预览：图片直接看、PDF 交给浏览器自带的阅读器、其它格式显示**抽出来的文字**
+     *  （那正是模型看到的东西 —— 比「下载下来自己找」有用）。 */
+    async previewBasis(f) {
+      this.previewId = f.id;
+      this.previewName = f.name || '依据';
+      this.previewUrl = this.basisRawUrl(f, true);
+      this.previewKind = f.kind === 'image' ? 'image' : (f.kind === 'pdf' ? 'pdf' : 'text');
+      this.previewText = '';
+      this.previewNote = '';
+      this.basisPreview = true;
+      if (this.previewKind !== 'text') return;
+      try {
+        const r = await this.api(
+          '/api/homework-grades/' + this.gid + '/basis/' + f.id + '/text');
+        this.previewText = r.text || '';
+        if (!String(r.text || '').trim()) {
+          this.previewNote = f.text_warn || '这份文件里没有文字可预览 —— 下载原件看吧';
+        }
+      } catch (e) {
+        this.previewNote = '读不出来：' + e.message;
+      }
+    },
+    openBasisRaw() {
+      if (!this.previewId) return;
+      window.open(this.basisRawUrl({ id: this.previewId }, false), '_blank');
+    },
+    /** 剪贴板里的文件（截图 / 从资源管理器复制的文件）。
+     *  两条来源都试：`items[kind=file]`（截图工具最常见）、`files`（有的浏览器只放这里）。
+     *  从网页复制的 `<img>` 拿不到二进制（只有一串 HTML），那种返回空 —— 不硬猜 URL。 */
+    filesFromClipboard(e) {
+      const cd = e && e.clipboardData;
+      if (!cd) return [];
+      const out = [];
+      const items = cd.items || [];
+      for (let i = 0; i < items.length; i += 1) {
+        const it = items[i];
+        if (it && it.kind === 'file') {
+          const f = it.getAsFile ? it.getAsFile() : null;
+          if (f) out.push(this.namePasted(f));
+        }
+      }
+      if (!out.length) {
+        const files = cd.files || [];
+        for (let i = 0; i < files.length; i += 1) out.push(this.namePasted(files[i]));
+      }
+      return out;
+    },
+    /** 剪贴板来的 Blob 常常**没有文件名**（截图工具只给一个 Blob）。
+     *  后端按扩展名判格式，没名字会被当成未知格式退回来 —— 这里补一个。 */
+    namePasted(f) {
+      if (f && f.name) return f;
+      const type = String((f && f.type) || '');
+      const ext = type.indexOf('jpeg') >= 0 ? 'jpg'
+        : type.indexOf('webp') >= 0 ? 'webp' : 'png';
+      try {
+        return new File([f], '粘贴-' + Date.now() + '.' + ext, { type: type || 'image/png' });
+      } catch (e) {
+        return f;        // 老浏览器没有 File 构造器：原样传，让后端说话
+      }
+    },
+    /** 全局粘贴。**只在真的贴进来文件时接管**。
+     *  ⚠️ 输入框里的粘贴一律放过去 —— 老师往评语框里贴一段文字是常规操作，
+     *     抢过来就是灾难（旧版批改页踩过这条）。 */
+    onBasisPaste(e) {
+      const t = e && e.target;
+      const tag = String((t && t.tagName) || '').toUpperCase();
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || (t && t.isContentEditable)) return;
+      if (!this.gid || !this.basisEditable) return;
+      const files = this.filesFromClipboard(e);
+      if (!files.length) return;
+      e.preventDefault();
+      this.uploadBasisFiles(files);
+    },
+
     async openNew() {
       this.newOpen = true;
       if (this.lessons.length) return;
@@ -1909,6 +2397,14 @@ const app = createApp({
       this.archiving = false;
       this.saving = false;
       this.savedAt = '';          // 上一份的「已保存 11:45」不能留在这一份上
+      /* 判定依据也要复位：上一份的失败列表留着，下一份会显示一堆
+         「某某文件没传上去」—— 那是上一份的事。模式在 applyDetail 里跟服务端对齐。 */
+      this.basisMode = 'ai';
+      this.basisBusy = false;
+      this.basisHot = false;
+      this.basisFailed = [];
+      this.basisPreview = false;
+      this.basisModeSaving = false;
       this.cancelAsked = false;   // 换一份作业时必须清，否则新作业的终止按钮点不动
       // ⚠️ 「点过开批」的旗必须跟着记录走。不重置的话，切到另一份 queued 的记录时
       //    会被上一份的旗顶成「批改中」→ 按钮又是灰的。
@@ -1931,6 +2427,8 @@ const app = createApp({
     /** 把服务端的详情摊进「分割草稿」。**刷新页也不丢已保存的分割**就靠这一步。 */
     applyDetail(d) {
       this.g = d;
+      // 模式以**服务端**为准：库里那个才是开批时真正生效的口径。
+      this.basisMode = d.answer_mode || 'ai';
       this.syncRegions();
       this.$nextTick(() => { this.paintAll(); this.$nextTick(() => this.paintAll()); });
     },
@@ -2508,6 +3006,18 @@ const app = createApp({
        *   甚至更糟的错误提示 —— 这就是「终止不顺畅」最直观的样子。 */
     },
     async runGrade() {
+      /* ★ 选了「按我的答案 / 按我的细则」却一份依据都没传 —— **别提交**。
+       *   让服务端 422 回来再弹红字也能拦住，但那时候老师已经点了「开始批改」、
+       *   还得自己猜是哪一步不对；依据在页面上就已经看得见了，当场拦更省事。 */
+      if (this.basisMode !== 'ai' && !this.basisRoleCount) {
+        this.tab = 'basis';
+        ElementPlus.ElMessage.error(this.basisMode === 'rubric'
+          ? '选了「按我的评分细则判定」，但还没上传细则 —— 先传一份再开始批改'
+          : '选了「按我给的答案判定」，但还没上传答案 —— 先传一份再开始批改');
+        return;
+      }
+      // 模式刚改过、还没落库：开批用的是库里的 answer_mode，先存住再跑。
+      if (!(await this.saveBasisMode())) return;
       /* ★ 有没保存的分割就先存。老师画完线直接点「开始批改」是最自然的顺序，
        *   而库里还是上一次的分割 → 批出来的题跟他刚才切的对不上，看起来像
        *   「我切的没用」。存不上就**不要开批**（否则批的是旧分区，更糟）。 */

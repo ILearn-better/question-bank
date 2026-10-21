@@ -24,6 +24,11 @@
   · **`total` 是页数**，不是题目数（batch_jobs 踩过这个歧义）。
   · **确认之前不进统计**：`status` 不到 done，掌握度 / 家长稿都不该读。
   · **标注坐标一律 0~1000**（按页归一化），与 `batch_items.figure_box` 同制。
+  · **判定依据可以是一份文件**（0034）：图片走视觉通道送给模型，
+    PDF / Word / Excel / TXT 抽成文字进 `text` 列；抽不出文字的**必须说出来**
+    （扫描版 PDF 收下但 note 非空），绝不假装「已经按你的答案判了」。
+    依据落在**批改自己的目录**（`grades/<gid>/basis/`），不进 lesson_files ——
+    否则一份答案 PDF 会被下次建批改当成学生作业**默认勾上**。
   · **AGPL 边界**：`grade_ai.py` / `grade_store.py` 里不许出现 pymupdf。
   · **静默失败要能看见**：`finish_reason == "length"` 必须当失败（全项目此前没有一处读它）。
 
@@ -158,6 +163,33 @@ def make_png(path: Path, w: int = 60, h: int = 80) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr)
                      + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+
+
+def make_xlsx(path: Path, rows: list) -> None:
+    """一张真正的 .xlsx（openpyxl 在 requirements 里：课表导入就用它）。"""
+    import openpyxl
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "答案"
+    for r in rows:
+        ws.append(list(r))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    wb.save(str(path))
+
+
+def make_pdf_no_text(path: Path) -> None:
+    """一张**没有任何文字层**的 PDF —— 就是老师最常发的那种「扫描件」。
+
+    它必须走「收下 + note 非空」那条路：直接拒收会让老师以为 PDF 不支持，
+    静默收下又会让模型在看不见答案的情况下照常批。
+    """
+    import pymupdf
+    doc = pymupdf.open()
+    page = doc.new_page()
+    page.draw_rect(pymupdf.Rect(60, 60, 260, 260), color=(0, 0, 0), fill=(0.85, 0.85, 0.85))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    doc.save(str(path))
+    doc.close()
 
 
 def mk_student(db, name: str = "批改测试学生") -> Student:
@@ -406,10 +438,21 @@ def t_setup() -> None:
         _k, _r = G._answer_texts(db, g)
         check("但喂给 AI 的依据是空（ai 模式不该塞答案）", _k == "" and _r == "")
 
-        # 切到 key 但清空答案 → 422
+        # 切到 key 同时把答案清空：**允许**（老师要换答案，得能先清空再填新的）。
+        # 拦的是「开批」——「key 模式 + 依据空」跑起来就等于拿 AI 自解冒充按答案判。
+        # ⚠️ 2026-10-21 改的口径：以前这里要求 422，结果真浏览器上
+        #    「切模式」和「传依据」互相要求对方先做到，整个功能用不了。
+        # ⚠️ 用 expect_err 拿状态码而不是直接调：直接调的话，这道门被（有人）加回去时
+        #    抛的是 traceback，输出里压根没有 [FAIL] 行 —— 反向验证会把「崩了」当「守住了」。
         st, msg = expect_err(G.patch_setup, db, g.id,
                              GradeSetupPatch(answer_mode="key", answer_text=""))
-        check("切到「用我给的答案」却把答案清空 → 422", st == 422, msg)
+        db.refresh(g)
+        _k, _r = G._answer_texts(db, g)
+        check("★★ 清空答案也允许改（要换答案得能先清空）",
+              st == 0 and _k == "", f"st={st} {msg[:40]}")
+        st, msg = expect_err(G.launch, db, g)
+        check("★★ 清空之后开批 → 422（依据空不能冒充「按老师答案判」）",
+              st == 422 and "依据" in msg, msg[:60])
 
         # 重写答案会覆盖旧的 txt（不该攒出一堆 answer_2.txt）
         G.patch_setup(db, g.id, GradeSetupPatch(answer_mode="key", answer_text="3. x=3"))
@@ -2269,6 +2312,219 @@ def t_cancel_points() -> None:
         G._crop_block = orig_crop
 
 
+# ================================================================ ⑰ 判定依据（文件）
+def t_basis() -> None:
+    print("\n⑰ 判定依据：上传 / 抽取 / 限额 / 真进批改")
+    from app.schemas import GradeSetupPatch
+    from app.services import grade_basis
+
+    db = SessionLocal()
+    try:
+        stu = mk_student(db, "依据测试学生")
+        ls = mk_lesson(db, stu)
+        sub_f = mk_submission(db, ls, "依据作业.png")
+        db.commit()
+
+        # —— 默认模式必须是 AI（用户点名：默认选中 AI 自主判定）——
+        # ⚠️ 这两条**必须排在建任务之前**：默认值一旦退回 key，`create_grade` 会
+        #    当场抛「答案还是空的」，测试直接崩在下面那行 —— 那样得到的是一个
+        #    traceback，而不是一句「默认值错了」，查起来多绕一圈。
+        check("★ GradeIn 的 default 是 ai（API 不传时不该落回 key）",
+              GradeIn.model_fields["answer_mode"].default == "ai",
+              GradeIn.model_fields["answer_mode"].default)
+        check("★ GradeIn 不传 answer_mode 就落到 ai",
+              GradeIn(lesson_id=ls.id, file_ids=[sub_f.id]).answer_mode == "ai",
+              GradeIn(lesson_id=ls.id, file_ids=[sub_f.id]).answer_mode)
+
+        g = G.create_grade(db, GradeIn(lesson_id=ls.id, file_ids=[sub_f.id]))
+        db.commit()
+        check("★ 新建批改默认是「AI 自主判定」（不是 key）", g.answer_mode == "ai", g.answer_mode)
+
+        # —— ★★★ 回归：切模式**不能**要求「依据已经存在」——
+        # 真浏览器上就是这么锁死的：界面上「先切模式、再传依据」，而 AI 模式下
+        # 前端不许上传（传上去也没去处）。两边都要求对方先做到 → 功能整体不可用，
+        # 而且只表现成「切了又自动跳回 AI」，一句报错都不明显。
+        # 这里的断言方向是**反的**（要求不报错），别看着别扭就改回去。
+        # ⚠️ 用 expect_err 拿状态码而不是直接调：断言要是写成「不抛错就行」，
+        #    反向验证（故意把这道门加回去）时抛出的会是 traceback，
+        #    输出里没有 [FAIL] 行 → 反向验证会误判成「守住了」。
+        st, msg = expect_err(G.patch_setup, db, g.id, GradeSetupPatch(answer_mode="key"))
+        db.refresh(g)
+        check("★★★ 一份依据都没有时切到「按我给的答案判定」也允许（否则和上传互锁）",
+              st == 0 and g.answer_mode == "key", f"st={st} {msg[:60]}")
+        st, msg = expect_err(G.launch, db, g)
+        check("★★ 但这时开批照样被拦（校验只留在开批那一处）",
+              st == 422 and "依据" in msg, msg[:60])
+        G.patch_setup(db, g.id, GradeSetupPatch(answer_mode="ai"))   # 收回 ai，后面按原剧本走
+
+        # —— 图片依据：走视觉通道，chars 必须是 0 且**不能报错** ——
+        p_img = TMP / "答案.png"
+        make_png(p_img)
+        r1 = G.add_basis_file(db, g.id, "answer", "答案.png", p_img.read_bytes())
+        check("★ 图片依据收下了（答案照片是最高频的一种）",
+              r1["file"]["kind"] == "image", r1["file"]["kind"])
+        check("图片的 chars 是 0 而不是「读失败」", r1["file"]["chars"] == 0)
+        check("图片没有 note（它本来就该没有文字层，不是错误）", r1["note"] == "", r1["note"])
+
+        # —— Excel 依据：必须真的抽出格子（老师常把答案做成表）——
+        p_xlsx = TMP / "答案.xlsx"
+        make_xlsx(p_xlsx, [["题号", "答案", "分值"], [1, "x=2 或 x=3", 5], [2, 42, 4]])
+        r2 = G.add_basis_file(db, g.id, "answer", "答案.xlsx", p_xlsx.read_bytes())
+        check("★ Excel 依据收下了（后端白名单里有 .xlsx）",
+              r2["file"]["kind"] == "sheet", r2["file"]["kind"])
+        check("★★ Excel 里的字被抽出来了", "x=2 或 x=3" in (r2["file"]["preview"] or ""),
+              r2["file"]["preview"][:60])
+        check("数值 42 抽成「42」而不是「42.0」（答案里的精度会误导人）",
+              "| 42 |" in (r2["file"]["preview"] or ""), r2["file"]["preview"][:80])
+
+        # —— TXT ——
+        r3 = G.add_basis_file(db, g.id, "answer", "答案.txt", "1. A\n2. B\n".encode())
+        check("TXT 依据抽出了正文", "2. B" in (r3["file"]["preview"] or ""), r3["file"]["preview"])
+
+        # —— 扫描版 PDF：收下，但**必须留 note** ——
+        p_pdf = TMP / "扫描答案.pdf"
+        make_pdf_no_text(p_pdf)
+        r4 = G.add_basis_file(db, g.id, "answer", "扫描答案.pdf", p_pdf.read_bytes())
+        check("★ 扫描版 PDF 收下了（不拒收）", r4["file"]["id"] > 0)
+        check("★★ 但 note 必须说「模型看不见这份」（静默收下最糟）",
+              bool(r4["note"]) and "看不见" in r4["note"], r4["note"][:60])
+        check("扫描版 PDF 的 chars 是 0", r4["file"]["chars"] == 0)
+
+        # —— 落盘位置：批改自己的目录，**不进 lesson_files** ——
+        bdir = config.UPLOAD_DIR / "grades" / str(g.id) / "basis"
+        check("★ 依据落在 grades/<gid>/basis/（不进「交作业」清单）", bdir.is_dir(), str(bdir))
+        check("★★ 依据文件没有变成 lesson_files（否则下次建批改会被默认勾当作业）",
+              db.scalar(select(LessonFile).where(
+                  LessonFile.lesson_id == ls.id, LessonFile.name == "答案.png")) is None)
+        check("存的是原名（老师认得出自己传的是哪份）", r1["file"]["name"] == "答案.png")
+
+        # —— 拒收：老式 .xls / 空文件 / 怪格式 / 超大 ——
+        st, msg = expect_err(G.add_basis_file, db, g.id, "answer", "旧答案.xls", b"whatever")
+        check("★ 老式 .xls → 422 且提示去另存（不假装支持）",
+              st == 422 and "另存" in msg, msg[:60])
+        st, msg = expect_err(G.add_basis_file, db, g.id, "answer", "空.png", b"")
+        check("空文件 → 422", st == 422, msg[:40])
+        st, msg = expect_err(G.add_basis_file, db, g.id, "answer", "快捷方式.lnk", b"x")
+        check("不认识的格式 → 422", st == 422, msg[:60])
+        st, msg = expect_err(G.add_basis_file, db, g.id, "answer", "大.png",
+                             b"x" * (grade_basis.MAX_BASIS_BYTES + 1))
+        check("★ 超过单份上限 → 422（文案里带 MB 数）",
+              st == 422 and "MB" in msg, msg[:60])
+        st, msg = expect_err(G.add_basis_file, db, g.id, "bogus", "答案.png", p_img.read_bytes())
+        check("role 只认 answer / rubric → 422", st == 422, msg[:40])
+
+        # —— 份数上限 ——
+        used = len([f for f in G.detail(db, g)["files"] if f["role"] in ("answer", "rubric")])
+        room = grade_basis.MAX_BASIS_FILES - used
+        for i in range(room):
+            G.add_basis_file(db, g.id, "answer", f"填充{i}.png", p_img.read_bytes())
+        st, msg = expect_err(G.add_basis_file, db, g.id, "answer", "第十一份.png", p_img.read_bytes())
+        check(f"★ 超过 {grade_basis.MAX_BASIS_FILES} 份 → 422",
+              st == 422 and str(grade_basis.MAX_BASIS_FILES) in msg, msg[:60])
+
+        # —— 真的进批改上下文 ——
+        G.patch_setup(db, g.id, GradeSetupPatch(answer_mode="key"))
+        db.refresh(g)
+        key_text, _rub = G._answer_texts(db, g)
+        imgs = G._answer_images(db, g)
+        check("★★ 上传的 Excel/TXT 正文进了 ctx（模型真能看到）",
+              "x=2 或 x=3" in key_text and "2. B" in key_text, key_text[:60])
+        check("★★ 答案图片进了 ctx 的图列表（走视觉通道，不抽字）",
+              len(imgs["answer"]) >= 1, len(imgs["answer"]))
+        check("★ 扫描版 PDF 因为没文字，**不会**被当图片塞进去（它本来也不是图）",
+              all(not x.endswith(".pdf") for x in imgs["answer"]), imgs["answer"][:2])
+
+        # —— 切回 ai：依据就不该再进 ctx ——
+        G.patch_setup(db, g.id, GradeSetupPatch(answer_mode="ai"))
+        k_ai, r_ai = G._answer_texts(db, g)
+        check("★★ ai 模式下依据不塞进 ctx（老师选的是「模型自己解」）",
+              k_ai == "" and r_ai == "", k_ai[:40])
+
+        # —— ★ 回归：改「粘贴的答案」**不许**把上传的依据一起删掉 ——
+        n_before = len([f for f in G.detail(db, g)["files"] if f["role"] in ("answer", "rubric")])
+        G.patch_setup(db, g.id, GradeSetupPatch(answer_text="1. C"))
+        n_after = len([f for f in G.detail(db, g)["files"] if f["role"] in ("answer", "rubric")])
+        check("★★★ 重写「粘贴的答案」不会删掉上传的依据（_is_pasted_row 的意义）",
+              n_after == n_before + 1, f"{n_before} → {n_after}")
+        # 此刻是 ai 模式 → 喂模型的 ctx 必须是空的（上面那条刚验过）；
+        # 这里验的是**回显**，所以要 respect_mode=False。
+        check("粘贴的那份确实加进来了",
+              "1. C" in (G._answer_texts(db, g, respect_mode=False)[0] or ""))
+
+        # —— 删除：行 + 原件 ——
+        victim = r2["file"]["id"]
+        vpath = list(bdir.glob("*.xlsx"))
+        check("删除前原件在磁盘上", len(vpath) == 1, [p.name for p in vpath])
+        G.delete_basis_file(db, g.id, victim)
+        check("★ 删依据后行没了",
+              db.get(HomeworkGradeFile, victim) is None)
+        check("★★ 删依据后磁盘上那份原件也删了（不留垃圾）",
+              len(list(bdir.glob("*.xlsx"))) == 0)
+
+        # —— 归属：别的批改的 id → 404 ——
+        other = G.create_grade(db, GradeIn(lesson_id=ls.id, file_ids=[sub_f.id]))
+        db.commit()
+        st, msg = expect_err(G.delete_basis_file, db, other.id, r1["file"]["id"])
+        check("★★ 拿别的批改的 id 来删 → 404（不是 403，不泄露存在性）", st == 404, msg[:40])
+        st, msg = expect_err(G.basis_raw_path, db, other.id, r1["file"]["id"])
+        check("取原件同样 404", st == 404, msg[:40])
+
+        # —— ★ 删光之后开批必须被拦（launch 那道门）——
+        for f in [x for x in G.detail(db, g)["files"] if x["role"] in ("answer", "rubric")]:
+            G.delete_basis_file(db, g.id, f["id"])
+        G.patch_setup(db, g.id, GradeSetupPatch(answer_mode="ai"))   # 先收拾成干净状态
+        db.refresh(g)
+        key_now, _r = G._answer_texts(db, g)
+        check("（准备）依据确实空了", key_now == "", key_now[:30])
+        # 直接改库里的 mode：模拟「依据被删完、mode 还停在 key」
+        g.answer_mode = "key"
+        db.commit()
+        st, msg = expect_err(G.launch, db, g)
+        check("★★★ 依据空了还要开批 → 422（不能拿 AI 自解冒充按老师答案判）",
+              st == 422 and "依据" in msg, msg[:60])
+        g.answer_mode = "ai"
+        db.commit()
+
+        # —— 批过之后就锁住 ——
+        g.status, g.done = "reviewing", 1
+        db.commit()
+        st, msg = expect_err(G.add_basis_file, db, g.id, "answer", "晚了.png", p_img.read_bytes())
+        check("★ 批过之后再传依据 → 422（旧结果是按旧依据算的）",
+              st == 422 and "重新批改" in msg, msg[:60])
+        g.status, g.done = "queued", 0
+        db.commit()
+
+        # —— 契约：file_dict 给出「看不看得见」的判据 ——
+        r5 = G.add_basis_file(db, g.id, "rubric", "细则.txt", "每步 2 分".encode())
+        f5 = [x for x in G.detail(db, g)["files"] if x["id"] == r5["file"]["id"]][0]
+        check("★★ detail 里的文件带 chars（界面据此判断「模型看不看得见」）",
+              f5["chars"] == len("每步 2 分"), f5["chars"])
+        check("带 preview（老师能确认传的是不是这份）", "每步" in f5["preview"])
+        check("带 lesson_file_id（提交件才非空，前端据此区分两类文件）",
+              "lesson_file_id" in f5)
+
+        # —— 迁移 0034 ——
+        mig = BE / "alembic" / "versions" / "0034_grade_file_text.py"
+        check("★ 迁移文件 0034 在", mig.is_file(), str(mig))
+        mtext = read(mig)
+        check("0034 接在 0033 后面", 'down_revision: Union[str, None] = "0033"' in mtext)
+        check("0034 只加一列 text", mtext.count("op.add_column") == 1
+              and '"text"' in mtext, "add_column 或列名不对")
+
+        # —— 前后端限额必须同值（否则界面放行、后端 422）——
+        wb_src = read(FE / "workbench.html")
+        m = re.search(r"const BASIS_MAX_FILES = (\d+);", wb_src)
+        check("★★ 前端的份数上限与后端同值",
+              bool(m) and int(m.group(1)) == grade_basis.MAX_BASIS_FILES,
+              m.group(1) if m else "没找到")
+        m = re.search(r"const BASIS_MAX_MB = (\d+);", wb_src)
+        check("★★ 前端的大小上限与后端同值",
+              bool(m) and int(m.group(1)) * 1024 * 1024 == grade_basis.MAX_BASIS_BYTES,
+              m.group(1) if m else "没找到")
+    finally:
+        db.close()
+
+
 def main() -> int:
     Base.metadata.create_all(engine)
     print("=" * 72)
@@ -2290,6 +2546,7 @@ def main() -> int:
     t_regions()
     t_cross_page()
     t_answer_images()
+    t_basis()
 
     print("\n" + "=" * 72)
     print(f"共 {total} 项，失败 {len(fails)} 项")

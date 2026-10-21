@@ -27,7 +27,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
 from .. import config, taxonomy
@@ -54,7 +54,7 @@ from ..schemas import (
     GradeSetupPatch,
     GradeToBankIn,
 )
-from . import knowledge, storage
+from . import grade_basis, knowledge, storage
 
 # 页 = 一次模型调用。并发数与 batch_page 同一个量级：再高只是把模型的限流打满。
 WORKERS = 3
@@ -245,7 +245,21 @@ def brief(grade: HomeworkGrade) -> dict:
     }
 
 
-def file_dict(f: HomeworkGradeFile) -> dict:
+def file_dict(f: HomeworkGradeFile, db: Session | None = None) -> dict:
+    """一条文件行给前端的样子。
+
+    0034 之后 `files` 里混着两类东西：学生的**提交件**（引用 lesson_files）
+    和老师传的**判定依据**（自落盘 + text 列）。所以要多给三样：
+      · `lesson_file_id` —— 提交件才有，前端据此知道原件的出处；
+      · `chars` —— 抽出来多少字；
+      · `preview` —— 开头一小段，老师能确认「传的是不是这份」。
+    **必须给出 `chars`**：一份读不出字的依据（扫描版 PDF）模型其实看不见，
+    界面得据此提醒；只列个文件名，老师会以为已经给过答案了。
+    """
+    chars = len(f.text or "")
+    if not chars and f.lesson_file_id and db is not None:
+        lf = db.get(LessonFile, f.lesson_file_id)
+        chars = int(getattr(lf, "chars", 0) or 0) if lf is not None else 0
     return {
         "id": f.id,
         "name": f.name,
@@ -253,6 +267,9 @@ def file_dict(f: HomeworkGradeFile) -> dict:
         "kind": f.kind,
         "size_bytes": f.size_bytes,
         "pages": f.pages,
+        "lesson_file_id": f.lesson_file_id,
+        "chars": chars,
+        "preview": (f.text or "")[:160],
     }
 
 
@@ -322,7 +339,7 @@ def detail(db: Session, grade: HomeworkGrade) -> dict:
         .order_by(HomeworkGradeMark.page_no, HomeworkGradeMark.id)
     ).all()
     out["items"] = [item_dict(i) for i in items]
-    out["files"] = [file_dict(f) for f in files]
+    out["files"] = [file_dict(f, db) for f in files]
     out["marks"] = [mark_dict(m) for m in marks]
     # 老师画的「一题一区域」框。有框的页按框逐题批，没框的页保持整页一次判。
     out["regions"] = list_regions(db, grade.id)
@@ -516,8 +533,7 @@ def patch_setup(db: Session, gid: int, payload: GradeSetupPatch) -> HomeworkGrad
     必须走「重新批改」把它清掉重来 —— 否则老师会以为依据改了、其实判定还是旧的。
     """
     grade = get_grade(db, gid)
-    if grade.done or grade.status not in ("queued", "failed"):
-        raise GradeError(422, "这份已经开始批过了 —— 改判定依据请点「重新批改」（会重跑一遍）")
+    _assert_setup_editable(grade)
 
     if payload.answer_mode is not None:
         grade.answer_mode = payload.answer_mode
@@ -556,33 +572,42 @@ def patch_setup(db: Session, gid: int, payload: GradeSetupPatch) -> HomeworkGrad
             ))
 
     db.flush()
-    # 改完重新校验：切到 key/rubric 却没依据，等于拿「AI 自己解」冒充「按老师答案判」——
-    # 那是拿错标准批学生，必须在开批前拦住。**图也算依据**（会真的送进模型）。
-    key_text, rub_text = _answer_texts(db, grade)
-    imgs = _answer_images(db, grade)
-    if grade.answer_mode == "key" and not (key_text or imgs["answer"]):
-        raise GradeError(422, "选了「老师给答案」，但答案还是空的 —— 粘一段文字，或传一张答案照片")
-    if grade.answer_mode == "rubric" and not (rub_text or imgs["rubric"]):
-        raise GradeError(422, "选了「评分细则」，但细则还是空的 —— 写下来，或传一张细则照片")
-
+    # ⚠️⚠️ 这里**故意不查 `_missing_basis`**（2026-10-21 真浏览器测出来的死锁）：
+    #
+    #    老师看到的顺序是「先切模式、再传依据」（依据那一栏在模式下面），而且
+    #    前端在 `answer_mode == "ai"` 时**不许上传**（传上去也没去处，会当场拦下）。
+    #    两边一夹：
+    #        切到 key —— 需要先有依据 —— 被拒；
+    #        传依据 —— 需要先切到 key —— 被拒。
+    #    结果是这个功能整体用不了，且只表现为「切了又自动跳回去」。
+    #
+    #    「切了 key 但还没传」是一个**正当的过渡态**：界面会显示
+    #    「还没传依据（点开始批改会被拦）」，`launch()` 那道门也照样拦得住
+    #    （依据后来被删光的情况只有它管得到）。所以校验只留在开批那一处。
+    #    **不许在这里再补一道** —— 补了就又把老师锁死在 AI 模式里。
     db.commit()
     return grade
 
 
 def _drop_pasted(db: Session, grade: HomeworkGrade, role: str) -> None:
-    """删掉某个 role 下**粘贴出来的**那几行（`lesson_file_id` 为空的就是），连磁盘上的 txt 一起。
+    """删掉某个 role 下**粘贴出来的**那几行，连磁盘上的 txt 一起。
 
-    只删粘贴的：引用的 `lesson_files` 是老师从「交作业」传的答案文件，
-    那是另一份归档原件，删了会连带把人家上传的文件抹掉。
+    ⚠️ 判据是 `_is_pasted_row`，**不能只看 `lesson_file_id is None`**：
+    0034 起，老师上传的依据文件（答案 PDF / 答案照片 / 细则 Excel）同样是
+    自落盘、同样没有 lesson_file_id。按老写法删「粘贴的那几行」，
+    会把刚传上来的答案整批删掉、连原件一起 unlink —— 而且不报错。
+    只删粘贴那两行还有第二个理由：引用的 `lesson_files` 是另一份归档原件，
+    删了会连带把人家上传的文件抹掉。
     """
     rows = db.scalars(
         select(HomeworkGradeFile).where(
             HomeworkGradeFile.grade_id == grade.id,
             HomeworkGradeFile.role == role,
-            HomeworkGradeFile.lesson_file_id.is_(None),
         )
     ).all()
     for f in rows:
+        if not _is_pasted_row(f):
+            continue
         if (f.stored or "").strip():
             p = storage.safe_join(f.stored)
             if p is not None and p.exists():
@@ -591,6 +616,185 @@ def _drop_pasted(db: Session, grade: HomeworkGrade, role: str) -> None:
                 except OSError:
                     pass          # 删不掉文件不影响逻辑：行删了就再也不会被读到
         db.delete(f)
+
+
+# ---------------------------------------------------------------- 判定依据（文件那一半）
+# 一条判定依据 = 一行 `homework_grade_files`（role = answer / rubric）。
+# 三种来源并存，界面上一律叫「判定依据」：
+#   · 老师**粘贴**的文字 → `_add_answer_text_file` 落的 `answer.txt` / `rubric.txt`；
+#   · 老师**上传**的图片 / PDF / Word / Excel → 本段落的 `add_basis_file`，原件落
+#     `<grade dir>/basis/`，抽出来的正文进 `text` 列（0034）；
+#   · 引用 `lesson_files` 的老记录（旧版批改页传的答案照片）—— 只读，不动。
+_PASTED_BASENAMES = ("answer.txt", "rubric.txt")
+
+
+def _is_pasted_row(f: HomeworkGradeFile) -> bool:
+    """这一行是「老师粘贴的文字」吗（`_add_answer_text_file` 落的那两个 txt）。
+
+    ⚠️ 判据是**文件名**，不是「有没有 lesson_file_id」：0034 起上传的依据文件
+    同样自落盘、同样没有 lesson_file_id，用后者会把上传件当成粘贴件删掉。
+    `_add_answer_text_file` 永远只写 `answer.txt` / `rubric.txt` 这两个名字，
+    所以这个判据是确定的（改那边的文件名时必须一起改这里）。
+    """
+    if f.lesson_file_id:
+        return False
+    return Path(str(f.stored or "")).name in _PASTED_BASENAMES
+
+
+def _assert_setup_editable(grade: HomeworkGrade) -> None:
+    """开批之前才允许动判定依据。**批过就锁住**。
+
+    理由：那批判定是按旧依据批出来的。改了依据却留着旧判定，比不改更糟 ——
+    老师以为换了标准，实际上结果还是旧标准算的。要换就点「重新批改」。
+    """
+    if grade.done or grade.status not in ("queued", "failed"):
+        raise GradeError(422, "这份已经开始批过了 —— 改判定依据请点「重新批改」（会重跑一遍）")
+
+
+def _missing_basis(db: Session, grade: HomeworkGrade) -> str:
+    """缺的判定依据是哪一类：`"answer"` / `"rubric"` / `""`（不缺）。
+
+    **规则只在这里一处**，唯一的调用点是 `launch()`（真开批那一刻）。
+    ⚠️ `patch_setup()` **故意不调用它**：切模式那一步要求「依据已经存在」，
+    会跟「AI 模式下不许上传」互锁，老师永远切不过去（详见那里的注释）。
+    """
+    key_text, rub_text = _answer_texts(db, grade)
+    imgs = _answer_images(db, grade)
+    if grade.answer_mode == "key" and not (key_text or imgs["answer"]):
+        return "answer"
+    if grade.answer_mode == "rubric" and not (rub_text or imgs["rubric"]):
+        return "rubric"
+    return ""
+
+
+def basis_dir(gid: int) -> Path:
+    """这份批改的「判定依据」目录。
+
+    刻意放在批改自己的目录下、**不进 lesson_files**：一份答案 PDF 若混进
+    「交作业」清单，下次建批改时会被默认勾上当学生作业批（那是真会发生的错）。
+    """
+    return grade_dir(int(gid)) / "basis"
+
+
+def basis_dict(db: Session, f: HomeworkGradeFile) -> dict:
+    """给界面的一条依据。`kind`/`chars`/`text_warn` 是「模型到底看不看得见」的判据。"""
+    d = file_dict(f, db)
+    d["pasted"] = _is_pasted_row(f)
+    # 读不出字、又不是图片 → 模型其实看不见它。界面必须明说（不能只列个文件名）。
+    d["text_warn"] = ("" if d["kind"] == "image" or d["chars"] else
+                      "这份没读出文字，模型看不见里面的内容")
+    return d
+
+
+def add_basis_file(db: Session, gid: int, role: str, filename: str,
+                   data: bytes) -> dict:
+    """收一份判定依据。返回 `{"file": …, "note": …}`。
+
+    校验顺序是**先全部校验、最后才落盘**：类型 → 空文件 → 大小 → 份数。
+    反过来的话，一份超限的文件会先躺在磁盘上，然后这条请求 422 ——
+    老师重试一次就多一份垃圾文件，谁也不会来清。
+
+    `note` 非空 = 收下了但抽不出文字（扫描版 PDF 之类），界面要如实显示：
+    静默收下一份模型看不见的依据，比直接拒绝更糟 —— 老师会以为已经按他的答案判了。
+    """
+    grade = get_grade(db, gid)
+    _assert_setup_editable(grade)
+    if role not in ("answer", "rubric"):
+        raise GradeError(422, f"role 只能是 answer / rubric（收到 {role!r}）")
+
+    name = Path(str(filename or "")).name or "basis"      # 只取文件名，防路径穿越
+    if grade_basis.is_legacy_xls(name):
+        raise GradeError(422, "老式 .xls 读不了 —— 请在 Excel 里「另存为」.xlsx 或 .csv 再传")
+    if grade_basis.kind_of(name) is None:
+        raise GradeError(
+            422,
+            f"判定依据不收这种格式（{Path(name).suffix or '无扩展名'}）。{grade_basis.SUPPORTED_NOTE}")
+    if not data:
+        raise GradeError(422, f"「{name}」是空文件 —— 重新选一次吧")
+    if len(data) > grade_basis.MAX_BASIS_BYTES:
+        mb = grade_basis.MAX_BASIS_BYTES // 1024 // 1024
+        raise GradeError(
+            422, f"「{name}」太大了（超过 {mb}MB）—— 答案/细则一般不会这么大，确认一下选错文件没有")
+
+    used = int(db.scalar(
+        select(func.count()).select_from(HomeworkGradeFile).where(
+            HomeworkGradeFile.grade_id == grade.id,
+            HomeworkGradeFile.role.in_(("answer", "rubric")),
+        )
+    ) or 0)
+    if used >= grade_basis.MAX_BASIS_FILES:
+        raise GradeError(
+            422,
+            f"判定依据最多 {grade_basis.MAX_BASIS_FILES} 份，这份已经有 {used} 份了"
+            " —— 先在列表里删掉几份再传")
+
+    d = basis_dir(grade.id)
+    d.mkdir(parents=True, exist_ok=True)
+    ext = Path(name).suffix.lower()
+    # 落盘名洗一遍（中文名、表情、`..` 都可能出现在上传文件名里），重名加 _2。
+    stored_name = storage.unique_name(
+        d, storage.safe_token(Path(name).stem, "basis") + ext)
+    p = d / stored_name
+    p.write_bytes(data)
+
+    info = grade_basis.extract(p, name)
+    row = HomeworkGradeFile(
+        owner_id=config.OWNER_ID, grade_id=grade.id, lesson_file_id=None,
+        name=name, stored=storage.rel(p), role=role, kind=info["kind"] or "",
+        size_bytes=len(data), pages=0, text=info["text"] or "",
+    )
+    db.add(row)
+    db.commit()
+    return {"file": basis_dict(db, row), "note": info["note"] or ""}
+
+
+def delete_basis_file(db: Session, gid: int, fid: int) -> dict:
+    """删一份判定依据（行 + 磁盘原件）。
+
+    已批过的不能删：删完库里 mode 还是「按我的答案判」，那份任务就变成了
+    「说按老师答案判、其实没有答案」—— 只能走「重新批改」。
+    """
+    grade = get_grade(db, gid)
+    _assert_setup_editable(grade)
+    f = get_basis_row(db, gid, fid)
+    rel = f.stored
+    lesson_file_id = f.lesson_file_id
+    grade_dir_ = grade_dir(grade.id)
+    db.delete(f)
+    db.commit()
+    # 只删自己那份原件。引用 lesson_files 的老记录**不碰** ——
+    # 那是「交作业」里同一份文件，删了会把学生交的作业一起抹掉。
+    if rel and not lesson_file_id:
+        storage.unlink_rels([rel], stop=grade_dir_)
+    return {"ok": True}
+
+
+def get_basis_row(db: Session, gid: int, fid: int) -> HomeworkGradeFile:
+    """取一行依据，**顺带确认它确实属于这份批改**。
+
+    ⚠️ 归属不对一律 404（不是 403）：状态码不该告诉人家「这条记录存在，只是你没权限」。
+    预览原件、看正文、删除都走这一处，别各写一份判据。
+    """
+    grade = get_grade(db, gid)
+    f = db.get(HomeworkGradeFile, fid)
+    if f is None or f.grade_id != grade.id or f.role not in ("answer", "rubric"):
+        raise GradeError(404, "这份判定依据不在这份批改里")
+    return f
+
+
+def basis_raw_path(db: Session, gid: int, fid: int) -> tuple[Path, str]:
+    """取回一份依据的**原件**（预览 / 下载）。返回 (磁盘路径, 原始文件名)。"""
+    f = get_basis_row(db, gid, fid)
+    p: Path | None = None
+    if f.lesson_file_id:
+        lf = db.get(LessonFile, f.lesson_file_id)
+        if lf is not None:
+            p = storage.safe_join(lf.stored)
+    elif (f.stored or "").strip():
+        p = storage.safe_join(f.stored)
+    if p is None or not p.exists() or not p.is_file():
+        raise GradeError(404, "这份依据的原件已经不在磁盘上了 —— 删掉它重传一份吧")
+    return p, (f.name or p.name)
 
 
 # ---------------------------------------------------------------- 一题一区域
@@ -1264,7 +1468,11 @@ def _answer_texts(db: Session, grade: HomeworkGrade,
     ).all()
     for f in rows:
         text = ""
-        if (f.stored or "").strip():
+        # 0034 起，上传的依据文件自带一份正文（PDF/Word/Excel 都抽好了）——
+        # **优先用它**：原件是 PDF 时 `stored` 根本不能当文本念。
+        if (f.text or "").strip():
+            text = f.text
+        elif (f.stored or "").strip():
             p = storage.safe_join(f.stored)
             if p is not None and p.exists():
                 try:
@@ -1302,16 +1510,18 @@ def _answer_images(db: Session, grade: HomeworkGrade) -> dict[str, list[str]]:
     ).all()
     for f in rows:
         role = f.role if f.role in out else "answer"
-        text = ""
+        # 0034：自落盘的依据文件把正文存在 text 列里（原件可能是 PDF/Excel）。
+        text: str = f.text or ""
         path: Path | None = None
         if f.lesson_file_id:
             lf = db.get(LessonFile, f.lesson_file_id)
             if lf is not None:
-                text = lf.text or ""
+                text = text or (lf.text or "")
                 path = storage.safe_join(lf.stored)
         elif (f.stored or "").strip():
             path = storage.safe_join(f.stored)
-            if path is not None and path.exists() and path.suffix.lower() == ".txt":
+            if not text and path is not None and path.exists() \
+                    and path.suffix.lower() == ".txt":
                 try:
                     text = path.read_bytes().decode("utf-8-sig")
                 except (OSError, UnicodeDecodeError):
@@ -1565,6 +1775,19 @@ def launch(db: Session, grade: HomeworkGrade) -> bool:
     永远 `running` 的僵尸（没人写它了）。以「本进程里真的有这么个线程」为准，
     僵尸就能被重新认领 —— 否则这份作业再也批不了。
     """
+    # ★ 开批前最后一道门：依据是**可以被单独删掉**的（DELETE /basis/{fid}），
+    #   删完库里 mode 还是 key/rubric。没有这道门，一份「按我的答案判」的任务会在
+    #   依据为空的情况下开跑 —— 模型退回自己解题，结果却标着「按老师答案判」，
+    #   那是拿错标准批学生。改依据（patch_setup）**故意不查**（会和「AI 模式下
+    #   不许传依据」互锁），所以「改到空」「后来被删空」全靠这一道门兜住。
+    missing = _missing_basis(db, grade)
+    if missing:
+        raise GradeError(
+            422,
+            "这份要「按我给的答案判定」，但依据已经空了 —— 先传一份答案再开始批改"
+            if missing == "answer" else
+            "这份要「按我的评分细则判定」，但细则已经空了 —— 先传一份细则再开始批改",
+        )
     with _run_lock:
         if grade.id in _running:
             return False

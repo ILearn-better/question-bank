@@ -675,12 +675,16 @@ class GradeIn(BaseModel):
       · `ai`     —— 不用老师给，模型自己解题（会标 reference_unverified，老师能展开看它的解法）
       · `key`    —— 老师给答案：`answer_text` 粘文字，或 `answer_file_ids` 给照片/Word
       · `rubric` —— 老师给分步评分细则：`rubric_text`（每步多少分、扣分条件）
+
+    ⚠️ 默认值是 `ai`（2026-10-21 用户点名：「默认选中 AI 自主判定」）。
+    与库里 `homework_grades.answer_mode` 的 server_default 不一致是无害的：
+    ORM 插入时一定会带上这里的值，SQL 默认值只在「有人手写 INSERT」时才起作用。
     """
 
     lesson_id: int
     curriculum_id: Optional[int] = None
     file_ids: List[int] = Field(default_factory=list)
-    answer_mode: Literal["ai", "key", "rubric"] = "key"
+    answer_mode: Literal["ai", "key", "rubric"] = "ai"
     answer_text: str = ""
     rubric_text: str = ""
     answer_file_ids: List[int] = Field(default_factory=list)
