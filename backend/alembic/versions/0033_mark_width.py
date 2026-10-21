@@ -23,8 +23,11 @@ Create Date: 2026-10-21
 
     `0` 不是「没有线宽」——SVG 里 `stroke-width:0` 会让笔迹**整条消失**。
     它是「这一笔没指定粗细，交给样式表」（旧记录全是 0，行为与改动前完全一样）。
-    前端 `GradeMarkLayer` 绑的是 `:stroke-width="s.width > 0 ? s.width : null"`：
-    为 0 时**不输出该属性**，CSS 的 `stroke-width: 2.2` 照旧生效。
+    前端 `GradeMarkLayer` 用的是 **inline style**（不是 `stroke-width` 属性）：
+    `:style="s.width > 0 ? { strokeWidth: s.width + 'px' } : null"`，
+    为 0 时**不输出**，CSS 的 `stroke-width: 2.2` 照旧生效。
+    ⚠️ 不能改成 `:stroke-width` 属性：呈现属性优先级**低于**样式表，
+       会被 `.gmark .shape { stroke-width: 2.2 }` 盖掉，选粗细没反应。
 
     ⚠️ 单位是**屏幕像素**（不是 0~1000 坐标单位）。前端模板上配了
        `vector-effect: non-scaling-stroke`，所以页图放大缩小时笔画粗细不变 ——
