@@ -738,6 +738,9 @@ class GradeMarkIn(BaseModel):
     points: List[float] = Field(default_factory=list)   # 手绘折线 [x,y,x,y,…]
     text: str = ""
     color: str = ""
+    # 笔迹粗细（0~1000 坐标系里的单位，与 geo/points 同一套）。
+    # 0 = 没指定 → 前端不输出 stroke-width，走样式表默认（旧记录全是 0，行为不变）。
+    width: float = 0.0
     item_id: Optional[str] = None
 
 

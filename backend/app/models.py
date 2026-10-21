@@ -1342,6 +1342,10 @@ class HomeworkGradeMark(Base):
     points: Mapped[str] = mapped_column(Text, default="[]", server_default="[]")    # 手绘折线，0~1000
     text: Mapped[str] = mapped_column(Text, default="", server_default="")
     color: Mapped[str] = mapped_column(String, default="", server_default="")
+    # 笔迹粗细，**屏幕像素**（前端配 `vector-effect: non-scaling-stroke`，缩放时不变）；
+    # 0 = 没指定，交给样式表（`.gmark .shape { stroke-width: 2.2 }`）。
+    # ⚠️ 不能用 0 当「细」：SVG 的 stroke-width:0 会让这一笔整条消失。
+    width: Mapped[float] = mapped_column(REAL, default=0.0, server_default="0")
     created_by: Mapped[str] = mapped_column(String, default="ai", server_default="ai")
     flags: Mapped[str] = mapped_column(String, default="[]", server_default="[]")     # mark_rough …
     created_at: Mapped[str] = mapped_column(Text, default=_now, server_default=NOW)

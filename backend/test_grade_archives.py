@@ -563,8 +563,18 @@ def t_migration() -> None:
         from alembic.script import ScriptDirectory
         cfg = Config(str(ROOT / "backend" / "alembic.ini"))
         cfg.set_main_option("script_location", str(ROOT / "backend" / "alembic"))
-        head = ScriptDirectory.from_config(cfg).get_current_head()
-        check("★ head 是 0032", head == "0032", str(head))
+        script = ScriptDirectory.from_config(cfg)
+        head = script.get_current_head()
+        # 断言「0032 在 head 的祖先链上」，而不是「head 恰好就是 0032」：
+        # 后者每新增一条迁移就假红一次（加 0033 笔迹粗细那次就红过一次）。
+        chain, rev = [], script.get_revision(head)
+        while rev is not None:
+            chain.append(rev.revision)
+            down = rev.down_revision
+            rev = script.get_revision(down[0] if isinstance(down, tuple) else down) \
+                if down else None
+        check("★ 0032 在迁移链上且 head 是链头",
+              "0032" in chain and chain[0] == head, f"head={head} 链={chain[:4]}")
     except Exception as e:                     # noqa: BLE001
         check("读 alembic 版本链", False, f"{type(e).__name__}: {e}")
 
@@ -580,7 +590,7 @@ def t_migration() -> None:
     check("★★ downgrade 明确不删磁盘文件（降级不该抹掉老师的劳动成果）",
           "不删磁盘" in text and "drop_table" in text, "看不到这条约定")
 
-    # 真跑过：当前库版本应是 0032（本次测试的临时库在 import 时已由 conftest 建好）
+    # 真跑过：临时库在 import 时已由 conftest 迁到 head（所以表一定在）
     from app import migrate
     with engine.connect() as c:
         import sqlalchemy as sa

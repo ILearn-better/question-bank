@@ -372,6 +372,13 @@
   .ink-dot { width: 16px; height: 16px; border-radius: 50%; border: 2px solid transparent;
              cursor: pointer; box-shadow: inset 0 0 0 1px rgba(0,0,0,.12); }
   .ink-dot.on { border-color: #303133; }
+  .ink-w { width: 20px; height: 16px; display: inline-flex; align-items: center;
+           justify-content: center; cursor: pointer; border-radius: 3px;
+           border: 2px solid transparent; }
+  .ink-w i { display: block; width: 14px; border-radius: 2px; }
+  .ink-w.on { border-color: #303133; }
+  .save-state { font-size: 12px; color: #67c23a; white-space: nowrap; }
+  .save-state.warn { color: #e6a23c; font-weight: 600; }
   body { margin: 0; background: #f0f2f5; font-family: "PingFang SC", "Microsoft YaHei", sans-serif; }
   .topbar {
     display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
@@ -684,6 +691,26 @@
                          :title="undoStack.length ? '撤销上一步（Ctrl+Z）' : '没有可撤销的操作'">
                 ↶ 撤销<template v-if="undoStack.length">（{{ undoStack.length }}）</template>
               </el-button>
+              <!-- 笔的粗细：与颜色并列（这两个都是「这一笔长什么样」）。
+                   细档 = 以前唯一的那一档，所以不用它的人也感觉不到变化。 -->
+              <span class="ink-pick" v-if="INK_TOOLS.includes(tool)" title="笔迹粗细">
+                <span v-for="w in INK_WIDTHS" :key="w" class="ink-w" :class="{ on: inkWidth === w }"
+                      :title="'粗细 ' + w" @click="inkWidth = w">
+                  <i :style="{ height: (w + 1) + 'px', background: inkColor }"></i>
+                </span>
+              </span>
+              <div style="flex:1"></div>
+              <!-- ★ 保存（Ctrl+S）。画到一半手是停在纸上的，所以键盘也要能用。
+                   这个按钮做三件事：① 本机草稿队列补发 ② 分割草稿有改动一并存
+                   ③ 明确回答「存住没有」。批改本身是自动落库的，它不改变这一点。 -->
+              <el-button size="small" type="success" plain :loading="saving" :disabled="!gid"
+                         @click="saveNow" :title="'保存这份批改（Ctrl+S）'">💾 保存</el-button>
+              <span class="save-state" :class="{ warn: pendingMarkCount || dirty, ok: !pendingMarkCount && !dirty && savedAt }">
+                <template v-if="pendingMarkCount">● 未保存 {{ pendingMarkCount }} 笔</template>
+                <template v-else-if="dirty">● 分割改动未保存</template>
+                <template v-else-if="savedAt">已保存 {{ savedAt }}</template>
+                <template v-else>已保存</template>
+              </span>
             </div>
           </template>
 
@@ -792,7 +819,7 @@
                      ⚠️ 只传 marks：线/框/带子工作台自己画了（抄录题页那套），
                         再传一遍会同一样东西画两遍。 -->
                 <grade-mark-layer v-if="marksReady" :marks="marksOf(pno)" :mode="layerMode"
-                                  :color="inkColor" :selected-item-id="selItem"
+                                  :color="inkColor" :pen-width="inkWidth" :selected-item-id="selItem"
                                   @create="(p) => addMark(pno, p)" @stamp="(p) => addMark(pno, p)"
                                   @erase="eraseMarks" @move="moveMark"
                                   @text-at="(p) => onTextAt(pno, p)" @pick="onPickMark">
@@ -1080,6 +1107,11 @@ const INK_TOOLS = ['ink', 'erase', 'text', 'check', 'cross'];
 /** 笔的颜色。红笔批改为默认 —— 老师就是这个习惯，别让人先去调色。 */
 const INK_COLORS = ['#dc2626', '#2563eb', '#111827', '#16a34a'];
 
+/** 笔的粗细三档（屏幕像素）。**第一档 2.2 与改这一列之前的 CSS 完全同值** ——
+ *  没选过粗细的笔迹看起来跟以前一模一样，老记录（width=0）也走这个默认。
+ *  用 REAL 存进库（0033），所以可以是 2.2 这种半档，不用凑整。 */
+const INK_WIDTHS = [2.2, 4.5, 7.5];
+
 const num = (v, d = 0) => { const n = Number(v); return Number.isFinite(n) ? n : d; };
 const clampUnit = (v) => Math.min(1000, Math.max(0, num(v)));
 const bodyText = (s) => String(s === null || s === undefined ? '' : s);
@@ -1130,6 +1162,15 @@ const app = createApp({
       thumbBroken: {},
       // ---- 手写批改 ----
       inkColor: INK_COLORS[0],
+      inkWidth: INK_WIDTHS[0],
+      /* ---- 保存状态（2026-10-21 用户要求：保存按钮 + Ctrl+S + 已保存时间）----
+       *  `savedAt` 是**最近一次成功写进服务端**的时刻，不是「上次点按钮的时刻」——
+       *  这个页面每画一笔就自动 POST，显示「落库到几点」才是真的。
+       *  「未保存」只有一种情况：本机草稿队列里还有没送上去的笔迹（网络断了/请求失败）。
+       *  ⚠️ 不要为了做出「保存了」的样子去写 savedAt：那是骗人的，
+       *     真正的判据是 `_draft.marks()` 空了没有（见 saveNow）。 */
+      saving: false,
+      savedAt: '',
       textOpen: false,
       textDraft: { page: 1, x: 0, y: 0, text: '' },
       /** 标注层是**动态 import** 的 ESM 组件，加载完才挂。
@@ -1147,7 +1188,7 @@ const app = createApp({
       undoStack: [],
       undoBusy: false,
       exporting: false,
-      INK_TOOLS, INK_COLORS,
+      INK_TOOLS, INK_COLORS, INK_WIDTHS,
       VERDICTS,
       _poll: null,
       // DOM 元素不参与响应式：markRaw 一下，否则每次 setRich 都触发一轮 patch
@@ -1237,6 +1278,10 @@ const app = createApp({
      *  换掉等于把验证过的东西再验一遍。归一化成 `view` 之后，
      *  那三种模式下标注层连子元素一起 `pointer-events:none`（见 CSS），指针照旧归工作台。 */
     layerMode() { return INK_TOOLS.indexOf(this.tool) >= 0 ? this.tool : 'view'; },
+    /** 本机队列里还没落库的笔迹条数 —— 「未保存」标记的唯一判据。
+     *  `localMarks` 由 pushLocal / dropLocal 维护，**出队只在服务端确认之后**
+     *  （见 `addMark` 与 `flushPending`），所以它非空就等于「确实还没存住」。 */
+    pendingMarkCount() { return (this.localMarks || []).length; },
     /** 某页的标注 = 服务端库里的 + 本机还没传上去的。
      *
      *  ⚠️ 本机那份**必须一起画出来**：等一个来回才看到，手感是断的
@@ -1357,9 +1402,22 @@ const app = createApp({
     onKeyDown(e) {
       const t = e.target || {};
       const tag = String(t.tagName || '').toUpperCase();
-      if (tag === 'INPUT' || tag === 'TEXTAREA' || t.isContentEditable) return;
+      const typing = tag === 'INPUT' || tag === 'TEXTAREA' || !!t.isContentEditable;
       if (!(e.ctrlKey || e.metaKey)) return;
-      if (String(e.key || '').toLowerCase() !== 'z') return;
+      const key = String(e.key || '').toLowerCase();
+
+      /* Ctrl+S：**输入框里也要拦**。
+       * 老师在文字框改备注时按 Ctrl+S，浏览器会弹「保存网页」—— 那个对话框
+       * 挡住页面、还存一份静态 HTML 到下载目录，比什么都不做强不了多少。
+       * 所以这一支放在 `typing` 判断**之前**，并且一定 preventDefault。 */
+      if (key === 's' && !e.shiftKey && !e.altKey) {
+        e.preventDefault();
+        if (this.gid) this.saveNow();
+        return;
+      }
+
+      if (typing) return;                  // 输入框里的 Ctrl+Z 留给浏览器（撤销打字）
+      if (key !== 'z') return;
       if (e.shiftKey) return;              // Ctrl+Shift+Z（重做）还没做，别假装支持
       if (!this.gid || !this.undoStack.length) return;
       e.preventDefault();
@@ -1398,6 +1456,9 @@ const app = createApp({
       }
     },
     async addMark(pno, payload) {
+      /* ⚠️ `payload` 由标注层给，含 `kind/geo/points/color/width`。
+       *   这里**原样透传**（只补 page_no）—— 手动列字段的话，加一个字段就得改两处，
+       *   而漏掉的那一处不会报错，只会静默地存成默认值。 */
       const body = Object.assign({ page_no: num(pno, 1) }, payload);
       const lid = this.pushLocal(body);
       try {
@@ -1407,6 +1468,7 @@ const app = createApp({
         });
         await this.settle();          // 取回服务端数据之后才出队，中间不留空白
         this.dropLocal([lid]);
+        this.noteSaved();             // 这一笔真的进库了 —— 状态条的「已保存」跟着走
         this.pushUndo({ type: 'add', id: (r && r.id) || null, lid });
       } catch (e) {
         /* 没传上去不代表「没画」—— 它还在本机队列里、界面上也看得见，
@@ -1600,7 +1662,7 @@ const app = createApp({
      *     换台设备 / 清过缓存之后 id 根本对不上。
      *  ⚠️ 一次批量发，不是一笔一个请求：刚打开那几秒网络最不稳，
      *     三十笔连发很容易断在半路（A 路线就是这么踩的）。 */
-    async flushPending() {
+    async flushPending({ quiet = false } = {}) {
       if (!DRAFT || !this._draft) return 0;
       const queue = this._draft.marks();
       if (!queue.length) return 0;
@@ -1618,15 +1680,25 @@ const app = createApp({
             marks: missing.map((m) => ({
               page_no: m.page_no, kind: m.kind, geo: m.geo, points: m.points,
               text: m.text, color: m.color,
+              // ⚠️ 别忘了这一行：单笔 `addMark` 是 payload 直传（天然带 width），
+              //    补发这条路是**手写的字段清单**，漏一个就静默丢失一个。
+              width: m.width || 0,
             })),
           }),
         });
         this.dropLocal(missing.map((m) => m.lid));
         await this.settle();
-        ElementPlus.ElMessage.success('补发了 ' + missing.length + ' 笔上次没传上去的批改');
+        this.noteSaved();
+        if (!quiet) {
+          ElementPlus.ElMessage.success('补发了 ' + missing.length + ' 笔上次没传上去的批改');
+        }
         return missing.length;
       } catch (e) {
-        // 留在本机，下次自动重试 —— 不刷屏，老师看不到也不影响继续画
+        /* 留在本机，下次自动重试 —— 页面自己补发时不刷屏，
+         * 老师看不到也不影响继续画（下次打开还会再试）。
+         * ⚠️ 但**显式保存**（quiet）必须把异常抛出去：老师点了「保存」，
+         *    我们回一句「已保存」而其实一个字节都没发出去，比不提示糟得多。 */
+        if (quiet) throw e;
         return 0;
       }
     },
@@ -1636,6 +1708,50 @@ const app = createApp({
       const d = await this.api('/api/homework-grades/' + this.gid);
       const keep = { regions: this.g && this.g.regions, skipped_pages: this.g && this.g.skipped_pages };
       this.g = Object.assign({}, this.g, d, this.dirty ? keep : {});
+    },
+    /** 记下「最后一次真的落到服务端」的时刻。只在**确实写成功**之后调。 */
+    noteSaved() {
+      const d = new Date();
+      const p2 = (n) => String(n).padStart(2, '0');
+      this.savedAt = p2(d.getHours()) + ':' + p2(d.getMinutes()) + ':' + p2(d.getSeconds());
+    },
+    /** ★ 保存（按钮 / Ctrl+S）。
+     *
+     *  这个页面**本来就是自动落库**的：每画一笔就 POST 一次，没送出去的存在本机
+     *  （`gradeDraft.js`），下次打开自动补发。所以「保存」不是「把笔迹写进去」，
+     *  而是「**现在就把所有还没落库的东西落库，然后明确告诉老师结果**」：
+     *
+     *    ① `_draft.flush()`  —— 先把本机草稿刷盘（纯 localStorage，跟网络无关）
+     *    ② `saveRegions(true)` —— 分割线/框有改动就一并存（Ctrl+S 不能只存一半）
+     *    ③ `flushPending({quiet:true})` —— 补发笔迹；失败**抛异常**（不是悄悄返回 0）
+     *    ④ 复核队列空了没有 —— 这是唯一可信的「已保存」判据
+     *
+     *  ⚠️ 失败时**什么都不能清**：本机队列不清、笔迹不删。老师点了保存没成功，
+     *     页面上那一笔必须还在，下一次打开还得能补发（用户要求「避免数据丢失」）。 */
+    async saveNow() {
+      if (!this.gid || this.saving) return;
+      this.saving = true;
+      try {
+        if (this._draft) this._draft.flush();
+        if (this.dirty) await this.saveRegions(true);
+        await this.flushPending({ quiet: true });
+        // ⚠️ 必须自己复核：`flushPending` 里「服务端已经有了就直接出队」也算成功，
+        //    但那一支同样会走到这里 —— 只有队列真的空了才敢说已保存。
+        const left = this._draft ? this._draft.marks().length : 0;
+        if (left) throw new Error('还有 ' + left + ' 笔没传上去');
+        this.noteSaved();
+        ElementPlus.ElMessage.success('已保存 ' + this.savedAt);
+      } catch (e) {
+        /* 失败也**保留全部批改内容**：本机队列（localStorage）与页面上的笔迹都不动。
+         * 提示里要说清楚「还在本地」，否则老师会以为白画了、重画一遍。 */
+        ElementPlus.ElMessage.error({
+          message: '保存失败：' + (e && e.message ? e.message : '网络异常')
+            + ' —— 批改内容还在本机，没丢；稍后再点一次「保存」或刷新页面会自动重试',
+          duration: 8000,
+        });
+      } finally {
+        this.saving = false;
+      }
     },
 
     /* ==================== 新建批改（上传作业）====================
@@ -1791,6 +1907,8 @@ const app = createApp({
       this.undoBusy = false;
       this.canceling = false;
       this.archiving = false;
+      this.saving = false;
+      this.savedAt = '';          // 上一份的「已保存 11:45」不能留在这一份上
       this.cancelAsked = false;   // 换一份作业时必须清，否则新作业的终止按钮点不动
       // ⚠️ 「点过开批」的旗必须跟着记录走。不重置的话，切到另一份 queued 的记录时
       //    会被上一份的旗顶成「批改中」→ 按钮又是灰的。

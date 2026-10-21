@@ -136,6 +136,8 @@ function buildShape(mark, off) {
     itemId: mark.item_id === undefined ? null : mark.item_id,
     kind,
     color,
+    // 0 = 这一笔没记粗细（0033 之前的老记录）→ 模板里不绑 style，走 CSS 默认
+    width: Number(mark.width) || 0,
     text: mark.text || '',
     x, y, w, h, cx, cy,
     rect: { x: r1(x), y: r1(y), w: r1(w), h: r1(h) },
@@ -194,6 +196,11 @@ export default {
     mode: { type: String, default: 'view' },
     /** 画笔颜色（老师批改常用红，其次蓝）。 */
     color: { type: String, default: '#dc2626' },
+    /** 笔迹粗细（屏幕像素；模板里配 `vector-effect: non-scaling-stroke`，
+     *  所以页图放大缩小时粗细不变，跟手写时的观感一致）。
+     *  ⚠️ `0` = 没指定 → **不输出** stroke-width 属性，走样式表默认值。
+     *     绝不能输出 `stroke-width: 0` —— SVG 里那是「整条笔迹消失」。 */
+    penWidth: { type: Number, default: 0 },
     /** 这一页已经画好的「一题一区域」框（{id, seq, label, box}）。**只传当前页**。 */
     regions: { type: Array, default: () => [] },
     /** 这一页的分割线 y 坐标（0~1000）。**只在 line 模式下显示与响应**。 */
@@ -542,6 +549,9 @@ export default {
           points: flatPoints(pts),        // [x,y,x,y,…]，与库里 _norm_geo 同一形态
           geo: bboxOf(pts),               // 包围盒只用于命中/统计，形状靠 points
           color: props.color,
+          // 粗细与颜色同一类东西（「这一笔长什么样」），跟着笔迹一起存，
+          // 换设备/改样式都不会让历史笔迹的观感变样
+          width: props.penWidth || 0,
         });
       }
       draft.value = [];
@@ -673,8 +683,15 @@ export default {
 
         <!-- 手绘折线（老师红笔 / AI 划的线）：和框可以同时存在。
              ink 是老师真笔迹，画粗一点、圆头圆角，看着才像笔。 -->
+        <!-- ⚠️ 粗细走 **inline style** 而不是 stroke-width 属性：
+             SVG 的呈现属性优先级**低于**样式表，样式表里那条 stroke-width: 2.2
+             会把它盖掉（写属性等于没写，而且不报错）。inline style 才盖得住。
+             ⚠️⚠️ 这个文件整体是一个模板字面量：注释里**不许出现反引号**，
+                 出现一个就把模板从那儿截断，整个组件加载失败（marksReady=false）。
+                 2026-10-21 在这条注释上踩过一次。 -->
         <polyline v-if="s.poly" class="shape" :class="{ ink: s.kind === 'ink' }"
                   :points="s.poly" :stroke="s.color"
+                  :style="s.width > 0 ? { strokeWidth: s.width + 'px' } : null"
                   fill="none" stroke-linecap="round" stroke-linejoin="round" />
         <circle v-if="s.dot" class="shape" :cx="s.dot.cx" :cy="s.dot.cy" r="7"
                 :stroke="s.color" fill="none" />
@@ -682,7 +699,8 @@ export default {
 
       <!-- 正在画的这一笔：不进库、不落后端，松手才提交（拖到一半网断了不至于留半条） -->
       <polyline v-if="draft.length > 1" class="gmark-draft" :points="draftPoly(draft)"
-                :stroke="color" fill="none" stroke-linecap="round" stroke-linejoin="round" />
+                :stroke="color" :style="penWidth > 0 ? { strokeWidth: penWidth + 'px' } : null"
+                fill="none" stroke-linecap="round" stroke-linejoin="round" />
     </svg>
 
     <!-- 文字标注用 HTML 定位：SVG 的 <text> 在非等比 viewBox 里会被压扁。

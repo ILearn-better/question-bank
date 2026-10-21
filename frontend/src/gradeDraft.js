@@ -102,6 +102,8 @@ export function readDraft(gid, now = Date.now()) {
       points: Array.isArray(m.points) ? m.points : [],
       text: String(m.text || ''),
       color: String(m.color || ''),
+      // 笔迹粗细（0033）。老草稿没有这个字段 → 0 = 走样式表默认，行为不变
+      width: Math.max(0, Number(m.width) || 0),
       sent: !!m.sent,
     }));
   if (obj.regions && typeof obj.regions === 'object') out.regions = obj.regions;
@@ -204,6 +206,8 @@ export function createDraft(gid, { delay = 250 } = {}) {
       points: Array.isArray(payload && payload.points) ? payload.points : [],
       text: String((payload && payload.text) || ''),
       color: String((payload && payload.color) || ''),
+      // ⚠️ 必须跟着存：补发走的是**批量接口**（手写字段清单），漏了就不报错地丢
+      width: Math.max(0, Number((payload || {}).width) || 0),
       sent: false,
     };
     current.marks = current.marks.concat([rec]);
@@ -265,6 +269,7 @@ export function localMark(rec) {
     points: rec.points,
     text: rec.text,
     color: rec.color,
+    width: rec.width || 0,
     created_by: 'teacher',
     item_id: null,
     pending: true,

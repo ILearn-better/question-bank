@@ -299,6 +299,7 @@ def mark_dict(m: HomeworkGradeMark) -> dict:
         "points": _json_list(m.points),
         "text": m.text,
         "color": m.color,
+        "width": float(m.width or 0),
         "created_by": m.created_by,
     }
 
@@ -2017,6 +2018,8 @@ def _mark_row(grade: HomeworkGrade, payload: GradeMarkIn, created_by: str) -> Ho
         points=json.dumps(_norm_geo(payload.points)),
         text=payload.text or "",
         color=payload.color or "",
+        # 铂笔粗细：0 = 走样式表默认；负数/天文数字都夹回来，否则SVG里这一笔会消失或扑屏。
+        width=max(0.0, min(200.0, _num(payload.width) or 0.0)),
         # 这个接口的调用方是批改页（老师），AI 层不写标注 —— 它只回文字结果，
         # 坐标由前端"模型给句子 → 老师点/拖"那条线来定。
         created_by=created_by,

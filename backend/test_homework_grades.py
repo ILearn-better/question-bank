@@ -230,6 +230,15 @@ def t_contract() -> None:
     check("标注表有 geo / points（0~1000 归一化坐标）",
           "geo" in tm.columns and "points" in tm.columns)
     check("标注可以挂整页（item_id 可空）", tm.columns["item_id"].nullable)
+    # 0033：粗细与颜色是同一类数据（「这一笔长什么样」），不是渲染参数 ——
+    # 放在 CSS 里的话，改一次样式表的默认值，历史批改的观感就一起变了。
+    check("★★ 标注表有 width（笔迹粗细，迁移 0033）", "width" in tm.columns, list(tm.columns)[-3:])
+    check("★ width 不能为空（旧记录迁移时落 0）",
+          "width" in tm.columns and tm.columns["width"].nullable is False)
+    mig33 = read(BE / "alembic" / "versions" / "0033_mark_width.py")
+    check("迁移 0033 接在 0032 后面",
+          'down_revision: Union[str, None] = "0032"' in mig33, mig33[:80])
+    check("迁移 0033 只加一列（width），不动别的表", mig33.count("add_column") == 1)
 
     from app.schemas import GradeIn as _GI
     check("GradeIn 有 answer_mode / answer_text / rubric_text",
@@ -543,6 +552,25 @@ def t_marks() -> None:
         d = G.detail(db, g)
         check("详情里带出标注", len(d["marks"]) == 2, len(d["marks"]))
         check("标注有 page_no（多页要按页分组）", d["marks"][0]["page_no"] == 1)
+
+        # ---- 笔迹粗细（0033）----
+        m3 = G.add_mark(db, g.id, GradeMarkIn(page_no=1, kind="ink",
+                                              points=[10, 10, 60, 60], width=4.5))
+        check("★ 笔迹粗细存得进去（4.5 这种半档也要保住，不能取整）",
+              abs(float(m3.width) - 4.5) < 1e-6, m3.width)
+        m4 = G.add_mark(db, g.id, GradeMarkIn(page_no=1, kind="ink", points=[1, 1, 2, 2]))
+        check("★ 没给粗细时落 0（0 = 走样式表默认，不是「没有线」）",
+              float(m4.width) == 0.0, m4.width)
+        # 负数在 SVG 里等于「这一笔消失」，天文数字会糊满整页 —— 一律夹回 0~200
+        m5 = G.add_mark(db, g.id, GradeMarkIn(page_no=1, kind="ink", width=-5))
+        m6 = G.add_mark(db, g.id, GradeMarkIn(page_no=1, kind="ink", width=9999))
+        check("★★ 负数/超大粗细被夹回 0~200",
+              (float(m5.width), float(m6.width)) == (0.0, 200.0),
+              (m5.width, m6.width))
+        d2 = G.detail(db, g)
+        check("★ 详情把粗细带回去（前端要按每条自己的宽度渲染）",
+              any(abs(float(x.get("width") or 0) - 4.5) < 1e-6 for x in d2["marks"]),
+              [x.get("width") for x in d2["marks"]])
 
         G.delete_mark(db, m.id)
         check("删标注成功", db.get(HomeworkGradeMark, m.id) is None)

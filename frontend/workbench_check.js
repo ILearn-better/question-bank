@@ -1613,7 +1613,7 @@ async function main() {
   checkTrue('★ 失败要说人话（不是只 console）',
     /ElMessage\.error\('存档失败/.test(arFn), arFn.slice(0, 160));
   checkTrue('★★ 换一份作业时重置 archiving（否则切过去按钮还在转）',
-    /this\.archiving = false;\s*\n\s*this\.cancelAsked = false;/.test(html), true);
+    /this\.archiving = false;[\s\S]{0,200}?this\.cancelAsked = false;/.test(html), true);
 
   /* ---- 真发一次 ---- */
   vm.gid = 7;
@@ -1739,6 +1739,132 @@ async function main() {
     const issues = cssIssues(fs.readFileSync(appCssPath, 'utf8'));
     checkTrue('★★ app.css 注释配平', issues.length === 0, issues.join(' | '));
   }
+
+  /* ============ 25. 保存（按钮 / Ctrl+S / 已保存时间 / 未保存标记）============
+     用户 2026-10-21：
+       · 画完能点「保存」或按 Ctrl+S
+       · 到底存住没有要说得清（已保存 + 时间；有没存的要标出来）
+       · 失败要报错，**而且已经画的一笔都不能丢**
+
+     这个页面本来就是**自动落库**的（每笔一个 POST，没送出去的进本机草稿队列，
+     下次打开自动补发）。所以「保存」的语义不是「把笔迹写进去」，而是
+     「现在就把所有还没落库的落库，并明确回答结果」—— 下面全按这个语义验。 */
+  await vm.loadGrade(7);
+  await sleep(120);
+
+  const saveBtn = [...D.querySelectorAll('button')]
+    .find((b) => /保存/.test(b.textContent || '') && !/存档|分割/.test(b.textContent || ''));
+  checkTrue('★ 卷面区域有「保存」按钮', !!saveBtn,
+    saveBtn ? saveBtn.textContent.trim() : '没找到');
+  checkTrue('★ 按钮绑的是 saveNow', /@click="saveNow"/.test(html), '');
+  checkTrue('★★ 按钮有 loading（连点会并发两份请求）', /:loading="saving"/.test(html), '');
+
+  const stateTxt = () => {
+    const el = D.querySelector('.save-state');
+    return el ? el.textContent.replace(/\s+/g, ' ').trim() : '(没有 .save-state)';
+  };
+  checkTrue('★ 有保存状态条，且没动过时写着「已保存」', /已保存/.test(stateTxt()), stateTxt());
+
+  /* ---- 未保存标记 ---- */
+  const lidSave = vm.pushLocal({ page_no: 1, kind: 'ink', points: [10, 10, 30, 30], color: '#dc2626' });
+  await sleep(40);
+  check('★★ 本机还有没落库的笔 → pendingMarkCount', vm.pendingMarkCount, 1);
+  checkTrue('★★ 状态条换成「未保存 N 笔」', /未保存 1 笔/.test(stateTxt()), stateTxt());
+
+  /* ---- 保存失败：报错 + 一笔都不能少 ---- */
+  const origFetchSave = W.fetch;
+  W.fetch = async (u, o) => {
+    if (String(u) === '/api/homework-grades/7/marks/batch') {
+      return { ok: false, status: 500, json: async () => ({ detail: '网络断了' }) };
+    }
+    return origFetchSave(u, o);
+  };
+  MSGS.length = 0;
+  await vm.saveNow();
+  await sleep(100);
+  W.fetch = origFetchSave;
+  checkTrue('★★★ 保存失败要说「保存失败」（不能静默）',
+    /保存失败/.test((MSGS[MSGS.length - 1] || {}).text || ''),
+    (MSGS[MSGS.length - 1] || {}).text);
+  checkTrue('★★★ 并且说明「还在本机，没丢」（否则老师会重画一遍）',
+    /还在本机/.test((MSGS[MSGS.length - 1] || {}).text || ''), '');
+  check('★★★ 失败后本机那条**没有被清掉**（数据不能丢）', vm.localMarks.length, 1);
+  check('★★ 失败时不能写 savedAt（写了状态条就骗人）', vm.savedAt, '');
+  checkTrue('★ 失败后状态条仍然标红「未保存」', /未保存 1 笔/.test(stateTxt()), stateTxt());
+
+  /* ---- 保存成功 ---- */
+  MSGS.length = 0;
+  await vm.saveNow();
+  await sleep(150);
+  checkTrue('★★★ 成功提示「已保存」+ 时间',
+    /^已保存 \d\d:\d\d:\d\d$/.test((MSGS[MSGS.length - 1] || {}).text || ''),
+    (MSGS[MSGS.length - 1] || {}).text);
+  checkTrue('★ savedAt 是 HH:MM:SS', /^\d\d:\d\d:\d\d$/.test(vm.savedAt), vm.savedAt);
+  check('★★ 成功后本机队列清空', vm.localMarks.length, 0);
+  checkTrue('★ 状态条回到「已保存 时间」', /已保存 \d\d:\d\d:\d\d/.test(stateTxt()), stateTxt());
+  checkTrue('★★ 那一笔真的进了服务端（不是只发过请求）',
+    (LAST_DETAIL.marks || []).some((m) => String(m.points) === '10,10,30,30'),
+    JSON.stringify((LAST_DETAIL.marks || []).slice(-1)));
+
+  /* ---- Ctrl+S ---- */
+  const keys = (key, opts, target) => {
+    const ev = new W.KeyboardEvent('keydown',
+      Object.assign({ key, bubbles: true, cancelable: true }, opts || {}));
+    (target || W.document.body).dispatchEvent(ev);
+    return ev;
+  };
+  let saveCalls = 0;
+  const realSave = vm.saveNow;
+  vm.saveNow = function () { saveCalls += 1; return Promise.resolve(); };
+
+  const evS = keys('s', { ctrlKey: true });
+  await sleep(30);
+  check('★★ Ctrl+S 触发保存', saveCalls, 1);
+  checkTrue('★★ 并且 preventDefault（否则浏览器弹「保存网页」对话框）', evS.defaultPrevented, '');
+
+  /* 输入框里按 Ctrl+S：浏览器自己的「保存网页」会挡住页面，必须照样拦下来。
+     （与 Ctrl+Z 相反 —— 那个要留给浏览器撤销打字。） */
+  const ta = D.createElement('textarea');
+  D.body.appendChild(ta);
+  saveCalls = 0;
+  const evS2 = keys('s', { ctrlKey: true }, ta);
+  await sleep(30);
+  check('★★ 在输入框里按 Ctrl+S 也会保存', saveCalls, 1);
+  checkTrue('★★ 输入框里同样 preventDefault', evS2.defaultPrevented, '');
+  const evZ = keys('z', { ctrlKey: true }, ta);
+  checkTrue('★ 输入框里的 Ctrl+Z 仍然留给浏览器（撤销打字）', !evZ.defaultPrevented, '');
+  ta.remove();
+  vm.saveNow = realSave;
+
+  /* ---- 换一份作业：上一份的「已保存 11:45」不能留在这一份上 ---- */
+  await vm.loadGrade(7);
+  await sleep(120);
+  check('★★ 换一份作业会清空 savedAt', vm.savedAt, '');
+
+  /* ---- 笔迹粗细（迁移 0033）：跟着每一笔存，老记录 width=0 走默认 ---- */
+  check('★ 粗细第一档仍是 2.2（没选过粗细的笔迹观感不变）', vm.INK_WIDTHS[0], 2.2);
+  checkTrue('★ 标注层接到 pen-width', /:pen-width="inkWidth"/.test(html), '');
+  const layerSrc = fs.readFileSync(path.join(ROOT, 'src', 'components', 'GradeMarkLayer.js'), 'utf8');
+  checkTrue('★★ 每一笔按自己的 width 画（inline style；写属性会被样式表盖掉）',
+    /strokeWidth: s\.width \+ 'px'/.test(layerSrc), '');
+  checkTrue('★★ 松手提交时把 width 带上（不带就永远存成 0）',
+    /width: props\.penWidth \|\| 0/.test(layerSrc), '');
+  /* ---- 补发这条路也要带 width（单笔直传是另一条路，只修一条 = 半修）---- */
+  vm.pushLocal({ page_no: 2, kind: 'ink', points: [40, 40, 80, 80], color: '#dc2626', width: 4.5 });
+  await sleep(40);
+  CALLS.length = 0;
+  await vm.flushPending();
+  await sleep(150);
+  const batchCall = CALLS.filter((c) => c.url === '/api/homework-grades/7/marks/batch').pop();
+  check('★★★ 补发（批量接口）也带 width —— 断网补上去的笔迹不能全变成最细一档',
+    batchCall && batchCall.body && batchCall.body.marks[0].width, 4.5);
+  checkTrue('★★ 本机草稿里也存了 width（不然刷新一次就丢）',
+    /width: Math\.max\(0, Number\(\(payload \|\| \{\}\)\.width\) \|\| 0\)/.test(
+      fs.readFileSync(path.join(ROOT, 'src', 'gradeDraft.js'), 'utf8')), '');
+
+  const ti = layerSrc.indexOf('template:');
+  check('★★ 标注层模板里反引号正好 2 个（多一个模板就被截断、组件整个加载失败）',
+    layerSrc.slice(ti).split('').filter((c) => c.charCodeAt(0) === 96).length, 2);
 
   console.log('\n共 ' + total + ' 项，失败 ' + fails.length + ' 项');
   if (fails.length) {
