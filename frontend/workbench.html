@@ -2131,7 +2131,13 @@ const app = createApp({
       try {
         await ElementPlus.ElMessageBox.confirm(
           '会从这份批改里删掉「' + f.name + '」。\n'
-          + '文件本身还在磁盘上（老师能找回），但下次批改就少一份依据了。',
+          /* ⚠️ 文案必须与实现一致：上传的依据是**自落盘**的，删行会连原件一起
+             unlink（见 delete_basis_file）。老文案写「文件本身还在磁盘上，老师能
+             找回」—— 跟实现正好相反，老师信了这句就不备份了。
+             只有引用「交作业」里那份才真的不删文件，两种要分开说。 */
+          + (f.lesson_file_id
+            ? '这份是引用「交作业」里的原文件 —— 文件本身不动，只是不再当依据。'
+            : '原件也一起删掉（删了就找不回来），下次批改就少一份依据了。'),
           '删掉这份依据',
           { confirmButtonText: '删掉', cancelButtonText: '算了', type: 'warning' });
       } catch (e) { return; }                  // 老师点了「算了」

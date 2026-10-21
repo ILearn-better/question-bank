@@ -2063,6 +2063,10 @@ async function main() {
   await vm.removeBasis(vm.basisAll[0]);
   await sleep(90);
   check('★★ 删依据前问了老师一句（破坏性动作）', CONFIRMS.length, 1);
+  /* ⚠️ 上传的依据是自落盘的，删行会连原件一起 unlink —— 提示不能说
+     「文件还在磁盘上」。老师信了这句就不会另存，等真要找就找不回来了。 */
+  checkTrue('★★ 删除提示说的是实话（上传件的原件也删了）',
+    /找不回来/.test((CONFIRMS[0] || {}).msg || ''), (CONFIRMS[0] || {}).msg || '');
   check('★★ 删的是 DELETE .../basis/{id}',
     CALLS.filter((c) => c.method === 'DELETE'
       && /\/homework-grades\/7\/basis\/801$/.test(c.url)).length, 1);
