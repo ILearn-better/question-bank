@@ -2249,6 +2249,60 @@ async function main() {
   check('★★ 标注层模板里反引号正好 2 个（多一个模板就被截断、组件整个加载失败）',
     layerSrc.slice(ti).split('').filter((c) => c.charCodeAt(0) === 96).length, 2);
 
+  /* ---- ⑭ 顶栏「返回」：目标由**入口来源**决定（用户 2026-10-21 点名）
+   *
+   * 为什么要真挂载之后再断言：只测 `vm.backTarget` 那个 computed 是不够的 ——
+   * 模板可能压根没绑它（原来绑的是写死的 backUrl），computed 全对、界面上还是老地址。
+   * 「接口/逻辑全绿、用户点一下还是错」这个项目踩过很多次，所以这里看的是 DOM。 */
+  const backLinks = () => D.querySelectorAll('.topbar .back-link');
+  const backA = () => backLinks()[0];
+  checkTrue('★ 顶栏有一个真的「返回」链接（不是死文字）',
+    !!backA() && backA().tagName.toLowerCase() === 'a',
+    backA() && backA().outerHTML);
+
+  /* 挂载 URL 是 `?gid=7`（没有 from）→ 缺省分支：认得出学生就回那个学生的页 */
+  check('★ 缺省来源：回这份作业的学生页（不是录题平台）',
+    backA().getAttribute('href'), '/#/students/5');
+
+  vm.entrySrc = { from: 'student', sid: 4, gid: 7 };
+  await sleep(60);
+  check('★★ 学生信息进来 → 回**入口那个学生**（sid 4），不是记录上的 5',
+    backA().getAttribute('href'), '/#/students/4');
+  check('★★ 文案跟着变了（老师得知道这一下回哪儿）',
+    backA().textContent.trim(), '← 返回学生');
+
+  vm.entrySrc = { from: 'console', sid: 4, gid: 7 };
+  await sleep(60);
+  check('★★ 主控制台进来 → 回今日工作台（需求原话：不要求回旧版批改台）',
+    backA().getAttribute('href'), '/#/');
+  check('★★ 文案跟着变成「回到工作台」',
+    backA().textContent.trim(), '← 回到工作台');
+
+  vm.entrySrc = { from: 'workbench', sid: 5, gid: 7 };
+  await sleep(60);
+  check('★★ 旧版批改台点「新版工作台」进来 → 同样回学生页',
+    backA().getAttribute('href'), '/#/students/5');
+
+  /* 旧版批改台那个快捷入口：地址必须是 SPA 的真路由（/#/grade/:id）。
+     原来写的是 /entry.html#/grade/:id —— entry.html 是**录题平台**，不认 hash，
+     老师点「返回」就被甩进录题页，这就是用户报的那个 bug。 */
+  const legacyA = backLinks()[1];
+  check('★ 旧版批改台链接指向 SPA 真路由 /#/grade/7',
+    legacyA && legacyA.getAttribute('href'), '/#/grade/7');
+  const topHrefs = Array.from(D.querySelectorAll('.topbar a'))
+    .map((a) => a.getAttribute('href') || '');
+  checkTrue('★★★ 顶栏所有链接里没有 entry.html（这个 bug 的直接判据）',
+    topHrefs.every((h) => h.indexOf('entry.html') === -1), topHrefs);
+
+  /* 页面内改写地址栏（新建 / 换一份）不能把来源冲掉：
+     否则老师刷新一下，刚才「回学生页」就漂成别的了 —— 而界面上毫无提示。 */
+  vm.entrySrc = { from: 'student', sid: 4, gid: 7 };
+  await vm.loadGrade(7);
+  await sleep(80);
+  const searchNow = W.location.search;
+  checkTrue('★★ 页面内改写地址栏后 from / sid 还在',
+    /from=student/.test(searchNow) && /sid=4/.test(searchNow), searchNow);
+
   console.log('\n共 ' + total + ' 项，失败 ' + fails.length + ' 项');
   if (fails.length) {
     fails.forEach((f) => console.log('  - ' + f));

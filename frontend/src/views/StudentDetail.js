@@ -3,6 +3,7 @@
 import { computed, onMounted, ref } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import { studentsApi, homeworkApi, supplementsApi, prepApi, examsApi, plansApi, gradeApi, archiveApi } from '../api.js';
+import { FROM } from '../backTarget.js';
 import AbilityRadar from '../components/AbilityRadar.js';
 import FeedbackDialog from '../components/FeedbackDialog.js';
 import HomeworkDialog from '../components/HomeworkDialog.js';
@@ -325,7 +326,9 @@ export default {
           answer_mode: 'ai',
         });
         homeworkLesson.value = null;
-        router.push('/grade/' + g.id);
+        /* 带上**入口来源**：批改台的「返回」据此决定回哪儿（唯一出处 src/backTarget.js）。
+         * sid 显式带上 —— 「回哪个学生」在入口这一刻就知道，不该让批改台反查。 */
+        router.push({ path: '/grade/' + g.id, query: { from: FROM.STUDENT, sid: id } });
       } catch (e) {
         fail(e.message);
       }

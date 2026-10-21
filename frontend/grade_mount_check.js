@@ -207,7 +207,11 @@ const ROUTER_PKG = JSON.stringify({
   main: 'index.js', exports: { '.': './index.js' },
 }, null, 2);
 const ROUTER_STUB = `
-export const useRoute = () => ({ params: { id: '7' }, query: {}, path: '/grade/7' });
+/* query 在**调用时**读 window 上的值：这样同一次挂载里也能模拟
+   不同入口（学生信息 / 主控制台）传进来的参数。 */
+export const useRoute = () => ({ params: { id: '7' },
+  query: (typeof window !== 'undefined' && window.__ROUTE_QUERY__) || {},
+  path: '/grade/7' });
 export const useRouter = () => ({ push: async () => {} });
 `;
 
@@ -289,6 +293,8 @@ async function main() {
     // 桩掉就等于「只验了有没有调用，没验算得对不对」。
     copy('src/gradeDraft.js');
     copy('src/gradeLines.js');
+    // 「返回」目标的唯一出处：视图要 import 它（漏拷 = 挂载直接 ERR_MODULE_NOT_FOUND）
+    copy('src/backTarget.js');
     fs.writeFileSync(path.join(tmp, 'src', 'calls.js'), CALLS_STUB);
     fs.writeFileSync(path.join(tmp, 'src', 'api.js'), API_STUB);
     fs.writeFileSync(path.join(tmp, 'src', 'store.js'), STORE_STUB);
@@ -354,6 +360,9 @@ async function main() {
     W.prompt = (msg) => (W.__promptAnswer === undefined ? '老师备注' : W.__promptAnswer);
 
     // ---- 3. 挂载真视图 ----
+    /* 模拟「学生信息 → 改作业」这条入口：SPA 会带上 from=student & sid。
+       这条链子断在哪一环，工作台的「返回」就会退化成别的目标。 */
+    W.__ROUTE_QUERY__ = { from: 'student', sid: '5' };
     const mod = await import(pathToFileURL(path.join(tmp, 'src', 'views', 'HomeworkGrade.js')).href);
     const app = W.Vue.createApp(mod.default);
     // 真实应用里 router-link 是全局注册的；这里给个最小的，不然整片导航会消失
@@ -375,6 +384,21 @@ async function main() {
       '含 ' + body().length + ' 字符');
     checkTrue('页头渲染出来了', (root.querySelector('h1') || {}).textContent === '作业批改',
       (root.querySelector('h1') || {}).textContent);
+
+    /* ---- 入口来源：决定「新版工作台」把哪个上下文传下去 ----
+     * 用户 2026-10-21 的口径：返回目标由**进入来源**决定。工作台是独立页，
+     * 它自己不知道从哪儿来 —— 全靠这里把 from / sid 带在链接上。 */
+    const headLinks = () => Array.from(root.querySelectorAll('.page-head a'));
+    const wbLink = () => headLinks().find((a) => /新版工作台/.test(a.textContent || ''));
+    checkTrue('★ 页头有「新版工作台」入口（普通链接，不是路由）', !!wbLink(),
+      headLinks().map((a) => a.outerHTML).join(' '));
+    check('★★ 它把 gid + 来源 + 学生三样都带过去（漏一样工作台就判不出来源）',
+      wbLink() && wbLink().getAttribute('href'),
+      '/workbench.html?gid=7&from=student&sid=5');
+    /* 旧版批改台自己的「返回学生」不能被动过 —— 需求：保留原有跳转行为 */
+    const backStu = headLinks().find((a) => /返回学生/.test(a.textContent || ''));
+    check('★ 旧版批改台的「返回学生」照旧指向这个学生的页面',
+      backStu && backStu.getAttribute('href'), '/students/5');
 
     /* ============ 4. 逐题卡片：文字、公式、判定 ============ */
     const cards = () => Array.from(D.querySelectorAll('.g-item'));

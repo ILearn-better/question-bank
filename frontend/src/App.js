@@ -43,7 +43,9 @@ export default {
         <router-link to="/papers">出卷</router-link>
         <!-- 批改工作台：零构建的独立页（与题库录题 / 批量入库同一层），
              自己做卷面分割与手写批改，不进 router 是为了随手甩给别人一个直链。 -->
-        <a href="/workbench.html">批改工作台</a>
+        <!-- ?from=console：让工作台知道是「主控制台」进来的，返回回今日工作台
+             （不传的话它会走缺省分支，把老师丢到学生页）。口径见 src/backTarget.js。 -->
+        <a href="/workbench.html?from=console">批改工作台</a>
         <router-link to="/notes">笔记</router-link>
         <router-link to="/settings">设置</router-link>
       </nav>

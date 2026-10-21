@@ -3,6 +3,7 @@
 import { onMounted, ref } from 'vue';
 import { useRouter } from 'vue-router';
 import { dashboardApi, lessonsApi, gradeApi } from '../api.js';
+import { FROM } from '../backTarget.js';
 import FeedbackDialog from '../components/FeedbackDialog.js';
 import HomeworkDialog from '../components/HomeworkDialog.js';
 import {
@@ -74,7 +75,8 @@ export default {
           answer_mode: 'ai',
         });
         homeworkLesson.value = null;
-        router.push('/grade/' + g.id);
+        // 从主控制台（今日工作台）进来的 → 返回回今日工作台，不回学生页。
+        router.push({ path: '/grade/' + g.id, query: { from: FROM.CONSOLE } });
       } catch (e) {
         fail(e.message);
       }

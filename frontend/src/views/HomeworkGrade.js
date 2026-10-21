@@ -31,6 +31,7 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue';
 import { useRoute } from 'vue-router';
 import { gradeApi, lessonFilesApi } from '../api.js';
+import { FROM } from '../backTarget.js';
 import { ensureLibs, renderRichEl } from '../mathRender.js';
 import { fail, ok, warn } from '../store.js';
 import GradeMarkLayer from '../components/GradeMarkLayer.js';
@@ -107,6 +108,28 @@ export default {
   setup() {
     const route = useRoute();
     const gid = route.params.id;
+
+    /* 本页是被谁打开的 —— 决定「新版工作台」按钮把哪个来源继续往下传。
+     * 学生信息 / 主控制台进来时会带 `?from=`；什么都没带的（直接打开 /grade/7、
+     * 或从历史记录点进来）按 `workbench` 算，也就是「旧版批改台」这个入口。
+     * 口径与判断全在 src/backTarget.js，这里只做一次清洗，别在这另立规则。 */
+    const entrySource = (function () {
+      const raw = String((route.query && route.query.from) || '').trim().toLowerCase();
+      return [FROM.STUDENT, FROM.WORKBENCH, FROM.CONSOLE].indexOf(raw) >= 0 ? raw : FROM.WORKBENCH;
+    })();
+
+    /* 新版工作台（workbench.html）的地址：gid + 来源 + 学生，三样都带过去。
+     * ⚠️ 它是独立的零构建页，不是路由 —— 所以是普通链接，绝不能写成 router-link。
+     * ⚠️ sid 必须带：旧版批改台「返回」回哪个学生，靠的是这个上下文，不是反查。 */
+    const workbenchHref = computed(function () {
+      const d = detail.value;
+      if (!d) return '';
+      const qs = new URLSearchParams();
+      qs.set('gid', String(d.id));
+      qs.set('from', entrySource);
+      if (d.student_id) qs.set('sid', String(d.student_id));
+      return '/workbench.html?' + qs.toString();
+    });
 
     const detail = ref(null);
     const loading = ref(true);
@@ -1561,6 +1584,7 @@ export default {
 
     return {
       detail, loading, loadError, busy, pageNo, pageBroken, selectedItemId, polling,
+      workbenchHref, entrySource,
       editId, draft, bankOpenId, bankQuestionId, bankTags,
       items, marks, pageMarks, pageCount, pageUrl, running, statusLabel, statusTag,
       runLabel, tallyText, VERDICTS,
@@ -1600,7 +1624,7 @@ export default {
       <!-- 新工作台（路线 B）：整条文件处理链路照批量录题那一套（所有页竖排滚动 +
            右边块卡片逐块处理）。两个入口并存，老师对比后再决定删哪个 ——
            所以这里是一个**普通链接，不是路由**（那是独立的零构建页面）。 -->
-      <a v-if="detail" class="btn" :href="'/workbench.html?gid=' + detail.id"
+      <a v-if="detail" class="btn" :href="workbenchHref"
          title="所有页竖排滚动、右边块卡片逐块处理（照批量录题那一套）">新版工作台</a>
       <router-link v-if="detail" :to="'/students/' + detail.student_id" class="btn">返回学生</router-link>
       <router-link v-else to="/students" class="btn">返回学生</router-link>

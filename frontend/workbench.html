@@ -676,8 +676,14 @@
   <div class="topbar">
     <h1>批改工作台</h1>
     <span class="sub">拾课 · 照批量录题那一套</span>
-    <a class="back-link" :href="backUrl">← 旧版批改台</a>
-    <a class="back-link" href="/">回到工作台</a>
+    <!-- ★ 「返回」只有一个，目标由**入口来源**决定（学生信息/旧版批改台 → 那个学生页；
+         主控制台 → 今日工作台）。别再在这里写死任何一个地址：
+         原来写死成 entry.html#/grade/<gid>，那是**录题平台**且不认 hash 路由，
+         于是所有入口点返回都掉进录题页。口径见 src/backTarget.js。 -->
+    <a class="back-link" :href="backTarget.href">{{ backTarget.label }}</a>
+    <!-- 去旧版批改台看同一份。⚠️ 地址是 SPA 的 /#/grade/&lt;gid&gt;，不是 entry.html。 -->
+    <a v-if="legacyGradeUrl" class="back-link" :href="legacyGradeUrl"
+       title="旧版批改台的同一份（AI 判对错 + 逐题核对）">旧版批改台</a>
     <div style="flex:1"></div>
     <!-- ★ 页内新建。以前要「先去课时页点 AI 批改作业」，工作台自己打不开 ——
          老师的动线是「拿到照片就想批」，多跳一层就断在这儿了。 -->
@@ -908,6 +914,13 @@
             还没选作业。左边的「待批改」和历史记录<b>不依赖</b>当前选择，随时能回看。
           </div>
           <template v-else>
+            <!-- ★ 批改完成后（存档成功）的出口。老师说「批改完成后的返回」要回学生页看
+                 这份卷子 —— toast 三秒就没了，所以这里常驻一行。
+                 ⚠️ 地址取自 backTarget（与顶栏「返回」同一个出处），不在这里写死。 -->
+            <div v-if="archivedRel" class="hint" style="margin-bottom:8px">
+              已存进学生资料：<b>{{ archivedRel }}</b>
+              · <a :href="backTarget.href">{{ backTarget.why === 'console' ? '回工作台' : '去学生页看' }}</a>
+            </div>
             <!-- 进度条：与批量录题同一套观感 -->
             <div v-if="running" style="margin-bottom:10px">
               <el-progress :percentage="jobPct" :stroke-width="14" text-inside></el-progress>
@@ -1283,6 +1296,68 @@ const { createApp } = Vue;
 let LAYER = null;
 let DRAFT = null;
 
+/* ===================== 「返回」目标：来源 → 目的地 =====================
+ *
+ * 这一段与 `src/backTarget.js` **同逻辑的逐字拷贝**。
+ * 为什么是拷贝：本页是零构建的**普通脚本**页（classic script），写不了静态 import，
+ * 而 backTarget.js 是 ES 模块；项目里渲染管线也是这么两份的（mathRender.js）。
+ * ⚠️ **改一处必须同步另一处** —— `frontend/back_target_check.js` 会拿同一张输入表
+ *    逐条比对两份的答案，只改一边就红。
+ *
+ * 为什么要有它：原来本页的「返回」硬编码 `/entry.html#/grade/<gid>`，
+ * 而 entry.html 是**录题平台**（试卷分割录入），它根本不认 hash 路由 ——
+ * 于是不管老师从哪儿进来，点「返回」都被甩进录题页（用户 2026-10-21 点名）。
+ * 现在只认一个输入：URL 上的 `from`（缺省也有明确口径，见下面的分支）。
+ */
+/* ---- backTarget-mirror:begin ---- */
+const B_KNOWN = ['student', 'workbench', 'console'];
+const B_HOME = '/#/';
+const B_STUDENTS = '/#/students';
+function bId(v) { const n = Number(v); return (Number.isInteger(n) && n > 0) ? n : null; }
+function bStudentUrl(sid) { const id = bId(sid); return id ? (B_STUDENTS + '/' + id) : B_STUDENTS; }
+function bLegacyGradeUrl(gid) { const id = bId(gid); return id ? ('/#/grade/' + id) : ''; }
+function bParseSource(search) {
+  let q;
+  try { q = new URLSearchParams(search || ''); } catch (e) { q = new URLSearchParams(''); }
+  const raw = (q.get('from') || '').trim().toLowerCase();
+  return {
+    from: B_KNOWN.indexOf(raw) >= 0 ? raw : '',
+    sid: bId(q.get('sid')),
+    gid: bId(q.get('gid')),
+  };
+}
+function bBackTarget(o) {
+  const opt = o || {};
+  const from = opt.from ? String(opt.from) : '';
+  const known = bId(opt.sid) || bId(opt.studentId);
+  /* ① 主控制台进来的：回今日工作台就够了（需求原话「不要求回到旧版批改台」） */
+  if (from === 'console') return { href: B_HOME, label: '← 回到工作台', why: 'console' };
+  /* ② 学生信息 / 旧版批改台点「新版工作台」进来的：回**那个学生**的界面 */
+  if (from === 'student' || from === 'workbench') {
+    return { href: bStudentUrl(known), label: '← 返回学生', why: from };
+  }
+  /* ③ 缺省（老书签 / 别人甩过来的 ?gid= 直链 / from 拼错）：认得出学生就回学生页 */
+  if (known) return { href: bStudentUrl(known), label: '← 返回学生', why: 'inferred' };
+  return { href: B_HOME, label: '← 回到工作台', why: 'home' };
+}
+function bKeepQuery(src, gid) {
+  const s = src || {};
+  const q = new URLSearchParams();
+  const id = bId(gid);
+  if (id) q.set('gid', String(id));
+  if (s.from) q.set('from', s.from);
+  const sid = bId(s.sid);
+  if (sid) q.set('sid', String(sid));
+  const qs = q.toString();
+  return qs ? ('?' + qs) : '';
+}
+const BACK = {
+  parseSource: bParseSource, backTarget: bBackTarget, keepQuery: bKeepQuery,
+  studentUrl: bStudentUrl, legacyGradeUrl: bLegacyGradeUrl,
+};
+/* ---- backTarget-mirror:end ---- */
+
+
 /** 一个块的最小高度（0~1000 制）。**与后端 grade_store.REGION_MIN_SIDE 同值**：
  *  比这更薄的段裁出来只是一条糊字，送模型等于花钱买一句「读不清」，后端还会直接 422。
  *  前端先挡一层，老师就不用为一次手抖看一个红色报错。 */
@@ -1375,6 +1450,10 @@ const app = createApp({
   data() {
     return {
       grades: [], gid: null, g: null,
+      /* 入口来源（URL 上的 from / sid），**只在打开页面时读一次**：
+       * 之后地址栏会被 gid 改写（刷新 / 甩链接），但来源不该跟着变 ——
+       * 那是「这次是怎么进来的」这件事的事实，不是当前选中哪一份的属性。 */
+      entrySrc: BACK.parseSource(location.search),
       /* ---- 新建批改（上传作业）---- */
       newOpen: false, lessons: [], newLessonId: null,
       newFiles: [], newPick: [], upBusy: false, newBusy: false, dragHot: false,
@@ -1398,6 +1477,9 @@ const app = createApp({
          混在一起会让「点终止」那一下loading 跑到「开始批改」按钮上。 */
       canceling: false,
       archiving: false,      // 正在导出到作业存档（按钮转圈，防重复点）
+      /* 这一份存档存到哪儿了（相对路径）。非空 = 卡片里显示「已存进学生资料 + 去学生页看」。
+         换一份作业必须清掉 —— 否则会指着上一份的路径说「已存好」。 */
+      archivedRel: '',
       /* 「老师点过终止、还在等收尾」。与 canceling 分开是为了**防连点**：成功受理后
          canceling 一直为真直到轮询看到状态落地，这段时间按钮必须保持不可点，
          再发一次请求只会收到 409（后端已经开始收尾了）。 */
@@ -1470,11 +1552,26 @@ const app = createApp({
     };
   },
   computed: {
-    /** 回旧版批改台的地址。旧版是 SPA 里的路由 `/grade/:id`（entry.html），
-     *  所以这里必须拼进去当前 gid —— 写死一个列表页地址是不存在的路由。 */
-    backUrl() {
-      return this.gid ? '/entry.html#/grade/' + this.gid : '/entry.html';
+    /** 「返回」的目标 —— **由入口来源决定**（用户 2026-10-21 定的口径）。
+     *
+     *  学生信息 →「改作业」          → 该学生的学生信息界面（带学生上下文）
+     *  旧版批改台点「新版工作台」      → 同样回该学生的学生信息界面
+     *  主控制台侧栏直接进工作台        → 今日工作台（不要求回旧版批改台）
+     *  缺省（老书签 / 甩过来的直链）  → 认得出学生就回学生页，否则今日工作台
+     *
+     *  ⚠️ 这里**不再拼任何具体地址**：判断只在 `BACK.backTarget()` 一处（与
+     *     `src/backTarget.js` 同逻辑的拷贝）。以前写死 `/entry.html#/grade/<gid>`，
+     *     那是录题平台且不认 hash 路由 —— 所以「返回」永远跳到录题页。 */
+    backTarget() {
+      return BACK.backTarget({
+        from: this.entrySrc.from,
+        sid: this.entrySrc.sid,
+        studentId: this.g && this.g.student_id,
+        gid: this.gid,
+      });
     },
+    /** 旧版批改台同一份的地址。没打开具体一份 → 空串（按钮不显示）。 */
+    legacyGradeUrl() { return BACK.legacyGradeUrl(this.gid); },
     pageList() {
       const n = this.g ? num(this.g.total) : 0;
       return n > 0 ? Array.from({ length: n }, (_, i) => i + 1) : [];
@@ -2462,7 +2559,9 @@ const app = createApp({
         await this.loadGrade(d.id);
         // 把 gid 写进地址栏：老师随手刷新 / 甩链接给别人，打开的还是这一份。
         try {
-          history.replaceState(null, '', '?gid=' + d.id);
+          // ⚠️ 用 keepQuery 而不是 '?gid='+id：直接拼会把 from / sid 冲掉，
+          //    刷新一下「返回」就退化成缺省分支（老师会觉得「刚才是回学生的呀」）。
+          history.replaceState(null, '', BACK.keepQuery(this.entrySrc, d.id));
         } catch (e) { /* file:// 下没有 replaceState，忽略 */ }
         ElementPlus.ElMessage.success('批改任务建好了 —— 先在卷面上画线，再点「开始批改」');
       } catch (e) {
@@ -2509,6 +2608,7 @@ const app = createApp({
       this.undoBusy = false;
       this.canceling = false;
       this.archiving = false;
+      this.archivedRel = '';      // 上一份的「已存进…」不能留在这一份上
       this.saving = false;
       this.savedAt = '';          // 上一份的「已保存 11:45」不能留在这一份上
       /* 判定依据也要复位：上一份的失败列表留着，下一份会显示一堆
@@ -2536,7 +2636,7 @@ const app = createApp({
         return;
       }
       if (this.running) this.startPoll();
-      history.replaceState(null, '', '?gid=' + id);
+      history.replaceState(null, '', BACK.keepQuery(this.entrySrc, id));
       this.$nextTick(() => this.setupLazy());
     },
     /** 把服务端的详情摊进「分割草稿」。**刷新页也不丢已保存的分割**就靠这一步。 */
@@ -3088,7 +3188,12 @@ const app = createApp({
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ grade_id: this.gid }),
         });
-        ElementPlus.ElMessage.success('已存进学生资料：' + (r.rel_path || r.name));
+        /* ★ 存档成功就是老师心里那句「批改完成了」。这时候最想干的事是**回学生页
+         *   看这份卷子**，所以除了说一句存到哪儿，卡片里还会常驻一行出口
+         *   （见模板 `archivedRel` 那段）—— toast 三秒就没了，链接根本点不到。
+         *   那一行的地址与顶栏「返回」同一个出处（backTarget），不另算一套。 */
+        this.archivedRel = r.rel_path || r.name;
+        ElementPlus.ElMessage.success('已存进学生资料：' + this.archivedRel);
       } catch (e) {
         ElementPlus.ElMessage.error('存档失败：' + e.message);
       } finally {
