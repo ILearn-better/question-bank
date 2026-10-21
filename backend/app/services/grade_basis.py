@@ -192,3 +192,63 @@ def extract(path: Path, name: str) -> dict:
         # 一份依据读不出来不该让整个上传 500 —— 收下，把原因说出来。
         return {"kind": kind or "", "text": "", "note": f"读这个文件时出错（{type(e).__name__}: {e}）"}
     return {"kind": kind or "", "text": _clip(r.get("text") or ""), "note": ""}
+
+# ---------------------------------------------------------------- 判定模式
+# 2026-10-21 改口径：从「三选一」改成「**AI 基准 + 可叠加的条件**」。
+# 老师可以只要 AI 自己解，也可以再加「按我的答案」、再加「按我的细则」，
+# 两个都加 = 两个条件一起生效（答案定对错，细则定 partial / 漏步）。
+#
+# 编码存在老列 `homework_grades.answer_mode` 里（TEXT，无 CHECK）：
+#     ""/"ai" → 只有 AI 基准
+#     "key" / "rubric" → 叠加一个条件
+#     "key+rubric" → 两个都叠加
+# **不许各处直接拿 answer_mode 跟 "key" 比** —— 一律走 `parse_modes()`：
+# 以后再加第三种条件（比如「按错因分类」）时，只改这一个文件就行。
+MODE_AI = "ai"
+CONDITIONS = ("key", "rubric")          # 可叠加的两个条件，顺序 = 提示词里的顺序
+_MODE_SEP = "+"
+
+
+def parse_modes(raw) -> set[str]:
+    """把库里的编码（或前端传来的 list）解成一串条件。认不出来的一律忽略。
+
+    容忍 list/tuple/set 是为了让 `basis_modes: ["key","rubric"]` 这种入参
+    也能直接喂进来 —— 少写一层转换，也少一个「两边理解不一致」的机会。
+    """
+    if raw is None:
+        return set()
+    if isinstance(raw, (list, tuple, set, frozenset)):
+        items = list(raw)
+    else:
+        items = str(raw).replace(",", _MODE_SEP).split(_MODE_SEP)
+    out = set()
+    for x in items:
+        s = str(x).strip().lower()
+        if s in CONDITIONS:
+            out.add(s)
+    return out
+
+
+def encode_modes(modes) -> str:
+    """条件集合 → 库里的编码。空集 = `"ai"`（**只有 AI 基准**）。"""
+    picked = parse_modes(modes)
+    if not picked:
+        return MODE_AI
+    return _MODE_SEP.join(m for m in CONDITIONS if m in picked)
+
+
+def modes_of(grade) -> set[str]:
+    """从 `HomeworkGrade`（或任何带 `answer_mode` 的对象/字典）取条件集合。"""
+    if isinstance(grade, dict):
+        return parse_modes(grade.get("answer_mode"))
+    return parse_modes(getattr(grade, "answer_mode", None))
+
+
+def mode_label(raw) -> str:
+    """给人看的一句话。**基准永远在**，所以只用说叠加了什么。"""
+    modes = parse_modes(raw)
+    if not modes:
+        return "AI 自主判定"
+    names = {"key": "按我给的答案判定", "rubric": "按我的评分细则判定"}
+    return "AI 自主判定 ＋ " + " ＋ ".join(names[m] for m in CONDITIONS if m in modes)
+

@@ -58,7 +58,8 @@ function loadJsdom() {
 function DETAIL() {
   return {
     id: 7, student_id: 5, lesson_id: 31, status: DETAIL_STATUS,
-    answer_mode: DETAIL_MODE, answer_text: '', rubric_text: '',
+    answer_mode: detailMode(), basis_modes: DETAIL_MODES.slice(),
+    answer_text: '', rubric_text: '',
     total: 3, done: DETAIL_STATUS === 'queued' ? 0 : 3, failed: 0,
     score: null, full_score: null, error: '',
     created_at: '2026-10-19T10:00:00', finished_at: '2026-10-19T10:03:00',
@@ -171,7 +172,11 @@ let FAIL_ARCHIVE = false;
  * 判定依据只在「还没批出结果」时能改（与后端 `_assert_setup_editable` 同一个判据），
  * 写死 reviewing 的话整节都在测「锁住」这一条分支。 */
 let DETAIL_STATUS = 'reviewing';
-let DETAIL_MODE = 'ai';
+/** 勾上的条件（`[]` / `['key']` / `['rubric']` / `['key','rubric']`）。
+ *  桩里也只留这一份真值，`answer_mode` 由它算出来 —— 跟后端同一个编码规则，
+ *  否则桩会「自己编一个库里不可能出现的状态」，测试再绿也没意义。 */
+let DETAIL_MODES = [];
+const detailMode = () => (DETAIL_MODES.slice().sort().join('+') || 'ai');
 /** 界面上「已传的依据」= 这个数组（真后端从 detail.files 里来）。 */
 let BASIS_ROWS = [];
 /** 下一回上传故意失败一次 —— 验「失败留在列表里可以单条重试」。 */
@@ -229,7 +234,7 @@ function makeFetch() {
     }
     /* ---- 判定依据（0034）：改模式 / 上传 / 删 / 取正文 ---- */
     if (u === '/api/homework-grades/7' && method === 'PATCH') {
-      DETAIL_MODE = (body && body.answer_mode) || DETAIL_MODE;
+      DETAIL_MODES = (body && body.basis_modes) || [];
       const keepMarks = (LAST_DETAIL && LAST_DETAIL.marks) || [];
       const keepItems = (LAST_DETAIL && LAST_DETAIL.items) || [];
       LAST_DETAIL = DETAIL();
@@ -1526,9 +1531,10 @@ async function main() {
   checkTrue('★ 地址栏写进了 gid（刷新 / 甩链接给别人还是这一份）',
     /replaceState/.test(html) && /gid=/.test(html), true);
   /* ★ 默认 answer_mode='ai'：老师手上多半没有标准答案，这一步不该问他要。 */
-  checkTrue('★ 建档默认 answer_mode=ai（没答案也能开始批）',
-    !!NEW_GRADE_BODY && NEW_GRADE_BODY.answer_mode === 'ai',
-    NEW_GRADE_BODY && NEW_GRADE_BODY.answer_mode);
+  checkTrue('★ 建档默认只有 AI 基准（basis_modes=[]，没答案也能开始批）',
+    !!NEW_GRADE_BODY && Array.isArray(NEW_GRADE_BODY.basis_modes)
+    && NEW_GRADE_BODY.basis_modes.length === 0,
+    NEW_GRADE_BODY && JSON.stringify(NEW_GRADE_BODY.basis_modes));
   vm.newOpen = false;
 
   /* ============ 22. ★★★ 撤销（Ctrl+Z）============
@@ -1916,41 +1922,57 @@ async function main() {
      用户 2026-10-21 四条：
        ① 上传入口：点击 / 拖拽 / 粘贴；图片与常见文件；缩略图 + 列表 + 预览 + 删除；
           限制类型、数量、大小。
-       ② 三种互斥模式（AI 自主 / 按我的答案 / 按我的细则），**默认 AI**，各带一句说明。
+       ② **AI 基准 + 可叠加的条件**（2026-10-21 用户改的口径）：默认只有 AI 自主判定，
+          勾「按我的答案」加一个条件、勾「按我的细则」再加一个，两个能同时勾；
+          每档各带一句说明。
        ③ 后两种必须至少一份依据，没有就**拦住不让提交**；依据要真的进批改。
        ④ 沿用现有交互，补上传中的加载态、失败重试、错误提示。
 
      ⚠️ 这一节把桩的 status 切成 queued：依据只在「还没批出结果」时能改，
         沿用上一节的 reviewing 会让整节都在测「锁住」那一条分支。 */
   DETAIL_STATUS = 'queued';
-  DETAIL_MODE = 'ai';
+  DETAIL_MODES = [];
   BASIS_ROWS = [];
   BASIS_FAIL_ONCE = false;
   LAST_DETAIL = null;
   await vm.loadGrade(7);
   await sleep(120);
 
-  check('★ 默认判定模式是 AI 自主', vm.basisMode, 'ai');
+  check('★ 默认一个条件都不勾（只剩 AI 基准）', vm.basisModes.length, 0);
   checkTrue('★ 默认档的说明文案不是空的（用户要求「各模式展示简洁说明」）',
     String(vm.basisModeDesc || '').length > 10, vm.basisModeDesc.slice(0, 24));
 
-  const radioEls = [...D.querySelectorAll('.basis-modes .el-radio')];
-  check('★★ 三档模式都渲染出来了（互斥 = 单选，不是勾选框）', radioEls.length, 3);
-  const modeTxt = radioEls.map((r) => r.textContent.trim()).join('|');
-  checkTrue('★★ 三档名字对得上：AI / 答案 / 细则',
+  /* 结构：1 个**恒选的基准** + 2 个可勾的条件。用 checkbox 而不是 radio ——
+     radio 天生互斥，表达不了「加一个条件」，也对不上后端的 `key+rubric`。 */
+  const boxes = [...D.querySelectorAll('.basis-modes .el-checkbox')];
+  check('★★ 基准 + 两个条件 = 三个复选框（不是三选一的单选框）', boxes.length, 3);
+  const modeTxt = boxes.map((r) => r.textContent.trim()).join('|');
+  checkTrue('★★ 名字对得上：AI 基准 / 按我给的答案 / 按我的评分细则',
     /AI/.test(modeTxt) && /答案/.test(modeTxt) && /细则/.test(modeTxt), modeTxt);
-  checkTrue('★ 默认选中的就是 AI 那一档',
-    radioEls.some((r) => /AI/.test(r.textContent) && /is-checked/.test(r.className)), modeTxt);
+  const baseBox = D.querySelector('.basis-modes .el-checkbox.basis-base');
+  checkTrue('★★ 基准那档是**勾着的**（它恒生效）',
+    !!baseBox && /is-checked/.test(baseBox.className), baseBox ? baseBox.className : '没渲染');
+  checkTrue('★★ 基准那档**点不动**（关掉它就没有判定标准了）',
+    /is-disabled/.test((baseBox && baseBox.className) || ''), (baseBox && baseBox.className) || '');
+  checkTrue('★ 基准那档标了「基准」两个字（否则老师以为三选一）',
+    !!baseBox && /基准/.test(baseBox.textContent), baseBox ? baseBox.textContent : '');
+  check('★ 两个条件默认都没勾', [...D.querySelectorAll('.basis-conds .el-checkbox')]
+    .filter((x) => /is-checked/.test(x.className)).length, 0);
 
   /* ---- ① 换模式要**立刻落库**（开批时服务端读的是库里那个值）---- */
   CALLS.length = 0;
-  vm.basisMode = 'key';
+  vm.basisModes = ['key'];
   await vm.onBasisModeChange();
   await sleep(60);
   const modePatch = CALLS.filter(
     (c) => c.url === '/api/homework-grades/7' && c.method === 'PATCH').pop();
-  check('★★ 换模式立刻 PATCH answer_mode（只改界面 = 批出来的口径和选的不一样）',
-    modePatch && modePatch.body.answer_mode, 'key');
+  check('★★ 勾条件立刻 PATCH basis_modes（只改界面 = 批出来的口径和勾的不一样）',
+    JSON.stringify((modePatch && modePatch.body && modePatch.body.basis_modes) || null),
+    JSON.stringify(['key']));
+  check('★ 落库后服务端存的是 key（不是只改内存）',
+    JSON.stringify(DETAIL_MODES), JSON.stringify(['key']));
+  checkTrue('★ 页签外那行口径跟着变（不用切页签也知道这次按什么判）',
+    /答案/.test(vm.basisModeLabel) && /AI/.test(vm.basisModeLabel), vm.basisModeLabel);
 
   /* ---- ② 上传：类型 / 大小当场拦 ---- */
   const mkFile = (name, type, size) => new W.File(
@@ -1984,18 +2006,46 @@ async function main() {
     upSrc.indexOf('this.basisBusy = true') > -1
     && upSrc.indexOf('this.basisBusy = true') < upSrc.indexOf("'/basis?role='"), '');
 
-  /* ---- ⑤ AI 模式下传依据：没去处，要劝住 ---- */
-  vm.basisMode = 'ai';
+  /* ---- ⑤ 一个条件都没勾时传依据：没去处，要劝住 ---- */
+  vm.basisModes = [];
   CALLS.length = 0;
   MSGS.length = 0;
   await vm.uploadBasisFiles([mkFile('多余.png')]);
-  check('★ AI 模式下不发上传请求（AI 自己解用不到依据）',
+  check('★ 只有 AI 基准时不发上传请求（自己解用不到依据）',
     CALLS.filter((c) => /\/basis/.test(c.url)).length, 0);
-  checkTrue('★★ 而且要说明白为什么（不能点了一下什么都不发生）',
-    /先切到/.test(MSGS.map((m) => m.text).join('')), MSGS.map((m) => m.text).join('|'));
+  checkTrue('★★ 而且要说明白为什么 + 下一步点哪里（不能点了一下什么都不发生）',
+    /勾上/.test(MSGS.map((m) => m.text).join('')), MSGS.map((m) => m.text).join('|'));
+
+  /* ---- ⑤b 没勾条件时，上传区就地给两个按钮（用户报的「想传东西却被劝住」）---- */
+  /* 先把条件真的收回库里（只改 vm 不改库的话，下面「quickAddMode 会 PATCH」是假绿：
+     saveBasisMode 比的是 vm 与 g.basis_modes，两边不同步就永远不觉得有变化）。 */
+  await vm.saveBasisMode();
+  await sleep(60);
+  const dropEl = D.querySelector('.basis-drop');
+  checkTrue('★★★ 没勾条件时，上传区不是等着劝人，而是给「先选一个条件」',
+    !!dropEl && /先选一个条件/.test(dropEl.textContent),
+    dropEl ? dropEl.textContent.slice(0, 40) : '没渲染');
+  const quickBtns = [...((dropEl && dropEl.querySelectorAll('button')) || [])];
+  check('★★★ 就地给出两个条件按钮（省得老师滚回去找复选框）', quickBtns.length, 2);
+  checkTrue('★★ 两个按钮分别对得上「答案」「细则」',
+    quickBtns.length === 2 && /答案/.test(quickBtns[0].textContent)
+    && /细则/.test(quickBtns[1].textContent),
+    quickBtns.map((x) => x.textContent.trim()).join('|'));
+
+  CALLS.length = 0;
+  await vm.quickAddMode('key');
+  await sleep(80);
+  check('★★★ 点「＋ 按我给的答案判定」→ 条件勾上了', vm.basisModes.join(), 'key');
+  check('★★★ 而且立刻落库（不是只改界面）',
+    JSON.stringify((CALLS.filter((c) => c.method === 'PATCH').pop() || {}).body
+      && CALLS.filter((c) => c.method === 'PATCH').pop().body.basis_modes),
+    JSON.stringify(['key']));
+  await sleep(60);
+  checkTrue('★★ 勾上之后上传区恢复正常（能挑文件了）',
+    !/先选一个条件/.test(D.querySelector('.basis-drop').textContent), '');
 
   /* ---- ⑥ 上传失败 → 留在列表里 → 单条重试 ---- */
-  vm.basisMode = 'rubric';
+  vm.basisModes = ['rubric'];
   await vm.onBasisModeChange();
   await sleep(60);
   BASIS_FAIL_ONCE = true;
@@ -2019,7 +2069,7 @@ async function main() {
   LAST_DETAIL = null;
   await vm.loadGrade(7);
   await sleep(90);
-  vm.basisMode = 'rubric';
+  vm.basisModes = ['rubric'];
   await vm.onBasisModeChange();
   await sleep(60);
   CALLS.length = 0;
@@ -2080,7 +2130,7 @@ async function main() {
   check('★ 批出结果之后依据锁住（与后端同一判据）', vm.basisEditable, false);
   CALLS.length = 0;
   MSGS.length = 0;
-  vm.basisMode = 'key';
+  vm.basisModes = ['key'];
   await vm.uploadBasisFiles([mkFile('晚了.png')]);
   check('★ 锁住时上传一个请求都不发',
     CALLS.filter((c) => /\/basis/.test(c.url)).length, 0);
@@ -2089,12 +2139,12 @@ async function main() {
 
   /* ---- ⑫ Ctrl+V 贴截图 ---- */
   DETAIL_STATUS = 'queued';
-  DETAIL_MODE = 'ai';
+  DETAIL_MODES = [];
   BASIS_ROWS = [];
   LAST_DETAIL = null;
   await vm.loadGrade(7);
   await sleep(90);
-  vm.basisMode = 'key';
+  vm.basisModes = ['key'];
   await vm.onBasisModeChange();
   await sleep(60);
 
@@ -2120,6 +2170,67 @@ async function main() {
   check('★★ 输入框里的粘贴不抢（老师要往里粘文字）',
     CALLS.filter((c) => /\/basis/.test(c.url)).length, 0);
 
+  /* ---- ⑫b 两个条件同时勾（用户点名：「选了两个相当于加了两个条件」）---- */
+  DETAIL_STATUS = 'queued';
+  DETAIL_MODES = [];
+  BASIS_ROWS = [];
+  LAST_DETAIL = null;
+  await vm.loadGrade(7);
+  await sleep(90);
+
+  CALLS.length = 0;
+  vm.basisModes = ['key', 'rubric'];
+  await vm.onBasisModeChange();
+  await sleep(80);
+  const bothPatch = CALLS.filter(
+    (c) => c.url === '/api/homework-grades/7' && c.method === 'PATCH').pop();
+  check('★★★ 两个都勾 → 一次 PATCH 就把两个条件都送上去',
+    JSON.stringify((bothPatch && bothPatch.body && bothPatch.body.basis_modes) || null),
+    JSON.stringify(['key', 'rubric']));
+  check('★★ 服务端存的是 key+rubric（一个条件都没丢）',
+    detailMode(), detailMode());
+  checkTrue('★★ 口径那行把两个条件都写出来（不能只说一个）',
+    /答案/.test(vm.basisModeLabel) && /细则/.test(vm.basisModeLabel), vm.basisModeLabel);
+  checkTrue('★★ 说明文案要说清「对错看答案、漏步看细则」（否则老师以为判两遍）',
+    /对错/.test(vm.basisModeDesc) && /细则/.test(vm.basisModeDesc), vm.basisModeDesc.slice(0, 40));
+  check('★★ 两个都勾 → 两份依据都缺（`basisMissing` 要有两条）',
+    vm.basisMissing.length, 2);
+  check('★★ 两个都勾才需要老师指明「这份传的是答案还是细则」', vm.basisNeedsRolePick, true);
+  checkTrue('★★ 界面上真出现了那个选择（不算明白就会把细则当答案传）',
+    /basis-rolepick/.test(D.querySelector('.basis-tabs, .el-tabs').innerHTML
+      || D.body.innerHTML), '');
+
+  /* 缺两个 → 一次说全，别让老师改好一个再挨一次 422 */
+  CALLS.length = 0;
+  MSGS.length = 0;
+  vm.tab = 'blocks';
+  await vm.runGrade();
+  await sleep(60);
+  check('★★★ 两个条件都缺 → 一个 /run 都不发', CALLS.filter((c) => /\/run$/.test(c.url)).length, 0);
+  const missMsg = MSGS.map((m) => m.text).join('|');
+  checkTrue('★★★ 提示里**两个都说到**（答案 + 细则），不是只说第一个',
+    /答案/.test(missMsg) && /细则/.test(missMsg), missMsg);
+
+  /* 传一份「细则」→ role 跟着选择走，不会落到 answer */
+  CALLS.length = 0;
+  vm.basisRolePick = 'rubric';
+  await vm.uploadBasisFiles([mkFile('细则.png')]);
+  await sleep(120);
+  check('★★ 两个都勾时，选「细则」上传就落到 role=rubric',
+    CALLS.filter((c) => /\/basis\?role=rubric$/.test(c.url)).length, 1);
+  check('★ 传了一份细则后，只缺答案了', vm.basisMissing.join(), 'key');
+
+  vm.basisRolePick = 'answer';
+  await vm.uploadBasisFiles([mkFile('答案.png')]);
+  await sleep(120);
+  CALLS.length = 0;
+  MSGS.length = 0;
+  vm.tab = 'blocks';
+  await vm.runGrade();
+  await sleep(80);
+  check('★★ 两份都齐了 → 正常开批（两个条件同时生效）',
+    CALLS.filter((c) => /\/run$/.test(c.url)).length, 1);
+
   /* ---- ⑬ 源码层的几条硬约定 ---- */
   const inputTag = (html.match(/<input ref="basisInput"[^>]*>/) || [''])[0];
   checkTrue('★ file input 不带 accept（本机经验：accept 会把想选的文件藏起来）',
@@ -2131,8 +2242,8 @@ async function main() {
     /window\.addEventListener\('paste', this\.onBasisPaste\)/.test(html), '');
   checkTrue('★★ 卸载时摘掉监听（不然切页面后还会抢 Ctrl+V）',
     /removeEventListener\('paste', this\.onBasisPaste\)/.test(html), '');
-  checkTrue('★★ 依据只在 key/rubric 下才上传（ai 模式下没有去处）',
-    /if \(this\.basisMode === 'ai'\)/.test(html), '');
+  checkTrue('★★ 一个条件都没勾时不上传（传上去没有去处）',
+    /if \(!this\.basisModes\.length\) \{/.test(html), '');
 
   const ti = layerSrc.indexOf('template:');
   check('★★ 标注层模板里反引号正好 2 个（多一个模板就被截断、组件整个加载失败）',

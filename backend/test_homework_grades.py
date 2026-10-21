@@ -273,12 +273,17 @@ def t_contract() -> None:
     check("迁移 0033 只加一列（width），不动别的表", mig33.count("add_column") == 1)
 
     from app.schemas import GradeIn as _GI
-    check("GradeIn 有 answer_mode / answer_text / rubric_text",
-          {"answer_mode", "answer_text", "rubric_text"} <= set(_GI.model_fields))
+    # 2026-10-21 起入参是 `basis_modes`（多选），不再有 `answer_mode` 这个单值入参。
+    check("GradeIn 有 basis_modes / answer_text / rubric_text",
+          {"basis_modes", "answer_text", "rubric_text"} <= set(_GI.model_fields))
+    check("★ GradeIn.basis_modes 默认是空列表（= 只有 AI 基准）",
+          _GI(lesson_id=1).basis_modes == [], _GI(lesson_id=1).basis_modes)
+    check("★★ 旧入参 answer_mode 已经没有了（留着就有两套真值，早晚分叉）",
+          "answer_mode" not in _GI.model_fields, list(_GI.model_fields))
     from app.schemas import GradeSetupPatch as _SP
     check("GradeSetupPatch 三个字段都可空（None = 不改）",
           all(_SP.model_fields[k].default is None for k in
-              ("answer_mode", "answer_text", "rubric_text")))
+              ("basis_modes", "answer_text", "rubric_text")))
 
     from app.routers import homework_grades as R
     paths = {(getattr(r, "path", ""), tuple(sorted(getattr(r, "methods", set()))))
@@ -391,17 +396,17 @@ def t_setup() -> None:
 
         # —— key 模式却没给答案 ——
         st, msg = expect_err(G.create_grade, db, GradeIn(
-            lesson_id=ls.id, file_ids=[s1.id], answer_mode="key"))
+            lesson_id=ls.id, file_ids=[s1.id], basis_modes=["key"]))
         check("选「用我给的答案」但答案是空的 → 422（不能拿 AI 自解冒充）", st == 422, msg)
         check("422 的文案是给老师看的人话（提到答案）", "答案" in msg, msg)
 
         # —— rubric 模式却没给细则 ——
         st, msg = expect_err(G.create_grade, db, GradeIn(
-            lesson_id=ls.id, file_ids=[s1.id], answer_mode="rubric"))
+            lesson_id=ls.id, file_ids=[s1.id], basis_modes=["rubric"]))
         check("选「用评分细则」但细则是空的 → 422", st == 422, msg)
 
         # —— 正常建（先按 AI 自解建，再在批改页改）——
-        g = G.create_grade(db, GradeIn(lesson_id=ls.id, file_ids=[s1.id], answer_mode="ai"))
+        g = G.create_grade(db, GradeIn(lesson_id=ls.id, file_ids=[s1.id]))
         check("建任务成功且状态是 queued（建了不自动跑）", g.status == "queued", g.status)
         check("total 是页数（一张图 = 1 页）", g.total == 1, g.total)
         check("done / failed 从 0 起", g.done == 0 and g.failed == 0)
@@ -409,8 +414,9 @@ def t_setup() -> None:
         check("归档目录已建", bool(g.dir_rel) and (config.UPLOAD_DIR / g.dir_rel).is_dir(), g.dir_rel)
 
         d = G.detail(db, g)
-        check("详情里能回显判定依据（answer_mode + 两段文本）",
-              d.get("answer_mode") == "ai" and d.get("answer_text") == "")
+        check("详情里能回显判定依据（answer_mode + basis_modes + 两段文本）",
+              d.get("answer_mode") == "ai" and d.get("answer_text") == ""
+              and d.get("basis_modes") == [], f'{d.get("answer_mode")}/{d.get("basis_modes")}')
         check("详情里带 items / files / marks / pages",
               {"items", "files", "marks", "pages"} <= set(d))
         check("提交件是引用而非复制（lesson_file_id 指回 lesson_files）",
@@ -420,7 +426,7 @@ def t_setup() -> None:
 
         # —— 开批前改依据（A1 的落地口子）——
         G.patch_setup(db, g.id, GradeSetupPatch(
-            answer_mode="key", answer_text="3. x=2 或 x=3\n4. 略"))
+            basis_modes=["key"], answer_text="3. x=2 或 x=3\n4. 略"))
         db.refresh(g)
         check("开批前能改成「用我给的答案」", g.answer_mode == "key", g.answer_mode)
         key_text, _rub = G._answer_texts(db, g)
@@ -431,7 +437,7 @@ def t_setup() -> None:
         check("详情能回显刚填的答案", "x=2" in (d.get("answer_text") or ""))
 
         # 切回 ai 之后，回显仍然保留（respect_mode=False 的意义）
-        G.patch_setup(db, g.id, GradeSetupPatch(answer_mode="ai"))
+        G.patch_setup(db, g.id, GradeSetupPatch(basis_modes=[]))
         d2 = G.detail(db, g)
         check("切回「AI 自己解」后，回显里答案还在（不然切一下就没了）",
               "x=2" in (d2.get("answer_text") or ""), d2.get("answer_text"))
@@ -445,18 +451,18 @@ def t_setup() -> None:
         # ⚠️ 用 expect_err 拿状态码而不是直接调：直接调的话，这道门被（有人）加回去时
         #    抛的是 traceback，输出里压根没有 [FAIL] 行 —— 反向验证会把「崩了」当「守住了」。
         st, msg = expect_err(G.patch_setup, db, g.id,
-                             GradeSetupPatch(answer_mode="key", answer_text=""))
+                             GradeSetupPatch(basis_modes=["key"], answer_text=""))
         db.refresh(g)
         _k, _r = G._answer_texts(db, g)
         check("★★ 清空答案也允许改（要换答案得能先清空）",
               st == 0 and _k == "", f"st={st} {msg[:40]}")
         st, msg = expect_err(G.launch, db, g)
         check("★★ 清空之后开批 → 422（依据空不能冒充「按老师答案判」）",
-              st == 422 and "依据" in msg, msg[:60])
+              st == 422 and ("答案" in msg or "细则" in msg), msg[:60])
 
         # 重写答案会覆盖旧的 txt（不该攒出一堆 answer_2.txt）
-        G.patch_setup(db, g.id, GradeSetupPatch(answer_mode="key", answer_text="3. x=3"))
-        G.patch_setup(db, g.id, GradeSetupPatch(answer_mode="key", answer_text="3. x=2"))
+        G.patch_setup(db, g.id, GradeSetupPatch(basis_modes=["key"], answer_text="3. x=3"))
+        G.patch_setup(db, g.id, GradeSetupPatch(basis_modes=["key"], answer_text="3. x=2"))
         txt2 = list((config.UPLOAD_DIR / g.dir_rel).glob("answer*.txt"))
         check("反复改答案不会攒出 answer_2.txt", len(txt2) == 1, [p.name for p in txt2])
         k2, _ = G._answer_texts(db, g)
@@ -466,7 +472,7 @@ def t_setup() -> None:
         g.status = "reviewing"
         g.done = 1
         db.commit()
-        st, msg = expect_err(G.patch_setup, db, g.id, GradeSetupPatch(answer_mode="ai"))
+        st, msg = expect_err(G.patch_setup, db, g.id, GradeSetupPatch(basis_modes=[]))
         check("开始批过之后改依据 → 422（旧判定是按旧依据算的）", st == 422, msg)
         check("422 文案提示去「重新批改」", "重新批改" in msg, msg)
         g.status = "queued"
@@ -485,7 +491,7 @@ def t_items() -> None:
         ls = mk_lesson(db, stu)
         s1 = mk_submission(db, ls)
         db.commit()
-        g = G.create_grade(db, GradeIn(lesson_id=ls.id, file_ids=[s1.id], answer_mode="ai"))
+        g = G.create_grade(db, GradeIn(lesson_id=ls.id, file_ids=[s1.id]))
         db.commit()
 
         # 直接塞一条结果（模拟 AI 跑完）
@@ -569,7 +575,7 @@ def t_marks() -> None:
         ls = mk_lesson(db, stu)
         s1 = mk_submission(db, ls)
         db.commit()
-        g = G.create_grade(db, GradeIn(lesson_id=ls.id, file_ids=[s1.id], answer_mode="ai"))
+        g = G.create_grade(db, GradeIn(lesson_id=ls.id, file_ids=[s1.id]))
         db.commit()
 
         m = G.add_mark(db, g.id, GradeMarkIn(page_no=1, kind="cross",
@@ -642,7 +648,7 @@ def t_marks_batch() -> None:
         ls = mk_lesson(db, stu)
         s1 = mk_submission(db, ls, "补发.png")
         db.commit()
-        g = G.create_grade(db, GradeIn(lesson_id=ls.id, file_ids=[s1.id], answer_mode="ai"))
+        g = G.create_grade(db, GradeIn(lesson_id=ls.id, file_ids=[s1.id]))
         db.commit()
 
         # 落一道题，测「挂错题」那条（item_id 属于别的作业）
@@ -652,7 +658,7 @@ def t_marks_batch() -> None:
         ls2 = mk_lesson(db, stu2)
         s2 = mk_submission(db, ls2, "别人的.png")
         db.commit()
-        g2 = G.create_grade(db, GradeIn(lesson_id=ls2.id, file_ids=[s2.id], answer_mode="ai"))
+        g2 = G.create_grade(db, GradeIn(lesson_id=ls2.id, file_ids=[s2.id]))
         db.commit()
         other = G._item_row(item_payload(), g2.id, 1, 0)
         db.add(other)
@@ -723,7 +729,7 @@ def t_run_with_stub() -> None:
         ls = mk_lesson(db, stu)
         s1 = mk_submission(db, ls, "作业1.png")
         db.commit()
-        g = G.create_grade(db, GradeIn(lesson_id=ls.id, file_ids=[s1.id], answer_mode="ai"))
+        g = G.create_grade(db, GradeIn(lesson_id=ls.id, file_ids=[s1.id]))
         db.commit()
 
         calls = {"n": 0}
@@ -771,7 +777,7 @@ def t_run_with_stub() -> None:
             G._recognize_page = orig
 
         # —— 一页失败 → partial，且错误要说得出来 ——
-        g2 = G.create_grade(db, GradeIn(lesson_id=ls.id, file_ids=[s1.id], answer_mode="ai"))
+        g2 = G.create_grade(db, GradeIn(lesson_id=ls.id, file_ids=[s1.id]))
         db.commit()
 
         def bad(png, ctx):
@@ -1107,7 +1113,7 @@ def t_ink_export() -> None:
         stu = mk_student(db, "手写批改学生")
         ls = mk_lesson(db, stu)
         lf = mk_submission(db, ls, "手写.png")
-        g = G.create_grade(db, GradeIn(lesson_id=ls.id, file_ids=[lf.id], answer_mode="ai"))
+        g = G.create_grade(db, GradeIn(lesson_id=ls.id, file_ids=[lf.id]))
 
         def det() -> dict:
             """每次都重新取一遍详情 —— 直接读 g 上的关系会拿到过期的 session 状态。"""
@@ -1236,7 +1242,7 @@ def t_regions() -> None:
         ls = mk_lesson(db, stu)
         s1 = mk_submission(db, ls, "框题.png")
         db.commit()
-        g = G.create_grade(db, GradeIn(lesson_id=ls.id, file_ids=[s1.id], answer_mode="ai"))
+        g = G.create_grade(db, GradeIn(lesson_id=ls.id, file_ids=[s1.id]))
         db.commit()
 
         # ---------------- 存框 / 整页替换 ----------------
@@ -1283,7 +1289,7 @@ def t_regions() -> None:
         # ---------------- 沿用同课时另一份的框 ----------------
         s2 = mk_submission(db, ls, "框题2.png")
         db.commit()
-        g2 = G.create_grade(db, GradeIn(lesson_id=ls.id, file_ids=[s2.id], answer_mode="ai"))
+        g2 = G.create_grade(db, GradeIn(lesson_id=ls.id, file_ids=[s2.id]))
         db.commit()
         G.put_regions(db, g.id, GradeRegionsPut(regions=[
             GradeRegionIn(q_no="1", box=[50, 100, 900, 300]),
@@ -1301,7 +1307,7 @@ def t_regions() -> None:
         ls2 = mk_lesson(db, stu2)
         s3 = mk_submission(db, ls2, "别的卷.png")
         db.commit()
-        g3 = G.create_grade(db, GradeIn(lesson_id=ls2.id, file_ids=[s3.id], answer_mode="ai"))
+        g3 = G.create_grade(db, GradeIn(lesson_id=ls2.id, file_ids=[s3.id]))
         db.commit()
         st, _msg = expect_err(G.copy_regions, db, g3.id, g.id)
         check("跨课时不许沿用（版面不一样）→ 422", st == 422, st)
@@ -1329,7 +1335,7 @@ def t_regions() -> None:
               G._crop_region(str(page), [0, 0, 5, 5], TMP / "crops", 1) is None)
 
         # ---------------- 按框批：一框一次调用 ----------------
-        g4 = G.create_grade(db, GradeIn(lesson_id=ls.id, file_ids=[s1.id], answer_mode="ai"))
+        g4 = G.create_grade(db, GradeIn(lesson_id=ls.id, file_ids=[s1.id]))
         db.commit()
         G.put_regions(db, g4.id, GradeRegionsPut(regions=[
             GradeRegionIn(q_no="1", box=[50, 100, 900, 300]),
@@ -1373,7 +1379,7 @@ def t_regions() -> None:
               "直角符号" in (G.item_dict(items4[0]).get("figure_note") or ""))
 
         # ---------------- 单框失败不毁整页 ----------------
-        g5 = G.create_grade(db, GradeIn(lesson_id=ls.id, file_ids=[s1.id], answer_mode="ai"))
+        g5 = G.create_grade(db, GradeIn(lesson_id=ls.id, file_ids=[s1.id]))
         db.commit()
         G.put_regions(db, g5.id, GradeRegionsPut(regions=[
             GradeRegionIn(q_no="1", box=[50, 100, 900, 300]),
@@ -1409,7 +1415,7 @@ def t_regions() -> None:
               g5.done == 1 and g5.failed == 0, (g5.done, g5.failed))
 
         # ---------------- 全失败 → 整页失败 ----------------
-        g6 = G.create_grade(db, GradeIn(lesson_id=ls.id, file_ids=[s1.id], answer_mode="ai"))
+        g6 = G.create_grade(db, GradeIn(lesson_id=ls.id, file_ids=[s1.id]))
         db.commit()
         G.put_regions(db, g6.id, GradeRegionsPut(regions=[
             GradeRegionIn(q_no="1", box=[50, 100, 900, 300]),
@@ -1494,7 +1500,7 @@ def t_skips_and_signals() -> None:
         ls = mk_lesson(db, stu)
         s1 = mk_submission(db, ls, "跳过.png")
         db.commit()
-        g = G.create_grade(db, GradeIn(lesson_id=ls.id, file_ids=[s1.id], answer_mode="ai"))
+        g = G.create_grade(db, GradeIn(lesson_id=ls.id, file_ids=[s1.id]))
         db.commit()
 
         # ---------------- 按块跳过：落库、读回、不删框 ----------------
@@ -1552,7 +1558,7 @@ def t_skips_and_signals() -> None:
               kept2 == {} and noop2 == set(), (kept2, noop2))
 
         # ---------------- 真跑一遍：跳过的不调模型 ----------------
-        g7 = G.create_grade(db, GradeIn(lesson_id=ls.id, file_ids=[s1.id], answer_mode="ai"))
+        g7 = G.create_grade(db, GradeIn(lesson_id=ls.id, file_ids=[s1.id]))
         db.commit()
         G.put_regions(db, g7.id, GradeRegionsPut(regions=[
             GradeRegionIn(q_no="1", box=[50, 100, 900, 300]),
@@ -1584,7 +1590,7 @@ def t_skips_and_signals() -> None:
               g7.done == 1 and g7.failed == 0, (g7.done, g7.failed))
 
         # 整页跳过 → 一次模型调用都不该有，但任务要能正常收尾
-        g8 = G.create_grade(db, GradeIn(lesson_id=ls.id, file_ids=[s1.id], answer_mode="ai"))
+        g8 = G.create_grade(db, GradeIn(lesson_id=ls.id, file_ids=[s1.id]))
         db.commit()
         G.set_page_skips(db, g8.id, [1])
         calls2: list[str] = []
@@ -1715,7 +1721,7 @@ def t_cancel() -> None:
         db.add(ls)
         db.flush()
         lf = mk_pdf_submission(db, ls, pages=2, name="终止卷.pdf")
-        g = G.create_grade(db, GradeIn(lesson_id=ls.id, file_ids=[lf.id], answer_mode="ai"))
+        g = G.create_grade(db, GradeIn(lesson_id=ls.id, file_ids=[lf.id]))
         gid = g.id
         db.commit()
         # ⚠️ 这里会**真的起一个后台线程**。两件事必须做，少一件它就会污染后面的测试：
@@ -1886,7 +1892,7 @@ def t_labels() -> None:
         db.add(ls)
         db.flush()
         lf = mk_pdf_submission(db, ls, pages=1, name="标签卷.pdf")
-        g = G.create_grade(db, GradeIn(lesson_id=ls.id, file_ids=[lf.id], answer_mode="ai"))
+        g = G.create_grade(db, GradeIn(lesson_id=ls.id, file_ids=[lf.id]))
         gid = g.id
         db.commit()
 
@@ -1952,7 +1958,7 @@ def t_cross_page() -> None:
         ls = mk_lesson(db, stu)
         lf = mk_pdf_submission(db, ls, pages=2)
         db.commit()
-        g = G.create_grade(db, GradeIn(lesson_id=ls.id, file_ids=[lf.id], answer_mode="ai"))
+        g = G.create_grade(db, GradeIn(lesson_id=ls.id, file_ids=[lf.id]))
         db.commit()
         check("两页 PDF 建出来的 total = 2（页数，不是题数）", g.total == 2, g.total)
 
@@ -2107,7 +2113,7 @@ def t_answer_images() -> None:
 
         # ---------------- 建任务：图片答案不再被拦 ----------------
         g = G.create_grade(db, GradeIn(lesson_id=ls.id, file_ids=[sub.id],
-                                       answer_mode="key", answer_file_ids=[ans.id]))
+                                       basis_modes=["key"], answer_file_ids=[ans.id]))
         db.commit()
         check("★ 图片答案能建任务（以前直接 422）", g.id is not None, g.id)
 
@@ -2140,7 +2146,7 @@ def t_answer_images() -> None:
         ans2 = mk_answer_image(db, ls, "细则照片.png")
         db.commit()
         g_rub = G.create_grade(db, GradeIn(lesson_id=ls.id, file_ids=[sub.id],
-                                          answer_mode="rubric", answer_file_ids=[ans2.id]))
+                                          basis_modes=["rubric"], answer_file_ids=[ans2.id]))
         db.commit()
         ctx_r = G._ctx_base(db, g_rub)
         check("rubric 模式的图进 rubric_images", len(ctx_r.get("rubric_images") or []) == 1,
@@ -2154,7 +2160,7 @@ def t_answer_images() -> None:
 
         # ---------------- 有文字的文件不重复送图 ----------------
         g_txt = G.create_grade(db, GradeIn(lesson_id=ls.id, file_ids=[sub.id],
-                                           answer_mode="key", answer_text="答案：x=2 或 x=3"))
+                                           basis_modes=["key"], answer_text="答案：x=2 或 x=3"))
         db.commit()
         ctx_txt = G._ctx_base(db, g_txt)
         check("粘贴了文字 → 不再额外送图（同一份依据别花两遍 token）",
@@ -2164,7 +2170,7 @@ def t_answer_images() -> None:
 
         # ---------------- 开批前换图 ----------------
         g_sw = G.create_grade(db, GradeIn(lesson_id=ls.id, file_ids=[sub.id],
-                                          answer_mode="key", answer_text="先给个占位"))
+                                          basis_modes=["key"], answer_text="先给个占位"))
         db.commit()
         G.patch_setup(db, g_sw.id, GradeSetupPatch(answer_file_ids=[ans.id]))
         check("★ 开批前能把答案换成照片（以前只能重建任务）",
@@ -2185,13 +2191,13 @@ def t_answer_images() -> None:
         db.add(bad)
         db.commit()
         st, msg = expect_err(G.create_grade, db, GradeIn(
-            lesson_id=ls.id, file_ids=[sub.id], answer_mode="key", answer_file_ids=[bad.id]))
+            lesson_id=ls.id, file_ids=[sub.id], basis_modes=["key"], answer_file_ids=[bad.id]))
         check("★ 既没文字又不能当图看 → 仍然 422（不能偷偷按 AI 自解批）", st == 422, (st, msg))
         check("并且给了可执行的出路（粘文字 / 传照片）",
               "粘贴文字" in msg and "答案照片" in msg, msg)
 
         # ai 模式不该带任何依据
-        g_ai = G.create_grade(db, GradeIn(lesson_id=ls.id, file_ids=[sub.id], answer_mode="ai"))
+        g_ai = G.create_grade(db, GradeIn(lesson_id=ls.id, file_ids=[sub.id]))
         db.commit()
         ctx_ai = G._ctx_base(db, g_ai)
         check("ai 模式下不塞任何答案图（老师没给依据）",
@@ -2325,16 +2331,15 @@ def t_basis() -> None:
         sub_f = mk_submission(db, ls, "依据作业.png")
         db.commit()
 
-        # —— 默认模式必须是 AI（用户点名：默认选中 AI 自主判定）——
-        # ⚠️ 这两条**必须排在建任务之前**：默认值一旦退回 key，`create_grade` 会
-        #    当场抛「答案还是空的」，测试直接崩在下面那行 —— 那样得到的是一个
+        # —— 默认必须是「只有 AI 基准」（用户点名：默认选中 AI 自主判定）——
+        # ⚠️ 这两条**必须排在建任务之前**：默认值一旦变成「要依据」，`create_grade`
+        #    会当场抛「答案还是空的」，测试直接崩在下面那行 —— 那样得到的是一个
         #    traceback，而不是一句「默认值错了」，查起来多绕一圈。
-        check("★ GradeIn 的 default 是 ai（API 不传时不该落回 key）",
-              GradeIn.model_fields["answer_mode"].default == "ai",
-              GradeIn.model_fields["answer_mode"].default)
-        check("★ GradeIn 不传 answer_mode 就落到 ai",
-              GradeIn(lesson_id=ls.id, file_ids=[sub_f.id]).answer_mode == "ai",
-              GradeIn(lesson_id=ls.id, file_ids=[sub_f.id]).answer_mode)
+        _g0 = GradeIn(lesson_id=ls.id, file_ids=[sub_f.id])
+        check("★ GradeIn 不传 basis_modes 就是空列表（= 只有 AI 基准）",
+              _g0.basis_modes == [], _g0.basis_modes)
+        check('★ 空条件编码成库里的 ai（老行不用迁）',
+              grade_basis.encode_modes([]) == "ai", grade_basis.encode_modes([]))
 
         g = G.create_grade(db, GradeIn(lesson_id=ls.id, file_ids=[sub_f.id]))
         db.commit()
@@ -2348,14 +2353,14 @@ def t_basis() -> None:
         # ⚠️ 用 expect_err 拿状态码而不是直接调：断言要是写成「不抛错就行」，
         #    反向验证（故意把这道门加回去）时抛出的会是 traceback，
         #    输出里没有 [FAIL] 行 → 反向验证会误判成「守住了」。
-        st, msg = expect_err(G.patch_setup, db, g.id, GradeSetupPatch(answer_mode="key"))
+        st, msg = expect_err(G.patch_setup, db, g.id, GradeSetupPatch(basis_modes=["key"]))
         db.refresh(g)
         check("★★★ 一份依据都没有时切到「按我给的答案判定」也允许（否则和上传互锁）",
               st == 0 and g.answer_mode == "key", f"st={st} {msg[:60]}")
         st, msg = expect_err(G.launch, db, g)
         check("★★ 但这时开批照样被拦（校验只留在开批那一处）",
-              st == 422 and "依据" in msg, msg[:60])
-        G.patch_setup(db, g.id, GradeSetupPatch(answer_mode="ai"))   # 收回 ai，后面按原剧本走
+              st == 422 and ("答案" in msg or "细则" in msg), msg[:60])
+        G.patch_setup(db, g.id, GradeSetupPatch(basis_modes=[]))   # 收回 ai，后面按原剧本走
 
         # —— 图片依据：走视觉通道，chars 必须是 0 且**不能报错** ——
         p_img = TMP / "答案.png"
@@ -2423,7 +2428,7 @@ def t_basis() -> None:
               st == 422 and str(grade_basis.MAX_BASIS_FILES) in msg, msg[:60])
 
         # —— 真的进批改上下文 ——
-        G.patch_setup(db, g.id, GradeSetupPatch(answer_mode="key"))
+        G.patch_setup(db, g.id, GradeSetupPatch(basis_modes=["key"]))
         db.refresh(g)
         key_text, _rub = G._answer_texts(db, g)
         imgs = G._answer_images(db, g)
@@ -2435,7 +2440,7 @@ def t_basis() -> None:
               all(not x.endswith(".pdf") for x in imgs["answer"]), imgs["answer"][:2])
 
         # —— 切回 ai：依据就不该再进 ctx ——
-        G.patch_setup(db, g.id, GradeSetupPatch(answer_mode="ai"))
+        G.patch_setup(db, g.id, GradeSetupPatch(basis_modes=[]))
         k_ai, r_ai = G._answer_texts(db, g)
         check("★★ ai 模式下依据不塞进 ctx（老师选的是「模型自己解」）",
               k_ai == "" and r_ai == "", k_ai[:40])
@@ -2472,7 +2477,7 @@ def t_basis() -> None:
         # —— ★ 删光之后开批必须被拦（launch 那道门）——
         for f in [x for x in G.detail(db, g)["files"] if x["role"] in ("answer", "rubric")]:
             G.delete_basis_file(db, g.id, f["id"])
-        G.patch_setup(db, g.id, GradeSetupPatch(answer_mode="ai"))   # 先收拾成干净状态
+        G.patch_setup(db, g.id, GradeSetupPatch(basis_modes=[]))   # 先收拾成干净状态
         db.refresh(g)
         key_now, _r = G._answer_texts(db, g)
         check("（准备）依据确实空了", key_now == "", key_now[:30])
@@ -2481,7 +2486,7 @@ def t_basis() -> None:
         db.commit()
         st, msg = expect_err(G.launch, db, g)
         check("★★★ 依据空了还要开批 → 422（不能拿 AI 自解冒充按老师答案判）",
-              st == 422 and "依据" in msg, msg[:60])
+              st == 422 and ("答案" in msg or "细则" in msg), msg[:60])
         g.answer_mode = "ai"
         db.commit()
 
@@ -2525,6 +2530,147 @@ def t_basis() -> None:
         db.close()
 
 
+# ================================================================ ⑱ 两个条件叠加
+def t_basis_both() -> None:
+    """2026-10-21 用户改的口径：**默认 AI 自主判定，勾后两个中的一个就加一个条件，
+    两个都勾 = 两个条件一起生效**。
+
+    这一节专门守「两个一起」这条路 —— 它跟「三选一」不是同一套代码：
+    以前 `if mode == "key" ... elif mode == "rubric"`，两段永远互斥；
+    现在要拼在一起，还要给模型一条**冲突裁决规则**（不给我就随机挑，
+    同一份作业重批两次结果都不一样）。
+    """
+    print("\\n⑱ 判定条件叠加：两个一起勾时的编码 / 校验 / 提示词")
+    from app.schemas import GradeSetupPatch
+    from app.services import grade_basis, grade_ai
+
+    # —— 编码：一个列存得下三个状态，且**顺序固定** ——
+    check("★★ 两个条件编码成 key+rubric",
+          grade_basis.encode_modes(["key", "rubric"]) == "key+rubric",
+          grade_basis.encode_modes(["key", "rubric"]))
+    check("★★ 传入顺序颠倒也编码成同一个值（否则库里出现两种写法）",
+          grade_basis.encode_modes(["rubric", "key"]) == "key+rubric",
+          grade_basis.encode_modes(["rubric", "key"]))
+    check("★★ 解回来是两个条件",
+          grade_basis.parse_modes("key+rubric") == {"key", "rubric"},
+          grade_basis.parse_modes("key+rubric"))
+    check("★★ 空集 / ai 都解成「没有条件」（AI 基准不算条件）",
+          grade_basis.parse_modes("ai") == set() and grade_basis.parse_modes("") == set(),
+          (grade_basis.parse_modes("ai"), grade_basis.parse_modes("")))
+    check("★ 认不出来的拼写忽略，不当成某一种条件",
+          grade_basis.parse_modes("keys") == set(), grade_basis.parse_modes("keys"))
+    check("★ 口径那行把两个条件都念出来",
+          "答案" in grade_basis.mode_label("key+rubric")
+          and "细则" in grade_basis.mode_label("key+rubric"),
+          grade_basis.mode_label("key+rubric"))
+
+    db = SessionLocal()
+    try:
+        stu = mk_student(db, "双条件学生")
+        ls = mk_lesson(db, stu)
+        sub_f = mk_submission(db, ls, "双条件作业.png")
+        p_img = TMP / "双条件答案.png"
+        make_png(p_img)
+        db.commit()
+
+        # —— 只给答案、却同时勾了细则 → 必须拦住，并且**点名缺的是细则** ——
+        st, msg = expect_err(
+            G.create_grade, db,
+            GradeIn(lesson_id=ls.id, file_ids=[sub_f.id],
+                    basis_modes=["key", "rubric"], answer_text="1. C"))
+        check("★★★ 两个都勾但只给了答案 → 422", st == 422, msg[:60])
+        check("★★★ 而且说的是「细则」空，不是笼统说「依据」", "细则" in msg, msg[:60])
+
+        # —— 两个都给齐 → 建得起来，库里存 key+rubric ——
+        g = G.create_grade(db, GradeIn(
+            lesson_id=ls.id, file_ids=[sub_f.id],
+            basis_modes=["key", "rubric"],
+            answer_text="1. C  2. B", rubric_text="每题 2 步，每步 1 分"))
+        db.commit()
+        check("★★★ 两个依据都给齐就能建任务（不再要求二选一）",
+              g.answer_mode == "key+rubric", g.answer_mode)
+        d = G.detail(db, g)
+        check("★★ 详情按固定顺序回 [key, rubric]（前端据此勾复选框）",
+              d.get("basis_modes") == ["key", "rubric"], d.get("basis_modes"))
+        check("★ _missing_basis 两个都齐时返回空列表",
+              G._missing_basis(db, g) == [], G._missing_basis(db, g))
+
+        # —— ctx：两段都得进，缺一段等于老师白传 ——
+        ctx = G._ctx_base(db, g)
+        check("★★★ ctx 里答案那段在", "C" in (ctx.get("answer_text") or ""),
+              (ctx.get("answer_text") or "")[:20])
+        check("★★★ ctx 里细则那段也在", "每步" in (ctx.get("rubric_text") or ""),
+              (ctx.get("rubric_text") or "")[:20])
+
+        # —— 提示词：两段 + 一条裁决规则 ——
+        full = grade_ai._reference_block("key+rubric", ctx)
+        check("★★★ 提示词里同时有「标准答案」和「评分细则」两段",
+              "标准答案" in full and "评分细则" in full, full[:40])
+        check("★★★ 还给了「谁管对错、谁管漏步」的裁决规则",
+              "排优先级" in full and "partial" in full, full[-80:])
+        check("★★ 只勾答案时**不出现**细则那一段（别把没传的东西塞给模型）",
+              "评分细则" not in grade_ai._reference_block("key", ctx))
+        check("★★ 一个条件都不勾 → 退回「自己解」那一段",
+              "你自己解" in grade_ai._reference_block("ai", {}))
+
+        # —— 图片分组：顺序必须是 先答案、后细则（错了模型会把答案当学生作答）——
+        ctx_img = {"answer_mode": "key+rubric",
+                   "answer_images": ["a1.png", "a2.png"], "rubric_images": ["r1.png"]}
+        groups = grade_ai._extra_image_groups(ctx_img)
+        check("★★ 图片分组是两组、先答案后细则",
+              [(w, len(i)) for w, i in groups]
+              == [("老师的标准答案", 2), ("老师的评分细则", 1)],
+              [(w, len(i)) for w, i in groups])
+
+        # —— 拼错的编码必须炸，不能静默降级成「自己解」——
+        try:
+            grade_ai._check_reference("keys", {"answer_text": "x"})
+            got = "没报错"
+        except Exception as e:            # noqa: BLE001 — 只要不是静默通过就行
+            got = "报错：" + str(e)[:30]
+        check("★★★ 拼错的条件名（keys）必须报错，不能当 ai 静默降级",
+              got.startswith("报错"), got)
+        check("★★ 两个条件同时勾、两个内容都在 → 校验通过并返回两个",
+              grade_ai._check_reference("key+rubric",
+                                        {"answer_text": "1 C", "rubric_text": "2 分"})
+              == {"key", "rubric"})
+        try:
+            grade_ai._check_reference("key+rubric", {"answer_text": "1 C"})
+            got2 = "没报错"
+        except Exception as e:            # noqa: BLE001
+            got2 = str(e)
+        check("★★★ 勾了两个但只给答案 → 报错并且点名「细则」（别让人猜）",
+              "细则" in got2, got2[:40])
+
+        # —— 两个都勾、细则那一份被删掉 → _missing_basis 必须点出 rubric ——
+        # 这是 `_missing_basis` 自己的守卫。`create_grade` 那边另有一道校验，
+        # **只测 create 的话，把这里的 rubric 判断删掉测试照样绿**（反向验证抓到的）。
+        for row in db.scalars(select(HomeworkGradeFile).where(
+                HomeworkGradeFile.grade_id == g.id,
+                HomeworkGradeFile.role == "rubric")).all():
+            db.delete(row)
+        db.commit()
+        check("★★★ 细则那份被删掉后，_missing_basis 点出 rubric（不是「不缺」）",
+              G._missing_basis(db, g) == ["rubric"], G._missing_basis(db, g))
+        st, msg = expect_err(G.launch, db, g)
+        check("★★ 这时开批 → 422 且点名「细则」", st == 422 and "细则" in msg, msg[:50])
+        # 细则补回来，后面还要用它验「收回条件后不再进 ctx」
+        G.add_basis_file(db, g.id, "rubric", "细则.txt", "每题 2 步，每步 1 分".encode())
+        check("（准备）细则补回来了", G._missing_basis(db, g) == [], G._missing_basis(db, g))
+
+        # —— 从单条件往上加第二个：不该把原来那份依据弄丢 ——
+        st, msg = expect_err(G.patch_setup, db, g.id,
+                             GradeSetupPatch(basis_modes=["key"]))
+        db.refresh(g)
+        check("★★ 收回一个条件也允许（key+rubric → key）",
+              st == 0 and g.answer_mode == "key", f"st={st} {msg[:40]}")
+        check("★★ 收回后细则那段就不进 ctx 了（条件与内容必须同步）",
+              "每步" not in (G._ctx_base(db, g).get("rubric_text") or ""),
+              (G._ctx_base(db, g).get("rubric_text") or "")[:20])
+    finally:
+        db.close()
+
+
 def main() -> int:
     Base.metadata.create_all(engine)
     print("=" * 72)
@@ -2547,6 +2693,7 @@ def main() -> int:
     t_cross_page()
     t_answer_images()
     t_basis()
+    t_basis_both()
 
     print("\n" + "=" * 72)
     print(f"共 {total} 项，失败 {len(fails)} 项")

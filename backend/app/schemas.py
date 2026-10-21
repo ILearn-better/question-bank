@@ -671,20 +671,22 @@ class GradeIn(BaseModel):
     提交件走 `file_ids`（`lesson_files.id`）—— 学生交的照片/PDF 已经在「交作业」那一步
     上传归档过了，这里只引用，不重传一份一样的。
 
-    答案的三种来源就对应 `answer_mode`：
-      · `ai`     —— 不用老师给，模型自己解题（会标 reference_unverified，老师能展开看它的解法）
-      · `key`    —— 老师给答案：`answer_text` 粘文字，或 `answer_file_ids` 给照片/Word
-      · `rubric` —— 老师给分步评分细则：`rubric_text`（每步多少分、扣分条件）
+    **判定方式 = AI 基准 + 可叠加的条件**（2026-10-21 用户改的口径：
+    「默认 AI 自主判定，选了那两个中的一个就加一个条件，选了两个相当于加了两个条件」）：
+      · 基准永远是 `ai` —— 模型先把题自己解一遍，这是底座，关不掉；
+      · `key`    —— 叠加「老师给的答案」：`answer_text` 粘文字，或 `answer_file_ids` 给照片/Word
+      · `rubric` —— 叠加「老师的评分细则」：`rubric_text`（分步给分点、扣分条件）
 
-    ⚠️ 默认值是 `ai`（2026-10-21 用户点名：「默认选中 AI 自主判定」）。
-    与库里 `homework_grades.answer_mode` 的 server_default 不一致是无害的：
-    ORM 插入时一定会带上这里的值，SQL 默认值只在「有人手写 INSERT」时才起作用。
+    两个条件可以同时选（`basis_modes=["key","rubric"]`）：答案定对错、细则定 partial 与漏步。
+    库里的编码走 `grade_basis.encode_modes()`（`ai` / `key` / `rubric` / `key+rubric`），
+    列还是原来那一个 `homework_grades.answer_mode` —— 不新增列、不需要迁移。
+    ⚠️ 默认空列表 = 只有 AI 基准（用户点名「默认选中 AI 自主判定」）。
     """
 
     lesson_id: int
     curriculum_id: Optional[int] = None
     file_ids: List[int] = Field(default_factory=list)
-    answer_mode: Literal["ai", "key", "rubric"] = "ai"
+    basis_modes: List[Literal["key", "rubric"]] = Field(default_factory=list)
     answer_text: str = ""
     rubric_text: str = ""
     answer_file_ids: List[int] = Field(default_factory=list)
@@ -705,7 +707,11 @@ class GradeSetupPatch(BaseModel):
     ⚠️ 换文件**不清已批的结果**：这个接口本来就只允许在没批出结果之前用（见上）。
     """
 
-    answer_mode: Optional[Literal["ai", "key", "rubric"]] = None
+    # 整份替换条件集合（`None = 不改`，`[] = 只剩 AI 基准`）。
+    # ⚠️ 这里**不校验「依据是否为空」**：界面上是「先勾条件、再传依据」，
+    #    在这儿拦会跟「AI 基准下不许上传」互锁（真浏览器测出来的死锁）。
+    #    校验只留在 `launch()` 一处。
+    basis_modes: Optional[List[Literal["key", "rubric"]]] = None
     answer_text: Optional[str] = None
     rubric_text: Optional[str] = None
     answer_file_ids: Optional[List[int]] = None

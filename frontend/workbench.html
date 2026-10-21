@@ -384,9 +384,20 @@
      有它，老师不用切页签也知道这次按什么标准批。 */
   .basis-line { display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
                 margin: 0 0 8px; font-size: 12.5px; }
-  .basis-modes { display: flex; flex-wrap: wrap; gap: 8px; }
+  /* 基准 + 条件两层：基准那行**灰掉且不可点**，条件是可勾的复选框。
+     视觉上必须能看出「上面那个是底座、下面这些是加上去的」，否则老师会以为三选一。 */
+  .basis-modes { display: flex; flex-direction: column; gap: 8px; }
+  .basis-base { cursor: default; }
+  .basis-base .el-checkbox__label { color: #303133; font-weight: 600; }
+  .basis-base-tag { margin-left: 6px; padding: 0 5px; font-size: 11px; font-weight: 400;
+                    color: #409eff; border: 1px solid #b3d8ff; border-radius: 3px;
+                    background: #ecf5ff; }
+  .basis-conds { display: flex; flex-wrap: wrap; gap: 8px; padding-left: 4px; }
+  /* 两个条件都勾时多一行「这份传的是 答案 / 细则」 */
+  .basis-rolepick { display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+                    margin: 2px 0 6px; font-size: 12.5px; }
   .basis-mode-desc { margin: 8px 0 10px; font-size: 12.5px; color: #606266;
-                     line-height: 1.65; }
+                     line-height: 1.65; white-space: pre-wrap; }
   /* 上传区：虚线框住一整块，拖上去要看得见「可以放这里」。
      ⚠️ 它只是多一条路 —— 点击、拖拽、Ctrl+V 三条都必须能用。 */
   .basis-drop { padding: 14px 12px; margin: 4px 0 10px; text-align: center;
@@ -924,10 +935,14 @@
             <div class="basis-line">
               <span class="muted-hint">判定依据</span>
               <el-tag size="small" effect="plain"
-                      :type="basisMode === 'ai' ? 'info' : 'warning'">{{ basisModeLabel }}</el-tag>
-              <template v-if="basisMode !== 'ai'">
-                <span v-if="basisRoleCount" class="muted-hint">· 已传 {{ basisRoleCount }} 份</span>
-                <span v-else class="basis-warn">· 还没传依据（点「开始批改」会被拦）</span>
+                      :type="basisModes.length ? 'warning' : 'info'">{{ basisModeLabel }}</el-tag>
+              <template v-if="basisModes.length">
+                <span class="muted-hint">
+                  · 答案 {{ basisKeyCount }} 份 / 细则 {{ basisRubricCount }} 份
+                </span>
+                <span v-if="basisWarn" class="basis-warn">
+                  · 缺{{ basisMissing.indexOf('key') >= 0 ? '答案' : '' }}{{ basisMissing.length > 1 ? '和' : '' }}{{ basisMissing.indexOf('rubric') >= 0 ? '细则' : '' }}（点「开始批改」会被拦）
+                </span>
               </template>
               <div style="flex:1"></div>
               <el-button v-if="tab !== 'basis'" size="small" text type="primary"
@@ -1020,13 +1035,33 @@
                    upload 走 **批改自己的接口**（不是「交作业」的文件上传）——
                    依据文件落到 grades/<gid>/basis/，不会混进提交件清单里。 -->
               <el-tab-pane :label="'判定依据' + (basisWarn ? ' ⚠' : '')" name="basis">
-                <el-radio-group v-model="basisMode" class="basis-modes"
-                                :disabled="!basisEditable || basisModeSaving"
-                                @change="onBasisModeChange">
-                  <el-radio v-for="m in BASIS_MODES" :key="'bm' + m.value"
-                            :value="m.value" border>{{ m.label }}</el-radio>
-                </el-radio-group>
+                <!-- 基准（恒在，勾着且不可取消）+ 可叠加的条件。
+                     ⚠️ 不用 el-radio 了：radio 天生互斥，表达不了「加一个条件」。
+                     用 checkbox-group 才能同时勾两个，也才对得上后端 `key+rubric`。 -->
+                <div class="basis-modes">
+                  <el-checkbox :model-value="true" disabled class="basis-base">
+                    AI 自主判定<span class="basis-base-tag">基准</span>
+                  </el-checkbox>
+                  <el-checkbox-group v-model="basisModes" class="basis-conds"
+                                     :disabled="!basisEditable || basisModeSaving"
+                                     @change="onBasisModeChange">
+                    <el-checkbox v-for="m in BASIS_CONDS" :key="'bm' + m.value"
+                                 :value="m.value" border>{{ m.label }}</el-checkbox>
+                  </el-checkbox-group>
+                </div>
                 <div class="basis-mode-desc">{{ basisModeDesc }}</div>
+
+                <!-- 两个条件都勾上时，上传的文件必须说清是哪一类 ——
+                     一份细则被当成答案，模型会拿它当标准答案去对答案。 -->
+                <div v-if="basisNeedsRolePick" class="basis-rolepick">
+                  <span class="muted-hint">这次传的是</span>
+                  <el-radio-group v-model="basisRolePick" size="small">
+                    <el-radio-button value="answer">答案</el-radio-button>
+                    <el-radio-button value="rubric">评分细则</el-radio-button>
+                  </el-radio-group>
+                  <span class="muted-hint">（两个条件都勾了，得说清这份属于哪一类；
+                    已经传了的按列表里的标签认）</span>
+                </div>
 
                 <div v-if="!basisEditable" class="hint" style="color:#e6a23c;margin-bottom:8px">
                   这份已经批过了 —— 判定依据锁住了（现在的结果就是按当时那份依据批的）。
@@ -1054,6 +1089,19 @@
                   </template>
                   <template v-else-if="!basisEditable">
                     <div class="basis-drop-main">这份已经批过了，不能再改依据</div>
+                  </template>
+                  <!-- 一个条件都没勾 → 直接在这儿给两个按钮。
+                       老师的心路是「我要传东西」，不是「我要先勾条件」；
+                       让他为了传一份文件往回滚去找复选框，就是这次用户报的那个别扭。 -->
+                  <template v-else-if="!basisModes.length">
+                    <div class="basis-drop-main">先选一个条件，文件才有去处</div>
+                    <div class="muted-hint" style="margin:6px 0 10px">
+                      按你给的答案判 → 点第一个；按你的评分细则判 → 点第二个（两个能一起选）
+                    </div>
+                    <el-button size="small" type="primary" plain
+                               @click.stop="quickAddMode('key')">＋ 按我给的答案判定</el-button>
+                    <el-button size="small" type="primary" plain
+                               @click.stop="quickAddMode('rubric')">＋ 按我的评分细则判定</el-button>
                   </template>
                   <template v-else>
                     <div class="basis-drop-main">📎 点这里选文件，或把文件拖进这个框</div>
@@ -1101,10 +1149,19 @@
                   </div>
                 </div>
                 <div v-else class="empty-block" style="padding:18px 0">
-                  还没有上传判定依据<br>
-                  <span style="font-size:12px">
-                    「AI 自主判定」不需要依据；另外两种模式至少要传一份
-                  </span>
+                  <template v-if="!basisModes.length">
+                    还没有上传判定依据<br>
+                    <span style="font-size:12px">
+                      现在只有「AI 自主判定」这个基准，它不需要依据 ——
+                      想让模型按你的标准判，先勾上面一个条件
+                    </span>
+                  </template>
+                  <template v-else>
+                    还没有上传判定依据<br>
+                    <span style="font-size:12px">
+                      勾了{{ basisModes.length > 1 ? '两个条件，两类都要给' : (basisModes[0] === 'rubric' ? '「按我的评分细则判定」，要传细则' : '「按我给的答案判定」，要传答案') }}
+                    </span>
+                  </template>
                 </div>
                 <div class="hint" style="margin-top:8px">
                   <b>依据怎么被用上</b>：图片会<b>原样送进模型看</b>（不用先转文字）；
@@ -1273,20 +1330,31 @@ const INK_COLORS = ['#dc2626', '#2563eb', '#111827', '#16a34a'];
  *  用 REAL 存进库（0033），所以可以是 2.2 这种半档，不用凑整。 */
 const INK_WIDTHS = [2.2, 4.5, 7.5];
 
-/** 判定依据的三种模式（**互斥**，默认 AI）。
- *  默认 ai 的理由：老师手上通常没有标准答案 —— 让模型自己解是成本最低、
- *  也最不会「拿错标准」的起点；要按自己的答案/细则判，就明确选另外两个。 */
-const BASIS_MODES = [
-  { value: 'ai', label: 'AI 自主判定',
-    desc: '模型自己把题解一遍，再对照学生作答判断对错。'
-      + '手上没有标准答案时选它 —— 但它解的题没有第二个人核对过，判得对不对要你自己扫一眼。' },
+/** 判定方式 = **AI 基准 + 可叠加的条件**（2026-10-21 用户改的口径）。
+ *
+ *  以前是「三选一」，老师说：默认 AI 自主判定，勾了后两个中的一个就加一个条件，
+ *  两个都勾 = 两个条件一起生效。所以现在：
+ *    · `AI 自主判定` 是**基准，恒在**，界面上勾着且不能取消（没有它就没人判了）；
+ *    · `key` / `rubric` 是可勾选的条件，两个能同时勾。
+ *  ⚠️ 与后端同一套名字：`grade_basis.CONDITIONS` + `MODE_TITLE`，别只改一边。 */
+const BASIS_BASE = {
+  label: 'AI 自主判定',
+  desc: '模型自己把题解一遍 —— 这是基准，始终生效。'
+    + '下面两个条件都不勾，它就自己解自己判（它解的题没第二个人核对，判得对不对要你自己扫一眼）。',
+};
+
+const BASIS_CONDS = [
   { value: 'key', label: '按我给的答案判定',
-    desc: '按你给的标准答案判。答案可以是一段文字、几张答案照片，'
+    desc: '加一个条件：按你给的标准答案判。答案可以是一段文字、几张答案照片，'
       + '或者一份 PDF / Word / Excel —— 传上来就会一起送进批改。' },
   { value: 'rubric', label: '按我的评分细则判定',
-    desc: '按你的分步评分细则判 —— 每一步给多少分、什么情况扣分。'
-      + '解答题只有答案往往判不准（过程对一半该怎么算），有细则时才选这个。' },
+    desc: '加一个条件：按你的分步评分细则判 —— 每一步给多少分、什么情况扣分。'
+      + '解答题只有答案往往判不准（过程对一半该怎么算），有细则时才勾它。' },
 ];
+/** 两个条件都勾时的一句话：**必须说清谁管对错、谁管步骤**，
+ *  否则老师会以为「两个都勾＝判两遍」。 */
+const BASIS_BOTH_DESC = '两个条件一起生效：对错看答案，partial（部分对）与漏步看细则；'
+  + '答案对但漏了细则里的给分点 → 判 partial，并在依据里点名漏了哪一步。';
 
 /** 依据的限额。**必须与后端一致**（backend/app/services/grade_basis.py 的
  *  MAX_BASIS_FILES / MAX_BASIS_BYTES）：后端是权威，这里只是为了「选完文件
@@ -1358,11 +1426,15 @@ const app = createApp({
        *     真正的判据是 `_draft.marks()` 空了没有（见 saveNow）。 */
       saving: false,
       savedAt: '',
-      /* ---- 判定依据（2026-10-21 用户要求：三种互斥模式 + 上传依据）----
-       *  `basisMode` 只是**界面上**的选择；真正生效的是库里的 `grade.answer_mode`
+      /* ---- 判定依据（2026-10-21：AI 基准 + 可叠加的条件 + 上传依据）----
+       *  `basisModes` 只装**勾上的条件**（`['key']` / `['rubric']` / `['key','rubric']`），
+       *  AI 基准不在里面 —— 它恒在。真正生效的是库里的 `grade.answer_mode`
        *  （开批时服务端读它），所以每改一次就立刻 PATCH，存不上就退回去。
-       *  ⚠️ 只在界面上改、忘了落库 → 批出来的口径和老师选的不一样，还不报错。 */
-      basisMode: 'ai',
+       *  ⚠️ 只在界面上改、忘了落库 → 批出来的口径和老师勾的不一样，还不报错。 */
+      basisModes: [],
+      /** 两个条件都勾时，这次上传的文件算「答案」还是「细则」——
+       *  不选的话一份细则会被当答案塞进 ctx（模型会拿细则当标准答案对答案）。 */
+      basisRolePick: 'answer',
       basisModeSaving: false,
       basisBusy: false,
       basisUploading: '',      // 加载态文案：正在传哪个文件
@@ -1390,7 +1462,7 @@ const app = createApp({
       undoBusy: false,
       exporting: false,
       INK_TOOLS, INK_COLORS, INK_WIDTHS,
-      BASIS_MODES, BASIS_MAX_FILES, BASIS_MAX_MB,
+      BASIS_BASE, BASIS_CONDS, BASIS_MAX_FILES, BASIS_MAX_MB,
       VERDICTS,
       _poll: null,
       // DOM 元素不参与响应式：markRaw 一下，否则每次 setRich 都触发一轮 patch
@@ -1486,24 +1558,44 @@ const app = createApp({
       return ((this.g && this.g.files) || [])
         .filter((f) => f.role === 'answer' || f.role === 'rubric');
     },
-    /** 当前模式对应哪一类：`key` → 答案，`rubric` → 细则。
-     *  ai 模式其实没有「依据」这个概念，但列表仍照实显示 —— 老师传过什么要看得见。 */
-    basisRole() { return this.basisMode === 'rubric' ? 'rubric' : 'answer'; },
-    /** **当前模式下**已有几份依据。「能不能开批」只看它。
-     *  切到细则却发现只有答案 → 这里会变成 0，界面上就该提醒再传。 */
+    /** 这次上传落到哪个 role：只勾一个条件时**由它决定**（不用老师再选一次），
+     *  两个都勾时才听 `basisRolePick`。 */
+    basisRole() {
+      const m = this.basisModes;
+      if (m.length > 1) return this.basisRolePick === 'rubric' ? 'rubric' : 'answer';
+      return m[0] === 'rubric' ? 'rubric' : 'answer';
+    },
+    /** 两个条件都勾时才需要老师指明「这份传的是答案还是细则」。 */
+    basisNeedsRolePick() { return this.basisModes.length > 1; },
+    basisKeyCount() { return this.basisAll.filter((f) => f.role === 'answer').length; },
+    basisRubricCount() { return this.basisAll.filter((f) => f.role === 'rubric').length; },
+    /** 当前上传目标的份数（上传时数「还会不会超」用）。 */
     basisRoleCount() {
-      return this.basisAll.filter((f) => f.role === this.basisRole).length;
+      return this.basisRole === 'rubric' ? this.basisRubricCount : this.basisKeyCount;
+    },
+    /** **勾了条件、但那一类一份都没有** → 返回缺的条件列表。
+     *  两个条件可以同时缺，所以是列表：一次说清，别让老师改好一个再挨一次拦。
+     *  ⚠️ 这份列表的形状与后端 `_missing_basis()` 一致（都是条件名）。 */
+    basisMissing() {
+      const out = [];
+      if (this.basisModes.indexOf('key') >= 0 && !this.basisKeyCount) out.push('key');
+      if (this.basisModes.indexOf('rubric') >= 0 && !this.basisRubricCount) out.push('rubric');
+      return out;
     },
     basisModeLabel() {
-      const m = BASIS_MODES.filter((x) => x.value === this.basisMode)[0];
-      return m ? m.label : 'AI 自主判定';
+      if (!this.basisModes.length) return BASIS_BASE.label;
+      return BASIS_BASE.label + ' ＋ '
+        + this.basisModes.map((v) => (BASIS_CONDS.filter((x) => x.value === v)[0] || {}).label || v)
+          .join(' ＋ ');
     },
     basisModeDesc() {
-      const m = BASIS_MODES.filter((x) => x.value === this.basisMode)[0];
-      return m ? m.desc : '';
+      if (!this.basisModes.length) return BASIS_BASE.desc;
+      if (this.basisModes.length > 1) return BASIS_BOTH_DESC;
+      const one = BASIS_CONDS.filter((x) => x.value === this.basisModes[0])[0];
+      return one ? one.desc : '';
     },
-    /** 选了要依据的模式，却一份都没有 —— 页签打 ⚠、顶部那行标红。 */
-    basisWarn() { return this.basisMode !== 'ai' && !this.basisRoleCount; },
+    /** 勾了条件却缺依据 —— 页签打 ⚠、顶部那行标红。 */
+    basisWarn() { return this.basisMissing.length > 0; },
     /** 什么时候能改依据：与后端 `_assert_setup_editable` **同一个判据**
      *  （批出结果就锁住）。两边不一致的话，界面会放任老师改一个存不进去的东西。 */
     basisEditable() {
@@ -1994,30 +2086,44 @@ const app = createApp({
      *  以前这条动线是「去课时页 → 点 AI 批改作业 → 再回到工作台」，跨两个页面。
      *  老师手里拿着学生发来的照片时，实际想要的就一件事：**把图丢进去开始批**。 */
     /* ============================ 判定依据 ============================ */
-    /** 页面上选了模式就立刻存库。返回值忽略 —— 结果由 `saveBasisMode` 自己提示。 */
-    onBasisModeChange() { this.saveBasisMode(); },
-    /** 把界面上选的模式写进库。返回 false = 没存上（调用方别继续）。
+    /** 上传区里那个「＋ 按我给的答案判定」：勾上并立刻落库。
      *
-     *  ⚠️ 必须真的落库：开批时服务端读的是 `homework_grades.answer_mode`，
-     *     只在界面上改，批出来的口径跟老师选的不一样 —— 而且全程不报错。
+     *  为什么要有它：老师想传东西时会直接点上传区，而上传区在没勾条件时只能劝住他。
+     *  与其把人劝回去找复选框，不如就地给一个按钮 —— 一次点击既勾了条件也准备好了去处。
+     */
+    async quickAddMode(v) {
+      if (this.basisModes.indexOf(v) >= 0) return;
+      this.basisModes = this.basisModes.concat([v]);
+      if (!(await this.saveBasisMode())) return;
+      this.basisRolePick = v === 'rubric' ? 'rubric' : 'answer';
+    },
+    /** 勾/取消一个条件就立刻存库。返回值忽略 —— 结果由 `saveBasisMode` 自己提示。 */
+    onBasisModeChange() { this.saveBasisMode(); },
+    /** 把界面上勾的条件写进库。返回 false = 没存上（调用方别继续）。
+     *
+     *  ⚠️ 必须真的落库：开批时服务端读的是 `homework_grades.answer_mode`
+     *     （编码成 `ai` / `key` / `rubric` / `key+rubric`），
+     *     只在界面上勾，批出来的口径跟老师勾的不一样 —— 而且全程不报错。
      */
     async saveBasisMode() {
       if (!this.g || !this.basisEditable) return true;
-      const want = this.basisMode;
-      if ((this.g.answer_mode || 'ai') === want) return true;
+      const want = this.basisModes.slice();
+      const cur = (this.g.basis_modes || []).slice();
+      // 比集合，不比顺序：勾的先后不该触发一次没意义的 PATCH
+      if (want.slice().sort().join() === cur.slice().sort().join()) return true;
       this.basisModeSaving = true;
       try {
         const d = await this.api('/api/homework-grades/' + this.gid, {
           method: 'PATCH', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ answer_mode: want }),
+          body: JSON.stringify({ basis_modes: want }),
         });
         const keep = { regions: this.g.regions, skipped_pages: this.g.skipped_pages };
         this.g = Object.assign({}, this.g, d, this.dirty ? keep : {});
         return true;
       } catch (e) {
-        // 存不上就退回库里那个值：界面显示的模式必须是**真的会生效**的那个
-        this.basisMode = this.g.answer_mode || 'ai';
-        ElementPlus.ElMessage.error('判定模式没改成：' + e.message);
+        // 存不上就退回库里那个值：界面显示的必须是**真的会生效**的那个
+        this.basisModes = (this.g.basis_modes || []).slice();
+        ElementPlus.ElMessage.error('判定条件没改成：' + e.message);
         return false;
       } finally { this.basisModeSaving = false; }
     },
@@ -2076,11 +2182,13 @@ const app = createApp({
         ElementPlus.ElMessage.warning('这份已经批过了 —— 判定依据锁住了，换依据得新建一份批改');
         return;
       }
-      /* 依据只在「按答案 / 按细则」下才有去处：AI 自己解的时候传上去用不到。
-         与其默默收下一堆用不上的文件，不如当场说清楚。 */
-      if (this.basisMode === 'ai') {
+      /* 依据只在勾了条件之后才有去处：一个条件都没勾（只有 AI 基准）时传上去用不到。
+         与其默默收下一堆用不上的文件，不如当场说清楚 ——
+         这句话也是老师最容易卡住的地方，要说清**下一步点哪里**。 */
+      if (!this.basisModes.length) {
         this.tab = 'basis';
-        ElementPlus.ElMessage.warning('先切到「按我给的答案判定」或「按我的评分细则判定」，文件才有去处');
+        ElementPlus.ElMessage.warning(
+          '先在「判定依据」里勾上「按我给的答案判定」或「按我的评分细则判定」，文件才有去处');
         return;
       }
       const role = this.basisRole;
@@ -2340,12 +2448,12 @@ const app = createApp({
       try {
         const d = await this.api('/api/homework-grades', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
-          // answer_mode 默认 ai：老师手上通常没有标准答案，让模型自己解。
-          // 要做给出题 modes 的工作台后面再加，这里不给没法提交。
+          // 建档只给「只有 AI 基准」（`basis_modes: []`）—— 新建这条路上还没有
+          // 上传答案的地方，勾条件等进工作台再勾（工作台里能传依据）。
           body: JSON.stringify({
             lesson_id: this.newLessonId,
             file_ids: this.newPick.slice(),
-            answer_mode: 'ai',
+            basis_modes: [],
           }),
         });
         this.newOpen = false;
@@ -2405,7 +2513,8 @@ const app = createApp({
       this.savedAt = '';          // 上一份的「已保存 11:45」不能留在这一份上
       /* 判定依据也要复位：上一份的失败列表留着，下一份会显示一堆
          「某某文件没传上去」—— 那是上一份的事。模式在 applyDetail 里跟服务端对齐。 */
-      this.basisMode = 'ai';
+      this.basisModes = [];
+      this.basisRolePick = 'answer';
       this.basisBusy = false;
       this.basisHot = false;
       this.basisFailed = [];
@@ -2433,8 +2542,9 @@ const app = createApp({
     /** 把服务端的详情摊进「分割草稿」。**刷新页也不丢已保存的分割**就靠这一步。 */
     applyDetail(d) {
       this.g = d;
-      // 模式以**服务端**为准：库里那个才是开批时真正生效的口径。
-      this.basisMode = d.answer_mode || 'ai';
+      // 条件以**服务端**为准：库里那个才是开批时真正生效的口径。
+      this.basisModes = (d.basis_modes || []).slice();
+      if (this.basisModes.length > 1 && this.basisRolePick !== 'rubric') this.basisRolePick = 'answer';
       this.syncRegions();
       this.$nextTick(() => { this.paintAll(); this.$nextTick(() => this.paintAll()); });
     },
@@ -3012,14 +3122,18 @@ const app = createApp({
        *   甚至更糟的错误提示 —— 这就是「终止不顺畅」最直观的样子。 */
     },
     async runGrade() {
-      /* ★ 选了「按我的答案 / 按我的细则」却一份依据都没传 —— **别提交**。
+      /* ★ 勾了条件却缺那一类依据 —— **别提交**。
        *   让服务端 422 回来再弹红字也能拦住，但那时候老师已经点了「开始批改」、
-       *   还得自己猜是哪一步不对；依据在页面上就已经看得见了，当场拦更省事。 */
-      if (this.basisMode !== 'ai' && !this.basisRoleCount) {
+       *   还得自己猜是哪一步不对；依据在页面上就已经看得见了，当场拦更省事。
+       *   两个条件可能同时缺（用户要求能同时勾），所以按 `basisMissing` 一次说全。 */
+      if (this.basisMissing.length) {
         this.tab = 'basis';
-        ElementPlus.ElMessage.error(this.basisMode === 'rubric'
-          ? '选了「按我的评分细则判定」，但还没上传细则 —— 先传一份再开始批改'
-          : '选了「按我给的答案判定」，但还没上传答案 —— 先传一份再开始批改');
+        const what = this.basisMissing
+          .map((m) => (m === 'rubric' ? '评分细则' : '答案')).join('、');
+        ElementPlus.ElMessage.error(
+          '勾了「' + this.basisMissing.map((m) => (m === 'rubric'
+            ? '按我的评分细则判定' : '按我给的答案判定')).join('」和「')
+          + '」，但还没上传' + what + ' —— 先传一份再开始批改');
         return;
       }
       // 模式刚改过、还没落库：开批用的是库里的 answer_mode，先存住再跑。

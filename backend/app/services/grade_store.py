@@ -225,6 +225,16 @@ def _block_kind(v) -> str:
 
 
 # ---------------------------------------------------------------- 序列化
+def _modes_list(grade: HomeworkGrade) -> list[str]:
+    """条件集合按**固定顺序**给前端（`["key","rubric"]`），前端据此勾复选框。
+
+    顺序固定不是洁癖：`set` 的迭代顺序每次进程都可能不同，
+    界面上的勾选顺序跟着抖一下，看着像「自己变了」。
+    """
+    m = grade_basis.modes_of(grade)
+    return [x for x in grade_basis.CONDITIONS if x in m]
+
+
 def brief(grade: HomeworkGrade) -> dict:
     """列表用的简报：**不含 items**（一节课几十条批改，带 items 会把响应撑成几 MB）。"""
     return {
@@ -233,6 +243,7 @@ def brief(grade: HomeworkGrade) -> dict:
         "lesson_id": grade.lesson_id,
         "status": grade.status,
         "answer_mode": grade.answer_mode,
+        "basis_modes": _modes_list(grade),
         "total": grade.total,
         "done": grade.done,
         "failed": grade.failed,
@@ -456,10 +467,11 @@ def create_grade(db: Session, payload: GradeIn) -> HomeworkGrade:
 
     answer_text = (payload.answer_text or "").strip()
     rubric_text = (payload.rubric_text or "").strip()
-    if payload.answer_mode == "key" and not (answer_text or ans_files):
-        raise GradeError(422, "选了「老师给答案」，但答案还是空的 —— 粘一段文字，或传一份答案文件")
-    if payload.answer_mode == "rubric" and not (rubric_text or ans_files):
-        raise GradeError(422, "选了「评分细则」，但细则还是空的 —— 每步多少分、什么情况扣分，得写下来")
+    modes = grade_basis.parse_modes(payload.basis_modes)
+    if "key" in modes and not (answer_text or ans_files):
+        raise GradeError(422, "选了「按我给的答案判定」，但答案还是空的 —— 粘一段文字，或传一份答案文件")
+    if "rubric" in modes and not (rubric_text or ans_files):
+        raise GradeError(422, "选了「按我的评分细则判定」，但细则还是空的 —— 每步多少分、什么情况扣分，得写下来")
     # 答案文件要么**能读出文字**，要么是**图片**（走视觉通道）。
     # 都不是就当场拦住：一份既没文字、又没法当图看的文件等于没给答案，
     # 而模型会退回"自己解题"却仍然显示「按老师答案判」—— 那是拿错标准批学生。
@@ -484,7 +496,7 @@ def create_grade(db: Session, payload: GradeIn) -> HomeworkGrade:
         lesson_id=lesson.id,
         curriculum_id=payload.curriculum_id,
         status="queued",                    # 建了就等着，跑不跑由 /run 决定
-        answer_mode=payload.answer_mode,
+        answer_mode=grade_basis.encode_modes(modes),   # ai / key / rubric / key+rubric
         total=total, done=0, failed=0,
         error="",
         created_at=_now(),
@@ -505,7 +517,9 @@ def create_grade(db: Session, payload: GradeIn) -> HomeworkGrade:
         ))
     # 答案/细则：粘贴的文字落 txt，引用的文件同样只引用。
     # rubric 模式下这批文件是**细则**，不是答案 —— 两者在 ctx 里走不同字段。
-    ans_role = "rubric" if payload.answer_mode == "rubric" else "answer"
+    # 只勾了细则 → 这批文件就是细则；其余情况（含两个都勾）落到 answer，
+    # 细则那边由老师在上传时自己选 role（`basisRole`）。
+    ans_role = "rubric" if modes == {"rubric"} else "answer"
     if answer_text:
         _add_answer_text_file(db, grade, answer_text, "answer", "答案（粘贴）")
     if rubric_text:
@@ -535,8 +549,8 @@ def patch_setup(db: Session, gid: int, payload: GradeSetupPatch) -> HomeworkGrad
     grade = get_grade(db, gid)
     _assert_setup_editable(grade)
 
-    if payload.answer_mode is not None:
-        grade.answer_mode = payload.answer_mode
+    if payload.basis_modes is not None:
+        grade.answer_mode = grade_basis.encode_modes(payload.basis_modes)
 
     # 只重写「粘贴的那份」，引用的 lesson_files 不动（那是另一批行，由 create 负责）
     if payload.answer_text is not None:
@@ -556,7 +570,9 @@ def patch_setup(db: Session, gid: int, payload: GradeSetupPatch) -> HomeworkGrad
             HomeworkGradeFile.role.in_(("answer", "rubric")),
             HomeworkGradeFile.lesson_file_id.is_not(None),
         ))
-        ans_role = "rubric" if (payload.answer_mode or grade.answer_mode) == "rubric" else "answer"
+        _modes = (grade_basis.parse_modes(payload.basis_modes) if payload.basis_modes is not None
+                  else grade_basis.modes_of(grade))
+        ans_role = "rubric" if _modes == {"rubric"} else "answer"
         for fid in dict.fromkeys(int(x) for x in payload.answer_file_ids):
             lf = _lesson_file(db, fid, grade.lesson_id, "答案文件")
             if not ((lf.text or "").strip() or _is_image_name(lf.name)):
@@ -575,7 +591,7 @@ def patch_setup(db: Session, gid: int, payload: GradeSetupPatch) -> HomeworkGrad
     # ⚠️⚠️ 这里**故意不查 `_missing_basis`**（2026-10-21 真浏览器测出来的死锁）：
     #
     #    老师看到的顺序是「先切模式、再传依据」（依据那一栏在模式下面），而且
-    #    前端在 `answer_mode == "ai"` 时**不许上传**（传上去也没去处，会当场拦下）。
+    #    前端在一个条件都没勾时**不许上传**（传上去也没去处，会当场拦下）。
     #    两边一夹：
     #        切到 key —— 需要先有依据 —— 被拒；
     #        传依据 —— 需要先切到 key —— 被拒。
@@ -652,19 +668,41 @@ def _assert_setup_editable(grade: HomeworkGrade) -> None:
 
 
 def _missing_basis(db: Session, grade: HomeworkGrade) -> str:
-    """缺的判定依据是哪一类：`"answer"` / `"rubric"` / `""`（不缺）。
+    """勾了条件、但那一类依据是空的：返回缺的条件列表（`[]` = 不缺）。
 
     **规则只在这里一处**，唯一的调用点是 `launch()`（真开批那一刻）。
-    ⚠️ `patch_setup()` **故意不调用它**：切模式那一步要求「依据已经存在」，
-    会跟「AI 模式下不许上传」互锁，老师永远切不过去（详见那里的注释）。
+    ⚠️ `patch_setup()` **故意不调用它**：勾条件那一步要求「依据已经存在」，
+    会跟「AI 基准下不许上传」互锁，老师永远勾不上（详见那里的注释）。
+
+    两个条件可以同时勾，所以返回值是**列表**而不是单个字符串：
+    缺哪个说哪个，别让老师修好一个又挨一次 422。
     """
+    modes = grade_basis.modes_of(grade)
+    if not modes:
+        return []
     key_text, rub_text = _answer_texts(db, grade)
     imgs = _answer_images(db, grade)
-    if grade.answer_mode == "key" and not (key_text or imgs["answer"]):
-        return "answer"
-    if grade.answer_mode == "rubric" and not (rub_text or imgs["rubric"]):
-        return "rubric"
-    return ""
+    missing: list[str] = []
+    if "key" in modes and not (key_text or imgs["answer"]):
+        missing.append("key")
+    if "rubric" in modes and not (rub_text or imgs["rubric"]):
+        missing.append("rubric")
+    return missing
+
+
+# 条件 → 人话。文案只在这里一处，launch 与前端提示用同一套名字。
+MODE_TITLE = {"key": "按我给的答案判定", "rubric": "按我的评分细则判定"}
+_MODE_WHAT = {"key": "答案", "rubric": "评分细则"}
+
+
+def _missing_basis_msg(missing: list[str]) -> str:
+    """把「缺什么」写成一句老师看得懂的话（缺几个就说几个，别只说第一个）。"""
+    what = "、".join(_MODE_WHAT[m] for m in missing)
+    if len(missing) == 1:
+        head = f"勾了「{MODE_TITLE[missing[0]]}」，"
+    else:
+        head = "两个条件都勾了，"
+    return f"{head}但{what}还是空的 —— 先传一份再开始批改"
 
 
 def basis_dir(gid: int) -> Path:
@@ -1452,13 +1490,14 @@ def _answer_texts(db: Session, grade: HomeworkGrade,
     """凑出"老师给的答案"与"评分细则"两段文字，喂给 AI 层。
 
     两处来源拼在一起：粘贴的文字（建任务时落成的 txt）与引用的 lesson_files
-    （上传时就抽好文字了）。**ai 模式下给空串**：老师没给依据，就不该往 ctx 里塞东西。
+    （上传时就抽好文字了）。**没勾条件时给空串**：老师没给依据，就不该往 ctx 里塞东西。
+    勾了哪个给哪个，两个都勾就两段都给（答案定对错、细则定 partial 与漏步）。
 
     respect_mode=False 只给界面的回显用：老师切到「AI 自己解」之后，
     之前填过的答案还得在文本框里，不然切一下就没了。
     """
-    if respect_mode and grade.answer_mode == "ai":
-        return "", ""
+    # 过滤放在末尾统一做（见函数尾那段 `if respect_mode:`）—— 这里不再提前 return，
+    # 否则「勾了 key 没勾 rubric」这种半开状态要写两处口径，早晚对不上。
     parts: dict[str, list[str]] = {"answer": [], "rubric": []}
     rows = db.scalars(
         select(HomeworkGradeFile)
@@ -1484,7 +1523,20 @@ def _answer_texts(db: Session, grade: HomeworkGrade,
             text = (lf.text if lf is not None else "") or ""
         if text.strip():
             parts[f.role].append(text.strip())
-    return "\n\n".join(parts["answer"]), "\n\n".join(parts["rubric"])
+    key_text = "\n\n".join(parts["answer"])
+    rub_text = "\n\n".join(parts["rubric"])
+    if respect_mode:
+        # **勾了哪个才给哪个**（逐段过滤，不是「有条件就全给」）：
+        #   · 一个条件都没勾 → 两段都空（老师没给依据，不该往 ctx 里塞东西）；
+        #   · 只勾 key → 细则那段就算以前传过也不给 —— 否则老师收回了条件、
+        #     提示词里却还在按旧的细则要求，界面和实际判定对不上；
+        #   · 两个都勾 → 两段都给（答案定对错、细则定 partial 与漏步）。
+        _m = grade_basis.modes_of(grade)
+        if "key" not in _m:
+            key_text = ""
+        if "rubric" not in _m:
+            rub_text = ""
+    return key_text, rub_text
 
 
 def _answer_images(db: Session, grade: HomeworkGrade) -> dict[str, list[str]]:
@@ -1497,10 +1549,10 @@ def _answer_images(db: Session, grade: HomeworkGrade) -> dict[str, list[str]]:
 
     规则：**已经有文字的文件不再送图**。同一份 PDF 答案既有文字层又要送图，
     等于把 token 花两遍，而文字比图更省、更准。
-    `ai` 模式返回空 —— 老师没给依据，就不该往 ctx 里塞东西。
+    一个条件都没勾 → 返回空（老师没给依据，不该往 ctx 里塞东西）。
     """
     out: dict[str, list[str]] = {"answer": [], "rubric": []}
-    if grade.answer_mode == "ai":
+    if not grade_basis.modes_of(grade):
         return out
     rows = db.scalars(
         select(HomeworkGradeFile)
@@ -1540,6 +1592,7 @@ def _ctx_base(db: Session, grade: HomeworkGrade) -> dict:
     return {
         "student": (stu.name if stu is not None else "") or "",
         "answer_mode": grade.answer_mode,
+        "basis_modes": _modes_list(grade),
         "answer_text": key_text,
         "rubric_text": rubric_text,
         # 答案/细则的**图片**（老师拍的照片）。没有文字依据时才非空，
@@ -1782,12 +1835,7 @@ def launch(db: Session, grade: HomeworkGrade) -> bool:
     #   不许传依据」互锁），所以「改到空」「后来被删空」全靠这一道门兜住。
     missing = _missing_basis(db, grade)
     if missing:
-        raise GradeError(
-            422,
-            "这份要「按我给的答案判定」，但依据已经空了 —— 先传一份答案再开始批改"
-            if missing == "answer" else
-            "这份要「按我的评分细则判定」，但细则已经空了 —— 先传一份细则再开始批改",
-        )
+        raise GradeError(422, _missing_basis_msg(missing))
     with _run_lock:
         if grade.id in _running:
             return False

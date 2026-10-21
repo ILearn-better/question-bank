@@ -44,7 +44,7 @@ items 里 `flags` 的取值（系统会给的那几个；模型自己给的标�
     json_salvaged        输出被截断/夹了废话，是从里面逐题抢救出来的
     unreadable_char      题内有看不清的字符（模型标，显示成 ⍰）
     insufficient_evidence 判错但依据在原文里找不到 → **已降级 ungradable**
-    reference_unverified 参考解是模型自己做的（answer_mode="ai"），没经老师核对
+    reference_unverified 参考解是模型自己做的（没勾任何条件时），没经老师核对
     unstable             两次采样 verdict 在 correct ↔ wrong 之间翻转
     transcription_conflict 两次采样转录不一致（二期：两遍都跑时才可能出）
     qtype_unknown        题型不在 taxonomy.QTYPES 里 → qtype 给 None
@@ -64,7 +64,7 @@ from pathlib import Path
 from PIL import Image
 
 from .. import taxonomy
-from . import ai_polish
+from . import ai_polish, grade_basis
 from .images import MAX_IMAGE_BYTES
 
 # ---------------------------------------------------------------- 常量
@@ -428,25 +428,37 @@ def _images_block(ctx: dict) -> str:
     而且看起来完全合理（老师给的答案当然对）。这个错比漏判更危险，
     因为它是「自信地判对」。
     """
-    mode = _as_str(ctx.get("answer_mode")) or "ai"
-    if mode == "key":
-        extra = list(ctx.get("answer_images") or [])
-        what = "老师的标准答案"
-    elif mode == "rubric":
-        extra = list(ctx.get("rubric_images") or [])
-        what = "老师的评分细则"
-    else:
+    groups = _extra_image_groups(ctx)
+    if not groups:
         return ""
-    if not extra:
-        return ""
-    lines = [f"\n\n## 这一批图（共 {len(extra) + 1} 张，按顺序）",
+    total = 1 + sum(len(items) for _what, items in groups)
+    lines = [f"\n\n## 这一批图（共 {total} 张，按顺序）",
              "第 1 张：**学生作答** —— 要判的就是它。"]
-    for i in range(len(extra)):
-        lines.append(
-            f"第 {i + 2} 张：{what} —— 这是**判据，不是学生写的**。"
-            "不要把它上面的内容当成 student_answer，也不要因为它写对了就判学生对。"
-        )
+    n = 1
+    for what, items in groups:
+        for _ in items:
+            n += 1
+            lines.append(
+                f"第 {n} 张：{what} —— 这是**判据，不是学生写的**。"
+                "不要把它上面的内容当成 student_answer，也不要因为它写对了就判学生对。"
+            )
     return "\n".join(lines)
+
+
+def _extra_image_groups(ctx: dict) -> list[tuple[str, list]]:
+    """老师给的额外图，**按送入模型的顺序**分组：先答案、后细则。
+
+    顺序是三处共用的：`_image_uris` 真按这个顺序拼、`_images_block` 按这个顺序
+    说「第几张是什么」。任何一处单独改都会让模型把答案当成学生作答 ——
+    那是「自信地判全对」，比漏判危险得多。所以只从这个函数取顺序。
+    """
+    modes = _modes_of(ctx)
+    out: list[tuple[str, list]] = []
+    if "key" in modes:
+        out.append(("老师的标准答案", list(ctx.get("answer_images") or [])))
+    if "rubric" in modes:
+        out.append(("老师的评分细则", list(ctx.get("rubric_images") or [])))
+    return [(" ".join(what.split()), items) for what, items in out if items]
 
 
 def _context_block(ctx: dict) -> str:
@@ -485,55 +497,66 @@ def _context_block(ctx: dict) -> str:
     return "\n".join(lines) + _images_block(ctx)
 
 
-def _reference_block(mode: str, ctx: dict) -> str:
-    """三种 answer_mode 的差别**只在于参考依据从哪来**，判定口径完全一样。"""
-    if mode == "key":
-        text = (ctx.get("answer_text") or "").strip()
-        if not text and (ctx.get("answer_images") or []):
-            # 老师给的是**答案照片**（没粘贴文字）。这里必须交代清楚，
-            # 否则「〔老师的答案〕」下面空着，模型会退回自己解题却仍声称按老师答案判。
-            text = "（答案在附图上 —— 第 2 张起来的图是老师给的答案，不是学生写的）"
-        steps = ctx.get("answer_steps") or None
-        block = (
-            "\n\n## 本次的依据：老师提供的标准答案\n"
-            "下面是老师给的答案，**以它为准**。\n"
-            "〔老师的答案〕\n" + text + "\n"
-        )
-        if steps:
-            # 老师给了结构化步骤就一并用上：分步的对照比一整段文字准得多
-            try:
-                block += "〔答案的结构化步骤〕\n" + json.dumps(
-                    steps, ensure_ascii=False) + "\n"
-            except (TypeError, ValueError):
-                pass
-        block += (
-            "判定口径：\n"
-            "· 学生写法与老师答案**数学上等价**就算 correct"
-            "（$x=2$ 与 $2=x$、先通分与直接约分，都算等价）；\n"
-            "· 老师答案可能只是简写、也可能有笔误：如果它明显算错，以数学上正确的为准，"
-            "并在 basis 里写明「老师答案此处疑有笔误」；\n"
-            "· 老师只给了最终结果、没给过程时，解答题只看最终结果："
-            "过程错但结果对 → partial。\n"
-            "· 老师的答案里对不上这一题的，correct_answer 留空，verdict 给 ungradable。"
-        )
-        return block
+def _modes_of(ctx: dict) -> set[str]:
+    """ctx 里的条件集合。**解析只走 `grade_basis.parse_modes`**，别在这儿另写一份 ——
+    两份解析早晚会对不上，表现是「界面勾了两个、提示词只给了一个」。"""
+    return grade_basis.parse_modes(ctx.get("answer_mode"))
 
-    if mode == "rubric":
-        text = (ctx.get("rubric_text") or "").strip()
-        if not text and (ctx.get("rubric_images") or []):
-            text = "（评分细则在附图上 —— 第 2 张起来的图是老师给的细则，不是学生写的）"
-        return (
-            "\n\n## 本次的依据：评分细则（分步给分点 / 扣分条件）\n"
-            "下面是老师给的评分细则，**以它为准**。\n"
-            "〔评分细则〕\n" + text + "\n"
-            "判定口径：\n"
-            "· 按细则里的分步给分点逐条对照：学生写到了哪一步、漏了哪一步；\n"
-            "· basis 里点名**违反了哪一条**，尽量照抄细则里那一条的措辞；\n"
-            "· correct_answer 写细则里这一题对应的给分点 / 关键步骤；\n"
-            "· **这一期不给分**：不要输出得分、扣分，只判 correct / partial / wrong；\n"
-            "· 细则没覆盖的写法，只要数学上正确就不要判错。"
-        )
 
+def _key_block(ctx: dict) -> str:
+    """「按我给的答案」这个条件贡献的那一段。"""
+    text = (ctx.get("answer_text") or "").strip()
+    if not text and (ctx.get("answer_images") or []):
+        # 老师给的是**答案照片**（没粘贴文字）。这里必须交代清楚，
+        # 否则「〔老师的答案〕」下面空着，模型会退回自己解题却仍声称按老师答案判。
+        text = "（答案在附图上 —— 第 2 张起来的图是老师给的答案，不是学生写的）"
+    steps = ctx.get("answer_steps") or None
+    block = (
+        "\n\n## 本次的依据：老师提供的标准答案\n"
+        "下面是老师给的答案，**以它为准**。\n"
+        "〔老师的答案〕\n" + text + "\n"
+    )
+    if steps:
+        # 老师给了结构化步骤就一并用上：分步的对照比一整段文字准得多
+        try:
+            block += "〔答案的结构化步骤〕\n" + json.dumps(
+                steps, ensure_ascii=False) + "\n"
+        except (TypeError, ValueError):
+            pass
+    block += (
+        "判定口径：\n"
+        "· 学生写法与老师答案**数学上等价**就算 correct"
+        "（$x=2$ 与 $2=x$、先通分与直接约分，都算等价）；\n"
+        "· 老师答案可能只是简写、也可能有笔误：如果它明显算错，以数学上正确的为准，"
+        "并在 basis 里写明「老师答案此处疑有笔误」；\n"
+        "· 老师只给了最终结果、没给过程时，解答题只看最终结果："
+        "过程错但结果对 → partial。\n"
+        "· 老师的答案里**对不上这一题的**：你自己先解一遍再判（这一题没有可对照的答案），"
+        "并在 basis 里说明「老师答案里没有这一题」；真解不出来才给 ungradable。"
+    )
+    return block
+
+
+def _rubric_block(ctx: dict) -> str:
+    """「按我的评分细则」这个条件贡献的那一段。"""
+    text = (ctx.get("rubric_text") or "").strip()
+    if not text and (ctx.get("rubric_images") or []):
+        text = "（评分细则在附图上 —— 第 2 张起来的图是老师给的细则，不是学生写的）"
+    return (
+        "\n\n## 本次的依据：评分细则（分步给分点 / 扣分条件）\n"
+        "下面是老师给的评分细则，**以它为准**。\n"
+        "〔评分细则〕\n" + text + "\n"
+        "判定口径：\n"
+        "· 按细则里的分步给分点逐条对照：学生写到了哪一步、漏了哪一步；\n"
+        "· basis 里点名**违反了哪一条**，尽量照抄细则里那一条的措辞；\n"
+        "· correct_answer 写细则里这一题对应的给分点 / 关键步骤；\n"
+        "· **这一期不给分**：不要输出得分、扣分，只判 correct / partial / wrong；\n"
+        "· 细则没覆盖的写法，只要数学上正确就不要判错。"
+    )
+
+
+def _self_solve_block() -> str:
+    """基准那一段：没有任何条件时它就是全部依据。"""
     return (
         "\n\n## 本次的依据：你自己解\n"
         "这一页**没有**老师提供的标准答案。请对每一道题**先自己完整解一遍**，"
@@ -543,6 +566,43 @@ def _reference_block(mode: str, ctx: dict) -> str:
         "⚠️ 你的解法是模型自己给的，老师会拿它当参考。拿不准的题（多解题、超纲题、"
         "题干读不清的题）verdict 给 ungradable，不要硬判。"
     )
+
+
+def _both_block() -> str:
+    """两个条件同时勾上时的**冲突裁决**。
+
+    不给裁决规则的话，模型会在「答案说对」「细则说漏了一步」之间随机挑，
+    同一份作业重批两次结果都不一样 —— 老师会以为系统不稳定。
+    """
+    return (
+        "\n\n## 两个依据同时在用：怎么排优先级\n"
+        "· **对错**看老师给的答案（数学等价即 correct）；\n"
+        "· **是否 partial**、漏了哪一步，看评分细则；\n"
+        "· 两边打架时（答案对但漏了细则里的关键步骤）→ 判 partial，"
+        "并把没满足的那条细则写进 basis；\n"
+        "· basis 里要能看出你用的是哪一条依据："
+        "「与老师答案一致 / 缺第 2 步给分点」这种写法，别只写「正确」。"
+    )
+
+
+def _reference_block(mode: str, ctx: dict) -> str:
+    """依据那一段 = **AI 基准 + 已勾的每个条件**（2026-10-21 从「三选一」改过来）。
+
+    以前三种模式互斥，只能挑一个；现在老师可以只留基准（模型自己解），
+    也可以加「按我的答案」、加「按我的细则」，两个都加就是两段一起给 +
+    一段裁决规则。所以这里**拼段落**，不再 `if/elif/else` 三选一。
+    """
+    modes = grade_basis.parse_modes(mode)
+    if not modes:
+        return _self_solve_block()
+    parts: list[str] = []
+    if "key" in modes:
+        parts.append(_key_block(ctx))
+    if "rubric" in modes:
+        parts.append(_rubric_block(ctx))
+    if len(parts) > 1:
+        parts.append(_both_block())
+    return "".join(parts)
 
 
 def _prompt_for(mode: str, ctx: dict) -> str:
@@ -609,13 +669,7 @@ def _image_uris(png_path, ctx: dict) -> list[str]:
     没有作答就没法判。
     """
     uris = [_prepare_image(png_path)]
-    mode = _as_str(ctx.get("answer_mode")) or "ai"
-    if mode == "key":
-        extra = list(ctx.get("answer_images") or [])
-    elif mode == "rubric":
-        extra = list(ctx.get("rubric_images") or [])
-    else:
-        extra = []
+    extra = [p for _what, items in _extra_image_groups(ctx) for p in items]
     for p in extra[:_MAX_ANSWER_IMAGES]:
         try:
             uris.append(_prepare_image(p))
@@ -1262,18 +1316,37 @@ def _call_model(uris, prompt: str, cfg: dict, temperature: float = 0) -> tuple[s
 
 
 # ---------------------------------------------------------------- 对外入口
+def _check_reference(answer_mode: str, ctx: dict) -> set[str]:
+    """校验「依据编码 + 依据内容」配不配得上，返回条件集合（不含 ai 基准）。
+
+    单独抽出来是**为了能直接测**：`_recognize` 一调就要联网、要配密钥，
+    而这段校验是纯逻辑 —— 放在里面的话「拼错的 keys 会不会静默降级」这种
+    要命的问题只能靠人肉跑真接口才验得到。
+
+    ⚠️ 不认识的 token 必须炸，不能当 ai 处理：拼错的 "keys" 静默降级成「自己解」，
+       老师却以为在按他的答案判 —— 那正是这次要防的错。
+    """
+    _known = {grade_basis.MODE_AI} | set(grade_basis.CONDITIONS)
+    _tokens = {t.strip().lower() for t in str(answer_mode).replace(",", "+").split("+")
+               if t.strip()}
+    if not _tokens or not _tokens <= _known:
+        raise _GradeError(
+            f"不认识的批改依据「{answer_mode}」，只能是 ai / key / rubric / key+rubric"
+        )
+    modes = _tokens - {grade_basis.MODE_AI}
+    if "key" in modes and not (_as_str(ctx.get("answer_text"))
+                               or (ctx.get("answer_images") or [])):
+        raise _GradeError("勾了「按我给的答案判定」，但没有读到答案内容")
+    if "rubric" in modes and not (_as_str(ctx.get("rubric_text"))
+                                  or (ctx.get("rubric_images") or [])):
+        raise _GradeError("勾了「按我的评分细则判定」，但没有读到细则内容")
+    return modes
+
+
 def _recognize(png_path: str, ctx: dict) -> tuple[list[dict], str]:
     answer_mode = _as_str(ctx.get("answer_mode")) or "ai"
-    if answer_mode not in ("ai", "key", "rubric"):
-        raise _GradeError(
-            f"不认识的批改依据「{answer_mode}」，只能是 ai / key / rubric"
-        )
-    if answer_mode == "key" and not (_as_str(ctx.get("answer_text"))
-                                     or (ctx.get("answer_images") or [])):
-        raise _GradeError("选择了「按老师答案批改」，但没有读到答案内容")
-    if answer_mode == "rubric" and not (_as_str(ctx.get("rubric_text"))
-                                        or (ctx.get("rubric_images") or [])):
-        raise _GradeError("选择了「按评分细则批改」，但没有读到细则内容")
+    # 条件允许叠加（`key+rubric`），校验与内容检查都在 `_check_reference` 一处。
+    modes = _check_reference(answer_mode, ctx)
 
     cfg = _load_cfg(ctx)
     model = _as_str(ctx.get("model")) or cfg.get("model") or ""
@@ -1307,7 +1380,7 @@ def _recognize(png_path: str, ctx: dict) -> tuple[list[dict], str]:
             "mode": answer_mode,
             "sample": 1,
         })
-        if answer_mode == "ai":
+        if not modes:      # 一个条件都没勾 = 参考解全靠模型自己，必须标出来
             # 参考解是模型自己做的，没经老师核对。**必须**标出来：
             # 模型解错了就是整题判错，这个差别不给老师看见就是灾难。
             if "reference_unverified" not in it["flags"]:
@@ -1328,7 +1401,7 @@ def _recognize(png_path: str, ctx: dict) -> tuple[list[dict], str]:
                         "model": cfg["model"], "finish_reason": finish2,
                         "mode": answer_mode, "sample": 2,
                     })
-                    if answer_mode == "ai" and "reference_unverified" not in it["flags"]:
+                    if not modes and "reference_unverified" not in it["flags"]:
                         it["flags"].append("reference_unverified")
                 items = apply_stability(items, items2)
         except Exception:                       # noqa: BLE001
@@ -1341,7 +1414,7 @@ def _recognize(png_path: str, ctx: dict) -> tuple[list[dict], str]:
 def recognize_page(png_path: str, ctx: dict) -> tuple[list[dict], str]:
     """批改**一页**。返回 (items, err)。
 
-    ctx = {"student": "李四", "answer_mode": "ai"|"key"|"rubric",
+    ctx = {"student": "李四", "answer_mode": "ai"|"key"|"rubric"|"key+rubric",
            "answer_text": "...", "rubric_text": "...", "page_no": 1,
            "answer_steps": [...](可选，老师答案的结构化步骤), "model": "(可选覆盖)"}
 
