@@ -18,12 +18,29 @@
 //
 // ④ **轮询只在跑的时候开**。每 2 秒取一次详情，status 离开 queued/running 就停；
 //    停下来那一刻提示一次，不每轮都弹。轮询失败不弹错误（下一轮还会来）。
+//
+// ⑤ **老师画的东西一律先落本机，再想办法送到服务端**（2026-10-19 加，用户原话：
+//    「我用笔画批改作业时，不小心退出，记录就没了，得重新批改」）。
+//    顺序不能反：先 `localDraft.pushMark` 再 POST。反过来的话，画完立刻关页面
+//    那一下，请求被浏览器取消，这笔就真的没有了 —— 而界面上它是"画过"的。
+//    详见 `src/gradeDraft.js` 头部：它存的不只是笔迹，还有框题草稿与判定依据文字。
+//
+// ⑥ **分割线只是「生成整页宽框」的快捷方式**，不是新的数据类型（`src/gradeLines.js`）。
+//    线切出来的段 `box = [0,y0,1000,y1]`，与框选出来的段在库里长一个样 ——
+//    所以裁切 / 跨页竖拼 / 逐题批改 / 沿用上一份，全都走已有那套，后端零改动。
 import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue';
 import { useRoute } from 'vue-router';
-import { gradeApi } from '../api.js';
+import { gradeApi, lessonFilesApi } from '../api.js';
+import { FROM } from '../backTarget.js';
 import { ensureLibs, renderRichEl } from '../mathRender.js';
 import { fail, ok, warn } from '../store.js';
 import GradeMarkLayer from '../components/GradeMarkLayer.js';
+import { createDraft, isLocalMarkId, localMark, sameMark } from '../gradeDraft.js';
+import {
+  LINE_MIN_GAP, endOfPageFromSegs, isFullWidth, lineToDropFor, linesFromSegs,
+  reslicePage, sortBlocksByGeometry,
+} from '../gradeLines.js';
+import { clampUnit } from '../markGeom.js';
 
 const POLL_MS = 2000;
 /** 轮询要继续的两个状态。⚠️ **只用于「停不停轮询」**，别拿它判断按钮禁不禁用（见 `running`）。
@@ -70,7 +87,18 @@ const FLAG_LABEL = {
   insufficient_evidence: '证据不足',
   figure_guess: '图题待确认',
   low_confidence: '识别把握低',
+  region_empty: '框里没读到题',
+  region_multi: '框画大了（读到多道题）',
 };
+
+/** 模型给的分类标签（0031）：学段 / 体系 / 知识点 / 考法。
+ *  **数组不是对象** —— 显示顺序要固定；JSON 的键序跨语言之后不保证。 */
+const LABEL_ORDER = [
+  { k: 'stage', name: '学段' },
+  { k: 'system', name: '体系' },
+  { k: 'kp', name: '知识点' },
+  { k: 'exam', name: '考法' },
+];
 
 const q = (s) => String(s === undefined || s === null ? '' : s).trim();
 
@@ -80,6 +108,28 @@ export default {
   setup() {
     const route = useRoute();
     const gid = route.params.id;
+
+    /* 本页是被谁打开的 —— 决定「新版工作台」按钮把哪个来源继续往下传。
+     * 学生信息 / 主控制台进来时会带 `?from=`；什么都没带的（直接打开 /grade/7、
+     * 或从历史记录点进来）按 `workbench` 算，也就是「旧版批改台」这个入口。
+     * 口径与判断全在 src/backTarget.js，这里只做一次清洗，别在这另立规则。 */
+    const entrySource = (function () {
+      const raw = String((route.query && route.query.from) || '').trim().toLowerCase();
+      return [FROM.STUDENT, FROM.WORKBENCH, FROM.CONSOLE].indexOf(raw) >= 0 ? raw : FROM.WORKBENCH;
+    })();
+
+    /* 新版工作台（workbench.html）的地址：gid + 来源 + 学生，三样都带过去。
+     * ⚠️ 它是独立的零构建页，不是路由 —— 所以是普通链接，绝不能写成 router-link。
+     * ⚠️ sid 必须带：旧版批改台「返回」回哪个学生，靠的是这个上下文，不是反查。 */
+    const workbenchHref = computed(function () {
+      const d = detail.value;
+      if (!d) return '';
+      const qs = new URLSearchParams();
+      qs.set('gid', String(d.id));
+      qs.set('from', entrySource);
+      if (d.student_id) qs.set('sid', String(d.student_id));
+      return '/workbench.html?' + qs.toString();
+    });
 
     const detail = ref(null);
     const loading = ref(true);
@@ -92,11 +142,25 @@ export default {
 
     /* 手写批改：老师直接在卷面上画。三种手段都是「往 marks 里加一条」，
      * 唯一区别是 mode —— 组件只管采集，落库/删除都在这一层（失败要能提示）。 */
-    const tool = ref('view');          // view | ink | erase | text | check | cross
+    const tool = ref('view');          // view | ink | erase | text | check | cross | region | line
     const inkColor = ref('#dc2626');
     const textDraft = ref(null);       // {x, y, text}：点完位置弹出来的输入框
     const exporting = ref('');         // 正在导出的格式（按钮置灰）
     const layerEl = ref(null);         // 标注层组件：拖动提交失败时要调它回滚本地位移
+
+    /* 本机草稿：笔迹队列 + 框题草稿 + 判定依据文字（见 src/gradeDraft.js）。
+     * `boot` 是**页面刚打开时**读到的那一份，后面所有判断都以它为准 ——
+     * 不要在别处再 readDraft 一次，两份快照一定会漂。 */
+    const localDraft = createDraft(gid);
+    const boot = localDraft.data;
+    const pendingMarks = ref(localDraft.marks());   // 本机队列（含已发送未对账的）
+    const syncPending = () => { pendingMarks.value = localDraft.marks(); };
+    /** 还没送上去的笔数 —— 只数 `sent === false` 的（sent 的其实已经在库里）。 */
+    const pendingUnsent = computed(
+      () => pendingMarks.value.filter((m) => !m.sent).length,
+    );
+    let regionsRestored = false;      // 框题草稿只在第一次 load 之后恢复一次
+    let flushedOnce = false;          // 补发也只在第一次 load 之后跑一次
 
     // 「识别有误」展开的那一题 + 草稿
     const editId = ref('');
@@ -136,9 +200,558 @@ export default {
     /* ---------------- 数据 ---------------- */
     const items = computed(() => (detail.value && detail.value.items) || []);
     const marks = computed(() => (detail.value && detail.value.marks) || []);
-    const pageMarks = computed(() => marks.value.filter((m) => Number(m.page_no || 1) === pageNo.value));
-    /** 老师自己放的（笔迹 / 文字 / √×）。撤销、清空只动这些 —— AI 猜的框一个字不碰。 */
+
+    /* 这一页要画的标注 = 服务端的 + **本机队列里还没对上的**。
+     *
+     * 为什么要有后一半：画完立刻关页面/断网时，那一笔只在队列里。
+     * 只画服务端的话，老师回来看到的就是「刚才画的那道红线不见了」——
+     * 明明数据还在本机，却表现得像丢了，比真丢了更让人不信任。
+     *
+     * 去重靠 `sameMark`（kind + 取整后的坐标 + 文字）：服务端已经有完全相同的一条，
+     * 就不再重复画 —— 否则「补发成功到下一次 load 之间」会看到同一笔画了两遍。
+     */
+    const pageMarks = computed(() => {
+      const server = marks.value.filter((m) => Number(m.page_no || 1) === pageNo.value);
+      const local = pendingMarks.value
+        .filter((m) => Number(m.page_no || 1) === pageNo.value)
+        .filter((m) => !server.some((s) => sameMark(s, m)))
+        .map(localMark);
+      return server.concat(local);
+    });
+    /** 老师自己放的（笔迹 / 文字 / √×）。撤销、清空只动这些 —— AI 猜的框一个字不碰。
+     *  ⚠️ 含本机待发的那些：老师刚画完就该能撤销，不能因为「还没传上去」而撤不了。 */
     const teacherMarks = computed(() => pageMarks.value.filter((m) => m.created_by === 'teacher'));
+    /** 只算服务端的那些 —— 撤销「上一笔」时要按 id 大小排，本机队列的 id 不是数字。 */
+    const serverTeacherMarks = computed(
+      () => marks.value.filter((m) => Number(m.page_no || 1) === pageNo.value
+        && m.created_by === 'teacher' && !isLocalMarkId(m.id)),
+    );
+
+    /* ---------------- 一题一区域：框选 + 分割线 ----------------
+     * 有段（框或线切出来的块）的页按块逐题批，没段的页整页一次判 —— 两条口径并存，
+     * 所以这里必须分清「服务器上已经存了的」和「正在拖但还没保存的草稿」。
+     *
+     * ★ 框选与分割线是**同一个东西的两种画法**（2026-10-19 用户要求「我还要分割线分割」）：
+     *   线切出来的段 = 整页宽的框 `[0,y0,1000,y1]`，落到库里与手拖的框一模一样。
+     *   于是裁切 / 跨页竖拼 / 逐题批改 / 沿用上一份 全都走已有那套，**后端零改动**。
+     *
+     * ⚠️ 进「框题」/「分割线」模式才把草稿从服务器同步一份：平时不该有两份状态，
+     *    否则轮询一刷新就把老师刚拖的框冲掉（或者反过来，草稿盖掉别人的改动）。
+     *    但**本机草稿里有没保存的改动时绝不能盖** —— 那正是「退出就没了」要防的事。 */
+    const regions = computed(() => (detail.value && detail.value.regions) || []);
+    const pageRegions = computed(
+      () => regions.value.filter((r) => Number(r.page_no || 1) === pageNo.value),
+    );
+    /* ⚠️ 草稿是**整份**的（按页分桶），不是「当前页一份」。
+     *    跨页题的几段天然落在不同页上：第 1 页画上半、翻页画下半，然后合成一道题。
+     *    如果草稿只存当前页，翻一下页上半段就没了 —— 跨页根本画不出来。
+     *    翻页**不提示未保存**（那是框题的常态操作），只有离开框题模式才提示。 */
+    const editAll = ref({});            // { 页号: [段…] }，每段 { id, seq, q_no, box, src, page_no, skipped }
+    /** 分割线：{ 页号: [y, …] }。**不是落库的实体** —— 它只决定「怎么切」，
+     *  切出来的段才是。保存之后线能从整页宽的段反推回来（见 syncRegions）。 */
+    const editLines = ref({});
+    /** 每页的**结束线**：`{ 页号: y }`，默认 1000（切到页底）。
+     *
+     *  这是「每页尾部处理不到位」那个旋钮：最后一题的作答区通常一直写到底，
+     *  但页脚、页码、条形码也在那儿。把它拖到 96% 就表示「下面 4% 不是题」。
+     *  ⚠️ 它**不是落库的实体**：切出来的最后一段底边就是它，重开页面从段反推
+     *     （`endOfPageFromSegs`）—— 同一个事实只有一个出处。 */
+    const editEnds = ref({});
+    const editRegions = computed(() => editAll.value[pageNo.value] || []);
+    const pageLines = computed(() => editLines.value[pageNo.value] || []);
+    const pageEnd = computed(() => Number(editEnds.value[pageNo.value] || 1000));
+    const lineCount = computed(
+      () => Object.values(editLines.value || {}).reduce((n, ys) => n + (ys || []).length, 0),
+    );
+    const regionsDirty = ref(false);
+    /** 框选与分割线共用一套面板 —— 数据上它们本来就是同一件事。 */
+    const editingRegions = computed(() => tool.value === 'region' || tool.value === 'line');
+
+    /** 把一串段按「题」（`seq`）聚合成块。界面上一行是一道题，不是一个框。 */
+    function groupSegs(list) {
+      const by = new Map();
+      (list || []).forEach((s) => {
+        const k = Number(s.seq || 0);
+        if (!by.has(k)) by.set(k, []);
+        by.get(k).push(s);
+      });
+      return Array.from(by.entries())
+        .sort((a, b) => a[0] - b[0])
+        .map(([seq, segs]) => {
+          const ordered = segs.slice().sort(
+            (a, b) => Number(a.page_no || 1) - Number(b.page_no || 1)
+              || Number((a.box || [0, 0])[1] || 0) - Number((b.box || [0, 0])[1] || 0),
+          );
+          const q = (ordered.find((s) => String(s.q_no || '').trim()) || {}).q_no || '';
+          return {
+            seq, q_no: String(q).trim(), label: String(q).trim() || String(seq + 1),
+            segs: ordered, pages: ordered.map((s) => Number(s.page_no || 1)),
+            // 一块被跳过 = 它的每一段都标了跳过（后端 put_regions 会归一成这个状态）。
+            skipped: ordered.every((s) => !!s.skipped),
+          };
+        });
+    }
+
+    /** 草稿摊平成段（每段补上它属于哪一页）。 */
+    function allDraftSegs() {
+      const out = [];
+      Object.entries(editAll.value || {}).forEach(([p, list]) => {
+        (list || []).forEach((s) => out.push({ ...s, page_no: Number(p) }));
+      });
+      return out;
+    }
+
+    /** 面板要显示的「题」：编辑模式下是草稿，平时是服务器存的。 */
+    const regionBlocks = computed(
+      () => groupSegs(editingRegions.value ? allDraftSegs() : regions.value),
+    );
+    /** 草稿里的**框**（段）总数 —— 与「题数」不是一个数，跨页题是 1 题 2 框。 */
+    const draftSegCount = computed(() => allDraftSegs().length);
+
+    /** 交给标注层画的框：每段一个框，label 用**它所属那道题**的标签（跨页两段同号）。 */
+    const layerRegions = computed(() => {
+      if (!editingRegions.value) return pageRegions.value;
+      const labels = new Map(regionBlocks.value.map((b) => [Number(b.seq), b.label]));
+      return editRegions.value.map((s) => ({
+        ...s, label: labels.get(Number(s.seq)) || '',
+      }));
+    });
+
+    /** 交给标注层画的分割线。编辑时用草稿里的线；平时从整页宽的段反推。 */
+    const layerLines = computed(() => (
+      editingRegions.value ? pageLines.value : linesFromSegs(pageRegions.value)
+    ));
+
+    /** 这一页由线切出来的段（只用于画淡色带 + 序号，让老师数得清切成了几题）。 */
+    const pageBands = computed(() => {
+      if (!editingRegions.value) return [];
+      return editRegions.value
+        .filter((s) => s.src === 'line')
+        .map((s) => s.box)
+        .sort((a, b) => Number(a[1]) - Number(b[1]));
+    });
+
+    function syncRegions() {
+      const by = {};
+      const forLines = {};
+      const ends = {};
+      const byPage = {};
+      regions.value.forEach((r) => {
+        const p = Number(r.page_no || 1);
+        const box = (r.box || []).slice();
+        // 整页宽的段只可能来自分割线（手拖一个框几乎不可能同时压在 0 和 1000 上）。
+        // 标出来之后，重开页面还能继续加线 / 拖线，而不是变成一堆"整页的框"。
+        const src = isFullWidth(box) ? 'line' : 'box';
+        (by[p] = by[p] || []).push({
+          id: r.id, seq: Number(r.seq || 0), q_no: r.q_no || '',
+          box, page_no: p, src, skipped: !!r.skipped,
+        });
+        (forLines[p] = forLines[p] || []).push({ box });
+        (byPage[p] = byPage[p] || []).push({ box });
+      });
+      const lines = {};
+      Object.entries(forLines).forEach(([p, list]) => {
+        const ys = linesFromSegs(list);
+        if (ys.length) lines[p] = ys;
+      });
+      // 结束线从段反推：最后一段的底边就是它（没有线段就是页底 1000）。
+      Object.entries(byPage).forEach(([p, list]) => {
+        const e = endOfPageFromSegs(list);
+        if (e < 1000) ends[p] = e;
+      });
+      editAll.value = by;
+      editLines.value = lines;
+      editEnds.value = ends;
+      regionsDirty.value = false;
+    }
+
+    /** 草稿落本机（内部防抖）。框题一页十几刀，丢一次就是十几分钟 —— 必须随画随存。 */
+    function touchRegionsDraft() {
+      localDraft.touch({
+        regions: {
+          dirty: !!regionsDirty.value, lines: editLines.value,
+          ends: editEnds.value, segs: editAll.value,
+        },
+      });
+    }
+
+    /** 按**阅读顺序**收口 seq（先页、再段顶边）。跨页题的分组不会被拆开 ——
+     *  `sortBlocksByGeometry` 只换号，同 seq 的几段一起换。 */
+    function sortAll() {
+      const flat = allDraftSegs();
+      if (!flat.length) { editAll.value = {}; return; }
+      const sorted = sortBlocksByGeometry(flat);
+      const by = {};
+      sorted.forEach((s) => {
+        const p = Number(s.page_no || 1);
+        (by[p] = by[p] || []).push(s);
+      });
+      editAll.value = by;
+    }
+
+    /** 某一页**重新切一遍**：线切出来的带 + 已有的框段（被框盖住的带不再生成）。
+     *
+     *  ⚠️ 新切出来的段必须给**唯一的 seq**。全填同一个值（比如 -1）的话，
+     *     它们会被 groupSegs 聚成「同一题」—— 一页切八刀，最后变成一道题。
+     *     这是分割线最容易错的一步：界面上框数是 9，题数是 1。
+     */
+    function resliceOne(p) {
+      const old = editAll.value[p] || [];
+      const raw = reslicePage(old, editLines.value[p] || [], editEnds.value[p] || 1000);
+      let next = 0;
+      allDraftSegs().forEach((s) => { next = Math.max(next, Number(s.seq) + 1); });
+      /* ★ **分组继承**：新带的**上边界**与某个旧线段相同，就把那个旧段的
+       *   `seq / q_no / skipped` 一起搬过来。
+       *
+       *   为什么必须有这一步：跨页题靠 `seq` 分组，而这里会把这一页的线段
+       *   **全部重建**。老师「把跨页题并好 → 顺手把末段底边拖到 96%」是很自然的
+       *   收尾顺序 —— 不继承的话，第 1 页那半段拿到一个新 seq，跨页题当场被拆成
+       *   两道（一道只有上半页、一道只有下半页）。界面上只表现为「题数多了一题」，
+       *   很难看出是哪一步拆的。
+       *
+       *   为什么按「上边界相同」而不是面积重叠比：一题的**起点**才是它的身份。
+       *   拖结束线只动末段的底边（y0 不变）→ 该继承；加一刀则下半段有一个新的
+       *   y0 → 该拿新 seq（「切歪了重切」就是在表达这个意思）。面积比两个方向
+       *   都会错：`new ⊂ old` 会把加一刀的两半都判成继承，`old ⊂ new` 则会把
+       *   「末段被截掉一大半」判成不继承 —— 跨页题照样被拆掉。
+       *   `taken` 保证一个旧段只被认领一次（两半继承同一个 seq 就并成一题了）。 */
+      const top = (b) => Math.round(Number((b || [])[1] || 0));
+      const taken = new Set();
+      const out = raw.map((s) => {
+        if (s.src !== 'line') return s;      // 框段原样：id / seq / q_no / 跨页分组全保住
+        const host = old.find((o) => o.src === 'line' && !taken.has(o)
+          && top(o.box) === top(s.box));
+        if (host) {
+          taken.add(host);
+          return {
+            ...s, seq: Number(host.seq || 0), q_no: host.q_no || '',
+            skipped: !!host.skipped, page_no: p,
+          };
+        }
+        const seg = { ...s, seq: next, page_no: p };
+        next += 1;
+        return seg;
+      });
+      editAll.value = { ...editAll.value, [p]: out };
+      sortAll();
+      regionsDirty.value = true;
+      touchRegionsDraft();
+    }
+
+    /* ---------------- 分割线的三个动作（标注层只报坐标，判断全在这一层） ---------------- */
+
+    /** 点一下加一条线。`y` 已经是 0~1000 的页坐标（换算在标注层做，这里不重算）。 */
+    function addLine(y) {
+      const p = pageNo.value;
+      const v = Math.round(Number(y));
+      if (!Number.isFinite(v)) return;
+      const cur = (editLines.value[p] || []).slice();
+      // 太近就不加：切出来的段会比后端 REGION_MIN_SIDE 还薄，送上去是 422，
+      // 界面上还会多一行「第 N 题 · 高 0.3%」—— 两个人都不知道该怎么办。
+      if (cur.some((l) => Math.abs(l - v) < LINE_MIN_GAP)) {
+        warn('离已有的线太近了 —— 那样切出来的题太薄，模型读不出内容');
+        return;
+      }
+      cur.push(v);
+      cur.sort((a, b) => a - b);
+      editLines.value = { ...editLines.value, [p]: cur };
+      resliceOne(p);
+    }
+
+    /** 拖线微调。标注层只在真挪动过时才报（点一下不动手什么都不做）。 */
+    function moveLine(payload) {
+      const p = pageNo.value;
+      const from = Math.round(Number(payload && payload.from));
+      const to = Math.round(Number(payload && payload.to));
+      if (!Number.isFinite(from) || !Number.isFinite(to)) return;
+      const cur = (editLines.value[p] || [])
+        .map((l) => (Math.abs(l - from) < 0.5 ? to : l))
+        .sort((a, b) => a - b);
+      editLines.value = { ...editLines.value, [p]: cur };
+      resliceOne(p);
+    }
+
+    function removeLine(y) {
+      const p = pageNo.value;
+      const v = Number(y);
+      const cur = (editLines.value[p] || []).filter((l) => Math.abs(l - v) > 0.5);
+      editLines.value = { ...editLines.value, [p]: cur };
+      resliceOne(p);
+    }
+
+    /* ---------------- 每页尾部：结束线（末段切到哪为止） ----------------
+     * 用户原话：「每页尾部处理也不到位」。真实情况是：最后一题的作答区一直写到
+     * 页底，而页底还有页脚 / 页码 / 条形码 —— 末段必然把那些一起送进模型。
+     * 这里给一个明确的旋钮：末段底边拖到 96%，下面 4% 就不进任何块。
+     * ⚠️ 只影响**线切出来的段**；手拖的框本来就由老师自己定边，不去动它。 */
+    function setPageEnd(y) {
+      const p = pageNo.value;
+      const v = Math.round(clampUnit(Number(y)));
+      if (!Number.isFinite(v) || v <= 0) return;
+      // 结束线必须落在最后一条线下方，否则会切出一个 0 高度的段（后端直接 422）
+      const lastLine = (editLines.value[p] || []).slice().sort((a, b) => b - a)[0] || 0;
+      if (v - lastLine < LINE_MIN_GAP) {
+        warn('结束线太靠上了 —— 至少要离最后一条分割线 ' + LINE_MIN_GAP + ' 的距离');
+        return;
+      }
+      editEnds.value = { ...editEnds.value, [p]: v };
+      resliceOne(p);
+    }
+
+    function resetPageEnd() {
+      const p = pageNo.value;
+      const next = { ...editEnds.value };
+      delete next[p];
+      editEnds.value = next;
+      resliceOne(p);
+    }
+
+    /** 末段下方那一截（页脚带）的位置，给标注层画一条提示 —— 没有就是 null。 */
+    const pageTail = computed(() => {
+      if (!editingRegions.value) return null;
+      const e = Number(editEnds.value[pageNo.value] || 1000);
+      return e < 1000 ? [0, e, 1000, 1000] : null;
+    });
+
+    /* ---------------- 不送 AI：按块 / 按页（0030） ---------------- */
+
+    /** 一块（可能多段）设不设「不判」。**只改草稿**，点「保存分割」才落库。
+     *  ⚠️ 按 `seq` 改**整块的所有段**：跨页题只跳上半段等于只批半道题。 */
+    function toggleBlockSkip(b) {
+      const seq = Number(b && b.seq);
+      const want = !(b && b.skipped);
+      const by = {};
+      Object.entries(editAll.value).forEach(([k, list]) => {
+        by[k] = (list || []).map((s) => (Number(s.seq) === seq ? { ...s, skipped: want } : s));
+      });
+      editAll.value = by;
+      regionsDirty.value = true;
+      touchRegionsDraft();
+    }
+
+    /** 整页不看：**立即落库**（它是一条独立接口，不跟着「保存分割」走）。
+     *  理由：老师说「这页不看」的那一刻就该生效，混在还没保存的框草稿里很容易漏。 */
+    const skippedPages = computed(
+      () => ((detail.value && detail.value.skipped_pages) || []).map(Number),
+    );
+    const pageSkipped = computed(() => skippedPages.value.includes(pageNo.value));
+    async function togglePageSkip() {
+      const next = pageSkipped.value
+        ? skippedPages.value.filter((n) => n !== pageNo.value)
+        : skippedPages.value.concat([pageNo.value]);
+      busy.value = 'pskip';
+      try {
+        const d = await gradeApi.setSkippedPages(gid, next);
+        if (detail.value) detail.value = { ...detail.value, skipped_pages: d.skipped_pages || [] };
+        ok(pageSkipped.value ? '这一页会重新送去批改' : '这一页不再送 AI 了（框都还留着）');
+      } catch (e) {
+        fail(e.message);
+      } finally {
+        busy.value = '';
+      }
+    }
+
+    /** 这一块切出来的样子（现裁、不落盘）。**保存前就能看** —— 这就是
+     *  「分割截图完后看不到图」的正解：切歪了当场发现，而不是等模型判完。
+     *  用 `id` 做 key 让浏览器缓存同一块的图；坐标一变 URL 就变，自然失效。 */
+    function blockPreview(b) {
+      const segs = (b && b.segs) || [];
+      if (!segs.length) return '';
+      const spec = segs
+        .map((s) => `${Number(s.page_no || 1)}:${(s.box || []).join(',')}`)
+        .join(';');
+      return gradeApi.regionImageUrl(gid, spec);
+    }
+    /** 大图：点缩略图新开一个页签看原尺寸（不引弹窗库）。 */
+    function openPreview(b) {
+      const url = blockPreview(b);
+      if (url) window.open(url, '_blank', 'noopener');
+    }
+
+    /** 画完一个框（标注层发上来的是 [x0,y0,x1,y1]）。只在本地，点「保存框」才落库。 */
+    function addRegionBox(box) {
+      const p = pageNo.value;
+      const list = (editAll.value[p] || []).slice();
+      let seq = 0;
+      allDraftSegs().forEach((s) => { seq = Math.max(seq, Number(s.seq) + 1); });
+      list.push({ id: null, seq, q_no: '', box, page_no: p, src: 'box' });
+      editAll.value = { ...editAll.value, [p]: list };
+      // 再切一次：被这个框盖住的线切段要退场，否则同一道题会出现两次
+      // （老师「先画线切好，再单独框住其中一题」就是靠这一步收口的）。
+      resliceOne(p);
+    }
+
+    /** 点图上的框/段 → 从草稿里去掉它（保存时才真的删）。
+     *
+     *  ⚠️ 线段不能"直接删段"：重切时它还会回来。删线段 = **删掉它上边那条线**
+     *     （语义是「这一刀不需要，并到相邻那段去」），见 gradeLines.lineToDropFor。
+     *  ⚠️ 匹配用 `box + seq` 而不是对象引用：标注层拿到的 `layerRegions` 是
+     *     `map` 出来的**新对象**，`x !== r` 永远成立 —— 那样点了删不掉，
+     *     而界面上看着"点了没反应"（2026-10-19 顺手修掉的老 bug）。
+     */
+    function dropRegion(r) {
+      if (!r) return;
+      const p = pageNo.value;
+      if (r.src === 'line' || isFullWidth(r.box)) {
+        const y = lineToDropFor(r.box, editLines.value[p] || []);
+        if (y !== null) { removeLine(y); return; }
+      }
+      const sig = JSON.stringify(r.box || []);
+      editAll.value = {
+        ...editAll.value,
+        [p]: editRegions.value.filter((x) => !(JSON.stringify(x.box || []) === sig
+          && Number(x.seq) === Number(r.seq))),
+      };
+      regionsDirty.value = true;
+      sortAll();
+      touchRegionsDraft();
+    }
+
+    /** 删掉**整道题**（跨页题的两段一起删）—— 面板上的「删」按钮。
+     *
+     *  ⚠️ 线段删了会「复活」：它在 `editLines` 里还有对应的那一刀，重切时又出来。
+     *     所以线段要先把它上边那条线删掉（与 dropRegion 同一条规则）。 */
+    function dropBlock(b) {
+      const segs = (b && b.segs) || [];
+      if (segs.some((s) => s.src === 'line')) {
+        segs.filter((s) => s.src === 'line').forEach((s) => {
+          const p = Number(s.page_no || 1);
+          const y = lineToDropFor(s.box, editLines.value[p] || []);
+          if (y !== null) {
+            editLines.value = {
+              ...editLines.value,
+              [p]: (editLines.value[p] || []).filter((l) => Math.abs(l - y) > 0.5),
+            };
+          }
+        });
+      }
+      const next = {};
+      Object.entries(editAll.value).forEach(([p, list]) => {
+        next[p] = (list || []).filter((s) => Number(s.seq) !== Number(b.seq));
+      });
+      editAll.value = next;
+      regionsDirty.value = true;
+      sortAll();
+      touchRegionsDraft();
+    }
+
+    /** 把这道题并入**上一题**（跨页题的收口动作，与批量录题的「并入上一块」同一个意思）。
+     *
+     *  这是「跨页分割的题目合并」的落点：第 2 页的第一段（接着上一页那道题的）
+     *  并入第 1 页的最后一段 → 两段同一个 `seq` → 后端竖拼成一张图再判。
+     *  ⚠️ 只认**列表顺序**，不要求两段在页面上相邻 —— 正是跨页时的常态。 */
+    function mergeRegion(b) {
+      const blocks = regionBlocks.value;
+      const i = blocks.findIndex((x) => Number(x.seq) === Number(b.seq));
+      if (i <= 0) {
+        warn('这就是第一题，上面没有可以并的');
+        return;
+      }
+      const prev = Number(blocks[i - 1].seq);
+      const next = {};
+      Object.entries(editAll.value).forEach(([p, list]) => {
+        next[p] = (list || []).map(
+          (s) => (Number(s.seq) === Number(b.seq) ? { ...s, seq: prev } : s),
+        );
+      });
+      editAll.value = next;
+      regionsDirty.value = true;
+      sortAll();
+      touchRegionsDraft();
+    }
+
+    /** 题号收口（旧名 relabelRegions）：老师删掉中间一题后，后面的要顺上来。
+     *  现在直接交给 `sortAll` —— 它按**几何**排，连「先画第 2 页后画第 1 页」
+     *  也能排对（分割线是逐页切的，老师完全可能从中间某页开始）。 */
+    function relabelRegions() {
+      sortAll();
+    }
+
+    /** 改题号 = 改**整道题**（跨页题两段一起改，否则会变成两道题）。 */
+    function setRegionQNo(b, v) {
+      const next = {};
+      Object.entries(editAll.value).forEach(([p, list]) => {
+        next[p] = (list || []).map(
+          (s) => (Number(s.seq) === Number(b.seq) ? { ...s, q_no: v } : s),
+        );
+      });
+      editAll.value = next;
+      regionsDirty.value = true;
+      touchRegionsDraft();
+    }
+
+    /** 清空**整份**草稿（跨页框存在之后，「本页」这个词已经不够用了）。
+     *  ⚠️ 线也要一起清 —— 只清段的话，下一次任何 operation 触发重切，
+     *     整页的段又会长回来（老师会以为「清空没生效」）。 */
+    function clearRegions() {
+      if (!allDraftSegs().length && !lineCount.value) return;
+      editAll.value = {};
+      editLines.value = {};
+      regionsDirty.value = true;
+      touchRegionsDraft();
+    }
+
+    async function saveRegions() {
+      busy.value = 'regions';
+      try {
+        const segs = allDraftSegs();
+        // `grouped: true` 是**显式声明**「我按 seq 分好组了」。不传的话后端按
+        // 「一框一题」处理 —— 那是安全的默认值，但跨页题会被拆成两题。
+        const res = await gradeApi.putRegions(gid, {
+          grouped: true,
+          regions: segs.map((s) => ({
+            page_no: Number(s.page_no),
+            seq: Number(s.seq || 0),
+            q_no: String(s.q_no || '').trim(),
+            box: s.box,
+            // 「这块不送 AI」。后端会把同一题几段归一成一致的值。
+            skipped: !!s.skipped,
+          })),
+        });
+        detail.value.regions = res.regions;
+        syncRegions();
+        // 存进库了 = 本机草稿的使命结束。不清的话，下次打开还会弹「恢复了没保存的框」。
+        localDraft.touch({ regions: null });
+        const blocks = groupSegs(res.regions || []);
+        const cross = blocks.filter((b) => b.pages.length > 1).length;
+        const skipped = blocks.filter((b) => b.skipped).length;
+        ok(segs.length
+          ? `已保存 ${blocks.length} 题（${segs.length} 个段${cross ? `，其中 ${cross} 题跨页` : ''}`
+            + `${skipped ? `，${skipped} 题不判` : ''}）`
+          : '已清空全部框 —— 整份退回整页批');
+        if (items.value.length) {
+          warn('框改了要重新批改一次才生效 —— 点右边「重新批改」');
+        }
+      } catch (e) {
+        fail(e.message);
+      } finally {
+        busy.value = '';
+      }
+    }
+
+    /** 沿用上一份的框：一套卷只画一次。**先取同课时的列表再拷**，
+     *  不猜 id —— 猜错了会把别人的卷面当成模板。 */
+    async function copyRegions() {
+      busy.value = 'copy';
+      try {
+        const rows = await gradeApi.list(detail.value.lesson_id);
+        const others = (rows || []).filter((r) => String(r.id) !== String(gid));
+        if (!others.length) {
+          warn('这节课只有这一份，没有可沿用的框 —— 先画一次');
+          return;
+        }
+        const res = await gradeApi.copyRegions(gid, others[0].id);
+        detail.value.regions = res.regions;
+        syncRegions();
+        const blocks = groupSegs(res.regions || []);
+        ok(`已沿用另一份的 ${blocks.length} 题（${(res.regions || []).length} 个框）`
+          + ' —— 扫一眼，框偏了就重画');
+      } catch (e) {
+        fail(e.message);
+      } finally {
+        busy.value = '';
+      }
+    }
 
     /** 页数：优先数提交件的 pages（total 就是页数，不是题数）；没有就按题上的最大页码兜底。 */
     const pageCount = computed(() => {
@@ -194,6 +807,18 @@ export default {
     const setupRubric = ref('');
     const setupTouched = ref(false);      // 用户动过没动过 —— 没动过就跟着服务端走
     const setupBusy = ref(false);
+    /** 答案/细则**引用的文件**（lesson_files.id）。
+     *  为什么要有这条：老师手上常常只有一张答案照片，没有可粘贴的文字。 */
+    const setupAnswerFiles = ref([]);
+    /** 服务器上「真的会被送进模型」的图片（按 role 分）。只给文字的话，
+     *  老师传了照片却看到答案框空着，会以为没生效。 */
+    const setupImages = computed(
+      () => (detail.value && detail.value.answer_images) || { answer: [], rubric: [] },
+    );
+    const answerImgCount = computed(
+      () => (setupImages.value.answer || []).length
+        + (setupImages.value.rubric || []).length,
+    );
     const setupEditable = computed(() => !!detail.value
       && ['queued', 'failed'].includes(detail.value.status) && !detail.value.done);
 
@@ -202,9 +827,42 @@ export default {
       setupMode.value = detail.value.answer_mode || 'ai';
       setupAnswer.value = detail.value.answer_text || '';
       setupRubric.value = detail.value.rubric_text || '';
+      setupAnswerFiles.value = (detail.value.answer_file_ids || []).map(Number);
       setupTouched.value = false;
     }
-    function touchSetup() { setupTouched.value = true; }
+
+    /** 把没保存的判定依据从本机草稿恢复回来。
+     *
+     *  为什么必须有这一步：老师粘贴了半页评分细则、又去翻了一下卷面，
+     *  回来发现输入框是空的 —— 那种「白填一遍」的挫败感比丢笔迹还强。
+     *  ⚠️ 已经批出结果时不恢复（`setupEditable` 为假）：那时候改了也存不进去，
+     *     不如让他看到服务端真实用的那一份。 */
+    function restoreDraftSetup() {
+      const s = boot.setup;
+      if (!s || setupTouched.value) return;
+      if (!setupEditable.value) { localDraft.touch({ setup: null }); return; }
+      if (!s.answer_mode && !s.answer_text && !s.rubric_text
+          && !(s.files || []).length) return;
+      setupMode.value = s.answer_mode || setupMode.value;
+      setupAnswer.value = String(s.answer_text || '');
+      setupRubric.value = String(s.rubric_text || '');
+      setupAnswerFiles.value = (s.files || []).map(Number);
+      // 标成「改过」：不保存就退出时，草稿还得在。否则下一轮 load 又把它冲掉。
+      setupTouched.value = true;
+      warn('恢复了上次没保存的判定依据 —— 看一眼对不对，再点「保存依据」');
+    }
+
+    function touchSetup() {
+      setupTouched.value = true;
+      localDraft.touch({
+        setup: {
+          answer_mode: setupMode.value,
+          answer_text: setupAnswer.value,
+          rubric_text: setupRubric.value,
+          files: setupAnswerFiles.value.slice(),
+        },
+      });
+    }
 
     /** 保存判定依据。返回 false = 别继续（比如老师填了细则但保存失败，不该照样开批）。 */
     async function saveSetup() {
@@ -215,6 +873,7 @@ export default {
           answer_mode: setupMode.value,
           answer_text: setupAnswer.value,
           rubric_text: setupRubric.value,
+          answer_file_ids: setupAnswerFiles.value,
         });
         initSetup();
         ok('判定依据改好了');
@@ -222,6 +881,139 @@ export default {
       } catch (e) {
         fail(e.message);
         return false;
+      } finally {
+        setupBusy.value = false;
+      }
+    }
+
+    /** 传一张答案 / 细则**照片**。图会真的随卷面一起送进模型（不是抽文字）。
+     *
+     *  为什么走 `role=homework`：这是**这次作业**的文件（答案页 / 细则页扫描件），
+     *  与提交件同一份清单，老师回头在「交作业」里也找得到，不会变成一份没人认领的孤儿。
+     *  ⚠️ `input` 上**不要**设 `accept` —— 本机经验：accept 会把老师想选的文件藏起来
+     *     （.lnk 那种），比选错更烦。格式不对后端会当场说清楚。 */
+    async function uploadAnswerFile(file) {
+      if (!file) return;
+      if (!setupEditable.value) {
+        warn('这份已经开始批了 —— 换依据要重建任务');
+        return;
+      }
+      // 剪贴板里的图常常**没有文件名**（截图工具只给一个 Blob）。
+      // 这里补一个名字：后端按扩展名判"这是不是图"，没有名字会被当成未知格式退回。
+      let f = file;
+      if (!f.name) {
+        const ext = String(f.type || '').includes('jpeg') ? 'jpg'
+          : String(f.type || '').includes('webp') ? 'webp' : 'png';
+        try {
+          f = new File([f], `paste-${Date.now()}.${ext}`, { type: f.type || 'image/png' });
+        } catch (e) {
+          f = file;        // 老浏览器没有 File 构造器：原样传，让后端说话
+        }
+      }
+      setupBusy.value = true;
+      try {
+        const fd = new FormData();
+        fd.append('file', f);
+        const up = await lessonFilesApi.upload(detail.value.lesson_id, fd, 'homework');
+        setupAnswerFiles.value = setupAnswerFiles.value.concat([Number(up.id)]);
+        detail.value = await gradeApi.patchSetup(gid, {
+          answer_mode: setupMode.value,
+          answer_text: setupAnswer.value,
+          rubric_text: setupRubric.value,
+          answer_file_ids: setupAnswerFiles.value,
+        });
+        initSetup();
+        localDraft.touch({ setup: null });     // 已经存进库了，本机草稿不必再留着
+        ok('答案照片传上去了 —— 批改时会把这张图一起给模型看');
+      } catch (err) {
+        fail(err.message);
+      } finally {
+        setupBusy.value = false;
+      }
+    }
+
+    /** 从 `<input type="file">` 选文件。 */
+    async function uploadAnswerImage(e) {
+      const file = (e.target && e.target.files && e.target.files[0]) || null;
+      if (e.target) e.target.value = '';      // 清掉 value：同一个文件再选一次也能触发
+      await uploadAnswerFile(file);
+    }
+
+    /** 从剪贴板 / 拖进来的东西里挑出**第一张图**。
+     *
+     *  用户 2026-10-19 的要求：「上传图片也可是缓存中的图片」——
+     *  最常走的就是这条路：截图（或从别的窗口复制一张图）→ Ctrl+V。
+     *  以前非得先存成文件再选，多两步，还要记得存哪儿了。
+     *
+     *  三种来源的差别（都遇到过）：
+     *    ① `items` 里的 `kind === 'file'` —— 截图工具、从图片编辑器复制，最常见
+     *    ② `files` —— 少数浏览器把粘贴的图只放这里，不放进 items
+     *    ③ 从网页复制的 `<img>` —— `items` 里只有一串 HTML/URL，**拿不到二进制**。
+     *       那种情况这里返回 null，页面提示「先存成文件」—— 不硬猜 URL（猜了也是 CORS 404）。
+     */
+    function imageFromClipboard(e) {
+      const cd = e && (e.clipboardData || e.dataTransfer || globalThis.clipboardData);
+      if (!cd) return null;
+      const items = cd.items || [];
+      for (let i = 0; i < items.length; i += 1) {
+        const it = items[i];
+        if (it && it.kind === 'file' && String(it.type || '').startsWith('image/')) {
+          const f = it.getAsFile ? it.getAsFile() : null;
+          if (f) return f;
+        }
+      }
+      const files = cd.files || [];
+      for (let i = 0; i < files.length; i += 1) {
+        if (String(files[i].type || '').startsWith('image/')) return files[i];
+      }
+      return null;
+    }
+
+    /** 全局粘贴：**只在判定依据能改、且真的贴了一张图时**接管。
+     *
+     *  ⚠️ 贴的是文字时**绝不 preventDefault** —— 老师往答案框里贴一段题目文本，
+     *     那是这个页面最常见的操作，抢过来就是灾难。
+     *  ⚠️ 只在 `setupMode` 不是 `ai` 时接（AI 自己解的时候没有"给答案"这个概念）。
+     */
+    function onPaste(e) {
+      if (setupMode.value === 'ai' || !setupEditable.value) return;
+      const file = imageFromClipboard(e);
+      if (!file) return;
+      e.preventDefault();
+      uploadAnswerFile(file);
+    }
+
+    /** 拖一张图到「或者直接传照片」那块。 */
+    function onAnswerDrop(e) {
+      if (!setupEditable.value) {
+        warn('这份已经开始批了 —— 换依据要重建任务');
+        return;
+      }
+      if (setupMode.value === 'ai') {
+        warn('先把上面切到「用我给的答案」或「用我的评分细则」，图才有去处');
+        return;
+      }
+      const dt = e && e.dataTransfer;
+      const files = (dt && dt.files) || [];
+      const img = Array.from(files).find((f) => String(f.type || '').startsWith('image/'));
+      if (img) { uploadAnswerFile(img); return; }
+      warn('拖进来的不是图片 —— 图片文件（png / jpg）才收');
+    }
+
+    async function clearAnswerImages() {
+      if (!setupEditable.value) {
+        warn('这份已经开始批了 —— 换依据要重建任务');
+        return;
+      }
+      setupBusy.value = true;
+      try {
+        detail.value = await gradeApi.patchSetup(gid, {
+          answer_mode: setupMode.value, answer_file_ids: [],
+        });
+        initSetup();
+        ok('已去掉答案照片 —— 只按粘贴的文字判');
+      } catch (err) {
+        fail(err.message);
       } finally {
         setupBusy.value = false;
       }
@@ -260,11 +1052,48 @@ export default {
         if (pageNo.value > pageCount.value) pageNo.value = pageCount.value;
         if (pageNo.value < 1) pageNo.value = 1;
         if (!setupTouched.value) initSetup();     // 没动过才跟服务端走，别把老师刚敲的字冲掉
+
+        /* ---- 本机草稿的恢复（只在**第一次**非 silent 加载之后做一次） ----
+         * 三件事分开做，因为它们的"该不该恢复"完全不同：
+         *   · 判定依据：已经批出结果就不恢复（改了也存不进去）
+         *   · 框题/分割线：有草稿就恢复，并标成"未保存"让老师知道要按保存
+         *   · 页号：恢复到上次看的那一页 —— 一页七八题，回来还得找回原页很烦 */
+        if (!silent && !regionsRestored) {
+          regionsRestored = true;
+          restoreDraftSetup();
+          const r = boot.regions;
+          if (r && (Object.keys(r.segs || {}).length || Object.keys(r.lines || {}).length)) {
+            editAll.value = r.segs || {};
+            editLines.value = r.lines || {};
+            editEnds.value = r.ends || {};
+            regionsDirty.value = true;
+            warn('恢复了上次没保存的框/分割线 —— 看一眼，对了就点「保存分割」');
+          }
+          if (boot.page_no > 1 && boot.page_no <= pageCount.value) pageNo.value = boot.page_no;
+        }
+        // 每次拿到服务端数据都对一次账：队列里「其实已经存进去了」的清掉
+        reconcile();
+        /* ⚠️ **先关 loading，再画**。题目区在模板里是 `v-else`（`v-if="loading"` 的反面），
+         * loading 还是 true 的时候那几个 `.g-rich` 容器**根本不在 DOM 里**，`setRich` 没被调过
+         * → `paintKey` 全部命中 `if (!el) return` → 题干 / 学生作答 / 参考答案**一片空白**。
+         * 2026-10-19 用 jsdom 真挂一遍才发现：容器有 3 个、内容 0 个。
+         * 为什么平时没露馅：轮询与「跑完自动刷新」都走 load(true)（silent，不动 loading），
+         * 容器早就在了 —— **只有第一次打开/刷新这一页**才白。 */
+        if (!silent) loading.value = false;
         await paintAll();
+
+        /* 补发上次没传上去的笔迹。放在**这里**（load 成功之后）而不是 onMounted：
+         * 补发前要先知道服务端已经有哪些，否则会把同一笔画两遍。
+         * `flushedOnce` 在调用**之前**置位 —— flushPending 内部还会 load(true) 一次，
+         * 不置位就是无限递归。 */
+        if (!flushedOnce && !silent) {
+          flushedOnce = true;
+          await flushPending();
+        }
       } catch (e) {
         if (!silent) { loadError.value = e.message; fail(e.message); }
       } finally {
-        if (!silent) loading.value = false;
+        if (!silent) loading.value = false;      // 兜底：上面那行之前就抛了也要放出来
       }
     }
 
@@ -298,30 +1127,144 @@ export default {
       }
     }
 
+    /** 终止批改。⚠️ 后端只是「受理」，在跑的 AI 调用掐不断（一次二三十秒），
+     *  所以：① 不能自己把 running 置 false（否则「状态说停了、题还在冒出来」）
+     *        ② 不能停轮询，要继续等状态真的落到 reviewing
+     *  已批的页后端会保留（reviewing），没批的就不批了。 */
+    async function cancelRun() {
+      if (!running.value || busy.value) return;
+      if (!window.confirm('终止后，已经批完的页会保留，没批的页就不批了。\n要现在停吗？')) return;
+      busy.value = 'cancel';
+      try {
+        await gradeApi.cancel(gid);
+        // 不把 runAsked 放下、也不改 status —— 等轮询看到后端真的收尾
+        startPolling();
+        ok('已请求终止，正在收尾（在跑的那几页会跑完）…');
+      } catch (e) {
+        fail(e.message);        // 后端 409 时 detail 里写的是「现在没在批改」
+      } finally {
+        busy.value = '';
+      }
+    }
+
     /* ---------------- 手写批改（画 / 擦 / 文字框 / 快放 √×） ----------------
      * 全部落到同一张 homework_grade_marks 表，kind 区分形状。
      * ⚠️ 坐标 0~1000、按页归一化，组件算好再交上来 —— 这里**不做任何坐标换算**，
      *    两边各算一次，迟早会出现「屏幕上是准的、导出的 PDF 跑位」。 */
 
     function setTool(t) {
-      tool.value = tool.value === t ? 'view' : t;   // 再点一次退出，不用另找「选择」按钮
+      const next = tool.value === t ? 'view' : t;   // 再点一次退出，不用另找「选择」按钮
+      // 离开「框题/分割线」时没保存的东西不能悄悄丢 —— 老师画了五个框最怕这个。
+      // ⚠️ 只提示、**不替老师清草稿**：本机草稿仍然在，下次点回来还能接着弄。
+      if (editingRegions.value && !['region', 'line'].includes(next)
+          && regionsDirty.value
+          && !window.confirm('这些框/分割线还没保存，切换就收起。要放弃吗？\n（不急：它们已经存在本机，点回来还在）')) {
+        return;
+      }
+      tool.value = next;
       if (tool.value !== 'text') textDraft.value = null;
+      // ⚠️ 有未保存草稿时**绝不**从服务器同步 —— 那会把老师刚画的一把盖掉，
+      //    正是「退出就没了」的同一个 bug 换了个触发点。
+      if (editingRegions.value && !regionsDirty.value) syncRegions();
     }
 
+    /* ---------------- 笔迹：先存本机，再送服务端 ----------------
+     * 顺序反过来就是这次要修的 bug（用户原话：「不小心退出，记录就没了」）：
+     * 先 POST 的话，画完立刻关页面那一下请求会被浏览器取消 —— 界面上"画过"，
+     * 库里没有，回来一看全没了。
+     *
+     * 现在的时序：
+     *   ① `pushMark` 进本机队列（localStorage，防抖写）→ 这一笔从此不会丢
+     *   ② 乐观显示：`pageMarks` 会把它和服务器的一起画出来
+     *   ③ POST；成功标 `sent`，`settle()` 拿到服务端数据，**对上了才出队**
+     *   ④ 失败：留在队列里，界面上照常显示，下次打开自动补发
+     */
     async function addMark(payload) {
+      const body = Object.assign({ page_no: pageNo.value }, payload);
+      const lid = localDraft.pushMark(body);
+      syncPending();
       try {
-        await gradeApi.addMark(gid, Object.assign({ page_no: pageNo.value }, payload));
+        await gradeApi.addMark(gid, body);
+        localDraft.setSent(lid, true);
+        syncPending();
         await settle();
+        // settle 成功才出队 —— 否则「POST 成功但详情没拉回来」会有一瞬间的空白
+        localDraft.dropMarks([lid]);
+        syncPending();
       } catch (e) {
-        fail(e.message);
+        fail(`${e.message} —— 这一笔已经存在本机，下次打开会自动补发`);
       }
     }
 
-    /** 松手时一次交上来一批 id。**串行删**：SQLite 单写者，并发删会撞锁。 */
+    /** 把队列里服务端还没有的补发上去。返回补了几笔。
+     *
+     *  ⚠️ **只发服务端没有的**：`sameMark` 比的是形状+坐标，不是 id ——
+     *     因为是另一台设备/清过缓存之后，id 早就对不上了。
+     *  ⚠️ 一次批量发（`addMarks`），不是一笔一个请求：刚打开页面那几秒里
+     *     网络最不稳，三十笔连发很容易断在半路。 */
+    async function flushPending(manual = false) {
+      const queue = localDraft.marks();
+      if (!queue.length) {
+        if (manual) ok('没有要补发的笔迹');
+        return 0;
+      }
+      const missing = queue.filter((m) => !marks.value.some((s) => sameMark(s, m)));
+      if (!missing.length) {
+        // 全都在库里了（上次其实发成功了，只是没来得及对账）
+        localDraft.dropMarks(queue.map((m) => m.lid));
+        syncPending();
+        if (manual) ok('没有要补发的笔迹');
+        return 0;
+      }
+      try {
+        await gradeApi.addMarks(gid, missing.map((m) => ({
+          page_no: m.page_no,
+          kind: m.kind,
+          geo: m.geo,
+          points: m.points,
+          text: m.text,
+          color: m.color,
+        })));
+        localDraft.dropMarks(missing.map((m) => m.lid));
+        syncPending();
+        await load(true);
+        ok(`补发了 ${missing.length} 笔上次没传上去的批注`);
+        return missing.length;
+      } catch (e) {
+        fail(`补发失败：${e.message}（还在本机，稍后自动重试）`);
+        return 0;
+      }
+    }
+
+    /** 对账：队列里「服务端已经有了」的清掉。
+     *
+     *  为什么不能发完就删：POST 成功与详情刷新之间有个空窗，
+     *  这段时间界面上靠队列里的那条撑着（否则笔迹会闪一下再回来）。 */
+    function reconcile() {
+      const queue = localDraft.marks();
+      if (!queue.length) return;
+      const gone = queue
+        .filter((m) => marks.value.some((s) => sameMark(s, m)))
+        .map((m) => m.lid);
+      if (gone.length) {
+        localDraft.dropMarks(gone);
+        syncPending();
+      }
+    }
+
+    /** 松手时一次交上来一批 id。**串行删**：SQLite 单写者，并发删会撞锁。
+     *  ⚠️ `local:` 开头的是**本机还没传上去的**，从队列里删就行 —— 发给服务端只会 404。 */
     async function eraseMarks(ids) {
       if (!ids || !ids.length) return;
+      const locals = ids.filter((x) => isLocalMarkId(x)).map((x) => String(x).slice(6));
+      const remotes = ids.filter((x) => !isLocalMarkId(x));
+      if (locals.length) {
+        localDraft.dropMarks(locals);
+        syncPending();
+      }
+      if (!remotes.length) return;
       try {
-        for (const mid of ids) await gradeApi.removeMark(mid);
+        for (const mid of remotes) await gradeApi.removeMark(mid);
         await settle();
       } catch (e) {
         fail(e.message);
@@ -361,9 +1304,20 @@ export default {
       await addMark({ kind: 'text', geo: [d.x, d.y, d.x, d.y], text, color: inkColor.value });
     }
 
-    /** 撤销：删掉本页最后一条自己放的。笔迹一笔一条，所以撤销 = 退掉一笔。 */
+    /** 撤销：先退**本机还没传上去的**最后一笔，再退服务端的。
+     *
+     *  为什么先退本机的：它们是"最后画的"（队列是有序追加），而且删本地的不发请求 ——
+     *  老师连着画三笔、发现第三笔画歪了，点一下就该立刻消失。
+     *  ⚠️ 服务端那批要按 **id 大小**找最后一笔；本机队列的 id 是字符串，混在一起排会乱。 */
     async function undoLast() {
-      const mine = teacherMarks.value;
+      const locals = pendingMarks.value
+        .filter((m) => Number(m.page_no || 1) === pageNo.value && !m.sent);
+      if (locals.length) {
+        localDraft.dropMark(locals[locals.length - 1].lid);
+        syncPending();
+        return;
+      }
+      const mine = serverTeacherMarks.value;
       if (!mine.length) return;
       const last = mine.reduce((a, b) => (Number(a.id) > Number(b.id) ? a : b));
       await eraseMarks([last.id]);
@@ -376,11 +1330,18 @@ export default {
       await eraseMarks(mine.map((m) => m.id));
     }
 
-    /** 导出带批改痕迹的副本。原件不动 —— 后端画在别的文件上。 */
-    function exportFile(fmt) {
+    /** 导出带批改痕迹的副本。原件不动 —— 后端画在别的文件上。
+     *
+     *  ⚠️ 导出读的是**服务端**的标注，本机队列里的还没传上去的那些画不进去。
+     *     所以先补发一次再导 —— 老师看到"我刚画的没出现在 PDF 里"只会以为功能坏了。 */
+    async function exportFile(fmt) {
       if (!detail.value || !detail.value.total) {
         warn('还没有页图 —— 先点「开始批改」，页图渲染出来才能导出');
         return;
+      }
+      if (detail.value && pendingUnsent.value) {
+        exporting.value = fmt;
+        try { await flushPending(); } finally { exporting.value = ''; }
       }
       exporting.value = fmt;
       const a = document.createElement('a');
@@ -390,6 +1351,30 @@ export default {
       a.click();
       a.remove();
       setTimeout(() => { exporting.value = ''; }, 1200);
+    }
+
+    /** ★ 导出到作业存档 —— 存进 `students/<学生>/<日期>/批改/`（学生资料「改作业」回看）。
+     *
+     *  ⚠️ 与 exportFile 的区别：那个是**下载到电脑**（发家长用），这个是**留在库里**
+     *     （以后回看用）。两个按钮并排，别合并 —— 合并之后「我只是想留个档」
+     *     也会在下载目录里多出一个文件。
+     *  ⚠️ 同样要先补发本机笔迹：导出读的是**服务端**标注，刚画的那几笔还在本机队列里。
+     */
+    async function archiveGrade() {
+      if (!detail.value || !detail.value.total) {
+        warn('还没有页图 —— 先点「开始批改」，页图渲染出来才能存档');
+        return;
+      }
+      busy.value = 'archive';
+      try {
+        if (pendingUnsent.value) await flushPending();
+        const r = await gradeApi.archive(gid);
+        ok('已存进学生资料：' + (r.rel_path || r.name));
+      } catch (e) {
+        fail('存档失败：' + e.message);
+      } finally {
+        busy.value = '';
+      }
     }
 
     async function setVerdict(item, v) {
@@ -511,8 +1496,14 @@ export default {
       else cardEls.delete(String(id));
     }
     function goPage(n) {
-      pageNo.value = Math.min(Math.max(1, Number(n) || 1), pageCount.value);
+      const target = Math.min(Math.max(1, Number(n) || 1), pageCount.value);
+      if (target === pageNo.value) return;
+      // ⚠️ 框题模式下翻页**不提示未保存**：草稿是整份按页分桶存的（editAll），
+      //    翻页只是换一桶看。跨页题本来就是「第 1 页画一半、翻到第 2 页画另一半」，
+      //    每翻一次都弹一次确认，等于把这条操作路径堵死。
+      pageNo.value = target;
       pageBroken.value = false;
+      localDraft.touch({ page_no: target });    // 重开回到上次那一页（一页七八题，找回来很烦）
     }
     const prevPage = () => goPage(pageNo.value - 1);
     const nextPage = () => goPage(pageNo.value + 1);
@@ -535,11 +1526,56 @@ export default {
     /** ungradable 必须说清为什么 —— 只给一个灰点，老师会当成「AI 没干活」。 */
     const naReason = (item) => item.error_reason || '识别不清 / 图题 / 没作答';
 
+    /* ---------------- 模型回的两个「界面上要用」的信号（0030） ----------------
+     * `block_kind` / `tail_note` 是区域模式才有的字段。**只在区域模式下发**，
+     * 老记录（整页批的）里是空串 —— 所以这里必须能优雅地什么都不显示。
+     *
+     * ⚠️ 它们**只当提示，绝不自动跳过**：模型说「这块像卷头」也可能是它读错了，
+     *    自动跳过就等于让模型决定「什么不判」，而老师根本不知道它跳了。
+     *    所以这里只给一行提示 + 一个「去设成不判」的跳转，决定权还在老师手上。 */
+    const BLOCK_KIND_LABEL = {
+      header: '卷头 / 页眉', section: '段落标题', footer: '页脚 / 页码',
+      blank: '空白', other: '其它（不像题目本体）',
+    };
+    /** 这块「不像一道题」时返回中文名，否则返回空串（question 和空都算正常题）。 */
+    const oddKind = (item) => {
+      const k = String((item && item.block_kind) || '').trim();
+      return k && k !== 'question' ? (BLOCK_KIND_LABEL[k] || BLOCK_KIND_LABEL.other) : '';
+    };
+    /** 模型给的分类标签（0031）。⚠️ **按固定顺序**输出，不遍历 `Object.keys()`：
+     *  JSON 的键序跨语言（Python → JSON → JS）之后不保证，四个标签的先后会跳。
+     *  空值与纯空白一律滤掉 —— 「学段·」这种半个标签比没有还难看。 */
+    const labelsOf = (item) => {
+      const m = (item && item.labels && typeof item.labels === 'object') ? item.labels : {};
+      return LABEL_ORDER
+        .filter((x) => String(m[x.k] || '').trim())
+        .map((x) => ({ k: x.k, name: x.name, v: String(m[x.k]).trim() }));
+    };
+    /** 有框才谈得上「设成不判」—— 整页批的记录里没有块可点。 */
+    const hasBlocks = computed(() => regions.value.length > 0);
+    /** 从题卡跳到那一页的分割模式，让老师自己点「这块不判」。
+     *  不替老师做决定，也不按 seq 猜是哪一块（item.seq 与 region.seq 不同源）。
+     *
+     *  ⚠️ `setTool` 是**切换**语义（再点一次退出）—— 已经在这个模式里就不能再调，
+     *     否则「去设成不判」会把人踢回选择模式，正好反着来（挂载检查抓到的）。 */
+    function gotoSkipBlock(item) {
+      if (!item) return;
+      if (Number(item.page_no) !== pageNo.value) goPage(Number(item.page_no));
+      if (editingRegions.value) return;
+      setTool(regions.value.some((r) => isFullWidth(r.box)) ? 'line' : 'region');
+    }
+
     onMounted(async () => {
+      // 全局粘贴只服务于「判定依据传图」：贴文字时 onPaste 会立刻返回，
+      // 不抢 textarea 的正常粘贴（见 onPaste 的说明）。
+      window.addEventListener('paste', onPaste);
       await load();
       startPolling();
     });
     onBeforeUnmount(() => {
+      // 页面被路由切走时把草稿冲掉 —— 防抖窗口里那两百毫秒不能成为"丢一笔"的口子
+      localDraft.flush();
+      window.removeEventListener('paste', onPaste);
       stopPolling();
       richEls.clear();
       painted.clear();
@@ -548,19 +1584,35 @@ export default {
 
     return {
       detail, loading, loadError, busy, pageNo, pageBroken, selectedItemId, polling,
+      workbenchHref, entrySource,
       editId, draft, bankOpenId, bankQuestionId, bankTags,
       items, marks, pageMarks, pageCount, pageUrl, running, statusLabel, statusTag,
       runLabel, tallyText, VERDICTS,
-      load, run, setVerdict, toggleReviewed, openFix, closeFix, saveAnswer,
+      load, run, cancelRun, setVerdict, toggleReviewed, openFix, closeFix, saveAnswer,
       rerunItem, openBank, closeBank, saveToBank, confirm,
       setRich, setCard, goPage, prevPage, nextPage, onPick,
       verdictLabel, confLabel, flagLabel, naReason,
+      // 模型回的两个信号（只当提示，不自动跳过）
+      oddKind, hasBlocks, gotoSkipBlock, labelsOf,
       setupMode, setupAnswer, setupRubric, setupTouched, setupBusy, setupEditable,
-      touchSetup, saveSetup,
+      setupAnswerFiles, setupImages, answerImgCount, uploadAnswerImage, clearAnswerImages,
+      touchSetup, saveSetup, onAnswerDrop, onPaste,
       // 手写批改
       tool, inkColor, textDraft, exporting, INK_COLORS, teacherMarks, layerEl,
       setTool, addMark, eraseMarks, onTextAt, saveText, moveMark,
-      undoLast, clearPageMarks, exportFile,
+      undoLast, clearPageMarks, exportFile, archiveGrade,
+      // 本机草稿：待发笔迹 / 补发
+      pendingMarks, pendingUnsent, flushPending,
+      // 一题一区域（框选 + 分割线）：有段按段批，没段仍整页批
+      pageRegions, editRegions, editLines, pageLines, pageBands, lineCount,
+      layerRegions, layerLines, regionsDirty, editingRegions,
+      regionBlocks, draftSegCount,
+      addRegionBox, dropRegion, dropBlock, mergeRegion, setRegionQNo,
+      addLine, moveLine, removeLine,
+      // 不送 AI（按块 / 按页）+ 每页尾部（结束线）+ 块的缩略图
+      toggleBlockSkip, skippedPages, pageSkipped, togglePageSkip,
+      pageEnd, pageTail, setPageEnd, resetPageEnd, blockPreview, openPreview,
+      saveRegions, copyRegions, syncRegions, clearRegions,
     };
   },
   template: `
@@ -569,6 +1621,11 @@ export default {
       <h1>作业批改</h1>
       <span class="sub" v-if="detail">课时 #{{ detail.lesson_id }}</span>
       <div class="spacer"></div>
+      <!-- 新工作台（路线 B）：整条文件处理链路照批量录题那一套（所有页竖排滚动 +
+           右边块卡片逐块处理）。两个入口并存，老师对比后再决定删哪个 ——
+           所以这里是一个**普通链接，不是路由**（那是独立的零构建页面）。 -->
+      <a v-if="detail" class="btn" :href="workbenchHref"
+         title="所有页竖排滚动、右边块卡片逐块处理（照批量录题那一套）">新版工作台</a>
       <router-link v-if="detail" :to="'/students/' + detail.student_id" class="btn">返回学生</router-link>
       <router-link v-else to="/students" class="btn">返回学生</router-link>
     </div>
@@ -591,6 +1648,13 @@ export default {
           <span v-if="polling" class="small muted">· 自动刷新中</span>
           <div class="spacer"></div>
           <button class="btn sm" :disabled="running || busy === 'run'" @click="run">{{ runLabel }}</button>
+          <!-- 终止：只在跑批时出现。一份 6 页的作业十几分钟，切错分割想重来时
+               没有「停」就只能刷新页面 —— 而刷新之后线程还在跑。 -->
+          <button v-if="running" class="btn sm danger" :disabled="busy === 'cancel'"
+                  :title="'停在这里。已经批完的页会保留，没批的页就不批了'"
+                  @click="cancelRun">
+            {{ busy === 'cancel' ? '正在收尾…' : '终止' }}
+          </button>
           <!-- 只有「待核对」才能确认：没批完就确认，等于确认了一份半成品 -->
           <button class="btn sm primary" :disabled="detail.status !== 'reviewing' || busy === 'confirm'"
                   :title="detail.status === 'reviewing' ? '确认后这份批改才会进统计' : '批完（待核对）才能确认'"
@@ -607,8 +1671,26 @@ export default {
                   title="只导出当前这一页（PNG）" @click="exportFile('png')">
             {{ exporting === 'png' ? '导出中…' : '本页图' }}
           </button>
+          <!-- ★ 导出到**作业存档**：留在库里（不是下载到电脑）。
+               存进「学生 / 日期 / 批改」这个目录，之后在「学生资料 → 改作业」里能回看。
+               ⚠️ 这段注释里**不许出现反引号**：模板是字面量，反引号会把模板提前截断。 -->
+          <button class="btn sm" :disabled="busy === 'archive' || !detail.total"
+                  :title="detail.total
+                    ? '存进这个学生的资料（带笔迹的 PDF），以后在学生资料里能回看'
+                    : '页图还没渲染，先点开始批改'"
+                  @click="archiveGrade">
+            {{ busy === 'archive' ? '存档中…' : '导出到作业存档' }}
+          </button>
         </div>
         <div class="grade-tip">AI 只判对错，不给分；核对过才算数。</div>
+        <!-- 本机草稿里还有没送上去的笔迹：**必须说出来**，否则老师会以为「刚才那笔没存上」
+             而重画一遍（重画的结果是两条重叠的批注）。 -->
+        <div v-if="pendingUnsent" class="grade-draft-tip">
+          有 {{ pendingUnsent }} 笔批注还没传上去（已存在本机，不会丢）
+          <button class="btn ghost sm" :disabled="busy === 'flush'" @click="flushPending(true)">
+            {{ busy === 'flush' ? '补发中…' : '立即补发' }}
+          </button>
+        </div>
         <!-- 新建完任务是「未开始」：**不会自动批**，不点按钮永远不会跑 → 必须说出来，
              否则页面写着「未开始」也能被当成「在排队」（2026-10-17 实际踩到）。
              ⚠️ 要排除 running：刚点完开始批改的那一瞬间服务端也还是 queued（还没写 running），
@@ -656,6 +1738,24 @@ export default {
           <textarea rows="5" v-model="setupRubric" :disabled="!setupEditable" @input="touchSetup"
                     placeholder="第 3 题（10 分）：设未知数 2 分；列方程 3 分；解方程 3 分；检验作答 2 分。只写答案不写过程最多给 4 分。"></textarea>
         </div>
+        <div v-if="setupMode !== 'ai'" class="field" style="margin-top:8px">
+          <label class="small">或者直接传照片
+            <span class="muted">（答案页 / 手写细则；<b>Ctrl+V 直接粘贴</b>截图，或把图拖到下面这块）</span></label>
+          <!-- 拖拽区：包住整个文件行。dragover 上的 .prevent 是必须的 —— 不拦的话
+               浏览器会用「打开这个文件」接管，老师拖进来的图会把整页导航走。 -->
+          <div class="grade-ansfile grade-drop" :class="{ off: !setupEditable }"
+               @dragover.prevent @drop.prevent="onAnswerDrop">
+            <input type="file" :disabled="!setupEditable || setupBusy"
+                   @change="uploadAnswerImage">
+            <span v-if="answerImgCount" class="small" style="color:var(--success, #16a34a)">
+              已附 {{ answerImgCount }} 张
+            </span>
+            <button v-if="answerImgCount" class="btn ghost sm" :disabled="setupBusy"
+                    @click="clearAnswerImages">去掉</button>
+            <span v-else class="small muted">或拖一张图进来 · 也可以 Ctrl+V</span>
+          </div>
+          <div v-if="!setupEditable" class="small muted">已开始批了，依据不能再换。</div>
+        </div>
         <div class="small muted" v-if="setupMode === 'ai'">
           AI 会自己先解一遍再对照。它解错时整题会判错 —— 核对时留意一下。
         </div>
@@ -671,6 +1771,14 @@ export default {
             <button class="btn ghost sm" :disabled="pageNo <= 1" @click="prevPage">← 上一页</button>
             <span class="small">第 {{ pageNo }} / {{ pageCount }} 页</span>
             <button class="btn ghost sm" :disabled="pageNo >= pageCount" @click="nextPage">下一页 →</button>
+            <!-- 整页不看（0030）：封页、空白作答页、草稿页。**立即生效**，
+                 不跟着「保存分割」走 —— 老师说这页不看的那一刻就该不看。 -->
+            <button class="btn ghost sm" :class="{ on: pageSkipped }" :disabled="busy === 'pskip'"
+                    :title="pageSkipped ? '这一页现在不送 AI，点一下恢复' : '这一页整页不送 AI（框都还留着）'"
+                    @click="togglePageSkip">
+              {{ pageSkipped ? '本页不判 · 恢复' : '本页不判' }}
+            </button>
+            <span v-if="pageSkipped" class="tag orange">不送 AI</span>
             <div class="spacer"></div>
             <span class="small muted" v-if="pageMarks.length">这一页 {{ pageMarks.length }} 处标注</span>
             <span class="small muted" v-else>这一页没有标注</span>
@@ -689,6 +1797,11 @@ export default {
             <button class="g-tool g-mark" :class="{ on: tool === 'cross' }" title="点一下卷面就放一个 ×"
                     @click="setTool('cross')">×</button>
             <span class="g-sep"></span>
+            <button class="g-tool" :class="{ on: tool === 'line' }"
+                    title="画分割线逐题切开：在题目之间的空隙点一下就是一刀，比逐题拖框快得多"
+                    @click="setTool('line')">逐题分割</button>
+            <button class="g-tool" :class="{ on: tool === 'region' }" title="框出每道题的作答范围：有框就一题一裁一判，比整页判准得多"
+                    @click="setTool('region')">框题</button>
             <button v-for="c in INK_COLORS" :key="c.v" class="g-color" :class="{ on: inkColor === c.v }"
                     :style="{ background: c.v }" :title="c.n" @click="inkColor = c.v"></button>
             <div class="spacer"></div>
@@ -699,7 +1812,94 @@ export default {
             {{ tool === 'ink' ? '按住左键在卷面上写 / 画，松手就存。'
               : tool === 'erase' ? '按住左键划过要擦的笔迹（AI 的框也能擦）。'
               : tool === 'text' ? '在卷面上点一下，弹框里写批注，Ctrl+Enter 放上去。'
+              : tool === 'line' ? '在题目之间的空隙点一下 = 放一条分割线；按住线可以上下拖微调。相邻两条线之间就是一道题。'
+              : tool === 'region' ? '按住拖出一个框，把一道题（题干 + 作答）整个框进去。框宁大勿小 —— 切掉笔画就再也读不回来了。'
               : '在要判的地方点一下，就放一个 ' + (tool === 'check' ? '√' : '×') + '。' }}
+          </div>
+
+          <!-- ============ 分割 / 框题面板：两种画法共用一块 ============ -->
+          <!-- 数据上它们是同一件事（线切出来就是整页宽的框），所以面板也共用：
+               一行 = 一道题，跨页题显示成「跨第 1 + 2 页 · 2 段」。 -->
+          <div v-if="editingRegions" class="grade-regions">
+            <div class="gr-head">
+              <b>{{ tool === 'line' ? '逐题分割' : '框题' }}</b>
+              <span class="small muted">
+                {{ regionBlocks.length }} 题 · {{ draftSegCount }} 段<template v-if="lineCount"> · {{ lineCount }} 条分割线</template>
+              </span>
+              <span v-if="regionsDirty" class="small" style="color:var(--warning)">未保存</span>
+              <div class="spacer"></div>
+              <button class="btn ghost sm" :disabled="busy === 'copy'" @click="copyRegions">
+                {{ busy === 'copy' ? '沿用中…' : '沿用上一份' }}
+              </button>
+              <button class="btn ghost sm" :disabled="!draftSegCount && !lineCount" @click="clearRegions">全清</button>
+              <button class="btn sm" :disabled="busy === 'regions'" @click="saveRegions">
+                {{ busy === 'regions' ? '保存中…' : '保存分割' }}
+              </button>
+            </div>
+            <div v-if="!regionBlocks.length" class="small muted" style="padding:6px 0">
+              <template v-if="tool === 'line'">
+                还没分割线 —— 在卷面上<b>逐题点一下</b>，线之间就是一道题。
+                第一条线以上也算一段（学生可能从页顶就开始写），多出来的页眉段点「删」就行。
+              </template>
+              <template v-else>
+                还没画框 —— 在卷面上拖出一个框，把一道题（题干 + 作答）整个框进去。
+              </template>
+              有段的页<b>一段一次</b>判（切得越准，读得越清），没段的页仍然整页判一次。
+            </div>
+            <div v-else class="gr-list">
+              <!-- 一行 = 一道题。**必须带缩略图**：以前这里只有「第 1 页 / 跨第 1+2 页」两句话，
+                   切歪了只能等模型判完才知道哪块不对 —— 这就是用户说的「分割截图完后看不到图」。
+                   图走 /region-image 现裁（不落盘），**保存前就能看**，改一下坐标 URL 就变。 -->
+              <div v-for="b in regionBlocks" :key="'b-' + b.seq" class="gr-row"
+                   :class="{ off: b.skipped }">
+                <div class="gr-row-top">
+                  <span class="gr-no">{{ b.seq + 1 }}</span>
+                  <label class="small">题号</label>
+                  <input class="gr-q" :value="b.q_no" placeholder="留空就按顺序"
+                         @input="setRegionQNo(b, $event.target.value)">
+                  <span v-if="b.pages.length > 1" class="gr-span" :title="'两段会竖拼成一张图再判'">
+                    跨第 {{ b.pages.join(' + ') }} 页 · {{ b.pages.length }} 段
+                  </span>
+                  <span v-else class="small muted">第 {{ b.pages[0] }} 页</span>
+                  <div class="spacer"></div>
+                  <button class="btn ghost sm" :class="{ on: b.skipped }" @click="toggleBlockSkip(b)"
+                          :title="b.skipped ? '恢复：这块会重新送去批改' : '这块不送 AI（卷头、结构说明段、重复页上的段）——框还留着'">
+                    {{ b.skipped ? '不判 · 恢复' : '这块不判' }}
+                  </button>
+                  <button v-if="b.seq > 0" class="btn ghost sm" @click="mergeRegion(b)"
+                          title="跨页题：并到上一题，两段竖拼成一张图再判">并入上一题</button>
+                  <button class="btn ghost sm" @click="dropBlock(b)">删</button>
+                </div>
+                <div class="gr-thumb">
+                  <img :src="blockPreview(b)" loading="lazy" alt="这块切出来的样子"
+                       @click="openPreview(b)" title="点一下看大图">
+                  <span v-if="b.skipped" class="gr-off-tag">不送 AI</span>
+                </div>
+              </div>
+            </div>
+            <!-- 每页尾部：末段切到哪为止。默认到页底（历史行为），
+                 拖到 96% 就把页脚 / 页码那一截排除在块之外。 -->
+            <div v-if="tool === 'line'" class="gr-tail">
+              <span class="small">末段底边</span>
+              <input type="range" min="50" max="100" step="1" :value="pageEnd / 10"
+                     @input="setPageEnd($event.target.value * 10)">
+              <span class="small" :class="{ muted: pageEnd >= 1000 }">{{ pageEnd / 10 }}%</span>
+              <span v-if="pageEnd < 1000" class="small muted">
+                下面 {{ (1000 - pageEnd) / 10 }}% 不进任何块、不送 AI
+              </span>
+              <span v-else class="small muted">一直切到页底</span>
+              <div class="spacer"></div>
+              <button class="btn ghost sm" @click="setPageEnd(960)"
+                      title="页脚 / 页码通常在底部 4% 内">截掉页脚（96%）</button>
+              <button v-if="pageEnd < 1000" class="btn ghost sm" @click="resetPageEnd">到页底</button>
+            </div>
+            <div class="small muted" style="margin-top:6px">
+              题号由段绑定 —— 学生把「第 3 题」写成「第 8 题」也不会判错归属。
+              <b>跨页题</b>：在第 1 页切上半段、翻到第 2 页切下半段，再点下面那行的
+              「并入上一题」合成一道（两段会竖拼成一张图）。
+              <b>弄完一定要点「保存分割」</b>，然后重新批改。
+              没保存的也不会丢 —— 已经存在本机，退出再回来还在。
+            </div>
           </div>
 
           <div class="grade-page">
@@ -708,8 +1908,13 @@ export default {
             <!-- ⚠️ 成对写，别写成自闭合：零构建的模板里自闭合会把后面的节点吞掉 -->
             <GradeMarkLayer ref="layerEl" :marks="pageMarks" :selected-item-id="selectedItemId"
                             :mode="tool" :color="inkColor"
+                            :regions="layerRegions" :lines="layerLines" :bands="pageBands"
+                            :tail="pageTail"
                             @pick="onPick" @create="addMark" @erase="eraseMarks"
-                            @text-at="onTextAt" @stamp="addMark" @move="moveMark"></GradeMarkLayer>
+                            @text-at="onTextAt" @stamp="addMark" @move="moveMark"
+                            @region="addRegionBox" @region-remove="dropRegion"
+                            @add-line="addLine" @move-line="moveLine"
+                            @remove-line="removeLine"></GradeMarkLayer>
             <div v-if="pageBroken" class="grade-page-miss small">
               这一页的图还没生成出来（点「开始批改」之后才有），或者这一页渲染失败了
             </div>
@@ -750,6 +1955,27 @@ export default {
                       class="tag orange">{{ flagLabel(f) }}</span>
                 <div class="spacer"></div>
                 <button class="btn ghost sm" @click.stop="goPage(item.page_no)">第 {{ item.page_no }} 页</button>
+              </div>
+
+              <!-- 模型给的分类标签（0031）：学段 / 体系 / 知识点 / 考法。
+                   这是「这一份作业覆盖了哪些学段/体系/考法」的唯一来源 —— 以前它只
+                   躺在模型的原始输出里，老师想知道得自己一题题翻。 -->
+              <div v-if="labelsOf(item).length" class="g-labels">
+                <span v-for="lb in labelsOf(item)" :key="'lb-' + item.id + '-' + lb.k"
+                      class="g-label" :class="'lb-' + lb.k">{{ lb.name }}·{{ lb.v }}</span>
+              </div>
+
+              <!-- 模型说「这块不像一道题」。**只提示、不自动跳过** —— 它也可能读错，
+                   让模型决定"什么不判"而老师不知道，是最糟的一种自动化。 -->
+              <div v-if="oddKind(item)" class="g-odd">
+                <span class="tag orange">{{ oddKind(item) }}</span>
+                <span class="small">
+                  模型认为这一块不是题目本体，判出来多半是噪音
+                  <template v-if="hasBlocks">—— 可以在框题里点「这块不判」，框会留着</template>
+                </span>
+                <button v-if="hasBlocks" class="btn ghost sm" @click.stop="gotoSkipBlock(item)">
+                  去设成不判
+                </button>
               </div>
 
               <!-- 题干：空容器 + 函数 ref，内容由 renderRichEl 写 innerHTML（不能有插值） -->
@@ -804,6 +2030,28 @@ export default {
                 </div>
                 <div v-if="item.basis" class="g-basis">{{ item.basis }}</div>
                 <div v-if="!item.basis && !item.error_reason" class="small muted">AI 还没给出依据</div>
+              </div>
+
+              <!-- 图上读到的东西。**必须显示**：图形证据现在可以作判定依据了，
+                   老师得能核对「它说的那条直角符号」到底在不在图上，否则等于盲信。 -->
+              <div class="g-sec" v-if="item.figure_note">
+                <div class="g-lb">
+                  图上读到的
+                  <span class="muted small">（（确定）能作数 /（看不清）只作疑）</span>
+                </div>
+                <div class="g-figure">{{ item.figure_note }}</div>
+              </div>
+
+              <!-- 模型报的「底部有问题」。这是「每页尾部处理不到位」的另一半：
+                   老师自己看不出末段被切掉了一角，模型说出来才知道要回去调结束线。
+                   三种情况（页脚占了 / 被页切掉 / 有邻题残字）都用同一句话提示。 -->
+              <div class="g-sec" v-if="item.tail_note">
+                <div class="g-lb">这一块的底部</div>
+                <div class="g-tail-note">{{ item.tail_note }}</div>
+                <div class="small muted" style="margin-top:4px">
+                  多半是页脚 / 页码占了地方，或者题目被页边界切断了 ——
+                  到分割模式把这一页的「末段底边」往上收一点，翻页看看下面还有没有内容。
+                </div>
               </div>
 
               <div class="g-meta" v-if="item.kp_name || (item.tags || []).length">

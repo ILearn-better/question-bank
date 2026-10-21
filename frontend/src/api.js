@@ -377,6 +377,10 @@ export const gradeApi = {
   patchSetup: (gid, body) => api.patch(`/api/homework-grades/${gid}`, body),
   /** 开始/重跑。**幂等**：已经在跑时返回当前进度，不会重复开一个任务。 */
   run: (gid) => api.post(`/api/homework-grades/${gid}/run`),
+  /** 终止。**只受理「真的在跑」的那一批**，没在跑时后端给 409（detail 里是理由）。
+   *  ⚠️ 语义是「受理」而不是「立刻停」—— 在跑的那几页 AI 调用掐不断，
+   *     拿到 200 之后要继续轮询，等状态落到 reviewing。 */
+  cancel: (gid) => api.post(`/api/homework-grades/${gid}/cancel`),
   /** 整份确认（此后才进统计口径）。note 可以留空。 */
   confirm: (gid, note) => api.post(`/api/homework-grades/${gid}/confirm`, { note }),
 
@@ -385,6 +389,28 @@ export const gradeApi = {
   /** 导出**带批改痕迹的副本**：fmt=pdf 整份多页、fmt=png 单页。原件不动。 */
   exportUrl: (gid, fmt = 'pdf', page = 1) =>
     `/api/homework-grades/${gid}/export?fmt=${encodeURIComponent(fmt)}&page=${Number(page) || 1}`,
+
+  /** ★ 导出到**作业存档**：存进 `students/<学生>/<日期>/批改/`，
+   *  之后在「学生资料 → 改作业」里能回看。
+   *  ⚠️ 与上面的 exportUrl 是两件事：那个是下载到电脑上（发家长用），
+   *     这个是留在库里（以后回看用）。后端自己出 PDF，前端只发一个 grade_id。 */
+  archive: (gid, body) => api.post('/api/grade-archives/generate',
+    Object.assign({ grade_id: gid }, body || {})),
+
+  /** 一题一区域：老师框出每道题的作答道在哪，一框一次判；没框的页仍整页判。 */
+  listRegions: (gid) => api.get(`/api/homework-grades/${gid}/regions`),
+  /** **整页替换**：传这一页的完整框列表，传空数组 = 清空这一页的框。 */
+  putRegions: (gid, body) => api.put(`/api/homework-grades/${gid}/regions`, body),
+  /** 沿用同一节课另一份的框（一套卷只画一次）。跨课时会 422。 */
+  copyRegions: (gid, fromGradeId) =>
+    api.post(`/api/homework-grades/${gid}/regions/copy`, { from_grade_id: fromGradeId }),
+  /** 一块切出来的样子（现裁、不落盘）。**保存前就能看**，切歪了当场发现。
+   *  spec 形如 `1:40,540,1000,800`，跨页多段用 `;` 连接（与 /documents 那个同名接口同一套语法）。 */
+  regionImageUrl: (gid, spec) =>
+    `/api/homework-grades/${gid}/region-image?spec=${encodeURIComponent(spec)}`,
+  /** 整页不送 AI（**整份替换**，与框同一套口径）。只存页号，不动框。 */
+  setSkippedPages: (gid, pages) =>
+    api.patch(`/api/homework-grades/${gid}/skipped-pages`, { pages }),
 
   /** 改一题的判定 / 学生作答 / 错因 / 考点 / 核对状态。
    *  ⚠️ 改 student_answer 会**作废这一题的判定并重跑**（旧的 evidence 引用已经不存在了）。 */
@@ -396,6 +422,10 @@ export const gradeApi = {
 
   /** 原件上的标注：新增 / 改 / 删。 */
   addMark: (gid, body) => api.post(`/api/homework-grades/${gid}/marks`, body),
+  /** **一次补发多条**。给批改页的本地草稿队列用：老师画完立刻关页面时，
+   *  那些没送出去的笔迹会攒在本机，下次打开一次性补上（见 src/gradeDraft.js）。
+   *  ⚠️ 服务端**不去重** —— 调用方要保证只发「服务端还没有的」。 */
+  addMarks: (gid, marks) => api.post(`/api/homework-grades/${gid}/marks/batch`, { marks }),
   patchMark: (mid, body) => api.patch(`/api/grade-marks/${mid}`, body),
   removeMark: (mid) => api.del(`/api/grade-marks/${mid}`),
 };
@@ -405,4 +435,19 @@ export const systemApi = {
   backup: () => api.post('/api/system/backup'),
   backups: () => api.get('/api/system/backups'),
   fkCheck: () => api.get('/api/system/foreign-key-check'),
+};
+
+/** ★ 批改文件留存：「学生资料 → 改作业」的存档。
+ *  两条写入口 —— generate（从批改出 PDF）/ upload（老师手传），读只有一套。 */
+export const archiveApi = {
+  list: (studentId) => api.get(`/api/students/${studentId}/grade-archives`),
+  get: (id) => api.get(`/api/grade-archives/${id}`),
+  /** 把一份批改导出成带笔迹的 PDF 并存进学生目录（后端出 PDF，前端只发 grade_id）。 */
+  generate: (body) => api.post('/api/grade-archives/generate', body),
+  /** 手传一份文件（线下批好的卷子、别处拿到的答案…）。
+   *  FormData 里带 student_id / archived_on / grade_id / grader / note。 */
+  upload: (formData) => api.upload('/api/grade-archives/upload', formData),
+  remove: (id) => api.del(`/api/grade-archives/${id}`),
+  /** 原件地址。inline=1 时图片与 PDF 就地显示（预览用），其它类型照样下载。 */
+  rawUrl: (id, inline) => `/api/grade-archives/${id}/raw` + (inline ? '?inline=1' : ''),
 };

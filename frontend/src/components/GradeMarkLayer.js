@@ -29,6 +29,17 @@
 //    **笔迹 ink 不参与**（点列几百个点，一来一回的 PATCH 太大，而且老师本来就不需要挪笔迹）。
 //    拖动中的位移只存在本地的 `offsets` 里（跟着手走），松手才 PATCH 一次 ——
 //    每动一帧发一个请求，SQLite 单写者会直接被拖垮。
+//
+// ⑦ **分割线模式（line）于 2026-10-19 加入**，与 region（框选）是同一件事的两种画法：
+//    线切出来的是**整页宽**的段（`box = [0,y0,1000,y1]`），框选出来的是任意矩形段。
+//    两者落到库里长一个样，所以后端一个字都没改 —— 这是「不重造轮子」的关键。
+//    交互刻意分成两条路（抄的是批量录题的结论）：
+//      · **落点离已有线 18 个单位以内 → 拖那条线**（老师画完总要微调）
+//      · **否则 → 加一条新线**
+//    删除**只走右侧那个 ×**，不靠「点在线附近就删」—— 那个设计在批量录题那边
+//    被实际踩过：想加线却把刚画好的那条删了，非常难用。
+//    ⚠️ line 模式下**段（region rect）不接收指针事件**：段是整页宽的，
+//       收事件等于「页面任何地方都点不了新线」。段的删除走右栏面板。
 import { ref, watch } from 'vue';
 
 import { UNIT, bboxOf, clampUnit as clamp, flatPoints, pagePoint, segDist, shiftGeo } from '../markGeom.js';
@@ -125,6 +136,8 @@ function buildShape(mark, off) {
     itemId: mark.item_id === undefined ? null : mark.item_id,
     kind,
     color,
+    // 0 = 这一笔没记粗细（0033 之前的老记录）→ 模板里不绑 style，走 CSS 默认
+    width: Number(mark.width) || 0,
     text: mark.text || '',
     x, y, w, h, cx, cy,
     rect: { x: r1(x), y: r1(y), w: r1(w), h: r1(h) },
@@ -163,6 +176,15 @@ const MIN_STEP = 2.2;      // 抽稀：两点距离小于这个就不记（一�
 const MOVE_KINDS = ['box', 'ellipse', 'check', 'cross', 'arrow', 'text'];
 const DRAG_MIN = 4;        // 屏幕像素：手一抖几个像素不该被当成拖动（与月历那边同一个经验）
 
+/** 「框题」的最小边长（0~1000 制，20 ≈ 纸面 2%）。
+ *  **与后端 grade_store.REGION_MIN_SIDE 同值** —— 前端先挡一层，
+ *  省得老师为一次手抖发一个请求再吃一个 422。改一处必须改两处。 */
+const REGION_MIN = 20;
+
+/** 分割线的「抓住」半径（0~1000 制，18 ≈ 纸面 1.8%）。
+ *  比这更远就是「在空白处点一下 = 加一条新线」；近一点就是「拖这条线」。 */
+const LINE_HIT = 18;
+
 export default {
   name: 'GradeMarkLayer',
   props: {
@@ -170,17 +192,43 @@ export default {
     marks: { type: Array, default: () => [] },
     /** 当前选中的题目 id（item_id）。同题的标注一起高亮，老师能对上「这条框属于哪道题」。 */
     selectedItemId: { type: [String, Number], default: null },
-    /** view | ink | erase | text | check | cross */
+    /** view | ink | erase | text | check | cross | region | line */
     mode: { type: String, default: 'view' },
     /** 画笔颜色（老师批改常用红，其次蓝）。 */
     color: { type: String, default: '#dc2626' },
+    /** 笔迹粗细（屏幕像素；模板里配 `vector-effect: non-scaling-stroke`，
+     *  所以页图放大缩小时粗细不变，跟手写时的观感一致）。
+     *  ⚠️ `0` = 没指定 → **不输出** stroke-width 属性，走样式表默认值。
+     *     绝不能输出 `stroke-width: 0` —— SVG 里那是「整条笔迹消失」。 */
+    penWidth: { type: Number, default: 0 },
+    /** 这一页已经画好的「一题一区域」框（{id, seq, label, box}）。**只传当前页**。 */
+    regions: { type: Array, default: () => [] },
+    /** 这一页的分割线 y 坐标（0~1000）。**只在 line 模式下显示与响应**。 */
+    lines: { type: Array, default: () => [] },
+    /** 这一页由线切出来的段（`[0,y0,1000,y1]`），只用于画淡色带 + 序号。 */
+    bands: { type: Array, default: () => [] },
+    /** 末段以下那一截（`[0,endY,1000,1000]`）：页脚带。**不进任何块、不送 AI**。
+     *  没设结束线时是 null（末段一直切到页底，与历史行为一致）。 */
+    tail: { type: Array, default: null },
   },
-  emits: ['pick', 'create', 'erase', 'text-at', 'stamp', 'move'],
+  emits: ['pick', 'create', 'erase', 'text-at', 'stamp', 'move', 'region', 'region-remove',
+    'add-line', 'move-line', 'remove-line'],
   setup(props, { emit, expose }) {
     const svgEl = ref(null);
     const drawing = ref(false);
     const draft = ref([]);        // 正在画的那一笔（[[x,y],…]）
     const erasing = ref([]);      // 这次按住橡皮已经划掉的 id（松手才真删）
+    /* 「框题」模式正在拖的那一个框（region 模式专用）。
+     * 与 draft 分开：draft 是笔迹点列，regionDraft 是两个角点 —— 混在一起，
+     * 判断「松手时该发 create 还是 region」就得靠 mode 二次分叉，很容易漏。 */
+    const regionDraft = ref(null);   // { x0, y0, x1, y1 }
+    /* 分割线模式的两个瞬态（line 模式专用）：
+     *   lineDrag = 正在拖的那条线 {from, cur}（cur 跟着手走，松手才发出去）
+     *   pending  = 还没决定「是点击还是拖动」的落点 y
+     * 为什么不复用 regionDraft：线只有一个数（y），框有两个角点 ——
+     * 硬塞进一个对象里，模板与 onUp 都要靠 mode 二次判断，是「漏一个分支」的温床。 */
+    const lineDrag = ref(null);
+    const pending = ref(null);
 
     /* ---- 拖动移动（只在 view 模式）----
      * offsets: { [markId]: { base, dx, dy } }
@@ -218,7 +266,14 @@ export default {
     const isPicked = (s) => same(s.itemId, props.selectedItemId);
     const isLinked = (s) => s.itemId !== null && s.itemId !== undefined;
     const isGone = (s) => erasing.value.includes(String(s.mark.id));
-    const canMove = (s) => props.mode === 'view'
+    /* 哪些模式下已有的标注可以按住拖走。
+     * `view` 是原来的口径；**text 也放开**（2026-10-20 用户：「我还需要文本框可以
+     * 移动」）—— 文字模式下点空白处是新建，点在**已有文本框**上就是挪它，
+     * 这是最朴素的直觉；不放开的话老师得先切回「只看」再拖回来，两次多余的点击。
+     * ⚠️ 画笔/橡皮必须保持纯画/纯擦：那两个模式下按住标注是「落笔」，不是「抓东西」，
+     *    混在一起会变成「想写一笔，结果把上一笔拖跑了」。 */
+    const MOVE_MODES = ['view', 'text'];
+    const canMove = (s) => MOVE_MODES.indexOf(props.mode) >= 0
       && MOVE_KINDS.includes(s.kind)
       && s.mark.id !== null && s.mark.id !== undefined;
     const isDragging = (s) => !!dragState.value && dragState.value.id === String(s.mark.id);
@@ -379,7 +434,43 @@ export default {
           geo: [x - half, y - half, x + half, y + half],
           color: props.mode === 'check' ? '#16a34a' : '#dc2626',
         });
+        return;
       }
+      if (props.mode === 'region') {
+        // 拖出一个框。**必须 setPointerCapture**：老师常在页图边缘起手，
+        // 不捕获的话指针一移出 svg 就收不到 pointermove，框会停在半路。
+        drawing.value = true;
+        regionDraft.value = { x0: x, y0: y, x1: x, y1: y };
+        try { svgEl.value.setPointerCapture(e.pointerId); } catch (err) { /* 老浏览器 */ }
+        return;
+      }
+      if (props.mode === 'line') {
+        drawing.value = true;
+        try { svgEl.value.setPointerCapture(e.pointerId); } catch (err) { /* 同上 */ }
+        const near = nearestLine(y);
+        if (near !== null) {
+          // 落在已有线附近 → 拖它（老师画完总要微调一两个点）
+          lineDrag.value = { from: near, cur: near };
+          pending.value = null;
+        } else {
+          // 空白处落手 → 先记下，松手才决定要不要加（这样按住往下蹭也不会加两条）
+          pending.value = y;
+          lineDrag.value = null;
+        }
+      }
+    }
+
+    /** 离 y 最近的那条线（在 LINE_HIT 以内）。没有就 null。 */
+    function nearestLine(y) {
+      let hit = null;
+      let best = LINE_HIT;
+      (props.lines || []).forEach((ly) => {
+        const v = Number(ly);
+        if (!Number.isFinite(v)) return;
+        const d = Math.abs(v - y);
+        if (d <= best) { best = d; hit = v; }
+      });
+      return hit;
     }
 
     function onMove(e) {
@@ -398,12 +489,58 @@ export default {
       if (props.mode === 'erase') {
         const m = hitTest(x, y);
         if (m) markErased(m);
+        return;
       }
+      if (props.mode === 'region' && regionDraft.value) {
+        regionDraft.value = { ...regionDraft.value, x1: x, y1: y };
+        return;
+      }
+      if (props.mode === 'line') {
+        // 拖线：cur 跟着手走（只改本地，松手才 emit）。按在空白处时也允许
+        // 上下蹭一点再松手 —— 那条线就放在蹭完的位置，比「点歪了删掉重画」省事。
+        if (lineDrag.value) lineDrag.value = { ...lineDrag.value, cur: y };
+        else if (pending.value !== null) pending.value = y;
+      }
+    }
+
+    /** 松手时的框 → 规整成 [x0,y0,x1,y1]（左上到右下）。太小就不算数。 */
+    function draftBox() {
+      const d = regionDraft.value;
+      if (!d) return null;
+      const x0 = Math.min(d.x0, d.x1), x1 = Math.max(d.x0, d.x1);
+      const y0 = Math.min(d.y0, d.y1), y1 = Math.max(d.y0, d.y1);
+      if (x1 - x0 < REGION_MIN || y1 - y0 < REGION_MIN) return null;
+      return [x0, y0, x1, y1].map((v) => Math.round(clamp(v)));
     }
 
     function onUp() {
       if (!drawing.value) return;
       drawing.value = false;
+
+      if (props.mode === 'region') {
+        const box = draftBox();
+        regionDraft.value = null;
+        // 太小 = 手抖点了一下，不当作画框（与后端 REGION_MIN_SIDE 同口径，
+        // 前端先挡一层，省得每次都吃一个 422）
+        if (box) emit('region', box);
+        return;
+      }
+
+      if (props.mode === 'line') {
+        const drag = lineDrag.value;
+        const pend = pending.value;
+        lineDrag.value = null;
+        pending.value = null;
+        if (drag) {
+          const to = Math.round(clamp(drag.cur));
+          // 没挪动 = 只是点了一下这条线。**什么都不做**（删除走右侧 ×）——
+          // 批量录题那边试过「点在附近就删」，实际用起来是「想加线把已有的删了」。
+          if (Math.abs(to - drag.from) >= 1) emit('move-line', { from: drag.from, to });
+          return;
+        }
+        if (pend !== null) emit('add-line', Math.round(clamp(pend)));
+        return;
+      }
 
       if (props.mode === 'ink' && draft.value.length >= 2) {
         const pts = draft.value;
@@ -412,6 +549,9 @@ export default {
           points: flatPoints(pts),        // [x,y,x,y,…]，与库里 _norm_geo 同一形态
           geo: bboxOf(pts),               // 包围盒只用于命中/统计，形状靠 points
           color: props.color,
+          // 粗细与颜色同一类东西（「这一笔长什么样」），跟着笔迹一起存，
+          // 换设备/改样式都不会让历史笔迹的观感变样
+          width: props.penWidth || 0,
         });
       }
       draft.value = [];
@@ -425,11 +565,54 @@ export default {
 
     expose({ clearOffsets });   // 父组件 PATCH 失败时调它，界面退回原位
 
+    /** 分割线：当前显示用的列表（拖动中的那条用 cur 替代 from，才跟手）。 */
+    const lineList = () => (props.lines || [])
+      .map((v) => Number(v))
+      .filter((v) => Number.isFinite(v))
+      .map((v) => {
+        const cur = lineDrag.value && lineDrag.value.from === v ? lineDrag.value.cur : v;
+        return { y: Math.round(clamp(cur)), from: v, lx: '0%', ly: pct(cur) };
+      })
+      .sort((a, b) => a.y - b.y);
+
+    /** 段落带 + 序号：让老师一眼数出「这一页切成了几题」。**纯展示，不收事件**。 */
+    const bandList = () => (props.bands || []).map((b) => {
+      const v = numList(b);
+      if (v.length < 4) return null;
+      const y0 = clamp(Math.min(v[1], v[3]));
+      const y1 = clamp(Math.max(v[1], v[3]));
+      return { y: r1(y0), h: r1(y1 - y0), ly: pct(y0) };
+    }).filter(Boolean);
+
+    /** 拖线时右上角那个读数（「精度得让人看得见」，与批量录题同一个理由）。 */
+    const lineTip = () => {
+      const d = lineDrag.value;
+      if (!d) return null;
+      return { y: Math.round(clamp(d.cur)), ly: pct(d.cur) };
+    };
+
     return {
-      svgEl, drawing, draft, erasing,
+      svgEl, drawing, draft, erasing, regionDraft, lineDrag, pending,
       shapesFor, isPicked, isLinked, isGone, canMove, isDragging, pick, onPickClick,
       onDown, onMove, onUp, startDrag, dragTo, endDrag, cancelDrag,
+      lineList, bandList, lineTip,
       draftPoly: (pts) => pts.map((p) => `${r1(p[0])},${r1(p[1])}`).join(' '),
+      /** 框 → 画图要用的四个数 + 标签位置。**永不返回 null**（模板里直接取属性）。 */
+      regionRect: (box) => {
+        const b = numList(box);
+        if (b.length < 4) return { x: 0, y: 0, w: 0, h: 0, lx: '0%', ly: '0%' };
+        const x = Math.min(b[0], b[2]);
+        const y = Math.min(b[1], b[3]);
+        return {
+          x: r1(x), y: r1(y),
+          w: r1(Math.abs(b[2] - b[0])), h: r1(Math.abs(b[3] - b[1])),
+          lx: pct(x), ly: pct(y),
+        };
+      },
+      draftRect: (d) => ({
+        x: r1(Math.min(d.x0, d.x1)), y: r1(Math.min(d.y0, d.y1)),
+        w: r1(Math.abs(d.x1 - d.x0)), h: r1(Math.abs(d.y1 - d.y0)),
+      }),
     };
   },
   template: `
@@ -439,6 +622,35 @@ export default {
          画笔/橡皮/文字模式下由 CSS 反向打开整层的事件，同时让标注失去指针。 -->
     <svg class="gmark-svg" ref="svgEl" viewBox="0 0 1000 1000" preserveAspectRatio="none"
          @pointerdown="onDown" @pointermove="onMove" @pointerup="onUp" @pointercancel="onUp">
+      <!-- 一题一区域：**只在「框题」与「分割线」模式下显示**。平时也画出来的话
+           整页都是虚线框，老师就看不 clean 自己批到哪儿了。
+           line 模式下这些框只作参考（不收事件，见 app.css 的 .mode-line 规则）。 -->
+      <g v-if="mode === 'region' || mode === 'line'" class="gmark-regions">
+        <!-- ⚠️ key 里**必须带下标兜底**。刚画出来还没保存的框 id 是 null（父组件只给了
+             { id: null, q_no, box }），只写 'rg-' + r.id 的话连画三个 →
+             三个 'rg-null' 撞在一起。Vue 的 keyed diff 靠 key 找回节点，撞了就**删中间那个会删错格子**，
+             而界面上看着仍然「有这么多框」，谁也发现不了。
+             ⚠️ 这段注释在模板字面量里，**别写反引号**（会把模板提前截断，整文件语法错）。 -->
+        <g v-for="(r, i) in regions" :key="'rg-' + (r.id == null ? 'new' + i : r.id)" class="gmark-region"
+           @pointerdown.stop @click.stop="$emit('region-remove', r)">
+          <rect :x="regionRect(r.box).x" :y="regionRect(r.box).y"
+                :width="regionRect(r.box).w" :height="regionRect(r.box).h" class="rg-rect" />
+        </g>
+        <rect v-if="regionDraft" :x="draftRect(regionDraft).x" :y="draftRect(regionDraft).y"
+              :width="draftRect(regionDraft).w" :height="draftRect(regionDraft).h" class="rg-draft" />
+      </g>
+      <!-- 分割线：段带（淡）+ 线本身。**整组不收指针事件**（段是整页宽的，
+           收事件就等于「页面任何地方都点不了新线」）。线的拖动由 svg 根节点统一处理。 -->
+      <g v-if="mode === 'line'" class="gl-layer">
+        <!-- 末段以下（页脚带）：**明确画出来**，表示这一截不进任何块、不送 AI。
+             没有它的话老师只会看到「最后一段到 96%」，说不清下面那 4% 去哪了。 -->
+        <rect v-if="tail" class="gl-tail" x="0" :y="tail[1]" width="1000"
+              :height="Math.max(1, tail[3] - tail[1])" />
+        <rect v-for="(b, i) in bandList()" :key="'glb-' + i" class="gl-band"
+              x="0" :y="b.y" width="1000" :height="b.h" />
+        <line v-for="(l, i) in lineList()" :key="'gll-' + i" class="gl-line"
+              x1="0" :y1="l.y" x2="1000" :y2="l.y" />
+      </g>
       <g v-for="s in shapesFor(marks).filter(x => !isGone(x))" :key="s.key" class="gmark"
          :class="{ sel: isPicked(s), linked: isLinked(s), rough: s.mark.created_by !== 'teacher',
                    mv: canMove(s), drag: isDragging(s) }"
@@ -471,8 +683,15 @@ export default {
 
         <!-- 手绘折线（老师红笔 / AI 划的线）：和框可以同时存在。
              ink 是老师真笔迹，画粗一点、圆头圆角，看着才像笔。 -->
+        <!-- ⚠️ 粗细走 **inline style** 而不是 stroke-width 属性：
+             SVG 的呈现属性优先级**低于**样式表，样式表里那条 stroke-width: 2.2
+             会把它盖掉（写属性等于没写，而且不报错）。inline style 才盖得住。
+             ⚠️⚠️ 这个文件整体是一个模板字面量：注释里**不许出现反引号**，
+                 出现一个就把模板从那儿截断，整个组件加载失败（marksReady=false）。
+                 2026-10-21 在这条注释上踩过一次。 -->
         <polyline v-if="s.poly" class="shape" :class="{ ink: s.kind === 'ink' }"
                   :points="s.poly" :stroke="s.color"
+                  :style="s.width > 0 ? { strokeWidth: s.width + 'px' } : null"
                   fill="none" stroke-linecap="round" stroke-linejoin="round" />
         <circle v-if="s.dot" class="shape" :cx="s.dot.cx" :cy="s.dot.cy" r="7"
                 :stroke="s.color" fill="none" />
@@ -480,7 +699,8 @@ export default {
 
       <!-- 正在画的这一笔：不进库、不落后端，松手才提交（拖到一半网断了不至于留半条） -->
       <polyline v-if="draft.length > 1" class="gmark-draft" :points="draftPoly(draft)"
-                :stroke="color" fill="none" stroke-linecap="round" stroke-linejoin="round" />
+                :stroke="color" :style="penWidth > 0 ? { strokeWidth: penWidth + 'px' } : null"
+                fill="none" stroke-linecap="round" stroke-linejoin="round" />
     </svg>
 
     <!-- 文字标注用 HTML 定位：SVG 的 <text> 在非等比 viewBox 里会被压扁。
@@ -492,5 +712,25 @@ export default {
           @pointerdown="startDrag($event, s)" @pointermove="dragTo"
           @pointerup="endDrag" @pointercancel="cancelDrag"
           @click.stop="onPickClick(s)">{{ s.text }}</span>
+
+    <!-- 分割线：段序号 + 线上的 ×。
+         ⚠️ 点线本身**不删**（只拖），删除只走这个 × —— 见文件头 ⑦。 -->
+    <template v-if="mode === 'line'">
+      <span v-for="(b, i) in bandList()" :key="'glbn-' + i" class="gl-band-no"
+            :style="{ top: b.ly }">{{ i + 1 }}</span>
+      <span v-for="(l, i) in lineList()" :key="'gllx-' + i" class="gl-line-x"
+            :style="{ top: l.ly }" title="删掉这条分割线"
+            @click.stop="$emit('remove-line', l.from)">×</span>
+      <span v-if="lineTip()" class="gl-tip" :style="{ top: lineTip().ly }">
+        {{ lineTip().y }}
+      </span>
+    </template>
+
+    <!-- 框的编号：写「3 ×」，点一下就删（删框走列表也行，这里图省事）。
+         key 同样要有下标兜底 —— 理由见上面 gmark-regions 那段。 -->
+    <span v-for="(r, i) in (mode === 'region' ? regions : [])"
+          :key="'rgl-' + (r.id == null ? 'new' + i : r.id)"
+          class="gmark-rlabel" :style="{ left: regionRect(r.box).lx, top: regionRect(r.box).ly }"
+          @click.stop="$emit('region-remove', r)" :title="'点一下删掉这个框'">{{ r.label }} ×</span>
   </div>`,
 };

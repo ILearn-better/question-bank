@@ -1174,7 +1174,10 @@ class HomeworkGrade(Base):
     # queued → running → reviewing → done；出错是 partial（部分题失败）/ failed（整份没起来）
     status: Mapped[str] = mapped_column(String, default="queued", server_default="queued")
     # ai = 模型自己解题后判断；key = 老师给的答案；rubric = 老师给的分步评分细则
-    answer_mode: Mapped[str] = mapped_column(String, default="key", server_default="key")
+    # 默认 ai（2026-10-21 用户点名：新建批改默认「AI 自主判定」）。
+    # ⚠️ server_default 仍是 "key"：改它要给已有库来一次 batch 迁移，而它只在
+    #    「有人手写 INSERT 不带这一列」时才起作用 —— ORM 插入一定带上 Python 默认值。
+    answer_mode: Mapped[str] = mapped_column(String, default="ai", server_default="key")
 
     # ⚠️ total 是**页数**，不是题目数 —— 同 batch_jobs 踩过的坑：
     #    混着用，进度条会出现「done 3 / total 3」而列表里 11 条。
@@ -1187,6 +1190,10 @@ class HomeworkGrade(Base):
     full_score: Mapped[float | None] = mapped_column(REAL)
 
     error: Mapped[str] = mapped_column(Text, default="", server_default="")
+    # 整页不送 AI 的页号（0030），JSON 数组文本："[]" / "[2,5]"。
+    # 存文本而不是另开一张表的理由见迁移 0030：它永远「整份一次读写」，
+    # 行数不超过页数，多一张表只多一次 join。
+    skipped_pages: Mapped[str] = mapped_column(Text, default="[]", server_default="[]")
     dir_rel: Mapped[str] = mapped_column(Text, default="", server_default="")
     created_at: Mapped[str] = mapped_column(Text, default=_now, server_default=NOW)
     finished_at: Mapped[str | None] = mapped_column(Text)
@@ -1227,6 +1234,13 @@ class HomeworkGradeFile(Base):
     )
     name: Mapped[str] = mapped_column(String, nullable=False)
     stored: Mapped[str] = mapped_column(Text, default="", server_default="")   # 仅 answer/rubric 自落盘时用
+    # 抽出来的文字（0034）。答案/细则常常是一份 PDF / Word / Excel ——
+    # 「原件」与「给模型看的文字」必须分开：stored 指向原件（老师要能点开预览），
+    # 这里放抽出来的正文（喂给模型）。
+    # 为什么不用 lesson_files.text：那条路要求文件挂在课时下、且会出现在「交作业」
+    # 清单里 —— 一份答案 PDF 混进提交件后，下次建批改会被**默认勾上**当学生作业批。
+    # 所以依据文件落在批改自己的目录里，自带一份文字。图片恒为空串（走视觉通道）。
+    text: Mapped[str] = mapped_column(Text, default="", server_default="")
     role: Mapped[str] = mapped_column(String, default="submission", server_default="submission")
     kind: Mapped[str] = mapped_column(String, default="", server_default="")
     size_bytes: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
@@ -1273,11 +1287,29 @@ class HomeworkGradeItem(Base):
     score: Mapped[float | None] = mapped_column(REAL)
     full_score: Mapped[float | None] = mapped_column(REAL)
     basis: Mapped[str] = mapped_column(Text, default="", server_default="")         # 判定依据（人话）
+    # 图上读到的东西：几何要点（点/线/辅助线/记号 + 「（确定）」「（看不清）」标注）
+    # 或统计图表的数表（「区间:频数」等）。
+    # ⚠️ 2026-10 之前它只躺在 raw 里 —— 于是「凭图判分」的结论对老师完全不可核对，
+    #    他没法判断模型说的「有直角符号」是不是真有。现在单独一列、界面上直接给出来。
+    figure_note: Mapped[str] = mapped_column(Text, default="", server_default="")
     confidence: Mapped[str] = mapped_column(String, default="low", server_default="low")
     kp_name: Mapped[str] = mapped_column(Text, default="", server_default="")
     node_id: Mapped[int | None] = mapped_column(ForeignKey("nodes.id"))
     tags: Mapped[str] = mapped_column(Text, default="[]", server_default="[]")      # 错题标签
     error_reason: Mapped[str] = mapped_column(Text, default="", server_default="")
+    # 模型对「这一块是什么」的判断（0030）：question / header / section / footer /
+    # blank / other。**只当提示用，绝不自动跳过** —— 判错一块等于丢一道题，
+    # 而多问老师一句的代价是零。界面拿它在卡片上说「模型说这块像卷头，可以设不判」。
+    block_kind: Mapped[str] = mapped_column(String, default="", server_default="")
+    # 这一块**底部**的情况（0030）：底部被页脚占了 / 底部疑似被页切掉 / 底部有别题残字。
+    # 为什么值得单列：这是「每页尾部处理不到位」缺的那条信息 —— 以前模型看到了也不说，
+    # 老师只能从判定结果反推「最后一题怎么判错了」。
+    tail_note: Mapped[str] = mapped_column(Text, default="", server_default="")
+    # 模型给的结构化分类标签（0031）：{"stage": 学段, "system": 体系, "kp": 知识点,
+    # "exam": 考法}。JSON 文本而不是四列 —— 取值随体系变，加一个维度不该再迁移一次。
+    # ⚠️ 与 `tags` 的区别：`tags` 是老师随手打的（可改、重批不覆盖），
+    #    `labels` 是模型给的（只读、重批就换）。混在一起会出现「老师删了、重批又回来」。
+    labels: Mapped[str] = mapped_column(Text, default="{}", server_default="{}")
     flags: Mapped[str] = mapped_column(Text, default="[]", server_default="[]")     # transcription_conflict / insufficient_evidence …
     raw: Mapped[str] = mapped_column(Text, default="{}", server_default="{}")       # 模型原始输出（供复核与重放）
     transcription_version: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
@@ -1320,8 +1352,132 @@ class HomeworkGradeMark(Base):
     points: Mapped[str] = mapped_column(Text, default="[]", server_default="[]")    # 手绘折线，0~1000
     text: Mapped[str] = mapped_column(Text, default="", server_default="")
     color: Mapped[str] = mapped_column(String, default="", server_default="")
+    # 笔迹粗细，**屏幕像素**（前端配 `vector-effect: non-scaling-stroke`，缩放时不变）；
+    # 0 = 没指定，交给样式表（`.gmark .shape { stroke-width: 2.2 }`）。
+    # ⚠️ 不能用 0 当「细」：SVG 的 stroke-width:0 会让这一笔整条消失。
+    width: Mapped[float] = mapped_column(REAL, default=0.0, server_default="0")
     created_by: Mapped[str] = mapped_column(String, default="ai", server_default="ai")
-    flags: Mapped[str] = mapped_column(Text, default="[]", server_default="[]")     # mark_rough …
+    flags: Mapped[str] = mapped_column(String, default="[]", server_default="[]")     # mark_rough …
     created_at: Mapped[str] = mapped_column(Text, default=_now, server_default=NOW)
 
     __table_args__ = (Index("idx_hwgrade_marks_grade", "grade_id", "page_no"),)
+
+
+class HomeworkGradeRegion(Base):
+    """**一题一区域**：老师在这页上框出「第 N 题的作答在哪」，每框单独裁切、单独调模型。
+
+    为什么值得单开一张表（而不是继续整页一次判所有题）：
+
+    1. **整页理解是最大的系统性误差源**。整页 4000×3000 里，单题的作答可能只有
+       300×300；视觉编码器一降采样，角度符号、上下标、小数点全糊。裁出来再放大，
+       等于把「有效分辨率」翻几倍 —— 不动模型、不花钱。
+    2. **消掉题号错配**。题号由框索引（`seq` / `q_no`）决定，不依赖模型认学生手写的
+       「第 3 题」—— 学生写串行、写漏题号都不会再判错归属。
+    3. **隔离跨题污染**。上一题的字迹伸进下一题区域，是「打乱分组」的直接原因；
+       框外的东西模型根本看不见，这个问题从物理上消失。
+
+    ⚠️ **为什么不建「卷面模板」这一层实体**：一套卷的框要复用，做法是
+    `PUT regions?copy_from=<同课时另一份>`，把框拷过来即可。多一层模板表意味着
+    「模板 / 记录」两处都能改、还要处理「模板改了旧记录跟不跟」。
+    **代价**必须写在这里：不同学生的照片会有平移/旋转，拷过来的框会偏。
+    所以（a）前端画框时提示「宁大勿小」，（b）裁切时按 `REGION_PAD` 外扩，
+    （c）框偏到裁掉了作答时，右栏会看到「转写为空」——老师能当场发现并修框。
+
+    ⚠️ `box` 与标注同制：**按页归一化的 0~1000 整数**，不是像素。
+    页图尺寸随渲染 dpi 变，存像素的框换个 dpi 就全错位。
+
+    ## 一段 ≠ 一题：`seq` 是题、`seg` 是段（0029 起）
+
+    一道题可能被页界切开（解答题跨页很常见），所以「一题」= `seq` 相同的一到多行：
+
+        seq=1 seg=0 page=1 box=…     第 1 题的上半段
+        seq=1 seg=1 page=2 box=…     第 1 题的下半段（接在上一段下面）
+        seq=2 seg=0 page=2 box=…     第 2 题
+
+    这样跨页题裁出来是**一张竖拼的图**，题号也仍然只有一个 —— 与批量录题的
+    `blocks`（一段或多段合成一道题）是同一套语义，只是这里给 AI 的是一道题、
+    要回来的是一条判定。旧的单选题记录 `seg` 全是 0，行为与 0028 完全一致。
+
+    ⚠️ 为什么复用 `pdf_adapter.crop_regions` 而不是自己拼：它本来就是
+    「多个区域（可跨页）竖着拼成一张 PNG」，批量录题的原貌图走的就是它；
+    拼接用的是 insert_image 渲染（Pixmap.copy 贴出来是全白的，踩过）。
+    """
+
+    __tablename__ = "homework_grade_regions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    owner_id: Mapped[int] = mapped_column(Integer, nullable=False, default=OWNER_ID, server_default=str(OWNER_ID))
+    grade_id: Mapped[int] = mapped_column(
+        ForeignKey("homework_grades.id", ondelete="CASCADE"), nullable=False
+    )
+    page_no: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    # 题序号（0 起）。**同一道题的几段共用同一个 seq** —— 这是「跨页题」的表示法。
+    seq: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    # 段序号（0 起）。单页题恒为 0；跨页题按页界先后 0,1,…，拼接顺序就是它。
+    seg: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    # 卷面题号。老师填了就一定用它（不采信模型认的题号）；空着才回落到模型的 q_no。
+    q_no: Mapped[str] = mapped_column(String, default="", server_default="")
+    box: Mapped[str] = mapped_column(Text, default="[]", server_default="[]")     # [x0,y0,x1,y1]，0~1000
+    # 「这一段不送 AI」（0030）：卷头段、纯结构说明段（「四、解答题；共 77 分」）、
+    # 重复页上的段。**不删框** —— 删了下次想恢复就得重画；这只是「别送模型」。
+    skipped: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    created_at: Mapped[str] = mapped_column(Text, default=_now, server_default=NOW)
+
+    __table_args__ = (Index("idx_hwregions_grade", "grade_id", "seq", "seg"),)
+
+
+class GradeArchive(Base):
+    """批改文件的**存档**：一份批改完成后落进「学生资料」里的可回看副本。
+
+    目标流程（用户 2026-10-20）：
+        上交作业 → 批改作业 → 记录归档到学生资料的「改作业」→ 点开看批改情况
+
+    三条「为什么单独一张表」：
+
+    ① **列表是「按学生、按日期」的，不是「按磁盘」。** 光扫目录拿不到
+       「这是哪份批改、批改人是谁、关联哪节课、AI 判了几题」——
+       那些都在库里，而目录只有一个文件名。
+    ② **预览要能区分「可内嵌」与「只能下载」。** 这个判断按 `kind` 走，
+       不能让浏览器猜后缀：`.docx` 拖进 iframe 是白屏，比给个下载按钮糟得多。
+    ③ **删记录要连文件一起删。** 得有一条记录知道文件在哪 ——
+       而读文件**只认这条记录里的 `rel_path`**，绝不接受客户端传路径
+       （`storage.safe_join` 是唯一入口，越界一律 None）。
+
+    ⚠️ `grade_id` 可空 + SET NULL：老师也可能把一份「线下批好的卷子」直接传进存档，
+       那种没有批改任务；而批改任务被清理时，存档是**另一份工作成果**，不该跟着消失。
+    ⚠️ `lesson_id` 是冗余的（能从 grade 走两步拿到）：批改没了还要能按课时找，
+       而且「改作业」列表上要显示「哪节课的作业」，每次 join 两层没必要。
+    """
+
+    __tablename__ = "grade_archives"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    owner_id: Mapped[int] = mapped_column(Integer, nullable=False, default=OWNER_ID, server_default=str(OWNER_ID))
+    student_id: Mapped[int] = mapped_column(
+        ForeignKey("students.id", ondelete="CASCADE"), nullable=False
+    )
+    grade_id: Mapped[int | None] = mapped_column(
+        ForeignKey("homework_grades.id", ondelete="SET NULL")
+    )
+    lesson_id: Mapped[int | None] = mapped_column(ForeignKey("lessons.id", ondelete="SET NULL"))
+
+    # 存档日期（= 目录名）。与批改的 created_at 可能不同：老师可以今天把上周的卷子存进来。
+    archived_on: Mapped[str] = mapped_column(String, nullable=False, default="", server_default="")
+    name: Mapped[str] = mapped_column(String, nullable=False)                 # 老师看到的原名
+    stored_name: Mapped[str] = mapped_column(String, default="", server_default="")  # 避重后的真名
+    # 相对 UPLOAD_DIR 的正斜杠路径 —— 换机器、搬数据目录都不失效（同 storage.rel）
+    rel_path: Mapped[str] = mapped_column(Text, default="", server_default="")
+    kind: Mapped[str] = mapped_column(String, default="", server_default="")  # pdf/png/docx…
+    size_bytes: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    # grade = 从批改导出（带笔迹的副本）；upload = 老师手传（线下批好的卷子、答案…）
+    source: Mapped[str] = mapped_column(String, default="grade", server_default="grade")
+    # 批改人。自用单机形态没有登录体系，所以是一个可改的文本，不是 FK
+    # （将来接登录时把这里换成 user_id 即可，不用动别的表）。
+    grader: Mapped[str] = mapped_column(String, default="", server_default="")
+    note: Mapped[str] = mapped_column(Text, default="", server_default="")
+    created_at: Mapped[str] = mapped_column(Text, default=_now, server_default=NOW)
+
+    __table_args__ = (
+        Index("idx_garachive_student", "student_id", "archived_on", "id"),
+        Index("idx_garachive_grade", "grade_id"),
+    )

@@ -44,7 +44,7 @@ items 里 `flags` 的取值（系统会给的那几个；模型自己给的标�
     json_salvaged        输出被截断/夹了废话，是从里面逐题抢救出来的
     unreadable_char      题内有看不清的字符（模型标，显示成 ⍰）
     insufficient_evidence 判错但依据在原文里找不到 → **已降级 ungradable**
-    reference_unverified 参考解是模型自己做的（answer_mode="ai"），没经老师核对
+    reference_unverified 参考解是模型自己做的（没勾任何条件时），没经老师核对
     unstable             两次采样 verdict 在 correct ↔ wrong 之间翻转
     transcription_conflict 两次采样转录不一致（二期：两遍都跑时才可能出）
     qtype_unknown        题型不在 taxonomy.QTYPES 里 → qtype 给 None
@@ -64,7 +64,7 @@ from pathlib import Path
 from PIL import Image
 
 from .. import taxonomy
-from . import ai_polish
+from . import ai_polish, grade_basis
 from .images import MAX_IMAGE_BYTES
 
 # ---------------------------------------------------------------- 常量
@@ -74,6 +74,10 @@ from .images import MAX_IMAGE_BYTES
 #   ⚠️ 不要去改 vision.py 里的 MAX_EDGE —— 那是公式识别的实测基线，
 #      改它等于把别人的回归基线一起挪了。批改要更高分辨率就在本文件里另定。
 GRADE_MAX_EDGE = 2200
+
+# 一次最多附几张「老师给的答案 / 细则」图。2 张是成本与够用的折中：
+# 一张答案 + 一张细则已经是常见上限，再多就是在为「拍糊了重拍一张」付费。
+_MAX_ANSWER_IMAGES = 2
 
 # JPEG 质量。同样因为手写：细笔画在 q85 上会被振铃吃掉，q90 的码率代价很小。
 GRADE_JPEG_QUALITY = 90
@@ -102,7 +106,26 @@ _STEM_LIMIT = 4000
 _ANSWER_LIMIT = 4000
 _BASIS_LIMIT = 600
 _REASON_LIMIT = 300
+# 图上要点可能是一整张数表（直方图十几个区间），比 basis 需要更长。
+_FIGURE_LIMIT = 1200
 _KP_LIMIT = 30
+# 尾部情况是一句话（「底部约 1/10 是页码与页脚；这道题疑似还没写完」），
+# 比 error_reason 短。给到 200 已经够宽松，再长就说明模型在写小作文。
+_TAIL_NOTE_LIMIT = 200
+
+# ---------------------------------------------------------------- 分类标签（0031）
+# 用户 2026-10-20 点名要的：「ai 输出中要附带对这道题的标签（学段 / 知识点 /
+# 体系 / 考法等）」。这四个是**一组**，界面上并排显示，所以打包成一个对象。
+#
+# ⚠️ 只有 stage 是枚举（学段是客观事实，枚举能让它可筛）；system / exam 刻意留成
+#    自由短词 —— 「体系」和「考法」的叫法随教材变（人教 / 北师大 / DSE / IGCSE
+#    各有一套），硬编枚举会让模型在拿不准时瞎选一个，那还不如让它写原话。
+LABEL_KEYS: tuple[str, ...] = ("stage", "system", "kp", "exam")
+# 学段。**认不出就留空**，不猜 —— 猜错了会进筛选条件，比空着有害得多。
+LABEL_STAGES: tuple[str, ...] = ("小学", "初中", "高中", "大学", "其他")
+# 每个值的长度上限。这些是要**并排显示在题卡上一行**的，长了会把卡片撑变形。
+_LABEL_VALUE_LIMIT = 24
+_LABEL_COUNT_LIMIT = 8
 
 _VERDICTS = ("correct", "partial", "wrong", "blank", "ungradable")
 
@@ -178,9 +201,27 @@ _TRANSCRIBE_RULES = (
     "挤成一行就看不出是在哪一步出的错了。\n"
     "6. 选择题：只记录学生**勾 / 圈 / 涂 / 写了哪个选项字母**（写进 student_answer，例如 \"B\"）。"
     "看不清勾了哪个 → verdict 给 ungradable，**不要靠题目内容去猜他可能选哪个**。\n"
-    "7. 几何图：可以用一句话描述学生画了什么（例如「在 $AB$ 上取中点 $D$，连 $CD$」），"
-    "写进 figure_note。**图形描述不得作为判错或扣分的依据** —— 画图没有可核对的口径，"
-    "画错一条辅助线不等于推理错。\n"
+    "7. 几何图（**这一条 2026-10 改过，别按老口径判**）：\n"
+    "   · figure_note 里写**结构化的**图信息，不要只写「画了一个三角形」。尽量交代四样：\n"
+    "     ① 图上出现的点与字母（含学生新命名的）；\n"
+    "     ② 连线 —— 尤其是学生**自己加的辅助线**，要写成可核对的形式"
+    "（「过 $D$ 作 $DP\\perp BP$，垂足 $P$」），不要只写「加了一条线」；\n"
+    "     ③ 标出的角、直角符号、等长记号、平行记号、圆弧记号；\n"
+    "     ④ 图上写出来的数值与单位。\n"
+    "   · 每一句后面标把握：`（确定）` 或 `（看不清）`。**看不清的不许猜** —— "
+    "猜一个不存在的记号，比说「看不清」危害大得多。\n"
+    "   · 一句一件事，用「；」隔开，方便后面逐句引用。\n"
+    "   · 图上一个记号都没有（纯示意图）就照实写「除字母外无任何标记」，"
+    "**不要**把「看起来像直角」写成直角。\n"
+    "8. 统计图表 / 数据表（频率分布直方图、茎叶图、箱线图、散点图、折线图、"
+    "列联表、分布列…）：\n"
+    "   · **先把图上的数读成一张表，再算**。绝不用「柱子大概这么高」代替具体数值 —— "
+    "「大概」在求频率、求距离、求四分位时会直接算错，而且错得很像对的。\n"
+    "   · 表写进 figure_note：直方图写「区间:频数」，茎叶图写「茎:叶 叶 叶」，"
+    "箱线图写「最小/下四分位/中位/上四分位/最大」，并注明轴名、单位、刻度间隔。\n"
+    "   · 图上**没有印数字**（纯图形）时必须写明「刻度需按格数推算」，"
+    "并写出你数到的格数与换算过程，不要直接抛一个凭感觉的数。\n"
+    "   · 读不出来的格子写「读不清」并标 `（看不清）`，**不要用题型常识补一个看着合理的数**。\n"
 )
 
 _JUDGE_RULES = (
@@ -197,6 +238,19 @@ _JUDGE_RULES = (
     "或者依据本身缺失。**不要**把它落成 wrong —— 冤枉一个学生，"
     "比这题暂时没批完糟糕得多。\n"
     "6. 学生整题空白（没写任何字、也没勾选）→ verdict 给 blank，不要给 wrong。\n"
+    "7. **图上画的可以作数，但要按把握分档**（这是唯一允许拿图当依据的地方）。\n"
+    "   老口径是「图形描述一律不得作为判错依据」，那条已经在 2026-10 废止 —— "
+    "它把「过 $D$ 作 $DP\\perp BP$」这类**作图得分点**整片判死了，几何题因此长期漏判。\n"
+    "   · figure_note 里标了 `（确定）`、且与题干不矛盾的图形信息 → **可以**作为判定依据。"
+    "例如题干要求作 $DP\\perp BP$，figure_note 写「$DP\\perp BP$，有直角符号（确定）」，"
+    "这一得分点就算写到了。\n"
+    "   · 标了 `（看不清）` 的 → 只能作**疑似**：verdict 照常给，但 confidence 降一档，"
+    "并在 basis 里写明「图形此处未看清」。\n"
+    "   · 图上根本没看见的 → **不等于是「学生没写」**。缺这一项证据时按 ungradable 处理，"
+    "不要判 wrong —— 你没看见不等于他没画。\n"
+    "   · 仍然**不因画得丑、比例不对、线条歪而扣分**。判的是「这条线在不在、"
+    "是不是垂直/平行/过某点」，不是画得好不好。\n"
+    "   → 一句话：**看见的能作数，看不清的只作疑，没看见的不作否**。\n"
 )
 
 _FIELD_RULES = (
@@ -208,6 +262,8 @@ _FIELD_RULES = (
     "**不是题目**，不要变成 questions 的元素。\n"
     "\n每个元素的字段固定为下面这些，一个都不能少、也不能改名"
     "（取不到值用空字符串 \"\" / 空数组 []，不要省略字段、不要写 null）：\n"
+    # `block_kind` / `tail_note` 只在区域模式要求（见 _REGION_BLOCK）——
+    # 整页模式里"这块是什么"没有意义（整页本来就有很多块），加了只是多两个字段要填。
     '  "q_no"            字符串。这一题在**卷面上印的题号**（如 "3"、"12"、"20(2)"）。'
     "不要自己重新编号，不要写成「第 3 题」。读不出来给空字符串。\n"
     '  "qtype"           字符串。**必须**是下面之一：' + _ENUM_QTYPE + "。"
@@ -236,7 +292,30 @@ _FIELD_RULES = (
     "10 个汉字以内（例如「一元二次方程」「线面垂直的判定」）。判断不了给空字符串。\n"
     '  "error_reason"    字符串。错因，人话，10~30 字（例如「漏了根的取舍」「移项没变号」）。'
     "判 correct 或 blank 时给空字符串。\n"
-    '  "figure_note"     字符串。有几何图时用一句话描述图上画了什么；没有图给空字符串。\n'
+    '  "labels"          对象。**这一题的分类标签**（学段 / 体系 / 知识点 / 考法），'
+    "四个键，都拿不准就给空字符串：\n"
+    "                      · `stage`  学段。**必须**是下面之一："
+    + "、".join(LABEL_STAGES) + "。"
+    "拿不准就**留空字符串**，不要猜 —— 猜错了会进筛选条件，比空着有害得多。\n"
+    "                      · `system` 体系 / 知识领域，中文短词，12 字以内"
+    "（例如「数与代数」「图形与几何」「统计与概率」「综合与实践」「香港 DSE 数学」）。"
+    "按**这份卷子所属的课程体系**写，不要自造。\n"
+    "                      · `kp`     知识点，中文短词，12 字以内。"
+    "**与上面的 `kp_name` 写同一个说法** —— 两者会被当成同一个东西，"
+    "写两个说法界面上就会出现自相矛盾的两处。\n"
+    "                      · `exam`   考法 / 解题路子，中文短词，12 字以内"
+    "（例如「直接计算」「公式变形」「数形结合」「分类讨论」「方程建模」"
+    "「逻辑推理」「空间想象」「数据分析」）。\n"
+    "                    例：\"labels\": {\"stage\": \"初中\", \"system\": \"数与代数\", "
+    "\"kp\": \"一元二次方程\", \"exam\": \"公式变形\"}\n"
+    '  "figure_note"     字符串。**这一题图上的关键信息**（不是「有没有图」的开关）：\n'
+    "                       · 几何图 → 点与字母；连的线（**学生后加的辅助线要写成可核对的形式**，"
+    "如「过 $D$ 作 $DP\\perp BP$」）；角/直角/等长/平行/圆弧记号；图上写的数值。"
+    "**每个分句后用 `（确定）` 或 `（看不清）` 标把握**，用「；」分隔。\n"
+    "                       · 统计图表 / 数据表 → 读出来的数表（「区间:频数」「茎:叶」"
+    "「五数概括」），含轴名、单位、刻度间隔。\n"
+    "                       · 没有图、也不需要读图 → 空字符串。\n"
+
     '  "flags"           字符串数组。上面规则要求打的标记放这里（例如 ["unreadable_char"]），'
     "没有就给 []。\n"
     "\n## 三条不要\n"
@@ -264,9 +343,122 @@ _OUTPUT_EXAMPLE = (
     '"basis":"第 1 步两边同除以 $x$ 时没有讨论 $x=0$，丢了一个根",'
     '"evidence_quote":"两边同除以 $x$，得 $x=3$","confidence":"medium",'
     '"kp_name":"一元二次方程","error_reason":"除未知数时漏了 $x=0$ 的情况",'
-    '"figure_note":"","flags":[]}'
+    '"labels":{"stage":"初中","system":"数与代数","kp":"一元二次方程","exam":"公式变形"},'
+    '"figure_note":"","flags":[]},'
+    # 几何题的示例**必须有**：figure_note 的「分句 + 确定性标注」这个写法，
+    # 只靠上面几行文字描述，模型多半会退回成「画了一个三角形」那种空话。
+    '{"q_no":"5","qtype":"解答题",'
+    '"stem":"如图，在 $\\triangle ABC$ 中 $AB=AC$，$D$ 是 $BC$ 的中点。求证：$AD\\perp BC$。",'
+    '"student_answer":"因为 $AB=AC$，$D$ 是 $BC$ 中点，所以 $BD=CD$；\\n'
+    '又 $AD=AD$，所以 $\\triangle ABD\\cong\\triangle ACD$；\\n'
+    '所以 $\\angle ADB=\\angle ADC=90^{\\circ}$，即 $AD\\perp BC$",'
+    '"correct_answer":"$BD=CD$、$AD=AD$、$AB=AC$ ⇒ $\\triangle ABD\\cong\\triangle ACD$（SSS）'
+    '⇒ $\\angle ADB=\\angle ADC$，又两者互补 ⇒ 各 $90^{\\circ}$ ⇒ $AD\\perp BC$",'
+    '"verdict":"correct","basis":"SSS 用对了，最后用补角得直角也写到了",'
+    '"evidence_quote":"","confidence":"high","kp_name":"等腰三角形性质",'
+    '"error_reason":"",'
+    '"figure_note":"$D$ 在 $BC$ 上，$AD$ 已画出（确定）；'
+    '$AB$、$AC$ 上有等长记号（确定）；$\\angle ADB$ 处有直角符号（确定）",'
+    '"labels":{"stage":"初中","system":"图形与几何","kp":"等腰三角形性质",'
+    '"exam":"逻辑推理"},'
+    '"flags":[]}'
     "]}\n"
 )
+
+# 裁出来的一道题专用的那一段。**只在 ctx["region"] 为真时插进提示词** ——
+# 整页流程看到这段会以为「一张图只能出一道题」，把整页里其余题全丢掉。
+_REGION_BLOCK = (
+    "\n## 这一张图是**一道题**（不是一整页）\n"
+    "这张图是从一页作业上裁下来的**一道题**：题干 + 学生在它下面的作答，图题还带图。\n"
+    "· **只输出一个** questions 元素。裁切边缘若带进相邻题的一两行字，**忽略它们**，"
+    "不要为它另开一条。\n"
+    "· `q_no` 一律给空字符串 —— 题号由系统按「这是第几个框」绑定，你不用认它。\n"
+    "· `stem` 只录**这一道题**的题干，相邻题的残字不要混进来。\n"
+    "· 边缘被切掉半行时，在 basis 里说明「疑似被裁切」，**不要去猜**被切掉的内容。\n"
+    "· 这一块里**确实没有题目**（裁到卷头 / 页脚 / 只有「四、解答题；共 77 分」这种结构说明"
+    " / 整块空白）→ **仍然输出一个元素**：`stem` 与 `student_answer` 给空字符串，"
+    "`verdict` 给 `ungradable`，`basis` 写一句「这一块是卷头/页脚/结构说明，不含题目」，"
+    "并把 `block_kind` 标对。**不要输出空数组** —— 空数组在界面上什么都不留，"
+    "老师只会觉得「这块丢了」。\n"
+    "\n### 这块图**本身**是什么、底部有没有问题（两个额外字段）\n"
+    "除了上面的判定，这一张图还要回两个**结构信号**。它们是给老师看提示用的，"
+    "不参与判定 —— 但少了它们，老师只能靠猜「这块为什么判不出来」。\n"
+    '· `block_kind`：这张图属于什么。**必须**是下面之一：\n'
+    "    · `question`  一道真正的练习题（有题干、或学生在这一块里作答）\n"
+    "    · `header`    卷头：姓名 / 班级 / 学号 / 考试标题 / 「本试卷共 N 页」这类\n"
+    "    · `section`   只有结构说明、本身没有题目："
+    "「四、解答题；本题共 5 小题，共 77 分」这种小题号小标题\n"
+    "    · `footer`    页脚：页码 / 条形码 / 「请在此作答」/ 印刷厂信息\n"
+    "    · `blank`     这一块是空白（裁空了，或者学生整块没写且没有题干）\n"
+    "    · `other`     说不清\n"
+    "  ⚠️ **拿不准就给 `question`。** 判成非题会被老师当成「这块可以不用判」，"
+    "判错一块等于丢一道题。\n"
+    '· `tail_note`：这一块的**底部**情况，一句话，没异常就给空字符串 ""。'
+    "只在这三种情况里写（可叠加，用「；」分隔）：\n"
+    "    ① 底部被**页脚 / 页码 / 印刷说明**占掉一部分"
+    "（这时要写明占了多少，例如「底部约 1/10 是页码与页脚」）；\n"
+    "    ② 底部**疑似被页切掉** —— 这道题看着还没写完、后面应该还有"
+    "（这时不要自己去补下一页的内容）；\n"
+    "    ③ 底部混进了**相邻题的一两行残字**（这时不要把它算进 student_answer）。\n"
+    "  ⚠️ 宁可不写也别瞎写：`tail_note` 会被做成界面提示，"
+    "写错会引导老师去重切一块本来没问题的图。\n"
+)
+
+# 放在**最后**（输出示例之后）：示例里正好是三道题，只在前面的规则里说「只输出一个」
+# 压不住它 —— 模型更爱照抄示例的形状，把一道题拆成三条。
+_ONE_ITEM_TAIL = (
+    "\n\n## 最后再说一遍：你只需要一道题\n"
+    "上面的示例是「一整页」长什么样。你现在这张图是从一页上**裁下来的一道题**，"
+    "所以 questions 数组里**恰好一个**元素。`q_no` 给空字符串。\n"
+    "这一块不是题（卷头 / 页脚 / 结构说明 / 空白）时也一样只给**一个**元素 —— "
+    "把 `block_kind` 标出来、`verdict` 给 `ungradable`，"
+    "**不要**改成空数组、也不要为相邻题的残字多开一条。\n"
+    # ⚠️ 必须在这里豁免：_FIELD_RULES 在 _REGION_BLOCK **之后**，里面那句
+    #    「不要输出上面没列出的字段」会把这两个字段直接压掉（实测模型极听话）。
+    "另外：`block_kind` 和 `tail_note` 这两个字段**只在这个流程里要** —— "
+    "前面「不要输出上面没列出的字段」那条对它们**例外**，两个都必须给。"
+    "其余的字段一个都不能少。\n"
+)
+
+
+def _images_block(ctx: dict) -> str:
+    """一次送了多张图时，**必须说清每张图是什么**。
+
+    不说的话最常见的错是「把答案照片当成学生作答」→ 判出全对，
+    而且看起来完全合理（老师给的答案当然对）。这个错比漏判更危险，
+    因为它是「自信地判对」。
+    """
+    groups = _extra_image_groups(ctx)
+    if not groups:
+        return ""
+    total = 1 + sum(len(items) for _what, items in groups)
+    lines = [f"\n\n## 这一批图（共 {total} 张，按顺序）",
+             "第 1 张：**学生作答** —— 要判的就是它。"]
+    n = 1
+    for what, items in groups:
+        for _ in items:
+            n += 1
+            lines.append(
+                f"第 {n} 张：{what} —— 这是**判据，不是学生写的**。"
+                "不要把它上面的内容当成 student_answer，也不要因为它写对了就判学生对。"
+            )
+    return "\n".join(lines)
+
+
+def _extra_image_groups(ctx: dict) -> list[tuple[str, list]]:
+    """老师给的额外图，**按送入模型的顺序**分组：先答案、后细则。
+
+    顺序是三处共用的：`_image_uris` 真按这个顺序拼、`_images_block` 按这个顺序
+    说「第几张是什么」。任何一处单独改都会让模型把答案当成学生作答 ——
+    那是「自信地判全对」，比漏判危险得多。所以只从这个函数取顺序。
+    """
+    modes = _modes_of(ctx)
+    out: list[tuple[str, list]] = []
+    if "key" in modes:
+        out.append(("老师的标准答案", list(ctx.get("answer_images") or [])))
+    if "rubric" in modes:
+        out.append(("老师的评分细则", list(ctx.get("rubric_images") or [])))
+    return [(" ".join(what.split()), items) for what, items in out if items]
 
 
 def _context_block(ctx: dict) -> str:
@@ -275,61 +467,96 @@ def _context_block(ctx: dict) -> str:
     姓名对判定毫无用处（图和字迹已经指向他本人了），而它是最直接的隐私面 ——
     提示词会把内容发到第三方，能少给一个字段就少给一个。
     上层需要人名时自己有，不必经过模型。
+
+    两种口径：整页（默认）与**裁出来的一道题**（ctx["region"]）。后者不能再说
+    「这一页可能有几道题」—— 那句话会让模型在裁切残留的相邻题上多加一条。
     """
-    lines = ["\n\n## 这一页"]
     page_no = ctx.get("page_no")
+    if ctx.get("region"):
+        where = f"第 {page_no} 页" if page_no else "一页作业"
+        label = str(ctx.get("region_label") or "").strip()
+        tip = f"（系统把这一块标成了「{label}」）" if label else ""
+        span = ctx.get("span_pages") or []
+        cross = ""
+        if span:
+            # 跨页题：一张图里是两页的段落竖拼的。不说清的话，中间的接缝
+            # 会被当成「题目到此结束」，下半段直接被丢掉。
+            cross = (
+                f" ⚠️ 这一张图是**跨页拼起来的**（{ '、'.join('第 %s 页' % p for p in span) }"
+                " 上的几段上下拼接），中间的白缝不是题目结束 —— 它是一道完整的题。"
+            )
+        return f"\n\n## 这一张图\n这是从{where}上裁下来的一道题{tip}。{cross}" + _images_block(ctx)
+
+    lines = ["\n\n## 这一页"]
     if page_no:
         lines.append(f"卷面第 {page_no} 页。")
     lines.append(
         "题号一律写**卷面上印的题号**（不要自己从 1 开始重编）。"
         "这一页可能有几道题，也可能只是一道大题的一小部分。"
     )
-    return "\n".join(lines)
+    return "\n".join(lines) + _images_block(ctx)
 
 
-def _reference_block(mode: str, ctx: dict) -> str:
-    """三种 answer_mode 的差别**只在于参考依据从哪来**，判定口径完全一样。"""
-    if mode == "key":
-        text = (ctx.get("answer_text") or "").strip()
-        steps = ctx.get("answer_steps") or None
-        block = (
-            "\n\n## 本次的依据：老师提供的标准答案\n"
-            "下面是老师给的答案，**以它为准**。\n"
-            "〔老师的答案〕\n" + text + "\n"
-        )
-        if steps:
-            # 老师给了结构化步骤就一并用上：分步的对照比一整段文字准得多
-            try:
-                block += "〔答案的结构化步骤〕\n" + json.dumps(
-                    steps, ensure_ascii=False) + "\n"
-            except (TypeError, ValueError):
-                pass
-        block += (
-            "判定口径：\n"
-            "· 学生写法与老师答案**数学上等价**就算 correct"
-            "（$x=2$ 与 $2=x$、先通分与直接约分，都算等价）；\n"
-            "· 老师答案可能只是简写、也可能有笔误：如果它明显算错，以数学上正确的为准，"
-            "并在 basis 里写明「老师答案此处疑有笔误」；\n"
-            "· 老师只给了最终结果、没给过程时，解答题只看最终结果："
-            "过程错但结果对 → partial。\n"
-            "· 老师的答案里对不上这一题的，correct_answer 留空，verdict 给 ungradable。"
-        )
-        return block
+def _modes_of(ctx: dict) -> set[str]:
+    """ctx 里的条件集合。**解析只走 `grade_basis.parse_modes`**，别在这儿另写一份 ——
+    两份解析早晚会对不上，表现是「界面勾了两个、提示词只给了一个」。"""
+    return grade_basis.parse_modes(ctx.get("answer_mode"))
 
-    if mode == "rubric":
-        text = (ctx.get("rubric_text") or "").strip()
-        return (
-            "\n\n## 本次的依据：评分细则（分步给分点 / 扣分条件）\n"
-            "下面是老师给的评分细则，**以它为准**。\n"
-            "〔评分细则〕\n" + text + "\n"
-            "判定口径：\n"
-            "· 按细则里的分步给分点逐条对照：学生写到了哪一步、漏了哪一步；\n"
-            "· basis 里点名**违反了哪一条**，尽量照抄细则里那一条的措辞；\n"
-            "· correct_answer 写细则里这一题对应的给分点 / 关键步骤；\n"
-            "· **这一期不给分**：不要输出得分、扣分，只判 correct / partial / wrong；\n"
-            "· 细则没覆盖的写法，只要数学上正确就不要判错。"
-        )
 
+def _key_block(ctx: dict) -> str:
+    """「按我给的答案」这个条件贡献的那一段。"""
+    text = (ctx.get("answer_text") or "").strip()
+    if not text and (ctx.get("answer_images") or []):
+        # 老师给的是**答案照片**（没粘贴文字）。这里必须交代清楚，
+        # 否则「〔老师的答案〕」下面空着，模型会退回自己解题却仍声称按老师答案判。
+        text = "（答案在附图上 —— 第 2 张起来的图是老师给的答案，不是学生写的）"
+    steps = ctx.get("answer_steps") or None
+    block = (
+        "\n\n## 本次的依据：老师提供的标准答案\n"
+        "下面是老师给的答案，**以它为准**。\n"
+        "〔老师的答案〕\n" + text + "\n"
+    )
+    if steps:
+        # 老师给了结构化步骤就一并用上：分步的对照比一整段文字准得多
+        try:
+            block += "〔答案的结构化步骤〕\n" + json.dumps(
+                steps, ensure_ascii=False) + "\n"
+        except (TypeError, ValueError):
+            pass
+    block += (
+        "判定口径：\n"
+        "· 学生写法与老师答案**数学上等价**就算 correct"
+        "（$x=2$ 与 $2=x$、先通分与直接约分，都算等价）；\n"
+        "· 老师答案可能只是简写、也可能有笔误：如果它明显算错，以数学上正确的为准，"
+        "并在 basis 里写明「老师答案此处疑有笔误」；\n"
+        "· 老师只给了最终结果、没给过程时，解答题只看最终结果："
+        "过程错但结果对 → partial。\n"
+        "· 老师的答案里**对不上这一题的**：你自己先解一遍再判（这一题没有可对照的答案），"
+        "并在 basis 里说明「老师答案里没有这一题」；真解不出来才给 ungradable。"
+    )
+    return block
+
+
+def _rubric_block(ctx: dict) -> str:
+    """「按我的评分细则」这个条件贡献的那一段。"""
+    text = (ctx.get("rubric_text") or "").strip()
+    if not text and (ctx.get("rubric_images") or []):
+        text = "（评分细则在附图上 —— 第 2 张起来的图是老师给的细则，不是学生写的）"
+    return (
+        "\n\n## 本次的依据：评分细则（分步给分点 / 扣分条件）\n"
+        "下面是老师给的评分细则，**以它为准**。\n"
+        "〔评分细则〕\n" + text + "\n"
+        "判定口径：\n"
+        "· 按细则里的分步给分点逐条对照：学生写到了哪一步、漏了哪一步；\n"
+        "· basis 里点名**违反了哪一条**，尽量照抄细则里那一条的措辞；\n"
+        "· correct_answer 写细则里这一题对应的给分点 / 关键步骤；\n"
+        "· **这一期不给分**：不要输出得分、扣分，只判 correct / partial / wrong；\n"
+        "· 细则没覆盖的写法，只要数学上正确就不要判错。"
+    )
+
+
+def _self_solve_block() -> str:
+    """基准那一段：没有任何条件时它就是全部依据。"""
     return (
         "\n\n## 本次的依据：你自己解\n"
         "这一页**没有**老师提供的标准答案。请对每一道题**先自己完整解一遍**，"
@@ -341,15 +568,58 @@ def _reference_block(mode: str, ctx: dict) -> str:
     )
 
 
+def _both_block() -> str:
+    """两个条件同时勾上时的**冲突裁决**。
+
+    不给裁决规则的话，模型会在「答案说对」「细则说漏了一步」之间随机挑，
+    同一份作业重批两次结果都不一样 —— 老师会以为系统不稳定。
+    """
+    return (
+        "\n\n## 两个依据同时在用：怎么排优先级\n"
+        "· **对错**看老师给的答案（数学等价即 correct）；\n"
+        "· **是否 partial**、漏了哪一步，看评分细则；\n"
+        "· 两边打架时（答案对但漏了细则里的关键步骤）→ 判 partial，"
+        "并把没满足的那条细则写进 basis；\n"
+        "· basis 里要能看出你用的是哪一条依据："
+        "「与老师答案一致 / 缺第 2 步给分点」这种写法，别只写「正确」。"
+    )
+
+
+def _reference_block(mode: str, ctx: dict) -> str:
+    """依据那一段 = **AI 基准 + 已勾的每个条件**（2026-10-21 从「三选一」改过来）。
+
+    以前三种模式互斥，只能挑一个；现在老师可以只留基准（模型自己解），
+    也可以加「按我的答案」、加「按我的细则」，两个都加就是两段一起给 +
+    一段裁决规则。所以这里**拼段落**，不再 `if/elif/else` 三选一。
+    """
+    modes = grade_basis.parse_modes(mode)
+    if not modes:
+        return _self_solve_block()
+    parts: list[str] = []
+    if "key" in modes:
+        parts.append(_key_block(ctx))
+    if "rubric" in modes:
+        parts.append(_rubric_block(ctx))
+    if len(parts) > 1:
+        parts.append(_both_block())
+    return "".join(parts)
+
+
 def _prompt_for(mode: str, ctx: dict) -> str:
+    # ⚠️ 顺序有讲究：_REGION_BLOCK 紧跟 _context_block，**必须在 _FIELD_RULES 之前** ——
+    #    _FIELD_RULES 里「这一页有几道题就输出几个元素」那句是整页口径，
+    #    区域口径的那段要压在它前面才不会被它盖过去（模型更认靠后的指令）。
+    #    所以区域模式下 _REGION_BLOCK 还额外把「只输出一个」重复了一遍。
     return (
         _ROLE
         + _context_block(ctx)
+        + (_REGION_BLOCK if ctx.get("region") else "")
         + _TRANSCRIBE_RULES
         + _JUDGE_RULES
         + _FIELD_RULES
         + _reference_block(mode, ctx)
         + _OUTPUT_EXAMPLE
+        + (_ONE_ITEM_TAIL if ctx.get("region") else "")
     )
 
 
@@ -385,6 +655,27 @@ def _prepare_image(path) -> str:
     buf = io.BytesIO()
     im.save(buf, "JPEG", quality=GRADE_JPEG_QUALITY, optimize=True)
     return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def _image_uris(png_path, ctx: dict) -> list[str]:
+    """学生作答那张 + 老师给的答案/细则图（如果有）。**顺序不能变**。
+
+    顺序就是提示词里「第 1 张 / 第 2 张」的指向，`_images_block` 按同一顺序写说明。
+    答案图先压到 `GRADE_MAX_EDGE`，与页图同一条通道 —— 一张 4000px 的手机
+    照片不压会直接超上限。
+
+    ⚠️ 单张答案图坏掉**不整单失败**：跳过它比让老师「整份批改失败、
+    还看不出是答案照片的问题」要好。但主图（学生作答）坏了必须抛 ——
+    没有作答就没法判。
+    """
+    uris = [_prepare_image(png_path)]
+    extra = [p for _what, items in _extra_image_groups(ctx) for p in items]
+    for p in extra[:_MAX_ANSWER_IMAGES]:
+        try:
+            uris.append(_prepare_image(p))
+        except _GradeError:
+            continue
+    return uris
 
 
 # ---------------------------------------------------------------- 配置
@@ -601,6 +892,44 @@ def _clip(s: str, n: int) -> str:
     return s if len(s) <= n else s[:n] + "…"
 
 
+def _labels(o: dict, kp_name: str = "") -> dict[str, str]:
+    """模型给的「学段 / 体系 / 知识点 / 考法」四个分类标签 → 干净的 dict。
+
+    ⚠️ 三条刻意的设计：
+
+    ① **只收 `LABEL_KEYS` 里的键**。模型很容易顺手加一个 `"difficulty"` 或把
+       整段解释塞进来 —— 那会让题卡上多出一个说不清的标签。多余的一律丢掉。
+
+    ② **`kp` 不给就回填 `kp_name`**。知识点有两个来源会让同一道题出现两个说法；
+       `kp_name` 是权威值（要拿去挂知识树），所以以它为准。
+
+    ③ **`stage` 认不出就留空，不猜**。理由同 `_qtype`：空着老师自己看，
+       猜错了会进筛选条件，比空着有害。
+
+    `labels` 也可能是字符串（模型偶尔把对象写成一行 JSON），那时整体当空处理 ——
+    不试图去 parse，parse 出来的键更容易乱。
+    """
+    raw = o.get("labels")
+    if not isinstance(raw, dict):
+        raw = {}
+    out: dict[str, str] = {}
+    for k in LABEL_KEYS:
+        v = _as_str(raw.get(k)).strip().strip("。；;,. ")
+        if not v:
+            continue
+        out[k] = _clip(v, _LABEL_VALUE_LIMIT)
+        if len(out) >= _LABEL_COUNT_LIMIT:
+            break
+    stage = out.get("stage", "")
+    if stage and stage not in LABEL_STAGES:
+        # 不在枚举里就丢掉（不猜）。「高中一年级」这类也不收 —— 学段只要四档，
+        # 年级不是学段，混进来就没法按学段筛了。
+        out.pop("stage", None)
+    if not out.get("kp") and kp_name:
+        out["kp"] = _clip(kp_name.strip(), _LABEL_VALUE_LIMIT)
+    return out
+
+
 def _qtype(o: dict) -> tuple[str | None, bool]:
     raw = _as_str(_pick(o, *_ALIAS["qtype"]))
     if raw in taxonomy.QTYPES:
@@ -731,6 +1060,10 @@ def _item_from_obj(o: dict, born: list[str]) -> dict:
         # 判对就没有错因。模型常在这时塞一句「无」/「没有错误」，那会在前端变成噪音。
         error_reason = ""
 
+    # 知识点单独取一次：`labels.kp` 缺省时要拿它回填（见 `_labels`），
+    # 免得同一道题的知识点在两处说法不一致。
+    kp_name = _clip(_as_str(_pick(o, *_ALIAS["kp_name"])), _KP_LIMIT)
+
     item = {
         "q_no": _clip(_as_str(_pick(o, *_ALIAS["q_no"])), 16),
         "qtype": qtype,
@@ -745,9 +1078,21 @@ def _item_from_obj(o: dict, born: list[str]) -> dict:
         "full_score": None,
         "basis": _clip(_as_str(_pick(o, *_ALIAS["basis"])), _BASIS_LIMIT),
         "confidence": _confidence(o),
-        "kp_name": _clip(_as_str(_pick(o, *_ALIAS["kp_name"])), _KP_LIMIT),
+        "kp_name": kp_name,
         "error_reason": error_reason,
         "flags": flags,
+        # 图上读到的东西（几何要点 / 统计图表的数表）。**必须落库并给老师看**：
+        # 2026-10 之前它只躺在 raw 里，于是「凭图判分」的结论对老师完全不可核对 ——
+        # 他没法判断模型说的「有直角符号」是不是真有。
+        "figure_note": _clip(_as_str(_pick(o, *_ALIAS["figure_note"])), _FIGURE_LIMIT),
+        # 两个结构信号（0030，只在区域模式要求模型给；整页模式没有这两个字段 → 空）。
+        # ⚠️ 不在这一层做合法性判断：`block_kind` 的枚举归一在 store 的 `_block_kind`，
+        #    与「认不出就归空」的策略放在一处，免得两处规则漂移。
+        "block_kind": _as_str(o.get("block_kind")).strip()[:16],
+        "tail_note": _clip(_as_str(o.get("tail_note")), _TAIL_NOTE_LIMIT),
+        # 分类标签（0031）：学段 / 体系 / 知识点 / 考法。归一化全在 `_labels` 里，
+        # 这里只负责取 —— 规则放一处，免得与提示词里的说法漂移。
+        "labels": _labels(o, kp_name),
         # 模型这一题的原始输出：复核/重放用。meta 里补「哪个模型、有没有被截断、哪种依据」，
         # 但不塞 prompt（一整段提示词几十 KB，存进每一行毫无意义）。
         "raw": {
@@ -884,20 +1229,25 @@ def _finish_reason(data: dict) -> str:
         return ""
 
 
-def _call_model(uri: str, prompt: str, cfg: dict, temperature: float = 0) -> tuple[str, str]:
+def _call_model(uris, prompt: str, cfg: dict, temperature: float = 0) -> tuple[str, str]:
     """发一次请求（含三级降级 + 截断重试）。返回 (正文, finish_reason)。
+
+    `uris` 可以是单张也可以是**一串**：串里第 1 张永远是学生作答，
+    后面的是老师给的答案/细则图（顺序与 `_images_block` 的说明一一对应）。
 
     降级顺序照抄 batch_page.recognize_page，理由一样：这些参数都是「锦上添花」，
     宁可退化成靠提示词约束，也不能让整条链路因为某个服务商不认某个参数而不可用：
         去掉 response_format → 去掉 reasoning_effort → 降 max_tokens
     """
+    if isinstance(uris, str):
+        uris = [uris]
     body = {
         "model": cfg["model"],
         "messages": [{
             "role": "user",
             # 图在前、要求在后：先看清内容，再读该怎么输出（与 vision/batch_page 一致）
             "content": [
-                {"type": "image_url", "image_url": {"url": uri}},
+                *({"type": "image_url", "image_url": {"url": u}} for u in uris),
                 {"type": "text", "text": prompt},
             ],
         }],
@@ -966,16 +1316,37 @@ def _call_model(uri: str, prompt: str, cfg: dict, temperature: float = 0) -> tup
 
 
 # ---------------------------------------------------------------- 对外入口
+def _check_reference(answer_mode: str, ctx: dict) -> set[str]:
+    """校验「依据编码 + 依据内容」配不配得上，返回条件集合（不含 ai 基准）。
+
+    单独抽出来是**为了能直接测**：`_recognize` 一调就要联网、要配密钥，
+    而这段校验是纯逻辑 —— 放在里面的话「拼错的 keys 会不会静默降级」这种
+    要命的问题只能靠人肉跑真接口才验得到。
+
+    ⚠️ 不认识的 token 必须炸，不能当 ai 处理：拼错的 "keys" 静默降级成「自己解」，
+       老师却以为在按他的答案判 —— 那正是这次要防的错。
+    """
+    _known = {grade_basis.MODE_AI} | set(grade_basis.CONDITIONS)
+    _tokens = {t.strip().lower() for t in str(answer_mode).replace(",", "+").split("+")
+               if t.strip()}
+    if not _tokens or not _tokens <= _known:
+        raise _GradeError(
+            f"不认识的批改依据「{answer_mode}」，只能是 ai / key / rubric / key+rubric"
+        )
+    modes = _tokens - {grade_basis.MODE_AI}
+    if "key" in modes and not (_as_str(ctx.get("answer_text"))
+                               or (ctx.get("answer_images") or [])):
+        raise _GradeError("勾了「按我给的答案判定」，但没有读到答案内容")
+    if "rubric" in modes and not (_as_str(ctx.get("rubric_text"))
+                                  or (ctx.get("rubric_images") or [])):
+        raise _GradeError("勾了「按我的评分细则判定」，但没有读到细则内容")
+    return modes
+
+
 def _recognize(png_path: str, ctx: dict) -> tuple[list[dict], str]:
     answer_mode = _as_str(ctx.get("answer_mode")) or "ai"
-    if answer_mode not in ("ai", "key", "rubric"):
-        raise _GradeError(
-            f"不认识的批改依据「{answer_mode}」，只能是 ai / key / rubric"
-        )
-    if answer_mode == "key" and not _as_str(ctx.get("answer_text")):
-        raise _GradeError("选择了「按老师答案批改」，但没有读到答案内容")
-    if answer_mode == "rubric" and not _as_str(ctx.get("rubric_text")):
-        raise _GradeError("选择了「按评分细则批改」，但没有读到细则内容")
+    # 条件允许叠加（`key+rubric`），校验与内容检查都在 `_check_reference` 一处。
+    modes = _check_reference(answer_mode, ctx)
 
     cfg = _load_cfg(ctx)
     model = _as_str(ctx.get("model")) or cfg.get("model") or ""
@@ -987,13 +1358,20 @@ def _recognize(png_path: str, ctx: dict) -> tuple[list[dict], str]:
             "批改和公式识别共用这一份配置。"
         )
 
-    uri = _prepare_image(png_path)
+    uris = _image_uris(png_path, ctx)
     prompt = _prompt_for(answer_mode, ctx)
-    text, finish = _call_model(uri, prompt, cfg, temperature=0)
+    text, finish = _call_model(uris, prompt, cfg, temperature=0)
 
     items, err = _parse_grade_text(text)
     if err:
         return [], err
+
+    if ctx.get("region") and len(items) > 1:
+        # 框画大了，把下一题的抬头也裁了进来。只留第一条（题干在上面），并打标 ——
+        # **不能静默丢**：老师要知道「这个框框多了」，否则会以为邻题被判进了这一题。
+        items = items[:1]
+        if "region_multi" not in items[0]["flags"]:
+            items[0]["flags"].append("region_multi")
 
     for it in items:
         it["raw"]["meta"].update({
@@ -1002,7 +1380,7 @@ def _recognize(png_path: str, ctx: dict) -> tuple[list[dict], str]:
             "mode": answer_mode,
             "sample": 1,
         })
-        if answer_mode == "ai":
+        if not modes:      # 一个条件都没勾 = 参考解全靠模型自己，必须标出来
             # 参考解是模型自己做的，没经老师核对。**必须**标出来：
             # 模型解错了就是整题判错，这个差别不给老师看见就是灾难。
             if "reference_unverified" not in it["flags"]:
@@ -1015,7 +1393,7 @@ def _recognize(png_path: str, ctx: dict) -> tuple[list[dict], str]:
         samples = 1
     if samples >= 2 and items:
         try:
-            text2, finish2 = _call_model(uri, prompt, cfg, temperature=0.7)
+            text2, finish2 = _call_model(uris, prompt, cfg, temperature=0.7)
             items2, _err2 = _parse_grade_text(text2)
             if items2:
                 for it in items2:
@@ -1023,7 +1401,7 @@ def _recognize(png_path: str, ctx: dict) -> tuple[list[dict], str]:
                         "model": cfg["model"], "finish_reason": finish2,
                         "mode": answer_mode, "sample": 2,
                     })
-                    if answer_mode == "ai" and "reference_unverified" not in it["flags"]:
+                    if not modes and "reference_unverified" not in it["flags"]:
                         it["flags"].append("reference_unverified")
                 items = apply_stability(items, items2)
         except Exception:                       # noqa: BLE001
@@ -1036,7 +1414,7 @@ def _recognize(png_path: str, ctx: dict) -> tuple[list[dict], str]:
 def recognize_page(png_path: str, ctx: dict) -> tuple[list[dict], str]:
     """批改**一页**。返回 (items, err)。
 
-    ctx = {"student": "李四", "answer_mode": "ai"|"key"|"rubric",
+    ctx = {"student": "李四", "answer_mode": "ai"|"key"|"rubric"|"key+rubric",
            "answer_text": "...", "rubric_text": "...", "page_no": 1,
            "answer_steps": [...](可选，老师答案的结构化步骤), "model": "(可选覆盖)"}
 
@@ -1057,3 +1435,20 @@ def recognize_page(png_path: str, ctx: dict) -> tuple[list[dict], str]:
     except Exception as e:                      # noqa: BLE001  这一层是兜底，什么都得接住
         # 不把 traceback 抛给上层：调用方是后台线程，抛出去的表现是「这页凭空消失」。
         return [], f"这一页批改失败：{type(e).__name__}: {_clip(str(e), 200)}"
+
+
+def recognize_region(png_path: str, ctx: dict) -> tuple[list[dict], str]:
+    """批改**一个框**（一道题）。契约与 `recognize_page` 完全一致。
+
+    ctx 多两个键：`region=True`（固定）、`region_label`（"第 3 题"，只写进提示词
+    帮模型定位，**不参与题号绑定**）。
+
+    返回 0 条**不是错误**：框画在了空白处 / 那一块确实没题。上层会补一条
+    「这个框里没读到题」的占位，让老师看见而不是让它凭空消失。
+    """
+    try:
+        return _recognize(png_path, {**(ctx or {}), "region": True})
+    except _GradeError as e:
+        return [], str(e)
+    except Exception as e:                      # noqa: BLE001
+        return [], f"这一题批改失败：{type(e).__name__}: {_clip(str(e), 200)}"

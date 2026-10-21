@@ -672,6 +672,21 @@ table.tbl td.pending { color: var(--warning); font-weight: 600; }
 .plan-preview { font-size: 13px; color: var(--text-2); overflow: hidden;
                 text-overflow: ellipsis; white-space: nowrap; margin-top: 3px; }
 
+/* ---------------- 批改存档（挂在上课记录每节课下面） ---------------- */
+/* 文件名可能很长（「批改_李芹旭_20261020_3.pdf」），允许断行但别撑破那一行 */
+.archive-name { font-size: 14px; word-break: break-all; }
+
+/* 上课记录里**每节课下面**那一行存档：一节课可能挂好几条，
+   用带框的卡片会把时间轴撑得很散，所以只给一条虚线分隔。
+   ⚠️ 不要 background —— 时间轴本身已经是卡片色。
+   ⚠️ 原来的 .archive-row / .archive-main / .archive-head（「改作业」总览卡片那套）
+      随卡片一起去掉了，2026-10-21 用户点名不要那份平铺总览。 */
+.archive-line { display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+                padding: 5px 0; border-bottom: 1px dashed var(--border); }
+.archive-line:last-child { border-bottom: none; }
+.archive-line .archive-name { cursor: pointer; min-width: 0; }
+.archive-line .archive-name:hover { color: var(--primary); text-decoration: underline; }
+
 /* 「看」那一面渲染出来的正文。容器由 JS 写 innerHTML（KaTeX 要求），
    所以排版规则全落在这里 —— 与 .q-rich 同一套行距，但**不设高度上限**：
    这里是专门点开来看的，限高就等于把内容藏起来。 */
@@ -737,6 +752,10 @@ table.tbl td.pending { color: var(--warning); font-weight: 600; }
                    line-height: 1.6; color: var(--text-3); text-align: center; padding: 20px; }
 /* 标注层：绝对铺满图片，SVG 用 0~1000 的归一化坐标（preserveAspectRatio="none"）。
    根节点不吃鼠标 —— 没标注的地方要能穿透到图片上。 */
+/* ⚠️ workbench.html 里那份拷贝多一个 `z-index: 20`，**这不是漂移**：
+ *   工作台的卷面上还有块带（z-index 2）、分割线（5）、框选（6）、草框（7）压着，
+ *   不抬高层的话红笔迹会被半透明色块染掉 —— 用户就是这么报的「看不到笔画」。
+ *   本页（A 路线）没有那些辅助层，不需要。 */
 .gmark-layer { position: absolute; inset: 0; pointer-events: none; }
 .gmark-svg { display: block; width: 100%; height: 100%; }
 .gmark { pointer-events: auto; cursor: pointer; }
@@ -870,6 +889,78 @@ table.tbl td.pending { color: var(--warning); font-weight: 600; }
 .g-color.on { box-shadow: 0 0 0 2px var(--primary); }
 .grade-toolhint { margin: -2px 0 8px; }
 
+/* ---------------- 框题面板（一题一区域）----------------
+   只在「框题」模式下出现：它改的是**批改口径**（有框就一框一次判），
+   不是批注，所以不跟画笔那排混在一起占视觉。 */
+.grade-regions { border: 1px dashed var(--border); border-radius: 8px;
+                 padding: 8px 10px; margin: 0 0 8px; background: var(--bg-2, #fafafa); }
+.gr-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.gr-list { margin-top: 6px; max-height: 300px; overflow: auto; }
+.gr-row { padding: 6px 0; border-top: 1px solid var(--border); }
+.gr-row-top { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+/* 「这块不判」：整行淡掉 + 缩略图去色，一眼与要送的块区分开（与录题页 .skipped 同一套视觉）。
+   ⚠️ 只淡、不禁用：还得能点回来。 */
+.gr-row.off { opacity: .62; }
+.gr-row.off .gr-thumb img { filter: grayscale(1); }
+.gr-no { display: inline-flex; align-items: center; justify-content: center;
+         min-width: 20px; height: 20px; border-radius: 4px; background: #2563eb;
+         color: #fff; font-size: 11px; }
+.gr-q { width: 84px; padding: 2px 6px; font-size: 12.5px;
+        border: 1px solid var(--border); border-radius: 5px; background: #fff; }
+/* 跨页题：这一题由几段拼的。要显眼 —— 老师得一眼看出「这两段会拼成一张图」。 */
+.gr-span { font-size: 11.5px; color: #b45309; background: #fef3c7;
+           border: 1px solid #fcd34d; border-radius: 4px; padding: 1px 6px; }
+/* 块缩略图：**「到底切成了什么」的唯一凭据**。
+   以前这一行只有「第 1 页 / 跨第 1+2 页」两句话，切歪了要等模型判完才知道。 */
+.gr-thumb { position: relative; margin-top: 5px; }
+.gr-thumb img { display: block; max-width: 100%; max-height: 118px; cursor: zoom-in;
+                border: 1px solid var(--border); border-radius: 6px; background: #fff; }
+.gr-off-tag { position: absolute; left: 6px; top: 6px; font-size: 11px; line-height: 1;
+              padding: 3px 7px; border-radius: 10px; background: #6b7280; color: #fff; }
+/* 每页尾部：末段底边的滑块。它是「每页尾部处理」那个旋钮，别藏进弹窗。 */
+.gr-tail { display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+           margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--border); }
+.gr-tail input[type="range"] { width: 140px; }
+
+/* 图的读数：等宽、可换行，像一张小表；不自作主张渲染 LaTeX（这里没有 $ 包裹） */
+.g-figure { white-space: pre-wrap; font-size: 12.5px; line-height: 1.6;
+            background: var(--bg-2, #fafafa); border: 1px solid var(--border);
+            border-radius: 6px; padding: 5px 7px; color: var(--text-2); }
+
+/* 模型给的分类标签（0031）：学段 / 体系 / 知识点 / 考法。
+   挤在一行、可换行 —— 四个标签各占一行的话，一份 10 题的作业光标签就占掉半屏。 */
+.g-labels { display: flex; flex-wrap: wrap; gap: 4px; margin: 4px 0 2px; }
+.g-label { font-size: 11.5px; line-height: 1.6; padding: 1px 6px; border-radius: 3px;
+           background: var(--bg-2, #f4f4f5); color: var(--text-2);
+           border: 1px solid var(--border); }
+/* 「学段」单独给个颜色：它是**唯一能拿来筛**的（枚举值），
+   老师在列表里扫一眼就能找到「这份全是初中的题」。 */
+.g-label.lb-stage { background: #ecf5ff; color: #409eff; border-color: #d9ecff; }
+
+/* 模型说「这块不像一道题」（block_kind ≠ question）。
+   ⚠️ 是**提示条**，不是自动跳过 —— 所以用橙色描边警告，而不是直接把它灰掉。 */
+.g-odd { display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+         margin: 6px 0 2px; padding: 5px 8px; border-radius: 6px; font-size: 12px;
+         background: #fff7ed; border: 1px solid #fdba74; color: #9a3412; }
+/* 模型说「底部有问题」（tail_note）。与上面同理：只提示，不改任何状态。 */
+.g-tail-note { white-space: pre-wrap; font-size: 12.5px; line-height: 1.6;
+               background: #fff7ed; border: 1px solid #fcd34d;
+               border-radius: 6px; padding: 5px 7px; color: #92400e; }
+
+/* 判定依据里的「传照片」：file input 与「已附 N 张」同一行，别把设置区撑高 */
+.grade-ansfile { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 4px; }
+.grade-ansfile input[type="file"] { font-size: 12px; max-width: 100%; }
+/* 拖拽区：虚线框住整行，拖上去要看得见「可以放这里」。
+   ⚠️ 它包的输入框仍然是普通文件选择 —— 拖拽只是多一条路，不是唯一的路。 */
+.grade-drop { padding: 8px; border: 1px dashed var(--line, #d7dce3); border-radius: 8px;
+              background: rgba(37, 99, 235, .02); }
+.grade-drop.off { border-color: var(--line, #e5e7eb); background: transparent; opacity: .7; }
+
+/* 本机草稿里还有没送上去的笔迹 —— 这条必须看得见（老师会以为丢了而重画）。 */
+.grade-draft-tip { display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+                   margin-top: 6px; padding: 5px 8px; border-radius: 6px; font-size: 12px;
+                   background: rgba(217, 119, 6, .1); color: #92400e; }
+
 /* ⚠️ 画/擦/放标记时整层接事件；同时让**已有标注**失去指针 ——
    否则笔一落就被某条标注吃掉（<g> 默认 pointer-events:auto），画不出线。 */
 .gmark-layer.mode-ink, .gmark-layer.mode-erase,
@@ -879,13 +970,63 @@ table.tbl td.pending { color: var(--warning); font-weight: 600; }
 .gmark-layer.mode-ink { cursor: crosshair; }
 .gmark-layer.mode-erase { cursor: cell; }
 .gmark-layer.mode-text { cursor: text; }
-.gmark-layer.mode-check, .gmark-layer.mode-cross { cursor: copy; }
-.gmark-layer.mode-ink .gmark, .gmark-layer.mode-erase .gmark,
+.gmark-layer.mode-check, .gmark-layer.mode-cross { cursor: copy; }.gmark-layer.mode-ink .gmark, .gmark-layer.mode-erase .gmark,
 .gmark-layer.mode-text .gmark, .gmark-layer.mode-check .gmark,
 .gmark-layer.mode-cross .gmark,
 .gmark-layer.mode-ink .gmark-label, .gmark-layer.mode-erase .gmark-label,
 .gmark-layer.mode-text .gmark-label, .gmark-layer.mode-check .gmark-label,
 .gmark-layer.mode-cross .gmark-label { pointer-events: none; }
+
+/* ---------------- 一题一区域（框题）----------------
+   与标注同一条 svg、同一套 0~1000 坐标，但语义不同：
+   标注是「老师批的话」，框是「批改单元」—— 有框的页一框一次模型调用。
+   框只用蓝虚线，不与红笔标注抢眼；编号是白字蓝底的小标签，点一下就删。 */
+.gmark-layer.mode-region { pointer-events: auto; touch-action: none; cursor: crosshair; }
+/* 画框时已有标注必须失去指针，否则起手那一下就被某条标注吃掉（同画笔那条坑） */
+.gmark-layer.mode-region .gmark,
+.gmark-layer.mode-region .gmark-label { pointer-events: none; }
+.gmark-region { pointer-events: auto; cursor: pointer; }
+.rg-rect { fill: rgba(37, 99, 235, .05); stroke: #2563eb; stroke-width: 1.8;
+           stroke-dasharray: 8 6; vector-effect: non-scaling-stroke; }
+.rg-rect:hover { fill: rgba(37, 99, 235, .14); }
+.rg-draft { fill: rgba(37, 99, 235, .1); stroke: #2563eb; stroke-width: 2;
+            vector-effect: non-scaling-stroke; pointer-events: none; }
+.gmark-rlabel { position: absolute; transform: translate(0, -100%); pointer-events: auto;
+                cursor: pointer; font-size: 11px; line-height: 1.5; padding: 0 6px;
+                border-radius: 4px; white-space: nowrap; background: #2563eb; color: #fff; }
+.gmark-rlabel:hover { background: #b91c1c; }
+
+/* ---------------- 分割线（逐题切）----------------
+   与框选同一件事的另一种画法：线切出来的是**整页宽**的段，落到库里与框一模一样。
+   所以后端零改动 —— 裁切 / 跨页竖拼 / 逐题批改全都走已有的那套。
+   颜色用琥珀（不是红、不是蓝）：它既不是老师的批语，也不是 AI 的框，是「刀」。 */
+.gmark-layer.mode-line { pointer-events: auto; touch-action: none; cursor: crosshair; }
+/* 切出来的段是**整页宽**的，这里必须让它失去指针 —— 否则整页都成了「段」，
+   老师点哪里都在点段，一条新线也画不出来。段的删除走右栏面板。 */
+.gmark-layer.mode-line .gmark,
+.gmark-layer.mode-line .gmark-label,
+.gmark-layer.mode-line .rg-rect,
+.gmark-layer.mode-line .gl-band { pointer-events: none; }
+.gl-band { fill: rgba(217, 119, 6, .045); }
+.gl-band:nth-child(even) { fill: rgba(217, 119, 6, .085); }
+.gl-line { stroke: #d97706; stroke-width: 2; stroke-dasharray: 10 6;
+           vector-effect: non-scaling-stroke; }
+.gl-band-no { position: absolute; right: 6px; transform: translate(0, -100%);
+              font-size: 11px; line-height: 1.5; padding: 0 5px; border-radius: 4px;
+              background: rgba(217, 119, 6, .16); color: #b45309; pointer-events: none; }
+.gl-line-x { position: absolute; right: 2px; transform: translate(0, -50%);
+             width: 20px; height: 20px; line-height: 18px; text-align: center;
+             border-radius: 50%; font-size: 13px; cursor: pointer; z-index: 2;
+             background: #d97706; color: #fff; border: 1px solid #fff;
+             box-shadow: 0 1px 4px rgba(0, 0, 0, .25); }
+.gl-line-x:hover { background: #b91c1c; }
+.gl-tip { position: absolute; left: 8px; transform: translate(0, -50%);
+          font-size: 11px; line-height: 1.5; padding: 0 5px; border-radius: 4px;
+          background: #b45309; color: #fff; pointer-events: none; }
+/* 末段以下（页脚带）：斜纹灰底 + 虚线边。**必须看得见** —— 否则老师不知道
+   「下面那 4% 去哪了」，会以为漏了一题。与录题页的 .tail-hint 同一套视觉语言。 */
+.gl-tail { fill: rgba(148, 163, 184, .22); stroke: #94a3b8; stroke-width: 1;
+           stroke-dasharray: 6 5; pointer-events: none; }
 
 /* 老师笔迹：比 AI 的框更活泼一点（粗、圆头、圆角），一眼能分出「这是我画的」 */
 .gmark .shape.ink { stroke-width: 3; }

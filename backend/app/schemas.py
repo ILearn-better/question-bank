@@ -671,16 +671,22 @@ class GradeIn(BaseModel):
     提交件走 `file_ids`（`lesson_files.id`）—— 学生交的照片/PDF 已经在「交作业」那一步
     上传归档过了，这里只引用，不重传一份一样的。
 
-    答案的三种来源就对应 `answer_mode`：
-      · `ai`     —— 不用老师给，模型自己解题（会标 reference_unverified，老师能展开看它的解法）
-      · `key`    —— 老师给答案：`answer_text` 粘文字，或 `answer_file_ids` 给照片/Word
-      · `rubric` —— 老师给分步评分细则：`rubric_text`（每步多少分、扣分条件）
+    **判定方式 = AI 基准 + 可叠加的条件**（2026-10-21 用户改的口径：
+    「默认 AI 自主判定，选了那两个中的一个就加一个条件，选了两个相当于加了两个条件」）：
+      · 基准永远是 `ai` —— 模型先把题自己解一遍，这是底座，关不掉；
+      · `key`    —— 叠加「老师给的答案」：`answer_text` 粘文字，或 `answer_file_ids` 给照片/Word
+      · `rubric` —— 叠加「老师的评分细则」：`rubric_text`（分步给分点、扣分条件）
+
+    两个条件可以同时选（`basis_modes=["key","rubric"]`）：答案定对错、细则定 partial 与漏步。
+    库里的编码走 `grade_basis.encode_modes()`（`ai` / `key` / `rubric` / `key+rubric`），
+    列还是原来那一个 `homework_grades.answer_mode` —— 不新增列、不需要迁移。
+    ⚠️ 默认空列表 = 只有 AI 基准（用户点名「默认选中 AI 自主判定」）。
     """
 
     lesson_id: int
     curriculum_id: Optional[int] = None
     file_ids: List[int] = Field(default_factory=list)
-    answer_mode: Literal["ai", "key", "rubric"] = "key"
+    basis_modes: List[Literal["key", "rubric"]] = Field(default_factory=list)
     answer_text: str = ""
     rubric_text: str = ""
     answer_file_ids: List[int] = Field(default_factory=list)
@@ -694,11 +700,21 @@ class GradeSetupPatch(BaseModel):
     已经批完再换依据，等于拿旧判定冒充新标准，那必须走「重新批改」（会清空结果）。
 
     字段是 Optional 且 `None = 不改`（同其它 Patch 的语义）；传空串 = 清空。
+
+    `answer_file_ids` 是**整份替换**答案依据文件（`None = 不改`，`[] = 清空`）。
+    为什么要能改：原来只有建任务那一次能挑答案文件，老师建完发现答案照片拍错了
+    就只能重建任务、把已选好的提交件重新选一遍。现在开批之前随时能换。
+    ⚠️ 换文件**不清已批的结果**：这个接口本来就只允许在没批出结果之前用（见上）。
     """
 
-    answer_mode: Optional[Literal["ai", "key", "rubric"]] = None
+    # 整份替换条件集合（`None = 不改`，`[] = 只剩 AI 基准`）。
+    # ⚠️ 这里**不校验「依据是否为空」**：界面上是「先勾条件、再传依据」，
+    #    在这儿拦会跟「AI 基准下不许上传」互锁（真浏览器测出来的死锁）。
+    #    校验只留在 `launch()` 一处。
+    basis_modes: Optional[List[Literal["key", "rubric"]]] = None
     answer_text: Optional[str] = None
     rubric_text: Optional[str] = None
+    answer_file_ids: Optional[List[int]] = None
 
 
 class GradeItemPatch(BaseModel):
@@ -732,7 +748,26 @@ class GradeMarkIn(BaseModel):
     points: List[float] = Field(default_factory=list)   # 手绘折线 [x,y,x,y,…]
     text: str = ""
     color: str = ""
+    # 笔迹粗细（0~1000 坐标系里的单位，与 geo/points 同一套）。
+    # 0 = 没指定 → 前端不输出 stroke-width，走样式表默认（旧记录全是 0，行为不变）。
+    width: float = 0.0
     item_id: Optional[str] = None
+
+
+class GradeMarksIn(BaseModel):
+    """一次补发**多条**标注。给批改页的本地草稿队列用。
+
+    为什么需要这一条：老师画完一笔就关页面时，那一个 POST 会被浏览器取消。
+    前端把没送出去的笔迹攒在本机（见 `frontend/src/gradeDraft.js`），
+    下次打开再补发 —— 一笔一个请求的话，画了三十笔就要发三十次，
+    在「刚打开页面、还在拉详情」的那几秒里很容易又断掉。
+
+    ⚠️ **要顺序**：数组顺序就是落库顺序（同一位置后画的盖在上面）。
+    ⚠️ **不做去重**：补发方自己保证「只发服务端还没有的」。
+       服务端要是猜「这条是不是已经有了」，猜错的方向是**把老师的两笔并成一笔**。
+    """
+
+    marks: List[GradeMarkIn] = Field(default_factory=list)
 
 
 class GradeMarkPatch(BaseModel):
@@ -743,6 +778,70 @@ class GradeMarkPatch(BaseModel):
     text: Optional[str] = None
     color: Optional[str] = None
     kind: Optional[Literal["box", "ellipse", "check", "cross", "arrow", "text", "ink"]] = None
+
+
+class GradeRegionIn(BaseModel):
+    """一题一区域的**一段**。坐标按页归一化 0~1000（与标注同制，不是像素）。
+
+    一段 = 一个框。**一道题可以有多段**（跨页题）：`seq` 相同的几段属于同一题，
+    `seg` 决定它们竖着拼起来的先后。单页题只发一段，`seg` 留 0 即可。
+
+    `q_no` 空着也行：批改时会回落到模型自己认的题号。填了就以它为准 ——
+    这样学生把「第 3 题」写成「第 8 题」时归属仍然是第 3 题。
+    """
+
+    page_no: int = 1
+    seq: int = 0                                        # 题序号（同一题的多段共用）
+    seg: int = 0                                        # 段内序号（0 起，拼接顺序）
+    q_no: str = ""
+    box: List[float] = Field(default_factory=list)      # [x0, y0, x1, y1]
+    # 「这一段不送 AI」（0030）。卷头段、纯结构说明段、重复页上的段都走这里。
+    # ⚠️ 只是「别送模型」，框仍然留着 —— 删框再画一遍的成本高得多。
+    skipped: bool = False
+
+
+class GradePageSkipsIn(BaseModel):
+    """整页不送 AI（0030）：封页、空白作答页、草稿页。
+
+    与「按块跳过」的关系：**页跳过优先**。一页被跳过时，落在这一页上的块
+    （包括从这页开始、跨到下一页的块）一起不送 —— 只批半道跨页题比不批更糟。
+    """
+
+    pages: List[int] = Field(default_factory=list)
+
+
+class GradeRegionsPut(BaseModel):
+    """**整份替换**老师画的框（不再按页分开发）。
+
+    为什么从「按页替换」改成「整份替换」：跨页题的两段**天然落在不同页上**，
+    按页提交的话，保存第 2 页时第 1 页那段还是库里的旧值，「一题两段」这个
+    组合根本没有一个时刻能被原子地写进去。整份替换把整份作业的框当成一张表，
+    一次写完 —— 结果永远等于老师屏幕上看到的样子。
+
+    ⚠️ 一次批改最多 60 段（`MAX_REGIONS_PER_PAGE × 页数` 的老上限按段算），
+    段数太多说明框画碎了，模型调用次数会线性涨。
+
+    `grouped` 是**显式的分组意愿**，不能靠猜：
+
+      · `False`（默认）—— 每个框就是一道题。老口径，也最安全。
+      · `True` —— 按 `seq` 分组，同一个 `seq` 的几段合成一题（跨页题）。
+
+    为什么不「所有 seq 都是 0 就当一题多段」：那正好和「前端没填 seq 的 8 个独立框」
+    长得一模一样，猜错的代价是 8 道题被并成一道。多一个布尔字段比赌一次强。
+    """
+
+    regions: List[GradeRegionIn] = Field(default_factory=list)
+    grouped: bool = False
+
+
+class GradeRegionsCopy(BaseModel):
+    """从**同一课时的另一份批改**把框拷过来（一套卷只画一次）。
+
+    ⚠️ 拷过来的是坐标本身。不同学生的照片会有平移/旋转，框会偏 ——
+    所以界面要提示「宁大勿小」，且拷完建议扫一眼。
+    """
+
+    from_grade_id: int
 
 
 class GradeToBankIn(BaseModel):
@@ -759,4 +858,18 @@ class GradeToBankIn(BaseModel):
 class GradeConfirmIn(BaseModel):
     """老师确认整份批改。确认之后，统计口径（掌握度 / 家长稿）才会读它。"""
 
+    note: str = ""
+
+
+# ============================================================ 批改文件留存
+class ArchiveGenerateIn(BaseModel):
+    """把一份批改**导出成带笔迹的 PDF** 并归档到学生资料。
+
+    `archived_on` 不填时取**批改那天**（不是今天）—— 目录是给人翻的，
+    按作业日期分才找得到「10 月 20 号那节课的卷子」（见 services/archive_store.py）。
+    """
+
+    grade_id: int
+    archived_on: Optional[str] = None
+    grader: str = ""
     note: str = ""

@@ -175,6 +175,98 @@ def t_duration() -> None:
     check("布尔值 → 报错（不是数字）", f(True)[0] is None, str(f(True)))
 
 
+# ================================================================ ③b 时长兜底
+def t_duration_fallback() -> None:
+    """时长「写 90、导进去变 60」的两种成因（用户 2026-10-20 报的）。
+
+    ①时间格式：Excel 那一列设成「时间」，输 1:30 想表示 1 小时半 →
+      openpyxl 给的是 time 对象，旧代码认不出 → 兜底 60
+    ②列没认出来：表头写成「每节时长」这种别名之外的写法 → 整列被忽略 →
+      **所有行**静默 60，预览里一片 60，看不出任何异常
+
+    所以这里守两件事：认得出的都要认出来；认不出/没填时必须**说得出来**。
+    """
+    from datetime import time as _time, timedelta as _td
+    section("③b 时长：Excel 时间格式 + 兜底必须说出来")
+    f = SI.parse_duration
+
+    check("Excel 时间单元格 time(1,30) → 90（不是 60）", f(_time(1, 30)) == (90, None), str(f(_time(1, 30))))
+    check("Excel 时间单元格 time(0,50) → 50", f(_time(0, 50)) == (50, None), str(f(_time(0, 50))))
+    check("timedelta 1h30m → 90", f(_td(hours=1, minutes=30)) == (90, None), str(f(_td(hours=1, minutes=30))))
+    check("Excel 时间分数 0.0625 → 90", f(0.0625) == (90, None), str(f(0.0625)))
+    check("文本 '1:30' → 90", f("1:30") == (90, None), str(f("1:30")))
+    check("全角 '1：30' → 90", f("1：30") == (90, None), str(f("1：30")))
+    check("'0:45' → 45", f("0:45") == (45, None), str(f("0:45")))
+    check("'1小时半' → 90", f("1小时半") == (90, None), str(f("1小时半")))
+    check("'一小时半' → 90", f("一小时半") == (90, None), str(f("一小时半")))
+    # 老行为不能被这条改坏：'1:90' 不是合法时钟
+    check("'1:90' → 报错（分钟不能 ≥60）", f("1:90")[0] is None, str(f("1:90")))
+
+    # ---- 整表：时间格式的列 ----
+    body = [
+        ["2026-10-23", "17:00", "甲", _time(1, 30), "数学", "线下", "南山", "", "已排课"],
+        ["2026-10-24", "10:00", "乙", _time(0, 50), "数学", "线下", "南山", "", "已排课"],
+    ]
+    res = SI.parse_workbook(mk_xlsx([HEAD] + body))
+    durs = [r["duration_min"] for r in res["rows"]]
+    check("★★ 整表：时间格式的 90/50 全读对（旧代码这里是 60/60）",
+          sorted(durs) == [50, 90], str(durs))
+    check("读对了就不该标「默认」",
+          all(not r["duration_defaulted"] for r in res["rows"]), str([r["duration_defaulted"] for r in res["rows"]]))
+
+    # ---- 整表：时长留空 → 60 但要标出来 ----
+    blank = [
+        ["2026-10-23", "17:00", "甲", "", "数学", "线下", "南山", "", "已排课"],
+        ["2026-10-24", "10:00", "乙", None, "数学", "线下", "南山", "", "已排课"],
+    ]
+    res = SI.parse_workbook(mk_xlsx([HEAD] + blank))
+    check("留空 → 60（默认值不变，用户明确要求保持 60）",
+          all(r["duration_min"] == 60 for r in res["rows"]), str([r["duration_min"] for r in res["rows"]]))
+    check("★ 留空的行要标 duration_defaulted", all(r["duration_defaulted"] for r in res["rows"]))
+    check("★ 留空要在 notes 里说清楚「已按 60 分钟」",
+          any("60 分钟" in n and "第" in n for n in res.get("notes") or []), str(res.get("notes")))
+    check("counts 里有 duration_defaulted 计数", res["counts"].get("duration_defaulted") == 2,
+          str(res["counts"]))
+
+    # ---- 整表：表头写成别名之外的「每节时长」→ 必须点名 ----
+    head_bad = list(HEAD)
+    head_bad[3] = "每节时长"
+    body_ok = [
+        ["2026-10-23", "17:00", "甲", 90, "数学", "线下", "南山", "", "已排课"],
+    ]
+    res = SI.parse_workbook(mk_xlsx([head_bad] + body_ok))
+    check("★ 认不出时长列时，仍然按 60 兜底（自证用户看到的 60 就是这么来的）",
+          res["rows"][0]["duration_min"] == 60, str(res["rows"][0]["duration_min"]))
+    check("★★ 但必须把「这列看着像时长却没用上」放在 notes 最前面",
+          bool(res.get("notes")) and "每节时长" in res["notes"][0] and "60 分钟" in res["notes"][0],
+          str(res.get("notes")))
+
+    # ---- 「课时费（元）」是钱不是时长，不能被误报 ----
+    head_fee = list(HEAD) + ["课时费（元）"]
+    body_fee = [
+        ["2026-10-23", "17:00", "甲", 90, "数学", "线下", "南山", "", "已排课", 300],
+    ]
+    res = SI.parse_workbook(mk_xlsx([head_fee] + body_fee))
+    # ⚠️ 判据只能锚「看着像时长」那条提示 —— 「忽略了这几列：课时费（元）」
+    #    是正常提示（那一列确实用不上），不是误报。第一版把它算成误报，红了。
+    check("「课时费（元）」不当时长列误报",
+          not any("看着像时长" in n for n in res.get("notes") or []) and res["rows"][0]["duration_min"] == 90,
+          str(res.get("notes")))
+
+    # ---- 前端：预览里要能看见「默认」 ----
+    src = (FE / "src" / "components" / "ScheduleImportDialog.js").read_text(encoding="utf-8")
+    check("★ 预览里标出「默认」（否则老师以为 60 是自己填的）",
+          "duration_defaulted" in src and "默认" in src)
+    # 反面：别把整表都标成默认 —— 只在真兜底时标
+    check("只对兜底的行标（v-if 绑定在 r.duration_defaulted 上）",
+          re.search(r'v-if="r\.duration_defaulted"', src) is not None)
+
+    # router 层也要把这个计数透出去（前端可能用它做提示）
+    router_src = (ROOT / "backend" / "app" / "routers" / "lesson_import.py").read_text(encoding="utf-8")
+    check("preview 的 counts 里带 duration_defaulted",
+          '"duration_defaulted"' in router_src)
+
+
 # ================================================================ ④ 金额
 def t_money() -> None:
     section("④ 单价怎么写都认")
@@ -1123,6 +1215,7 @@ def main() -> int:
     t_date()
     t_time()
     t_duration()
+    t_duration_fallback()
     t_money()
     t_enum()
     t_workbook()

@@ -27,7 +27,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
 from .. import config, taxonomy
@@ -38,6 +38,7 @@ from ..models import (
     HomeworkGradeFile,
     HomeworkGradeItem,
     HomeworkGradeMark,
+    HomeworkGradeRegion,
     Lesson,
     LessonFile,
     Question,
@@ -49,10 +50,11 @@ from ..schemas import (
     GradeItemPatch,
     GradeMarkIn,
     GradeMarkPatch,
+    GradeRegionsPut,
     GradeSetupPatch,
     GradeToBankIn,
 )
-from . import knowledge, storage
+from . import grade_basis, knowledge, storage
 
 # 页 = 一次模型调用。并发数与 batch_page 同一个量级：再高只是把模型的限流打满。
 WORKERS = 3
@@ -62,9 +64,44 @@ MAX_PAGES = 30
 
 VERDICTS = ("correct", "partial", "wrong", "blank", "ungradable")
 
+# ---------------------------------------------------------------- 一题一区域
+# 裁切时框向外扩多少（单位是 0~1000 的归一化坐标，12 ≈ 纸面 1.2%）。
+# 为什么要外扩：老师画框会贴着字画，正好切掉笔画的上缘/下缘（尤其是分数线、
+# 根号的上横线）；不同学生的照片还有平移，拷过来的框本来就偏。
+# 宁可多带一点页边 —— 多带的空白模型会忽略，切掉的笔画是永久丢失。
+REGION_PAD = 12
+
+# 框太小就当没画（0~1000 制下 20 ≈ 纸面 2%）。比这更小的框裁出来只是一团糊字，
+# 送模型等于花钱买一个「读不清」。
+REGION_MIN_SIDE = 20
+
+# 单页最多几个框。与 MAX_ITEMS_PER_PAGE 同量级：正常一页 10~40 题。
+MAX_REGIONS_PER_PAGE = 60
+
+# 一次补发多少条标注（批改页本地草稿队列的上限，与前端 gradeDraft.MAX_MARKS 同值）。
+# 设上限不是怕模型，是怕「本机攒了三个月没发出去的东西」一次性灌进来。
+MAX_MARKS_PER_BATCH = 200
+
+# 裁出来的小块放大上限。放太大只是把 JPEG 噪声一起放大、还更贵；
+# 4 倍足够把 300px 宽的一小块提到 1200px（模型实际吃的是 GRADE_MAX_EDGE）。
+REGION_MAX_ZOOM = 4.0
+
+# 跨页题拼接时，PDF 点 → 像素的放大倍数。A4 宽 595pt × 3 ≈ 1785px；
+# 两段竖拼后高度约 4000px，再由 grade_ai 统一压到 GRADE_MAX_EDGE，
+# 于是每段大约还有 1100px 高 —— 仍明显优于整页判（整页 2200 高要摊给一整页）。
+REGION_PDF_ZOOM = 3.0
+
+# 跨页拼接的两段之间留的白缝（像素）。不留缝会让人以为「上一段最后一行
+# 和下一段第一行是同一行」，模型也容易把两段的字连成一句。
+REGION_GAP = 8
+
 # 可以直接当"一页"渲染的图片格式（与 routers/documents.py 的 PAGE_IMAGE_EXTS 同制）。
 # 不进那个常量是分层问题：services 不该 import routers。
 _IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".bmp")
+
+
+def _is_image_name(name: str) -> bool:
+    return Path(str(name or "")).suffix.lower() in _IMAGE_EXTS
 
 
 class GradeError(Exception):
@@ -109,6 +146,15 @@ def _json_list(raw: str | None) -> list:
     return v if isinstance(v, list) else []
 
 
+def _json_dict(raw: str | None) -> dict:
+    """同 `_json_list`，只是要的是对象（labels 用）。坏数据一律当空，绝不抛。"""
+    try:
+        v = json.loads(raw or "{}")
+    except (TypeError, ValueError):
+        return {}
+    return v if isinstance(v, dict) else {}
+
+
 def _num(v) -> float | None:
     """分数：**缺数据就是 None，绝不用 0**。0 分和"没判"混成一个数会带偏正确率。"""
     if v is None or v == "":
@@ -135,7 +181,60 @@ def _confidence(v) -> str:
     return v if v in taxonomy.CONFIDENCES else "low"
 
 
+# 「这一块是什么」（0030）。**空字符串是合法值**：整页口径不产这个字段，
+# 老记录也没有 —— 界面见到空就什么都不显示。
+BLOCK_KINDS = ("question", "header", "section", "footer", "blank", "other")
+
+
+def _labels_of(v) -> dict:
+    """落库前再收一道口子（提示词那边 `grade_ai._labels` 已经归一过一次）。
+
+    为什么要两道：提示词是**别人写的模型输出**经过 `_item_from_obj` 来的；但
+    `patch_item` / 以后可能的导入路径也会碰到这个字段。落库这一层是底线 ——
+    只有这一层能保证「表里存的 labels 一定是「四个短字符串键」的形式」，
+    界面上才敢直接遍历渲染，不用再写一遍防御。
+    """
+    from app.services import grade_ai                    # 迟导入：避免循环 import
+
+    if not isinstance(v, dict):
+        return {}
+    out: dict[str, str] = {}
+    for k in grade_ai.LABEL_KEYS:
+        val = v.get(k)
+        if not isinstance(val, str):
+            continue
+        val = val.strip()[:24]
+        if val:
+            out[k] = val
+    stage = out.get("stage", "")
+    if stage and stage not in grade_ai.LABEL_STAGES:
+        out.pop("stage", None)
+    return out
+
+
+def _block_kind(v) -> str:
+    """模型说的「这块是什么」。**不认识就归空，不猜**。
+
+    为什么不像 `_verdict` 那样给个兜底值：
+      · 猜成 `question` → 「这块像页脚」的提示消失，老师又看不到线索了；
+      · 猜成 `header` / `section` → 界面会建议跳过，正好丢掉一道真题。
+    空值在界面上等于「模型没说」，这才是诚实的表达。
+    """
+    v = str(v or "").strip().lower()
+    return v if v in BLOCK_KINDS else ""
+
+
 # ---------------------------------------------------------------- 序列化
+def _modes_list(grade: HomeworkGrade) -> list[str]:
+    """条件集合按**固定顺序**给前端（`["key","rubric"]`），前端据此勾复选框。
+
+    顺序固定不是洁癖：`set` 的迭代顺序每次进程都可能不同，
+    界面上的勾选顺序跟着抖一下，看着像「自己变了」。
+    """
+    m = grade_basis.modes_of(grade)
+    return [x for x in grade_basis.CONDITIONS if x in m]
+
+
 def brief(grade: HomeworkGrade) -> dict:
     """列表用的简报：**不含 items**（一节课几十条批改，带 items 会把响应撑成几 MB）。"""
     return {
@@ -144,6 +243,7 @@ def brief(grade: HomeworkGrade) -> dict:
         "lesson_id": grade.lesson_id,
         "status": grade.status,
         "answer_mode": grade.answer_mode,
+        "basis_modes": _modes_list(grade),
         "total": grade.total,
         "done": grade.done,
         "failed": grade.failed,
@@ -156,7 +256,21 @@ def brief(grade: HomeworkGrade) -> dict:
     }
 
 
-def file_dict(f: HomeworkGradeFile) -> dict:
+def file_dict(f: HomeworkGradeFile, db: Session | None = None) -> dict:
+    """一条文件行给前端的样子。
+
+    0034 之后 `files` 里混着两类东西：学生的**提交件**（引用 lesson_files）
+    和老师传的**判定依据**（自落盘 + text 列）。所以要多给三样：
+      · `lesson_file_id` —— 提交件才有，前端据此知道原件的出处；
+      · `chars` —— 抽出来多少字；
+      · `preview` —— 开头一小段，老师能确认「传的是不是这份」。
+    **必须给出 `chars`**：一份读不出字的依据（扫描版 PDF）模型其实看不见，
+    界面得据此提醒；只列个文件名，老师会以为已经给过答案了。
+    """
+    chars = len(f.text or "")
+    if not chars and f.lesson_file_id and db is not None:
+        lf = db.get(LessonFile, f.lesson_file_id)
+        chars = int(getattr(lf, "chars", 0) or 0) if lf is not None else 0
     return {
         "id": f.id,
         "name": f.name,
@@ -164,6 +278,9 @@ def file_dict(f: HomeworkGradeFile) -> dict:
         "kind": f.kind,
         "size_bytes": f.size_bytes,
         "pages": f.pages,
+        "lesson_file_id": f.lesson_file_id,
+        "chars": chars,
+        "preview": (f.text or "")[:160],
     }
 
 
@@ -186,6 +303,15 @@ def item_dict(it: HomeworkGradeItem) -> dict:
         "tags": _json_list(it.tags),
         "error_reason": it.error_reason,
         "flags": _json_list(it.flags),
+        # 图上读到的东西。**必须给前端**：没有它，老师无法核对「模型说有直角符号」
+        # 到底是不是真有，而这条已经从「一律不采信」改成「可作判定依据」了。
+        "figure_note": it.figure_note or "",
+        # 模型对「这块是什么」的判断 + 尾部情况（0030）。
+        # 界面上是两句提示，不参与判定 —— 判错一块等于丢一道题，宁可让老师自己点。
+        "block_kind": it.block_kind or "",
+        "tail_note": it.tail_note or "",
+        # 分类标签（0031）：学段 / 体系 / 知识点 / 考法。界面上并排显示成一行标签。
+        "labels": _labels_of(_json_dict(it.labels)),
         "status": it.status,
         "question_id": it.question_id,
     }
@@ -201,6 +327,7 @@ def mark_dict(m: HomeworkGradeMark) -> dict:
         "points": _json_list(m.points),
         "text": m.text,
         "color": m.color,
+        "width": float(m.width or 0),
         "created_by": m.created_by,
     }
 
@@ -223,14 +350,26 @@ def detail(db: Session, grade: HomeworkGrade) -> dict:
         .order_by(HomeworkGradeMark.page_no, HomeworkGradeMark.id)
     ).all()
     out["items"] = [item_dict(i) for i in items]
-    out["files"] = [file_dict(f) for f in files]
+    out["files"] = [file_dict(f, db) for f in files]
     out["marks"] = [mark_dict(m) for m in marks]
+    # 老师画的「一题一区域」框。有框的页按框逐题批，没框的页保持整页一次判。
+    out["regions"] = list_regions(db, grade.id)
+    # 整页不送 AI 的页号（0030）。界面上要能一眼看到「这几页不看」，
+    # 否则老师会以为漏批了 —— 与「按块跳过」放在同一个返回里，前端一处对齐。
+    out["skipped_pages"] = skipped_pages_of(grade)
     # pages 是 total 的别名：前端按 1..pages 逐张去取 /page/{pno}。
     # 不另立第二套"总页数"概念 —— 两个字段各存一份，迟早有一个忘更新。
     out["pages"] = grade.total
     # 判定依据的原文，给批改页回显用（老师切到「AI 自己解」时也要能看见自己填过的答案，
     # 所以这里**不受 answer_mode 影响** —— respect_mode=False）。
     out["answer_text"], out["rubric_text"] = _answer_texts(db, grade, respect_mode=False)
+    # 答案/细则**引用的文件**与**真正的图片**。前端要能回显「这次用的是哪张照片」——
+    # 只给文字的话，老师传了照片却看到答案框空着，会以为没生效。
+    out["answer_file_ids"] = [
+        int(f.lesson_file_id) for f in files
+        if f.lesson_file_id and f.role in ("answer", "rubric")
+    ]
+    out["answer_images"] = _answer_images(db, grade)
     return out
 
 
@@ -328,19 +467,24 @@ def create_grade(db: Session, payload: GradeIn) -> HomeworkGrade:
 
     answer_text = (payload.answer_text or "").strip()
     rubric_text = (payload.rubric_text or "").strip()
-    if payload.answer_mode == "key" and not (answer_text or ans_files):
-        raise GradeError(422, "选了「老师给答案」，但答案还是空的 —— 粘一段文字，或传一份答案文件")
-    if payload.answer_mode == "rubric" and not (rubric_text or ans_files):
-        raise GradeError(422, "选了「评分细则」，但细则还是空的 —— 每步多少分、什么情况扣分，得写下来")
-    # 答案文件必须是**能读出文字**的：批改靠文本比对，照片里的答案没有文字就等于没给，
-    # 模型会退回"自己解题"却仍然显示「按老师答案判」—— 那是拿错标准批学生，必须当场拦住。
+    modes = grade_basis.parse_modes(payload.basis_modes)
+    if "key" in modes and not (answer_text or ans_files):
+        raise GradeError(422, "选了「按我给的答案判定」，但答案还是空的 —— 粘一段文字，或传一份答案文件")
+    if "rubric" in modes and not (rubric_text or ans_files):
+        raise GradeError(422, "选了「按我的评分细则判定」，但细则还是空的 —— 每步多少分、什么情况扣分，得写下来")
+    # 答案文件要么**能读出文字**，要么是**图片**（走视觉通道）。
+    # 都不是就当场拦住：一份既没文字、又没法当图看的文件等于没给答案，
+    # 而模型会退回"自己解题"却仍然显示「按老师答案判」—— 那是拿错标准批学生。
+    # （2026-10 起放行图片：`_answer_images` 会把图真的送进模型，
+    #   不再是「说按老师答案判、其实没看见答案」。）
     for lf in ans_files:
-        if not (lf.text or "").strip():
-            raise GradeError(
-                422,
-                f"答案文件「{lf.name}」里没有可读的文字"
-                f"（{lf.reason or '照片/扫描件不抽文字'}）—— 请把答案直接粘贴进文本框",
-            )
+        if (lf.text or "").strip() or _is_image_name(lf.name):
+            continue
+        raise GradeError(
+            422,
+            f"答案文件「{lf.name}」里没有可读的文字"
+            f"（{lf.reason or '这种格式不抽文字'}）—— 请粘贴文字，或直接传一张答案照片",
+        )
 
     total = sum(_page_count(lf) for lf in sub_files)
     if total > MAX_PAGES:
@@ -352,7 +496,7 @@ def create_grade(db: Session, payload: GradeIn) -> HomeworkGrade:
         lesson_id=lesson.id,
         curriculum_id=payload.curriculum_id,
         status="queued",                    # 建了就等着，跑不跑由 /run 决定
-        answer_mode=payload.answer_mode,
+        answer_mode=grade_basis.encode_modes(modes),   # ai / key / rubric / key+rubric
         total=total, done=0, failed=0,
         error="",
         created_at=_now(),
@@ -373,7 +517,9 @@ def create_grade(db: Session, payload: GradeIn) -> HomeworkGrade:
         ))
     # 答案/细则：粘贴的文字落 txt，引用的文件同样只引用。
     # rubric 模式下这批文件是**细则**，不是答案 —— 两者在 ctx 里走不同字段。
-    ans_role = "rubric" if payload.answer_mode == "rubric" else "answer"
+    # 只勾了细则 → 这批文件就是细则；其余情况（含两个都勾）落到 answer，
+    # 细则那边由老师在上传时自己选 role（`basisRole`）。
+    ans_role = "rubric" if modes == {"rubric"} else "answer"
     if answer_text:
         _add_answer_text_file(db, grade, answer_text, "answer", "答案（粘贴）")
     if rubric_text:
@@ -401,11 +547,10 @@ def patch_setup(db: Session, gid: int, payload: GradeSetupPatch) -> HomeworkGrad
     必须走「重新批改」把它清掉重来 —— 否则老师会以为依据改了、其实判定还是旧的。
     """
     grade = get_grade(db, gid)
-    if grade.done or grade.status not in ("queued", "failed"):
-        raise GradeError(422, "这份已经开始批过了 —— 改判定依据请点「重新批改」（会重跑一遍）")
+    _assert_setup_editable(grade)
 
-    if payload.answer_mode is not None:
-        grade.answer_mode = payload.answer_mode
+    if payload.basis_modes is not None:
+        grade.answer_mode = grade_basis.encode_modes(payload.basis_modes)
 
     # 只重写「粘贴的那份」，引用的 lesson_files 不动（那是另一批行，由 create 负责）
     if payload.answer_text is not None:
@@ -417,33 +562,68 @@ def patch_setup(db: Session, gid: int, payload: GradeSetupPatch) -> HomeworkGrad
         if payload.rubric_text.strip():
             _add_answer_text_file(db, grade, payload.rubric_text.strip(), "rubric", "评分细则（粘贴）")
 
-    db.flush()
-    # 改完重新校验：切到 key/rubric 却没依据，等于拿「AI 自己解」冒充「按老师答案判」——
-    # 那是拿错标准批学生，必须在开批前拦住。
-    key_text, rub_text = _answer_texts(db, grade)
-    if grade.answer_mode == "key" and not key_text:
-        raise GradeError(422, "选了「老师给答案」，但答案还是空的 —— 粘一段文字再开始批改")
-    if grade.answer_mode == "rubric" and not rub_text:
-        raise GradeError(422, "选了「评分细则」，但细则还是空的 —— 每步多少分、什么情况扣分，得写下来")
+    # 换/补**引用文件**（答案照片、细则照片、答案 PDF）。整份替换，粘贴的 txt 不动 ——
+    # 它们是老师刚敲的字，跟这批文件是两回事。
+    if payload.answer_file_ids is not None:
+        db.execute(delete(HomeworkGradeFile).where(
+            HomeworkGradeFile.grade_id == grade.id,
+            HomeworkGradeFile.role.in_(("answer", "rubric")),
+            HomeworkGradeFile.lesson_file_id.is_not(None),
+        ))
+        _modes = (grade_basis.parse_modes(payload.basis_modes) if payload.basis_modes is not None
+                  else grade_basis.modes_of(grade))
+        ans_role = "rubric" if _modes == {"rubric"} else "answer"
+        for fid in dict.fromkeys(int(x) for x in payload.answer_file_ids):
+            lf = _lesson_file(db, fid, grade.lesson_id, "答案文件")
+            if not ((lf.text or "").strip() or _is_image_name(lf.name)):
+                raise GradeError(
+                    422,
+                    f"答案文件「{lf.name}」里没有可读的文字（{lf.reason or '这种格式不抽文字'}）"
+                    "—— 请粘贴文字，或直接传一张答案照片",
+                )
+            db.add(HomeworkGradeFile(
+                owner_id=config.OWNER_ID, grade_id=grade.id, lesson_file_id=lf.id,
+                name=lf.name, stored="", role=ans_role, kind=lf.kind,
+                size_bytes=lf.size_bytes or 0, pages=lf.pages or 0,
+            ))
 
+    db.flush()
+    # ⚠️⚠️ 这里**故意不查 `_missing_basis`**（2026-10-21 真浏览器测出来的死锁）：
+    #
+    #    老师看到的顺序是「先切模式、再传依据」（依据那一栏在模式下面），而且
+    #    前端在一个条件都没勾时**不许上传**（传上去也没去处，会当场拦下）。
+    #    两边一夹：
+    #        切到 key —— 需要先有依据 —— 被拒；
+    #        传依据 —— 需要先切到 key —— 被拒。
+    #    结果是这个功能整体用不了，且只表现为「切了又自动跳回去」。
+    #
+    #    「切了 key 但还没传」是一个**正当的过渡态**：界面会显示
+    #    「还没传依据（点开始批改会被拦）」，`launch()` 那道门也照样拦得住
+    #    （依据后来被删光的情况只有它管得到）。所以校验只留在开批那一处。
+    #    **不许在这里再补一道** —— 补了就又把老师锁死在 AI 模式里。
     db.commit()
     return grade
 
 
 def _drop_pasted(db: Session, grade: HomeworkGrade, role: str) -> None:
-    """删掉某个 role 下**粘贴出来的**那几行（`lesson_file_id` 为空的就是），连磁盘上的 txt 一起。
+    """删掉某个 role 下**粘贴出来的**那几行，连磁盘上的 txt 一起。
 
-    只删粘贴的：引用的 `lesson_files` 是老师从「交作业」传的答案文件，
-    那是另一份归档原件，删了会连带把人家上传的文件抹掉。
+    ⚠️ 判据是 `_is_pasted_row`，**不能只看 `lesson_file_id is None`**：
+    0034 起，老师上传的依据文件（答案 PDF / 答案照片 / 细则 Excel）同样是
+    自落盘、同样没有 lesson_file_id。按老写法删「粘贴的那几行」，
+    会把刚传上来的答案整批删掉、连原件一起 unlink —— 而且不报错。
+    只删粘贴那两行还有第二个理由：引用的 `lesson_files` 是另一份归档原件，
+    删了会连带把人家上传的文件抹掉。
     """
     rows = db.scalars(
         select(HomeworkGradeFile).where(
             HomeworkGradeFile.grade_id == grade.id,
             HomeworkGradeFile.role == role,
-            HomeworkGradeFile.lesson_file_id.is_(None),
         )
     ).all()
     for f in rows:
+        if not _is_pasted_row(f):
+            continue
         if (f.stored or "").strip():
             p = storage.safe_join(f.stored)
             if p is not None and p.exists():
@@ -452,6 +632,824 @@ def _drop_pasted(db: Session, grade: HomeworkGrade, role: str) -> None:
                 except OSError:
                     pass          # 删不掉文件不影响逻辑：行删了就再也不会被读到
         db.delete(f)
+
+
+# ---------------------------------------------------------------- 判定依据（文件那一半）
+# 一条判定依据 = 一行 `homework_grade_files`（role = answer / rubric）。
+# 三种来源并存，界面上一律叫「判定依据」：
+#   · 老师**粘贴**的文字 → `_add_answer_text_file` 落的 `answer.txt` / `rubric.txt`；
+#   · 老师**上传**的图片 / PDF / Word / Excel → 本段落的 `add_basis_file`，原件落
+#     `<grade dir>/basis/`，抽出来的正文进 `text` 列（0034）；
+#   · 引用 `lesson_files` 的老记录（旧版批改页传的答案照片）—— 只读，不动。
+_PASTED_BASENAMES = ("answer.txt", "rubric.txt")
+
+
+def _is_pasted_row(f: HomeworkGradeFile) -> bool:
+    """这一行是「老师粘贴的文字」吗（`_add_answer_text_file` 落的那两个 txt）。
+
+    ⚠️ 判据是**文件名**，不是「有没有 lesson_file_id」：0034 起上传的依据文件
+    同样自落盘、同样没有 lesson_file_id，用后者会把上传件当成粘贴件删掉。
+    `_add_answer_text_file` 永远只写 `answer.txt` / `rubric.txt` 这两个名字，
+    所以这个判据是确定的（改那边的文件名时必须一起改这里）。
+    """
+    if f.lesson_file_id:
+        return False
+    return Path(str(f.stored or "")).name in _PASTED_BASENAMES
+
+
+def _assert_setup_editable(grade: HomeworkGrade) -> None:
+    """开批之前才允许动判定依据。**批过就锁住**。
+
+    理由：那批判定是按旧依据批出来的。改了依据却留着旧判定，比不改更糟 ——
+    老师以为换了标准，实际上结果还是旧标准算的。要换就点「重新批改」。
+    """
+    if grade.done or grade.status not in ("queued", "failed"):
+        raise GradeError(422, "这份已经开始批过了 —— 改判定依据请点「重新批改」（会重跑一遍）")
+
+
+def _missing_basis(db: Session, grade: HomeworkGrade) -> str:
+    """勾了条件、但那一类依据是空的：返回缺的条件列表（`[]` = 不缺）。
+
+    **规则只在这里一处**，唯一的调用点是 `launch()`（真开批那一刻）。
+    ⚠️ `patch_setup()` **故意不调用它**：勾条件那一步要求「依据已经存在」，
+    会跟「AI 基准下不许上传」互锁，老师永远勾不上（详见那里的注释）。
+
+    两个条件可以同时勾，所以返回值是**列表**而不是单个字符串：
+    缺哪个说哪个，别让老师修好一个又挨一次 422。
+    """
+    modes = grade_basis.modes_of(grade)
+    if not modes:
+        return []
+    key_text, rub_text = _answer_texts(db, grade)
+    imgs = _answer_images(db, grade)
+    missing: list[str] = []
+    if "key" in modes and not (key_text or imgs["answer"]):
+        missing.append("key")
+    if "rubric" in modes and not (rub_text or imgs["rubric"]):
+        missing.append("rubric")
+    return missing
+
+
+# 条件 → 人话。文案只在这里一处，launch 与前端提示用同一套名字。
+MODE_TITLE = {"key": "按我给的答案判定", "rubric": "按我的评分细则判定"}
+_MODE_WHAT = {"key": "答案", "rubric": "评分细则"}
+
+
+def _missing_basis_msg(missing: list[str]) -> str:
+    """把「缺什么」写成一句老师看得懂的话（缺几个就说几个，别只说第一个）。"""
+    what = "、".join(_MODE_WHAT[m] for m in missing)
+    if len(missing) == 1:
+        head = f"勾了「{MODE_TITLE[missing[0]]}」，"
+    else:
+        head = "两个条件都勾了，"
+    return f"{head}但{what}还是空的 —— 先传一份再开始批改"
+
+
+def basis_dir(gid: int) -> Path:
+    """这份批改的「判定依据」目录。
+
+    刻意放在批改自己的目录下、**不进 lesson_files**：一份答案 PDF 若混进
+    「交作业」清单，下次建批改时会被默认勾上当学生作业批（那是真会发生的错）。
+    """
+    return grade_dir(int(gid)) / "basis"
+
+
+def basis_dict(db: Session, f: HomeworkGradeFile) -> dict:
+    """给界面的一条依据。`kind`/`chars`/`text_warn` 是「模型到底看不看得见」的判据。"""
+    d = file_dict(f, db)
+    d["pasted"] = _is_pasted_row(f)
+    # 读不出字、又不是图片 → 模型其实看不见它。界面必须明说（不能只列个文件名）。
+    d["text_warn"] = ("" if d["kind"] == "image" or d["chars"] else
+                      "这份没读出文字，模型看不见里面的内容")
+    return d
+
+
+def add_basis_file(db: Session, gid: int, role: str, filename: str,
+                   data: bytes) -> dict:
+    """收一份判定依据。返回 `{"file": …, "note": …}`。
+
+    校验顺序是**先全部校验、最后才落盘**：类型 → 空文件 → 大小 → 份数。
+    反过来的话，一份超限的文件会先躺在磁盘上，然后这条请求 422 ——
+    老师重试一次就多一份垃圾文件，谁也不会来清。
+
+    `note` 非空 = 收下了但抽不出文字（扫描版 PDF 之类），界面要如实显示：
+    静默收下一份模型看不见的依据，比直接拒绝更糟 —— 老师会以为已经按他的答案判了。
+    """
+    grade = get_grade(db, gid)
+    _assert_setup_editable(grade)
+    if role not in ("answer", "rubric"):
+        raise GradeError(422, f"role 只能是 answer / rubric（收到 {role!r}）")
+
+    name = Path(str(filename or "")).name or "basis"      # 只取文件名，防路径穿越
+    if grade_basis.is_legacy_xls(name):
+        raise GradeError(422, "老式 .xls 读不了 —— 请在 Excel 里「另存为」.xlsx 或 .csv 再传")
+    if grade_basis.kind_of(name) is None:
+        raise GradeError(
+            422,
+            f"判定依据不收这种格式（{Path(name).suffix or '无扩展名'}）。{grade_basis.SUPPORTED_NOTE}")
+    if not data:
+        raise GradeError(422, f"「{name}」是空文件 —— 重新选一次吧")
+    if len(data) > grade_basis.MAX_BASIS_BYTES:
+        mb = grade_basis.MAX_BASIS_BYTES // 1024 // 1024
+        raise GradeError(
+            422, f"「{name}」太大了（超过 {mb}MB）—— 答案/细则一般不会这么大，确认一下选错文件没有")
+
+    used = int(db.scalar(
+        select(func.count()).select_from(HomeworkGradeFile).where(
+            HomeworkGradeFile.grade_id == grade.id,
+            HomeworkGradeFile.role.in_(("answer", "rubric")),
+        )
+    ) or 0)
+    if used >= grade_basis.MAX_BASIS_FILES:
+        raise GradeError(
+            422,
+            f"判定依据最多 {grade_basis.MAX_BASIS_FILES} 份，这份已经有 {used} 份了"
+            " —— 先在列表里删掉几份再传")
+
+    d = basis_dir(grade.id)
+    d.mkdir(parents=True, exist_ok=True)
+    ext = Path(name).suffix.lower()
+    # 落盘名洗一遍（中文名、表情、`..` 都可能出现在上传文件名里），重名加 _2。
+    stored_name = storage.unique_name(
+        d, storage.safe_token(Path(name).stem, "basis") + ext)
+    p = d / stored_name
+    p.write_bytes(data)
+
+    info = grade_basis.extract(p, name)
+    row = HomeworkGradeFile(
+        owner_id=config.OWNER_ID, grade_id=grade.id, lesson_file_id=None,
+        name=name, stored=storage.rel(p), role=role, kind=info["kind"] or "",
+        size_bytes=len(data), pages=0, text=info["text"] or "",
+    )
+    db.add(row)
+    db.commit()
+    return {"file": basis_dict(db, row), "note": info["note"] or ""}
+
+
+def delete_basis_file(db: Session, gid: int, fid: int) -> dict:
+    """删一份判定依据（行 + 磁盘原件）。
+
+    已批过的不能删：删完库里 mode 还是「按我的答案判」，那份任务就变成了
+    「说按老师答案判、其实没有答案」—— 只能走「重新批改」。
+    """
+    grade = get_grade(db, gid)
+    _assert_setup_editable(grade)
+    f = get_basis_row(db, gid, fid)
+    rel = f.stored
+    lesson_file_id = f.lesson_file_id
+    grade_dir_ = grade_dir(grade.id)
+    db.delete(f)
+    db.commit()
+    # 只删自己那份原件。引用 lesson_files 的老记录**不碰** ——
+    # 那是「交作业」里同一份文件，删了会把学生交的作业一起抹掉。
+    if rel and not lesson_file_id:
+        storage.unlink_rels([rel], stop=grade_dir_)
+    return {"ok": True}
+
+
+def get_basis_row(db: Session, gid: int, fid: int) -> HomeworkGradeFile:
+    """取一行依据，**顺带确认它确实属于这份批改**。
+
+    ⚠️ 归属不对一律 404（不是 403）：状态码不该告诉人家「这条记录存在，只是你没权限」。
+    预览原件、看正文、删除都走这一处，别各写一份判据。
+    """
+    grade = get_grade(db, gid)
+    f = db.get(HomeworkGradeFile, fid)
+    if f is None or f.grade_id != grade.id or f.role not in ("answer", "rubric"):
+        raise GradeError(404, "这份判定依据不在这份批改里")
+    return f
+
+
+def basis_raw_path(db: Session, gid: int, fid: int) -> tuple[Path, str]:
+    """取回一份依据的**原件**（预览 / 下载）。返回 (磁盘路径, 原始文件名)。"""
+    f = get_basis_row(db, gid, fid)
+    p: Path | None = None
+    if f.lesson_file_id:
+        lf = db.get(LessonFile, f.lesson_file_id)
+        if lf is not None:
+            p = storage.safe_join(lf.stored)
+    elif (f.stored or "").strip():
+        p = storage.safe_join(f.stored)
+    if p is None or not p.exists() or not p.is_file():
+        raise GradeError(404, "这份依据的原件已经不在磁盘上了 —— 删掉它重传一份吧")
+    return p, (f.name or p.name)
+
+
+# ---------------------------------------------------------------- 一题一区域
+def region_dict(r: HomeworkGradeRegion) -> dict:
+    q = (r.q_no or "").strip()
+    return {
+        "id": r.id,
+        "page_no": int(r.page_no or 1),
+        "seq": int(r.seq or 0),
+        "seg": int(r.seg or 0),
+        "q_no": q,
+        # 给老师看、也写进提示词帮模型定位。**不参与题号绑定**（绑定看 q_no）。
+        # 同一个 seq 的几段 label 相同 —— 它们本来就是同一道题。
+        "label": q or str(int(r.seq or 0) + 1),
+        "box": _json_list(r.box),
+        # 这一段「不送 AI」。只是别送模型，框还留着（0030）。
+        "skipped": bool(int(r.skipped or 0)),
+    }
+
+
+def _regions_of(db: Session, gid: int) -> list[HomeworkGradeRegion]:
+    return list(db.scalars(
+        select(HomeworkGradeRegion)
+        .where(HomeworkGradeRegion.grade_id == int(gid))
+        .order_by(HomeworkGradeRegion.seq, HomeworkGradeRegion.seg,
+                  HomeworkGradeRegion.page_no, HomeworkGradeRegion.id)
+    ).all())
+
+
+def list_regions(db: Session, gid: int) -> list[dict]:
+    return [region_dict(r) for r in _regions_of(db, gid)]
+
+
+def _seg_key(seg: dict) -> tuple:
+    """拼接顺序的排序键：先页、再上边、最后段号。
+
+    为什么不信前端给的 `seg`：段序是**几何事实**（谁在上面谁在前面），
+    让界面去维护它，迟早出现「两段 seg 都是 0」或「seg=2 却画在 seg=1 上面」。
+    后端按坐标重排，前端只管「哪几段是同一题」。
+    """
+    box = seg.get("box") or [0, 0, 0, 0]
+    try:
+        top = float(box[1])
+    except (TypeError, ValueError, IndexError):
+        top = 0.0
+    return (int(seg.get("page_no") or 1), top, int(seg.get("seg") or 0))
+
+
+def blocks_of(db: Session, gid: int) -> list[dict]:
+    """把「段」聚合成「题」：**一道题 = `seq` 相同的 1..N 段**（可跨页）。
+
+    这是与批量录题 `blocks` 对齐的地方：那边也是「一段或多段合成一道题」，
+    只不过那边要的是录进题库的题目，这边要的是一条判定 ——
+    管道相同，喂进去的内容和要回来的形状不同。
+
+    返回按 `seq` 排序的块列表，每块：
+        seq / q_no / label / segments[{page_no, box, seg}] / pages / cross_page
+    """
+    groups: dict[int, list] = {}
+    for r in _regions_of(db, gid):
+        groups.setdefault(int(r.seq or 0), []).append(r)
+
+    out: list[dict] = []
+    for seq in sorted(groups):
+        segs = [region_dict(r) for r in groups[seq]]
+        segs.sort(key=_seg_key)
+        q_no = next((s["q_no"] for s in segs if s["q_no"]), "")
+        pages = [s["page_no"] for s in segs]
+        out.append({
+            "seq": seq,
+            "q_no": q_no,
+            "label": q_no or str(seq + 1),
+            # seg 重排成 0..n-1：前端给的值只当提示，真正顺序由几何决定。
+            "segments": [{**s, "seg": i} for i, s in enumerate(segs)],
+            "pages": pages,
+            "cross_page": len(set(pages)) > 1,
+            # 「这一题不送 AI」。`put_regions` 已经把同一题的几段写成一致的值，
+            # 这里用 all() 是为了绝不因为一半的标记而漏批一整题。
+            "skipped": all(bool(s.get("skipped")) for s in segs),
+        })
+    return out
+
+
+def blocks_by_page(db: Session, gid: int) -> dict[int, list[dict]]:
+    """{起始页: [块, …]}。
+
+    **块归它的第一段所在页** —— 跨页题只在起始页那一个线程里处理，
+    否则两页线程都会去批同一道题，结果互相覆盖。
+    """
+    out: dict[int, list[dict]] = {}
+    for b in blocks_of(db, gid):
+        first = b["segments"][0]["page_no"] if b["segments"] else 1
+        out.setdefault(int(first), []).append(b)
+    return out
+
+
+def regions_by_page(db: Session, gid: int) -> dict[int, list[dict]]:
+    """{页号: [段, …]}。**保留扁平口径**：给「只想知道哪页有段」的调用方用。"""
+    out: dict[int, list[dict]] = {}
+    for r in _regions_of(db, gid):
+        out.setdefault(int(r.page_no or 1), []).append(region_dict(r))
+    return out
+
+
+def _apply_skips(by_page: dict[int, list[dict]], skip_pages: set[int]) -> tuple[dict, set]:
+    """把「不送 AI」从块表里摘掉，返回 (还要批的块, 不许再批的页)。
+
+    返回值里那个**页面集合**是这条逻辑的关键，不是顺手带的：
+
+      · 某页的块全被标了跳过 → 这一页不能再走「没块 = 整页一次判」的老口径，
+        否则「我把这页所有块都设成不判」的结果是**整页送给模型**，正好相反。
+      · 整页跳过的页也不能走那条路。
+    所以两者都要单独记下来，由调用方提交一个空结果占住 done 计数
+    （不占的话 done 永远追不上 total，任务卡在 running）。
+
+    ⚠️ 页跳过只影响「**从这一页开始**」的块。一道跨页题从第 2 页开始、下半段在第 3 页，
+       把第 3 页设为不看**不会**拦住它 —— 那半段是这道题的一部分，只批一半更糟。
+       界面上「页不看」的说明也是这么写的。
+    """
+    out: dict[int, list[dict]] = {}
+    noop: set[int] = set()
+    for pno, blocks in (by_page or {}).items():
+        pno = int(pno)
+        if pno in skip_pages:
+            continue
+        kept = [b for b in blocks if not b.get("skipped")]
+        if kept:
+            out[pno] = kept
+        elif blocks:
+            noop.add(pno)
+    return out, noop
+
+
+# ---------------------------------------------------------------- 不送 AI（0030）
+def skipped_pages_of(grade: HomeworkGrade) -> list[int]:
+    """整页跳过的页号，**永远返回排好序的 int 列表**。
+
+    存的是 JSON 文本，坏数据/空值一律当「一页都不跳」—— 这个字段读错的后果是
+    「以为跳过了一页、其实批了」，或者更糟「以为批了、其实跳了」，两种都别猜。
+    """
+    raw = _json_list(grade.skipped_pages)
+    out = []
+    for v in raw:
+        try:
+            n = int(v)
+        except (TypeError, ValueError):
+            continue
+        if n >= 1:
+            out.append(n)
+    return sorted(set(out))
+
+
+def set_page_skips(db: Session, gid: int, pages) -> dict:
+    """整页不送 AI：**整份替换**（与框一样，"屏幕上的样子"才是真值）。
+
+    为什么不按页增删：老师说的是「这几页别看」，前端手上就有完整集合，
+    发一次替换不会出现「删了第 2 页、第 5 页却被旧值带回来」。
+    ⚠️ 只存页号，**不动框** —— 取消跳过后框还在，不用重画。
+    """
+    grade = get_grade(db, gid)
+    if grade.status == "running":
+        raise GradeError(409, "正在批改，等这一遍跑完再改「不送 AI」的页")
+    total = max(1, int(grade.total or 1))
+    clean: list[int] = []
+    for v in pages or []:
+        try:
+            n = int(v)
+        except (TypeError, ValueError):
+            continue
+        if n < 1 or n > total:
+            raise GradeError(422, f"第 {n} 页不存在 —— 这份作业只有 {total} 页")
+        clean.append(n)
+    grade.skipped_pages = json.dumps(sorted(set(clean)))
+    db.commit()
+    return {"skipped_pages": skipped_pages_of(grade)}
+
+
+def region_preview_png(db: Session, gid: int, spec: str, zoom: float = 1.6) -> bytes:
+    """把「一块（可跨页多段）」现裁成 PNG **直接返回、不落盘**。
+
+    这是「分割截图完后看不到图」那一问的正解：老师画完线、框完题，右栏每一行
+    都能立刻看到这块到底切成了什么，**保存前就能看**（所以走 spec 而不是 rid）。
+    与录题页 `/documents/{id}/region-image` 同一套做法与同一套理由：
+
+      · 不落盘 —— `data/uploads/crops/` 里的每张图都有数据库行引用它，
+        靠引用计数回收。预览图没有行引用，攒多了就是纯垃圾（实测踩过：
+        题库 0 行、盘上 92 张图）。
+      · GET + 查询串 —— 要能直接当 `<img src>` 用，浏览器才会替我们做缓存、
+        懒加载与并发控制。
+
+    `spec` 形如 `1:40,540,1000,800`，跨页用 `;` 连接
+    （与 documents 那个接口的语法一致，量纲同为 0~1000）。
+    """
+    import io
+
+    from PIL import Image
+
+    segs = []
+    for part in str(spec or "").split(";"):
+        part = part.strip()
+        if not part:
+            continue
+        if ":" not in part:
+            raise GradeError(422, f"区域写法不对：{part}（应为 页号:x0,y0,x1,y1）")
+        head, tail = part.split(":", 1)
+        try:
+            pno = int(head)
+            nums = [float(x) for x in tail.split(",")]
+        except ValueError as e:
+            raise GradeError(422, f"区域写法不对：{part}") from e
+        box = _region_box(nums)
+        if box is None:
+            raise GradeError(422, f"这一块太小或位置不对：{part}")
+        segs.append((pno, box))
+    if not segs:
+        raise GradeError(422, "没有给出要预览的区域")
+
+    tiles = []
+    for pno, box in segs:
+        try:
+            png = page_png(db, gid, pno)
+        except GradeError:
+            raise
+        with Image.open(png) as im:
+            im = im.convert("RGB")
+            w, h = im.size
+            px0 = int(w * box[0] / 1000.0)
+            py0 = int(h * box[1] / 1000.0)
+            px1 = max(px0 + 2, min(w, int(w * box[2] / 1000.0)))
+            py1 = max(py0 + 2, min(h, int(h * box[3] / 1000.0)))
+            tile = im.crop((px0, py0, px1, py1)).copy()
+        # 预览图不看细节，只让老师确认「切的是不是这一块」——
+        # 按 zoom 放大到长边 ≈ 900 就够，太大反而让右栏一排卡片拉不动。
+        tiles.append(tile)
+
+    canvas = tiles[0] if len(tiles) == 1 else _stack_images(tiles)
+    if canvas is None:
+        raise GradeError(422, "这块裁不出内容")
+    edge = max(canvas.size)
+    scale = float(zoom) * 900.0 / float(edge or 1)
+    if abs(scale - 1.0) > 0.06:
+        w, h = canvas.size
+        canvas = canvas.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
+    buf = io.BytesIO()
+    canvas.save(buf, "PNG", optimize=True)
+    return buf.getvalue()
+
+
+def _region_box(values) -> list[int] | None:
+    """校验并规整成一个框。**位置反了自动纠正，太小就判无效**。
+
+    太小不是「凑合能用」而是真的不能用：0~1000 制下 20 ≈ 纸面 2%，
+    比这更小的框裁出来只是一团糊字，送模型等于花钱买一句「读不清」。
+    """
+    try:
+        v = [int(round(float(x))) for x in (values or [])]
+    except (TypeError, ValueError):
+        return None
+    if len(v) != 4:
+        return None
+    x0, x1 = sorted((max(0, min(1000, v[0])), max(0, min(1000, v[2]))))
+    y0, y1 = sorted((max(0, min(1000, v[1])), max(0, min(1000, v[3]))))
+    if (x1 - x0) < REGION_MIN_SIDE or (y1 - y0) < REGION_MIN_SIDE:
+        return None
+    return [x0, y0, x1, y1]
+
+
+def put_regions(db: Session, gid: int, payload: GradeRegionsPut) -> list[dict]:
+    """**整份替换**老师画的框（段）。
+
+    为什么不是逐条增删、也不是按页替换：跨页题的两段天然落在不同页上，
+    按页提交的话，「一题两段」这个组合没有任何一个时刻能被原子地写进去。
+    整份替换的结果永远等于老师屏幕上看到的样子，不会出现「界面 5 段、库里 7 条」。
+
+    段的顺序（`seg`）由**后端按几何重排**：先页、再上边。前端只负责说
+    「这几段是同一题」（同一个 `seq`），不用维护拼接顺序。
+    """
+    grade = get_grade(db, gid)
+    if grade.status == "running":
+        raise GradeError(409, "正在批改，等这一遍跑完再改框 —— 否则这一批用的框是哪一版说不清")
+
+    rows = list(payload.regions or [])
+    pages = max(1, int(grade.total or 1))
+    limit = MAX_REGIONS_PER_PAGE * pages
+    if len(rows) > limit:
+        raise GradeError(422, f"这份作业最多画 {limit} 个框（每页 {MAX_REGIONS_PER_PAGE} 个）")
+
+    # ⚠️ 分组意愿必须由调用方**显式**给（`grouped`），不靠猜：
+    #    「所有 seq 都是 0」既可能是「一题两段」，也可能是「老调用方的 8 个独立框」，
+    #    猜错的方向是把 8 道题并成一道，比多传一个布尔字段糟得多。
+    seqs = [int(r.seq or 0) for r in rows]
+    if not payload.grouped:
+        seqs = list(range(len(rows)))
+
+    keep: list[dict] = []
+    for i, reg in enumerate(rows):
+        page_no = int(reg.page_no or 1)
+        if page_no < 1 or page_no > pages:
+            raise GradeError(422, f"第 {i + 1} 个框画在第 {page_no} 页上，但这份作业只有 {pages} 页")
+        box = _region_box(reg.box)
+        if box is None:
+            raise GradeError(
+                422,
+                f"第 {i + 1} 个框太小或位置不对 —— 要能框住一整道题"
+                f"（宽高都不能小于纸面的 {REGION_MIN_SIDE / 10:.0f}%）",
+            )
+        keep.append({
+            "page_no": page_no,
+            "seq": seqs[i],
+            "q_no": str(reg.q_no or "").strip()[:16],
+            "box": box,
+            "skipped": bool(getattr(reg, "skipped", False)),
+        })
+
+    # 同一题内的拼接顺序：几何位置说了算，前端给的 seg 只当没有返回值时的兜底
+    by_seq: dict[int, list[dict]] = {}
+    for row in keep:
+        by_seq.setdefault(row["seq"], []).append(row)
+    for segs in by_seq.values():
+        segs.sort(key=_seg_key)
+        for i, row in enumerate(segs):
+            row["seg"] = i
+        # 「不送 AI」按**整块**算：跨页题只跳过上半段没有意义 —— 只批半道题比不批更糟。
+        # 所以只要有一段标了跳过，这一题的每一段都当跳过（库里也写成一致的值，
+        # 免得下次读出来是一半一半）。
+        if any(r["skipped"] for r in segs):
+            for r in segs:
+                r["skipped"] = True
+
+    db.execute(delete(HomeworkGradeRegion).where(HomeworkGradeRegion.grade_id == grade.id))
+    for row in sorted(keep, key=lambda x: (x["seq"], x["seg"])):
+        db.add(HomeworkGradeRegion(
+            owner_id=config.OWNER_ID,
+            grade_id=grade.id,
+            page_no=row["page_no"],
+            seq=row["seq"],
+            seg=row["seg"],
+            q_no=row["q_no"],
+            box=json.dumps(row["box"]),
+            skipped=int(bool(row.get("skipped"))),
+            created_at=_now(),
+        ))
+    db.commit()
+    return list_regions(db, grade.id)
+
+
+def copy_regions(db: Session, gid: int, from_gid: int) -> list[dict]:
+    """把**同一节课另一份**的框照抄过来（一套卷只画一次）。
+
+    ⚠️ 拷的是坐标本身，不是「模板」。不同学生拍照会有平移/旋转，框会偏 ——
+    所以界面必须提示「宁大勿小」，且 `_crop_region` 会按 `REGION_PAD` 外扩兜一层。
+    跨课时不拷：不同卷子的排版不一样，拷过去只会把框画在错误的题上。
+    """
+    grade = get_grade(db, gid)
+    if grade.status == "running":
+        raise GradeError(409, "正在批改，等这一遍跑完再改框")
+    if int(from_gid) == grade.id:
+        raise GradeError(422, "不能从自己这一份抄框")
+    src = get_grade(db, from_gid)
+    if int(src.lesson_id) != int(grade.lesson_id):
+        raise GradeError(422, "只能沿用同一节课里的框 —— 不同卷子的排版不一样")
+    src_rows = _regions_of(db, src.id)
+    if not src_rows:
+        raise GradeError(422, "那一份还没有画框，没有可沿用的")
+
+    db.execute(delete(HomeworkGradeRegion).where(HomeworkGradeRegion.grade_id == grade.id))
+    for r in src_rows:
+        db.add(HomeworkGradeRegion(
+            owner_id=config.OWNER_ID,
+            grade_id=grade.id,
+            page_no=int(r.page_no or 1),
+            seq=int(r.seq or 0),
+            seg=int(r.seg or 0),
+            q_no=r.q_no or "",
+            box=r.box or "[]",
+            skipped=int(r.skipped or 0),
+            created_at=_now(),
+        ))
+    db.commit()
+    return list_regions(db, grade.id)
+
+
+def _crop_region(png_path: str, box, out_dir: Path, seq: int) -> Path | None:
+    """按 0~1000 的框从页图上裁一块，外扩 `REGION_PAD`，放大后落盘。
+
+    返回新文件路径；框不可用 / 图读不出来时返回 **None**（不抛）：
+    一个框坏了不该毁掉一整页的批改结果。
+    """
+    from PIL import Image      # 与 grade_export 同一条依赖，不引新库
+
+    b = _region_box(box)
+    if b is None:
+        return None
+    try:
+        # 与 grade_ai 的送模型分辨率对齐。延迟 import：grade_ai 缺席时整条链路
+        # 应该走「AI 模块没就位」的既有分支，而不是在这里 ImportError。
+        try:
+            from .grade_ai import GRADE_MAX_EDGE
+        except Exception:                        # noqa: BLE001
+            GRADE_MAX_EDGE = 2200
+        with Image.open(png_path) as im:
+            im = im.convert("RGB")
+            w, h = im.size
+            if w < 8 or h < 8:
+                return None
+            x0 = max(0, b[0] - REGION_PAD)
+            y0 = max(0, b[1] - REGION_PAD)
+            x1 = min(1000, b[2] + REGION_PAD)
+            y1 = min(1000, b[3] + REGION_PAD)
+            px0 = int(w * x0 / 1000.0)
+            px1 = int(w * x1 / 1000.0)
+            py0 = int(h * y0 / 1000.0)
+            py1 = int(h * y1 / 1000.0)
+            # 至少 2px：极小框在极端比例下会算出 0 宽，crop 会抛
+            px1 = max(px0 + 2, min(w, px1))
+            py1 = max(py0 + 2, min(h, py1))
+            px0 = min(px0, px1 - 2)
+            py0 = min(py0, py1 - 2)
+            tile = im.crop((px0, py0, px1, py1))
+            zoom = min(REGION_MAX_ZOOM,
+                       max(1.0, float(GRADE_MAX_EDGE) / float(max(tile.size))))
+            if zoom > 1.01:
+                tile = tile.resize(
+                    (max(1, int(tile.width * zoom)), max(1, int(tile.height * zoom))),
+                    Image.LANCZOS,
+                )
+            out_dir.mkdir(parents=True, exist_ok=True)
+            out = out_dir / f"region_{int(seq):03d}.png"
+            tile.save(out, "PNG")
+            return out
+    except Exception:                            # noqa: BLE001
+        return None
+
+
+def _stack_images(tiles: list, gap: int = REGION_GAP):
+    """把几张 Pillow 图竖着拼成一张（宽度取最宽，白底填充）。
+
+    只在「跨文件 / 照片」这条兜底路径上用。PDF 的多段拼接走
+    `pdf_adapter.crop_regions` —— 那边是渲染级拼接，比贴图更干净。
+    """
+    from PIL import Image
+
+    if not tiles:
+        return None
+    w = max(t.width for t in tiles)
+    h = sum(t.height for t in tiles) + gap * (len(tiles) - 1)
+    canvas = Image.new("RGB", (max(1, w), max(1, h)), (255, 255, 255))
+    y = 0
+    for t in tiles:
+        canvas.paste(t, (0, y))
+        y += t.height + gap
+    return canvas
+
+
+def _fit_to_edge(path: Path) -> Path:
+    """把已落盘的一张图缩放到长边 ≈ `GRADE_MAX_EDGE`（与 `_crop_region` 同一把尺子）。
+
+    为什么跨页拼图也要过这一道：单段走 `_crop_region` 会把图放大到 2200px，
+    而 `crop_regions` 只是按 zoom 渲染、不放大。不过这一道的话，
+    **跨页题反而比单页题糊** —— 它内容更多、本来更需要分辨率。
+    放大上限与单段一致（`REGION_MAX_ZOOM`）：再大只是把噪声一起放大。
+    """
+    from PIL import Image
+
+    try:
+        from .grade_ai import GRADE_MAX_EDGE
+    except Exception:                            # noqa: BLE001
+        GRADE_MAX_EDGE = 2200
+    try:
+        with Image.open(path) as im:
+            im = im.convert("RGB")
+            w, h = im.size
+            edge = max(w, h)
+            if edge <= 0:
+                return path
+            scale = float(GRADE_MAX_EDGE) / float(edge)
+            if scale > 1.0:
+                scale = min(scale, REGION_MAX_ZOOM)
+            if abs(scale - 1.0) < 0.02:
+                return path
+            im = im.resize((max(1, int(w * scale)), max(1, int(h * scale))),
+                           Image.LANCZOS)
+            im.save(path, "PNG")
+        return path
+    except Exception:                            # noqa: BLE001
+        return path                              # 缩放失败就用原图，别因此判整块失败
+
+
+def _crop_block(block: dict, slots_by_pno: dict, out_dir: Path) -> Path | None:
+    """裁一个**块**（一道题，可含多段）成一张图。返回落盘路径，失败返回 None。
+
+    三条路径，按「能不能少造轮子」排：
+
+      1. **单段** → `_crop_region`（Pillow 从页图裁）。页图本来就是缓存的，
+         不需要把 0~1000 换算成 PDF 点。
+      2. **多段且都在同一个 PDF 上** → 复用 `pdf_adapter.crop_regions`。
+         它本来就是「多个区域（可跨页）竖着拼成一张 PNG」，批量录题的
+         跨页题原貌图走的就是它。这里只负责把归一化框换成点坐标。
+      3. **多段但跨文件 / 是照片** → 逐段 Pillow 裁再竖拼。
+         照片一页一张，理论上不会跨页；这条是兜底，保证不崩而不是主路径。
+
+    ⚠️ 与 `_crop_region` 一样：坏一个块不该毁一整页，所以**全部失败返回 None**，
+    由调用方补一条 ungradable 占位题。
+    """
+    segs = block.get("segments") or []
+    if not segs:
+        return None
+    seq = int(block.get("seq") or 0)
+
+    slots: list[dict] = []
+    for s in segs:
+        slot = slots_by_pno.get(int(s.get("page_no") or 1))
+        if slot is None or slot.get("path") is None:
+            return None
+        slots.append(slot)
+
+    if len(segs) == 1:
+        try:
+            png = pdf_adapter.render_page(
+                str(slots[0]["path"]), int(slots[0]["local"]), str(slots[0]["cache_dir"]))
+        except Exception:                        # noqa: BLE001
+            return None
+        return _crop_region(png, segs[0].get("box"), out_dir, seq)
+
+    src = str(slots[0]["path"])
+    same_src = len({str(s["path"]) for s in slots}) == 1
+    if same_src and src.lower().endswith(".pdf"):
+        regions = []
+        try:
+            for seg, slot in zip(segs, slots):
+                W, H = pdf_adapter.page_size(src, int(slot["local"]))
+                b = _region_box(seg.get("box"))
+                if b is None or W <= 0 or H <= 0:
+                    return None
+                pad_x = W * REGION_PAD / 1000.0
+                pad_y = H * REGION_PAD / 1000.0
+                regions.append((
+                    int(slot["local"]),
+                    max(0.0, b[0] / 1000.0 * W - pad_x),
+                    max(0.0, b[1] / 1000.0 * H - pad_y),
+                    min(W, b[2] / 1000.0 * W + pad_x),
+                    min(H, b[3] / 1000.0 * H + pad_y),
+                ))
+            out_dir.mkdir(parents=True, exist_ok=True)
+            name = pdf_adapter.crop_regions(
+                src, regions, str(out_dir), zoom=REGION_PDF_ZOOM, gap=REGION_GAP)
+            return _fit_to_edge(out_dir / name)
+        except Exception:                        # noqa: BLE001
+            return None
+
+    from PIL import Image
+
+    tiles = []
+    try:
+        for seg, slot in zip(segs, slots):
+            png = pdf_adapter.render_page(
+                str(slot["path"]), int(slot["local"]), str(slot["cache_dir"]))
+            b = _region_box(seg.get("box"))
+            if b is None:
+                return None
+            with Image.open(png) as im:
+                im = im.convert("RGB")
+                w, h = im.size
+                x0 = max(0, b[0] - REGION_PAD)
+                y0 = max(0, b[1] - REGION_PAD)
+                x1 = min(1000, b[2] + REGION_PAD)
+                y1 = min(1000, b[3] + REGION_PAD)
+                px0, py0 = int(w * x0 / 1000.0), int(h * y0 / 1000.0)
+                px1, py1 = int(w * x1 / 1000.0), int(h * y1 / 1000.0)
+                px1 = max(px0 + 2, min(w, px1))
+                py1 = max(py0 + 2, min(h, py1))
+                px0 = min(px0, px1 - 2)
+                py0 = min(py0, py1 - 2)
+                tiles.append(im.crop((px0, py0, px1, py1)).copy())
+        canvas = _stack_images(tiles)
+        if canvas is None:
+            return None
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out = out_dir / f"region_{seq:03d}.png"
+        canvas.save(out, "PNG")
+        return _fit_to_edge(out)
+    except Exception:                            # noqa: BLE001
+        return None
+
+
+def _region_placeholder(block: dict, reason: str) -> dict:
+    """框里什么都没批出来时的**占位题**。
+
+    必须留一条，否则老师只看到「这页比预期少一题」，会以为是自己漏画了框。
+    verdict 给 ungradable（不是 wrong）：没读到 ≠ 学生没写。
+
+    参数是**块**（一道题，可能多段）。`region_box` 保留第一段，是为了不破坏
+    已经按它断言的老测试；多段的完整列表放在 `region_boxes`。
+    """
+    boxes = [s.get("box") for s in (block.get("segments") or [])] or [[]]
+    return {
+        "q_no": str(block.get("q_no") or ""),
+        "qtype": None,
+        "stem": "",
+        "student_answer": "",
+        "correct_answer": "",
+        "verdict": "ungradable",
+        "basis": reason,
+        "confidence": "low",
+        "kp_name": "",
+        "error_reason": "",
+        "figure_note": "",
+        "flags": ["region_empty"],
+        "raw": {
+            "question": {
+                "region_box": boxes[0],
+                "region_boxes": boxes,
+                "region_seq": block.get("seq"),
+            },
+            "meta": {"model": "", "finish_reason": "", "mode": "", "sample": 1},
+        },
+    }
 
 
 # ---------------------------------------------------------------- 页 ↔ 文件
@@ -492,13 +1490,14 @@ def _answer_texts(db: Session, grade: HomeworkGrade,
     """凑出"老师给的答案"与"评分细则"两段文字，喂给 AI 层。
 
     两处来源拼在一起：粘贴的文字（建任务时落成的 txt）与引用的 lesson_files
-    （上传时就抽好文字了）。**ai 模式下给空串**：老师没给依据，就不该往 ctx 里塞东西。
+    （上传时就抽好文字了）。**没勾条件时给空串**：老师没给依据，就不该往 ctx 里塞东西。
+    勾了哪个给哪个，两个都勾就两段都给（答案定对错、细则定 partial 与漏步）。
 
     respect_mode=False 只给界面的回显用：老师切到「AI 自己解」之后，
     之前填过的答案还得在文本框里，不然切一下就没了。
     """
-    if respect_mode and grade.answer_mode == "ai":
-        return "", ""
+    # 过滤放在末尾统一做（见函数尾那段 `if respect_mode:`）—— 这里不再提前 return，
+    # 否则「勾了 key 没勾 rubric」这种半开状态要写两处口径，早晚对不上。
     parts: dict[str, list[str]] = {"answer": [], "rubric": []}
     rows = db.scalars(
         select(HomeworkGradeFile)
@@ -508,7 +1507,11 @@ def _answer_texts(db: Session, grade: HomeworkGrade,
     ).all()
     for f in rows:
         text = ""
-        if (f.stored or "").strip():
+        # 0034 起，上传的依据文件自带一份正文（PDF/Word/Excel 都抽好了）——
+        # **优先用它**：原件是 PDF 时 `stored` 根本不能当文本念。
+        if (f.text or "").strip():
+            text = f.text
+        elif (f.stored or "").strip():
             p = storage.safe_join(f.stored)
             if p is not None and p.exists():
                 try:
@@ -520,17 +1523,82 @@ def _answer_texts(db: Session, grade: HomeworkGrade,
             text = (lf.text if lf is not None else "") or ""
         if text.strip():
             parts[f.role].append(text.strip())
-    return "\n\n".join(parts["answer"]), "\n\n".join(parts["rubric"])
+    key_text = "\n\n".join(parts["answer"])
+    rub_text = "\n\n".join(parts["rubric"])
+    if respect_mode:
+        # **勾了哪个才给哪个**（逐段过滤，不是「有条件就全给」）：
+        #   · 一个条件都没勾 → 两段都空（老师没给依据，不该往 ctx 里塞东西）；
+        #   · 只勾 key → 细则那段就算以前传过也不给 —— 否则老师收回了条件、
+        #     提示词里却还在按旧的细则要求，界面和实际判定对不上；
+        #   · 两个都勾 → 两段都给（答案定对错、细则定 partial 与漏步）。
+        _m = grade_basis.modes_of(grade)
+        if "key" not in _m:
+            key_text = ""
+        if "rubric" not in _m:
+            rub_text = ""
+    return key_text, rub_text
+
+
+def _answer_images(db: Session, grade: HomeworkGrade) -> dict[str, list[str]]:
+    """「老师给的答案 / 评分细则」里的**图片**，按 role 分组返回磁盘路径。
+
+    为什么需要这条路：老师手上常常只有一张**答案照片**（参考答案页拍一张、
+    或者自己手写的细则拍一张）。以前只读抽取出来的文字，照片抽不出字 →
+    判据为空 → `create_grade` 干脆把这种文件拦在门外（422，让你去粘贴文字）。
+    现在把图**真的送进模型**，那条硬拦才不再需要。
+
+    规则：**已经有文字的文件不再送图**。同一份 PDF 答案既有文字层又要送图，
+    等于把 token 花两遍，而文字比图更省、更准。
+    一个条件都没勾 → 返回空（老师没给依据，不该往 ctx 里塞东西）。
+    """
+    out: dict[str, list[str]] = {"answer": [], "rubric": []}
+    if not grade_basis.modes_of(grade):
+        return out
+    rows = db.scalars(
+        select(HomeworkGradeFile)
+        .where(HomeworkGradeFile.grade_id == grade.id,
+               HomeworkGradeFile.role.in_(("answer", "rubric")))
+        .order_by(HomeworkGradeFile.id)
+    ).all()
+    for f in rows:
+        role = f.role if f.role in out else "answer"
+        # 0034：自落盘的依据文件把正文存在 text 列里（原件可能是 PDF/Excel）。
+        text: str = f.text or ""
+        path: Path | None = None
+        if f.lesson_file_id:
+            lf = db.get(LessonFile, f.lesson_file_id)
+            if lf is not None:
+                text = text or (lf.text or "")
+                path = storage.safe_join(lf.stored)
+        elif (f.stored or "").strip():
+            path = storage.safe_join(f.stored)
+            if not text and path is not None and path.exists() \
+                    and path.suffix.lower() == ".txt":
+                try:
+                    text = path.read_bytes().decode("utf-8-sig")
+                except (OSError, UnicodeDecodeError):
+                    text = ""
+        if (text or "").strip():
+            continue
+        if path is not None and path.exists() and path.suffix.lower() in _IMAGE_EXTS:
+            out[role].append(str(path))
+    return out
 
 
 def _ctx_base(db: Session, grade: HomeworkGrade) -> dict:
     stu = db.get(Student, grade.student_id)
     key_text, rubric_text = _answer_texts(db, grade)
+    imgs = _answer_images(db, grade)
     return {
         "student": (stu.name if stu is not None else "") or "",
         "answer_mode": grade.answer_mode,
+        "basis_modes": _modes_list(grade),
         "answer_text": key_text,
         "rubric_text": rubric_text,
+        # 答案/细则的**图片**（老师拍的照片）。没有文字依据时才非空，
+        # 由 grade_ai 作为额外图一起送进模型。
+        "answer_images": imgs["answer"],
+        "rubric_images": imgs["rubric"],
     }
 
 
@@ -567,6 +1635,23 @@ def _recognize_page(png: str, ctx: dict) -> tuple[list[dict], str]:
     return items, ""
 
 
+def _recognize_region(png: str, ctx: dict) -> tuple[list[dict], str]:
+    """调一次「单题区域」识别。契约与 `_recognize_page` 完全一致（两者互斥）。"""
+    ready, why = _ai_ready()
+    if not ready:
+        return [], why
+    from .grade_ai import recognize_region
+    try:
+        items, err = recognize_region(png, ctx)
+    except Exception as e:                           # noqa: BLE001
+        return [], f"AI 层异常（{type(e).__name__}: {e}）"
+    if err:
+        return [], str(err)
+    if not isinstance(items, list):
+        return [], "AI 层返回的不是逐题列表"
+    return items, ""
+
+
 # ---------------------------------------------------------------- 逐页写入
 def _item_row(r: dict, gid: int, pno: int, seq: int) -> HomeworkGradeItem:
     raw = r.get("raw")
@@ -590,10 +1675,18 @@ def _item_row(r: dict, gid: int, pno: int, seq: int) -> HomeworkGradeItem:
         score=_num(r.get("score")),               # 没判就是 NULL，不给 0
         full_score=_num(r.get("full_score")),
         basis=str(r.get("basis") or ""),
+        figure_note=str(r.get("figure_note") or ""),
         confidence=_confidence(r.get("confidence")),
         kp_name=str(r.get("kp_name") or "").strip(),
         tags=json.dumps(knowledge.clean_tags(r.get("tags")), ensure_ascii=False),
         error_reason=str(r.get("error_reason") or ""),
+        # 两个结构信号（0030）。**不认识的值一律归空**，不猜 —— 猜成 question 会让
+        # 「这块像页脚」的提示消失，猜成 header 又会诱导老师跳过一道真题。
+        block_kind=_block_kind(r.get("block_kind")),
+        tail_note=str(r.get("tail_note") or "").strip()[:200],
+        # 分类标签（0031）。只收「键值都是短字符串」的那些 —— 模型偶尔把一整段
+        # 解释塞进来，那会在题卡上变成一个大得离谱的标签。
+        labels=json.dumps(_labels_of(r.get("labels")), ensure_ascii=False),
         flags=json.dumps(flags, ensure_ascii=False),
         raw=raw_txt,
         transcription_version=1,
@@ -653,12 +1746,18 @@ def _bump(gid: int, done: int, failed: int) -> None:
         db.close()
 
 
-def _finalize(gid: int, done: int, first_err: str = "", abort: str = "") -> None:
+def _finalize(gid: int, done: int, first_err: str = "", abort: str = "",
+              canceled: bool = False) -> None:
     """收尾。状态机与 `batch_page._finalize` 同一套（前端不用分叉）：
 
     全成 → reviewing（**不是 done**：等人看）；全失败 → failed；一半 → partial。
     `failed` 在这里按 `total - done` 补算：线程中途挂了的话，没轮到的页也要算没批成，
     否则前端会看到一个永远停在「3/5」的进度条。
+
+    ⚠️ **终止（canceled）不算失败**。老师点终止多半是因为「太慢了」，已批的那些页
+    是他要的结果 —— 所以批到几页就留几页，状态给 `reviewing` 让他照常复核，
+    只在 error 里写清「只批了 N/M 页」。把它标成 failed 的话，那些结果在列表里
+    会显示成失败、还要重新批一遍，等于白等。
     """
     db = SessionLocal()
     try:
@@ -668,7 +1767,12 @@ def _finalize(gid: int, done: int, first_err: str = "", abort: str = "") -> None
         failed = max(0, int(g.total or 0) - done)
         g.done, g.failed = done, failed
         g.finished_at = _now()
-        if done == 0:
+        if canceled:
+            g.status = "reviewing" if done > 0 else "failed"
+            g.error = (f"已手动终止：只批了 {done}/{int(g.total or 0)} 页"
+                       + (f"（{first_err}）" if first_err else "")
+                       + ("，已批的可以照常复核" if done > 0 else "，一页都没批完"))
+        elif done == 0:
             g.status = "failed"
             g.error = abort or f"整份都没批成：{first_err or 'AI 没有返回结果'}"
         elif failed == 0:
@@ -686,6 +1790,35 @@ def _finalize(gid: int, done: int, first_err: str = "", abort: str = "") -> None
 # ---------------------------------------------------------------- 线程
 _run_lock = threading.Lock()
 _running: set[int] = set()
+"""老师点了「终止」的 gid。
+
+⚠️ 为什么不在数据库里存一个 `cancel_requested` 字段：
+   写库要开 Session，而这里是从**请求线程**写、**批改线程**读；进程崩了还会留下
+   一个永远为真的僵尸标记，下次开批立刻自我终止。进程内的集合就没这个问题 ——
+   进程一崩它自动消失，语义正好是「这次运行被要求停」。
+
+⚠️ 为什么不用 threading.Event：每个 gid 一个 Event 得配一张 dict 还要清理，
+   而这里只需要「有没有被要求停」这一个布尔，集合的 add/discard 就够了。
+"""
+_cancel: set[int] = set()
+
+
+def is_canceled(gid: int) -> bool:
+    with _run_lock:
+        return gid in _cancel
+
+
+def request_cancel(gid: int) -> bool:
+    """请求终止。**只在本进程真的在跑这一份时才受理**（返回 True）。
+
+    没在跑却返回成功，前端会一直等一个永远不会来的状态变化 —— 那正是
+    「点了没反应」的经典来源。所以这里必须区分「受理了」和「没在跑」。
+    """
+    with _run_lock:
+        if gid not in _running:
+            return False
+        _cancel.add(gid)
+        return True
 
 
 def launch(db: Session, grade: HomeworkGrade) -> bool:
@@ -695,10 +1828,22 @@ def launch(db: Session, grade: HomeworkGrade) -> bool:
     永远 `running` 的僵尸（没人写它了）。以「本进程里真的有这么个线程」为准，
     僵尸就能被重新认领 —— 否则这份作业再也批不了。
     """
+    # ★ 开批前最后一道门：依据是**可以被单独删掉**的（DELETE /basis/{fid}），
+    #   删完库里 mode 还是 key/rubric。没有这道门，一份「按我的答案判」的任务会在
+    #   依据为空的情况下开跑 —— 模型退回自己解题，结果却标着「按老师答案判」，
+    #   那是拿错标准批学生。改依据（patch_setup）**故意不查**（会和「AI 模式下
+    #   不许传依据」互锁），所以「改到空」「后来被删空」全靠这一道门兜住。
+    missing = _missing_basis(db, grade)
+    if missing:
+        raise GradeError(422, _missing_basis_msg(missing))
     with _run_lock:
         if grade.id in _running:
             return False
         _running.add(grade.id)
+        # ⚠️ 上一次留下的「终止」标记必须清掉。理论上 _cancel 在收尾时就 discard 了，
+        #    但线程被强杀 / 上次 _finalize 没走到时会留下 —— 不清的话新的一开批
+        #    就立刻自我终止，现象是「点开始 → 一秒钟就失败」。
+        _cancel.discard(grade.id)
     # 重跑＝重来：进度清零，**并且把上一次的"确认"作废**（reviewed_at 清空、回到 queued）。
     # 不这么做的话，重批中的结果会挂着一个旧的"已确认"，统计口径会读到半截数据。
     grade.status = "queued"
@@ -722,6 +1867,7 @@ def run_grade(gid: int) -> None:
     finally:
         with _run_lock:
             _running.discard(gid)
+            _cancel.discard(gid)      # 标记绝不能留到下一次开批
 
 
 def _run_grade(gid: int) -> None:
@@ -757,52 +1903,169 @@ def _run_grade(gid: int) -> None:
         db.commit()
         base_ctx = _ctx_base(db, grade)
         curriculum_id = grade.curriculum_id
+        # 框必须在关 session 之前读成纯 dict —— 线程里不许碰 ORM 对象。
+        # 空 dict = 一页都没画框 = 整条流程退回老口径（整页一次判）。
+        # 这里读成**块**（一题可多段），跨页题的几段由起始页那个线程一起处理。
+        by_page = blocks_by_page(db, gid)
+        # 「不送 AI」的两级（0030）。在这里就过滤掉，线程里不再判断 ——
+        # 线程里判断的话，模型调用和裁图都已经发生了，跳过等于没跳过。
+        skip_pages = set(skipped_pages_of(grade))
+        by_page, noop_pages = _apply_skips(by_page, skip_pages)
     finally:
         db.close()
 
+    slots_by_pno = {int(s["pno"]): s for s in slots}
     done = failed = 0
     first_err = ""
+    canceled = False
+    # ⚠️ 刻意不用 `with ThreadPoolExecutor(...)`：那个写法退出时会**等所有页跑完**，
+    #    老师点了「终止」却要干等十几页 AI 调用 —— 那就不是终止了。
+    #    改成显式 shutdown(wait=False, cancel_futures=True)：还没起跑的页当场作废。
+    pool = ThreadPoolExecutor(max_workers=WORKERS)
     try:
-        with ThreadPoolExecutor(max_workers=WORKERS) as pool:
-            futures = {pool.submit(_run_one_page, slot, base_ctx): slot["pno"] for slot in slots}
-            for fut in as_completed(futures):
-                pno = futures[fut]
+        futures = {}
+        for slot in slots:
+            pno = int(slot["pno"])
+            if is_canceled(gid):
+                canceled = True
+                break
+            if pno in skip_pages or pno in noop_pages:
+                # 「这一页不看」也要占一个 future：否则 done 永远追不上 total，
+                # 任务就卡在 running 里出不来。返回空结果 = 读完但没批（0 题）。
+                futures[pool.submit(lambda: ([], ""))] = slot["pno"]
+                continue
+            futures[pool.submit(_run_one_page, gid, slot, base_ctx,
+                                by_page.get(pno), slots_by_pno)] = slot["pno"]
+        for fut in as_completed(futures):
+            # ★ 终止：跳出收集循环。**已经在跑的那几个线程没法掐断**（一次 AI 调用
+            #   二三十秒，Python 没有安全的线程 kill），但剩下的会被 cancel_futures
+            #   立刻作废。所以「点终止」的实际等待 ≈ 一个页的时间，不是一整份。
+            if is_canceled(gid):
+                canceled = True
+                break
+            pno = futures[fut]
+            try:
+                items, err = fut.result()
+            except Exception as e:               # noqa: BLE001
+                items, err = [], f"{type(e).__name__}: {e}"
+            if err:
+                failed += 1
+                first_err = first_err or f"第 {pno} 页：{err}"
+            else:
                 try:
-                    items, err = fut.result()
-                except Exception as e:               # noqa: BLE001
-                    items, err = [], f"{type(e).__name__}: {e}"
-                if err:
+                    _write_page_items(gid, pno, items, curriculum_id)
+                    # ⚠️ 一页 0 道题也算 done：空白页/纯页眉确实被读完了。
+                    #    done 是页数，不是题目数 —— 别在这里改成 len(items)。
+                    done += 1
+                except Exception as e:           # noqa: BLE001
                     failed += 1
-                    first_err = first_err or f"第 {pno} 页：{err}"
-                else:
-                    try:
-                        _write_page_items(gid, pno, items, curriculum_id)
-                        # ⚠️ 一页 0 道题也算 done：空白页/纯页眉确实被读完了。
-                        #    done 是页数，不是题目数 —— 别在这里改成 len(items)。
-                        done += 1
-                    except Exception as e:           # noqa: BLE001
-                        failed += 1
-                        first_err = first_err or f"第 {pno} 页写库失败：{e}"
-                _bump(gid, done, failed)
+                    first_err = first_err or f"第 {pno} 页写库失败：{e}"
+            _bump(gid, done, failed)
     except Exception as e:                           # noqa: BLE001
         _finalize(gid, done, first_err, abort=f"批改线程异常终止：{e}")
+        return
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+    if canceled:
+        _renumber(gid)
+        _finalize(gid, done, first_err, canceled=True)
         return
     _renumber(gid)
     _finalize(gid, done, first_err)
 
 
-def _run_one_page(slot: dict, ctx_base: dict) -> tuple[list[dict], str]:
-    """在一个工作线程里处理一页：渲染页图 + 调 AI。**不碰数据库**，纯 I/O。"""
+def _run_one_page(gid: int, slot: dict, ctx_base: dict,
+                  blocks: list[dict] | None = None,
+                  slots_by_pno: dict | None = None) -> tuple[list[dict], str]:
+    """在一个工作线程里处理一页：渲染页图 + 调 AI。**不碰数据库**，纯 I/O。
+
+    ⚠️⚠️ 到处都是 `is_canceled(gid)` 的检查点 —— 这不是啰嗦，是「终止」能不能用的关键。
+    只在主循环的两个地方检查是不够的：排队的页虽然会被 cancel_futures 作废，
+    但**已经在跑的那一页**要跑完才会走到下一个检查点（一页 14 个块 ≈ 2.5 分钟）。
+    所以真正的检查粒度得下到这里：**块与块之间**。老师点终止，最坏只等一个块
+    的 AI 调用（几十秒），而不是一整页。
+
+    ⚠️ 被终止时返回 `([], "")` 而不是半截结果：主循环已经决定 break，这部分结果
+       不会写库，留个半截只会让 `_finalize` 的口径变复杂。
+
+    两种口径：
+      · **有块**（`blocks` 非空）→ 一块一裁一切。有效分辨率翻几倍、
+        题号由块绑定、块外内容根本看不见（跨题污染从物理上消失）。
+        跨页题的几段在这里**竖拼成一张图**再送 —— 与批量录题的 blocks 同一套语义。
+      · **没块** → 保持老行为：整页一次判。老记录、没画框的人零影响。
+
+    ⚠️ 块只归它的**第一段所在页**（`blocks_by_page` 就是这么分的），
+    否则跨页题会被两页线程各批一次、结果互相覆盖。
+    ⚠️ 单块失败**不毁整页**：失败的那块留一条 ungradable 占位（老师看得见），
+    其余块照常出结果。只有**一个都没成**才把整页算失败 —— 那种情况多半是
+    接口挂了 / 没配，重试整页才有意义。
+    """
     path = slot["path"]
     if path is None or not Path(path).exists():
         return [], "原件不在了（可能已被删除）"
+    if is_canceled(gid):
+        return [], ""
     try:
         # 页图走适配层（AGPL 的 pymupdf 只准在 adapters/pdf.py 里 import）。
         # 缓存目录按 gid + 文件分，见 grade_dir 的注释。
         png = pdf_adapter.render_page(str(path), int(slot["local"]), str(slot["cache_dir"]))
     except Exception as e:                           # noqa: BLE001
         return [], f"页图渲染不出来（{type(e).__name__}: {e}）"
-    return _recognize_page(png, {**ctx_base, "page_no": slot["pno"]})
+
+    pno = int(slot["pno"])
+    if is_canceled(gid):
+        return [], ""
+    if not blocks:
+        return _recognize_page(png, {**ctx_base, "page_no": pno})
+
+    lookup = dict(slots_by_pno or {})
+    lookup.setdefault(pno, slot)
+
+    items: list[dict] = []
+    good = 0
+    first_err = ""
+    for block in blocks:
+        if is_canceled(gid):
+            return [], ""
+        label = str(block.get("label") or (int(block.get("seq") or 0) + 1))
+        tile = _crop_block(block, lookup, Path(slot["cache_dir"]))
+        if tile is None:
+            first_err = first_err or f"第 {label} 题的框不可用（太小、画在纸外，或原件读不出来）"
+            items.append(_region_placeholder(block, "这个框裁不出内容 —— 框可能画到了纸外或太小"))
+            continue
+        ctx = {**ctx_base, "page_no": pno, "region": True, "region_label": label}
+        if block.get("cross_page"):
+            # 让提示词知道「这一张图是两页拼起来的」：否则模型看到中间的白缝
+            # 会以为题目到此为止，把下半段当另一道题丢掉。
+            ctx["span_pages"] = list(block.get("pages") or [])
+        try:
+            got, err = _recognize_region(str(tile), ctx)
+        except Exception as e:                       # noqa: BLE001
+            got, err = [], f"{type(e).__name__}: {e}"
+        # 一块判完立刻再看一眼终止旗：一堆积一块地等，才是「点了没反应」的来源。
+        if is_canceled(gid):
+            return [], ""
+        if err:
+            first_err = first_err or err
+            items.append(_region_placeholder(block, err))
+            continue
+        if not got:
+            # 框画在空白处 / 这一块确实没题。**不是错误**，但要留痕。
+            items.append(_region_placeholder(block, "这个框里没读到题目 —— 框画空了？"))
+            continue
+        it = got[0]
+        # 题号绑定：老师填的 q_no 一律优先，模型认的那个只当兜底。
+        # 这是「消掉题号错配」的关键一步 —— 学生把第 3 题写成第 8 题也不影响归属。
+        if str(block.get("q_no") or "").strip():
+            it["q_no"] = str(block["q_no"]).strip()
+        elif not str(it.get("q_no") or "").strip():
+            it["q_no"] = label
+        good += 1
+        items.append(it)
+
+    if good == 0 and first_err:
+        return [], first_err
+    return items, ""
 
 
 # ---------------------------------------------------------------- 老师改题
@@ -906,7 +2169,23 @@ def rerun_item(db: Session, iid: str) -> HomeworkGradeItem:
         raise GradeError(422, f"找不到第 {it.page_no} 页（原件可能已被删除）")
 
     ctx = {**_ctx_base(db, grade), "page_no": slot["pno"]}
-    items, err = _run_one_page(slot, ctx)
+    # 有块（画过框）的页必须走「按块批」—— 否则重批会退回整页口径，题号对不上，
+    # 还会用一次便宜的整页结果覆盖掉当初按块批出来的、更准的那一版。
+    by_page = blocks_by_page(db, grade.id)
+    blocks = by_page.get(int(it.page_no))
+    if blocks is None:
+        # 这道题可能是**跨页块的下半段**：它入库时记在起始页，但页号也可能
+        # 因为老数据/手工改过而对不上。扫一遍：哪个块的段跨到了这一页，
+        # 就用那个块的起始页 —— 否则会静默退回整页口径，重批反而更差。
+        for pno, bls in by_page.items():
+            if any(any(int(s["page_no"]) == int(it.page_no) for s in b["segments"])
+                   for b in bls):
+                blocks = bls
+                slot = next((s for s in slots if s["pno"] == pno), slot)
+                ctx = {**ctx, "page_no": int(pno)}
+                break
+    items, err = _run_one_page(grade.id, slot, ctx, blocks or [],
+                               {int(s["pno"]): s for s in slots})
     if err:
         raise GradeError(422, f"这页没批成：{err}")
 
@@ -932,6 +2211,7 @@ def rerun_item(db: Session, iid: str) -> HomeworkGradeItem:
     it.score = _num(hit.get("score"))
     it.full_score = _num(hit.get("full_score"))
     it.basis = str(hit.get("basis") or "")
+    it.figure_note = str(hit.get("figure_note") or "")
     it.confidence = _confidence(hit.get("confidence"))
     it.error_reason = str(hit.get("error_reason") or "")
     it.raw = hit.get("raw") if isinstance(hit.get("raw"), str) else json.dumps(
@@ -996,13 +2276,10 @@ def _norm_geo(values) -> list[int]:
     return out
 
 
-def add_mark(db: Session, gid: int, payload: GradeMarkIn, created_by: str = "teacher") -> HomeworkGradeMark:
-    grade = get_grade(db, gid)
-    if payload.item_id:
-        it = db.get(HomeworkGradeItem, payload.item_id)
-        if it is None or it.grade_id != grade.id:
-            raise GradeError(422, "这条标注挂的题不属于这份作业")
-    m = HomeworkGradeMark(
+def _mark_row(grade: HomeworkGrade, payload: GradeMarkIn, created_by: str) -> HomeworkGradeMark:
+    """一条标注的**构造**（不 commit）。单条与批量走同一个构造器 ——
+    两份各写一遍的话，`_norm_geo` 早晚只有一处被改到，表现是「批量补发的坐标夹不住」。"""
+    return HomeworkGradeMark(
         owner_id=config.OWNER_ID,
         grade_id=grade.id,
         item_id=payload.item_id or None,
@@ -1012,15 +2289,69 @@ def add_mark(db: Session, gid: int, payload: GradeMarkIn, created_by: str = "tea
         points=json.dumps(_norm_geo(payload.points)),
         text=payload.text or "",
         color=payload.color or "",
+        # 铂笔粗细：0 = 走样式表默认；负数/天文数字都夹回来，否则SVG里这一笔会消失或扑屏。
+        width=max(0.0, min(200.0, _num(payload.width) or 0.0)),
         # 这个接口的调用方是批改页（老师），AI 层不写标注 —— 它只回文字结果，
         # 坐标由前端"模型给句子 → 老师点/拖"那条线来定。
         created_by=created_by,
         flags="[]",
         created_at=_now(),
     )
+
+
+def add_mark(db: Session, gid: int, payload: GradeMarkIn, created_by: str = "teacher") -> HomeworkGradeMark:
+    grade = get_grade(db, gid)
+    if payload.item_id:
+        it = db.get(HomeworkGradeItem, payload.item_id)
+        if it is None or it.grade_id != grade.id:
+            raise GradeError(422, "这条标注挂的题不属于这份作业")
+    m = _mark_row(grade, payload, created_by)
     db.add(m)
     db.commit()
     return m
+
+
+def add_marks(db: Session, gid: int, payload, created_by: str = "teacher") -> list[HomeworkGradeMark]:
+    """一次补发多条标注（批改页本地草稿队列的出口）。**一次 commit**。
+
+    ⚠️ **不去重**：补发方（前端 `reconcile`）负责只发「服务端还没有的」。
+       服务端要是自己猜「这条是不是已经有了」，猜错的方向是把老师的两笔
+       并成一笔 —— 而重一点的代价只是多一条，重一笔的代价是**少一笔批注**。
+    ⚠️ 顺序即落库顺序：同一位置后画的要盖在上面，所以按传入顺序 add。
+    """
+    grade = get_grade(db, gid)
+    rows = list(getattr(payload, "marks", None) or [])
+    if not rows:
+        return []
+    if len(rows) > MAX_MARKS_PER_BATCH:
+        raise GradeError(
+            422,
+            f"一次最多补发 {MAX_MARKS_PER_BATCH} 条标注，这次有 {len(rows)} 条"
+            "（本地草稿攒太多了，先分两次补）",
+        )
+
+    # item_id 一次查完：逐条 db.get 在补发几十条时会变成几十次往返
+    ids = {str(p.item_id) for p in rows if p.item_id}
+    if ids:
+        alive = {
+            str(it.id) for it in db.scalars(
+                select(HomeworkGradeItem).where(
+                    HomeworkGradeItem.grade_id == grade.id,
+                    HomeworkGradeItem.id.in_(ids),
+                )
+            ).all()
+        }
+        missing = ids - alive
+        if missing:
+            raise GradeError(422, "有标注挂的题不属于这份作业（可能这一遍已经重批过了）")
+
+    made = []
+    for p in rows:
+        m = _mark_row(grade, p, created_by)
+        db.add(m)
+        made.append(m)
+    db.commit()
+    return made
 
 
 def _mark_or_404(db: Session, mid: int) -> HomeworkGradeMark:

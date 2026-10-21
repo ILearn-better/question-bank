@@ -14,8 +14,11 @@ docs/AI批改作业-实现计划.md §5：前端已经在照这个写。
 """
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Query
-from fastapi.responses import FileResponse
+import mimetypes
+from urllib.parse import quote
+
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
+from fastapi.responses import FileResponse, Response
 from sqlalchemy.orm import Session
 
 from ..db import get_db
@@ -25,9 +28,14 @@ from ..schemas import (
     GradeItemPatch,
     GradeMarkIn,
     GradeMarkPatch,
+    GradeMarksIn,
+    GradePageSkipsIn,
+    GradeRegionsCopy,
+    GradeRegionsPut,
     GradeSetupPatch,
     GradeToBankIn,
 )
+from ..services import grade_basis
 from ..services import grade_export
 from ..services import grade_store as store
 
@@ -95,10 +103,42 @@ def run_grade(gid: int, db: Session = Depends(get_db)):
     """
     try:
         grade = store.get_grade(db, gid)
+        # ⚠️ launch 里有一道「按我的答案判，但依据已经被删了」的校验（会抛 GradeError）。
+        #    不接住的话它会变成 500，老师看到的是一句「服务器内部错误」。
+        store.launch(db, grade)      # 已在跑时 launch 自己会什么都不做
     except store.GradeError as e:
         raise _fail(e) from e
-    store.launch(db, grade)          # 已在跑时 launch 自己会什么都不做
     return store.detail(db, grade)
+
+
+@router.post("/homework-grades/{gid}/cancel")
+def cancel_grade(gid: int, db: Session = Depends(get_db)):
+    """终止正在跑的批改。**只受理「本进程真的在跑」的那一批**（否则 409）。
+
+    为什么是「请求」而不是「立刻停」：一次 AI 调用二三十秒，Python 里没有安全的
+    线程 kill。这里做的是 —— ① 立旗 ② 让还没起跑的页当场作废（cancel_futures）。
+    所以真正在跑的最多还有 `WORKERS`(3) 页会跑完，状态会在几十秒内落到 reviewing。
+
+    ⚠️ 返回的是「已受理」而不是「已停」。前端拿到 200 后要**继续轮询**等状态落地；
+    别在这里同步 join 线程 —— 那就把「终止」变成「等它跑完」了。
+
+    ⚠️ 已批的页**保留**（状态 reviewing，error 里写明只批了几页）。
+    老师点终止通常是因为太慢，已出的结果是他要的，丢掉等于白等。
+    """
+    try:
+        grade = store.get_grade(db, gid)
+    except store.GradeError as e:
+        raise _fail(e) from e
+    if store.request_cancel(gid):
+        return {"ok": True, "gid": gid, "canceling": True}
+    # ⚠️ 走到这儿**不等于失败**：最常见的是「这一批刚好在这一瞬间跑完了」。
+    #    老师的目的是「别再跑了」，目的已经达成 —— 弹一个红字错误只会让他
+    #    以为按钮坏了，于是反复点（每一次都是同一个错）。
+    if grade.status not in ("running", "queued"):
+        return {"ok": True, "gid": gid, "canceling": False, "already_stopped": True}
+    raise HTTPException(
+        status_code=409,
+        detail=f"这份作业现在没在批改（当前状态：{grade.status}）—— 不用终止")
 
 
 @router.post("/homework-grades/{gid}/confirm")
@@ -142,6 +182,85 @@ def export_grade_file(gid: int, fmt: str = Query("pdf"), page: int = Query(1),
         raise _fail(e) from e
     media = "application/pdf" if path.suffix.lower() == ".pdf" else "image/png"
     return FileResponse(str(path), media_type=media, filename=name)
+
+
+# ---------------------------------------------------------------- 判定依据
+# 「按我给的答案 / 按我的评分细则」这两条模式要有依据。依据可以是图片、PDF、
+# Word、Excel、TXT —— 原件落在**批改自己的目录**，抽出来的正文进 `text` 列（0034）。
+# 刻意不走 `POST /lessons/{lid}/files`：那条路会把文件塞进「交作业」清单，
+# 下次建批改时被默认勾上当学生作业批。
+
+# 允许「就地显示」的扩展名。图片之外只放 PDF：
+# 浏览器自带的 PDF 阅读器是沙箱里的，点开就是预览、体验最好。
+# ⚠️ **绝不能放 .html / .svg** —— inline 渲染等于开一个 XSS 口子（上传者能控制内容）。
+_INLINE_OK = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".pdf"}
+
+
+@router.post("/homework-grades/{gid}/basis")
+async def upload_basis(gid: int, file: UploadFile = File(...),
+                       role: str = Query("answer", description="answer / rubric"),
+                       db: Session = Depends(get_db)):
+    """传一份判定依据。
+
+    `role`：`answer` = 答案，`rubric` = 评分细则（两条模式各用一份）。
+    格式白名单、大小、份数都在 `grade_basis` / `store.add_basis_file` 里卡。
+
+    返回里带 `note`：**非空表示收下了但抽不出文字**（扫描版 PDF 之类）。
+    界面必须显示 —— 静默收下一份模型看不见的依据，比直接拒绝更糟。
+    """
+    # 多读 1 字节用来判「超了」：读满整个文件再报错，等于让一个 500MB 的
+    # 文件先进内存。
+    data = await file.read(grade_basis.MAX_BASIS_BYTES + 1)
+    try:
+        return store.add_basis_file(db, gid, role, file.filename or "", data)
+    except store.GradeError as e:
+        raise _fail(e) from e
+
+
+@router.delete("/homework-grades/{gid}/basis/{fid}")
+def delete_basis(gid: int, fid: int, db: Session = Depends(get_db)):
+    """删一份判定依据。已批过的不能删（否则「按我的答案判」变成了没答案）。"""
+    try:
+        return store.delete_basis_file(db, gid, fid)
+    except store.GradeError as e:
+        raise _fail(e) from e
+
+
+@router.get("/homework-grades/{gid}/basis/{fid}/raw")
+def basis_raw(gid: int, fid: int,
+              inline: bool = Query(False, description="图片/PDF 可就地预览，其它一律下载"),
+              db: Session = Depends(get_db)):
+    """取回依据原件。
+
+    ⚠️ 别人的、或不属于这份批改的记录一律 **404**（不是 403）——
+    状态码不该告诉人家「这条记录存在，只是你没权限」。
+    """
+    try:
+        path, name = store.basis_raw_path(db, gid, fid)
+    except store.GradeError as e:
+        raise _fail(e) from e
+    media = mimetypes.guess_type(name)[0] or "application/octet-stream"
+    disp = "inline" if (inline and path.suffix.lower() in _INLINE_OK) else "attachment"
+    return FileResponse(str(path), media_type=media, filename=name,
+                        headers={"Content-Disposition":
+                                 f"{disp}; filename=file; filename*=UTF-8''{quote(name)}",
+                                 # 不靠浏览器猜类型：猜错一次就是一个可执行下载
+                                 "X-Content-Type-Options": "nosniff"})
+
+
+@router.get("/homework-grades/{gid}/basis/{fid}/text")
+def basis_text(gid: int, fid: int, db: Session = Depends(get_db)):
+    """依据抽出来的**正文**（预览用）。
+
+    为什么单独一条而不塞进 `detail`：10 份依据 × 两万字 = 一次轮询几百 KB，
+    而老师真正想看文字的时候只有「点开某一份」那一下。
+    """
+    try:
+        row = store.get_basis_row(db, gid, fid)
+    except store.GradeError as e:
+        raise _fail(e) from e
+    return {"text": row.text or "", "chars": len(row.text or ""),
+            "kind": row.kind or "", "name": row.name}
 
 
 # ---------------------------------------------------------------- 逐题
@@ -195,6 +314,21 @@ def add_mark(gid: int, payload: GradeMarkIn, db: Session = Depends(get_db)):
     return store.mark_dict(m)
 
 
+@router.post("/homework-grades/{gid}/marks/batch")
+def add_marks(gid: int, payload: GradeMarksIn, db: Session = Depends(get_db)):
+    """一次补发多条标注 —— 给批改页的**本地草稿队列**用。
+
+    为什么有这一条：老师画完一笔就关页面时，那一个 POST 会被浏览器取消。
+    前端把没送出去的存在本机（`frontend/src/gradeDraft.js`），下次打开再补发；
+    攒了三十笔就发三十次的话，在「刚打开、还在拉详情」的那几秒里很容易又断。
+    """
+    try:
+        rows = store.add_marks(db, gid, payload)
+    except store.GradeError as e:
+        raise _fail(e) from e
+    return {"marks": [store.mark_dict(m) for m in rows]}
+
+
 @router.patch("/grade-marks/{mid}")
 def patch_mark(mid: int, payload: GradeMarkPatch, db: Session = Depends(get_db)):
     """拖动 / 改颜色 / 改文字。**没传的字段 = 不改**。"""
@@ -212,3 +346,83 @@ def delete_mark(mid: int, db: Session = Depends(get_db)):
     except store.GradeError as e:
         raise _fail(e) from e
     return {"ok": True}
+
+
+# ---------------------------------------------------------------- 一题一区域
+# 这一段是「整页一次判所有题」之外的另一条口径：老师框出每道题的作答在哪，
+# 每框单独裁切、单独调模型。**没有框的页仍然走整页**，所以是纯增量。
+@router.get("/homework-grades/{gid}/regions")
+def list_regions(gid: int, db: Session = Depends(get_db)):
+    """这份作业画过的所有框（按页号 + 页内顺序）。"""
+    try:
+        store.get_grade(db, gid)
+    except store.GradeError as e:
+        raise _fail(e) from e
+    return {"regions": store.list_regions(db, gid)}
+
+
+@router.put("/homework-grades/{gid}/regions")
+def put_regions(gid: int, payload: GradeRegionsPut, db: Session = Depends(get_db)):
+    """**整份替换**这份作业画的框（每项是「一段」，同一 `seq` 的几段合成一题）。
+
+    为什么从「按页替换」改成「整份替换」：跨页题的两段天然落在不同页上，
+    按页提交时「一题两段」这个组合没有任何一个时刻能被原子写进去。
+    传空数组 = 清空全部框（整份退回整页批）。
+    """
+    try:
+        regions = store.put_regions(db, gid, payload)
+    except store.GradeError as e:
+        raise _fail(e) from e
+    return {"regions": regions}
+
+
+@router.post("/homework-grades/{gid}/regions/copy")
+def copy_regions(gid: int, payload: GradeRegionsCopy, db: Session = Depends(get_db)):
+    """沿用同一节课里另一份的框（一套卷只画一次）。
+
+    ⚠️ 拷的是坐标，不是模板 —— 不同学生的照片有平移/旋转，框会偏。
+    界面要提示「宁大勿小」，拷完建议扫一眼。
+    """
+    try:
+        regions = store.copy_regions(db, gid, payload.from_grade_id)
+    except store.GradeError as e:
+        raise _fail(e) from e
+    return {"regions": regions}
+
+
+@router.get("/homework-grades/{gid}/region-image")
+def grade_region_image(gid: int, spec: str, zoom: float = Query(1.6, ge=0.5, le=3.0),
+                       db: Session = Depends(get_db)):
+    """把一块（可跨页多段）现裁成 PNG **直接返回、不落盘** —— 给「切出来的到底是什么」做即时预览。
+
+    这是「分割截图完后看不到图」那一问的正解：**保存前**就要能看（所以按坐标 spec
+    而不是按 region id），老师才能当场发现「这一刀切歪了」。
+
+    `spec` 形如 `1:40,540,1000,800`，跨页用 `;` 连接（与 documents 的同名接口同一套语法，
+    量纲同为 0~1000）。
+    """
+    try:
+        png = store.region_preview_png(db, gid, spec, zoom)
+    except store.GradeError as e:
+        raise _fail(e) from e
+    return Response(
+        content=png,
+        media_type="image/png",
+        # 同一份卷子的同一块切出来是确定的 → 让浏览器别重复问。
+        # private：这是学生卷子，不进中间缓存。
+        headers={"Cache-Control": "private, max-age=600"},
+    )
+
+
+@router.patch("/homework-grades/{gid}/skipped-pages")
+def patch_skipped_pages(gid: int, payload: GradePageSkipsIn, db: Session = Depends(get_db)):
+    """整页不送 AI（0030）：封页、空白作答页、草稿页。
+
+    **整份替换**，与框同一套口径 —— 前端手上就有完整集合，
+    发一次替换不会出现「删了第 2 页、第 5 页却被旧值带回来」。
+    只存页号、**不动框**：取消跳过后框还在，不用重画。
+    """
+    try:
+        return store.set_page_skips(db, gid, payload.pages)
+    except store.GradeError as e:
+        raise _fail(e) from e

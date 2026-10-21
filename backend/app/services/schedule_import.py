@@ -215,23 +215,59 @@ _CN_NUM = {"半": 0.5, "一": 1, "两": 2, "二": 2, "三": 3, "四": 4, "五": 
            "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
 
 
+def _minutes_ok(total: float, raw) -> tuple[int | None, str | None]:
+    """统一收口：取整 + 范围校验（0 ~ 24 小时）。"""
+    n = int(round(total))
+    if 0 < n <= 24 * 60:
+        return n, None
+    return None, f"时长 {raw} 不像分钟数"
+
+
 def parse_duration(v) -> tuple[int | None, str | None]:
-    """→ (分钟 | None, 报错文案 | None)。认得 '90'、'90分钟'、'1.5小时'、'1小时30分'、'一小时'。"""
+    """→ (分钟 | None, 报错文案 | None)。
+
+    认得：'90'、'90分钟'、'1.5小时'、'1小时30分'、'一小时'、'1:30'（= 90 分钟）；
+    以及 **Excel 时间单元格**（老师把这一列设成了「时间」格式，输 1:30 想表示 1 小时半
+    —— openpyxl 读到的是 time / timedelta 对象，不是数字）。
+
+    ⚠️ 这条是用户 2026-10-20 报「课表里 90 分钟、导入后变成 60」时补的：
+    时长列被设成时间格式时，旧代码拿到的是 `01:30:00` 字符串，认不出来 →
+    落到「按 60 分钟兜底」那条路。**六十分钟不是错，错的是没告诉老师它是兜底值**。
+    """
     if _is_blank(v):
         return None, None
     if isinstance(v, bool):
         return None, "时长填的不是数字"
+
+    # ---- Excel 时间格式：1:30 表示 90 分钟（不是 1.5 分钟，也不是 90 秒）----
+    if isinstance(v, timedelta):
+        return _minutes_ok(v.total_seconds() / 60, v)
+    if isinstance(v, datetime):
+        return _minutes_ok(v.hour * 60 + v.minute + v.second / 60, v)
+    if isinstance(v, time):
+        return _minutes_ok(v.hour * 60 + v.minute + v.second / 60, v)
+
     if isinstance(v, (int, float)):
-        n = int(v)
-        return (n, None) if 0 < n <= 24 * 60 else (None, f"时长 {v} 不像分钟数")
+        # Excel 把「时间」存成一天的分数：0.0625 = 01:30 = 90 分钟。
+        # 整数字段直接当分钟数；(0,1) 之间的小数只可能是时间分数。
+        if 0 < float(v) < 1:
+            return _minutes_ok(float(v) * 24 * 60, v)
+        return _minutes_ok(v, v)
 
     s = str(v).strip()
     s = s.replace("：", ":").replace("　", "")
     if re.match(r"^\d+(\.\d+)?$", s):
-        n = int(float(s))
-        return (n, None) if 0 < n <= 24 * 60 else (None, f"时长 {v} 不像分钟数")
+        return _minutes_ok(float(s), v)
 
-    # 1小时30分 / 1.5小时 / 90分钟 / 一小时 / 半小时
+    # 「1:30」「1:30:00」—— 时钟写法，按 时:分(:秒) 折算
+    m = re.match(r"^(\d{1,2}):(\d{1,2})(?::(\d{1,2}))?$", s)
+    if m:
+        hh, mm, ss = int(m.group(1)), int(m.group(2)), int(m.group(3) or 0)
+        if mm <= 59 and ss <= 59:
+            return _minutes_ok(hh * 60 + mm + ss / 60, v)
+        return None, f"看不懂的时长写法「{v}」（写分钟数，或「1.5小时」）"
+
+    # 1小时30分 / 1.5小时 / 90分钟 / 一小时 / 半小时 / 一小时半
     num = r"(\d+(?:\.\d+)?|[一二两三四五六七八九十半])"
     h = re.search(num + r"\s*(?:个)?(?:小时|h|hour)", s, re.I)
     mi = re.search(num + r"\s*(?:分钟|分|min|m)\b", s, re.I)
@@ -246,8 +282,9 @@ def parse_duration(v) -> tuple[int | None, str | None]:
             total += _val(h) * 60
         if mi:
             total += _val(mi)
-        total = int(round(total))
-        return (total, None) if 0 < total <= 24 * 60 else (None, f"时长 {v} 不像分钟数")
+        elif re.search(r"(?:小时|h|hour)\s*(?:半|半节)", s, re.I):
+            total += 30                       # 「一小时半」「1小时半」→ 90
+        return _minutes_ok(total, v)
     return None, f"看不懂的时长写法「{v}」（写分钟数，或「1.5小时」）"
 
 
@@ -279,6 +316,22 @@ def parse_enum(v, aliases: dict[str, str], label: str) -> tuple[str | None, str 
 
 
 # ---------------------------------------------------------------- 表头定位
+def _looks_like_duration_header(v) -> bool:
+    """这一列**看起来**是在写时长吗？（表头没命中别名时，用来提醒老师）
+
+    只用来「说话」，不用来取值 —— 认不出来就是认不出来，绝不按它去解析。
+    「课时费 / 单价」这类是钱，不是时长，排除掉免得天天误报。
+    """
+    key = _norm(v)
+    if not key:
+        return False
+    if any(w in key for w in ("费", "价", "钱", "元", "¥", "￥")):
+        return False
+    if key in ("时长", "课时", "分钟", "分钟数", "小时", "min", "mins", "duration", "duration_min"):
+        return True
+    return any(w in key for w in ("时长", "课时长", "分钟数", "duration")) or key.endswith("min")
+
+
 def _match_columns(values: list) -> dict[str, int]:
     """把一行单元格值映射成 {字段名: 列下标(0-based)}。按别名归一化后**全等**匹配。"""
     out: dict[str, int] = {}
@@ -380,11 +433,22 @@ def parse_workbook(data: bytes, default_year: int | None = None) -> dict:
             )
             return result
 
+        # 「看着像时长、但表头没认出来」的列。
+        # 这一列没被映射 = 所有行都会静默按 60 分钟兜底 —— 用户的课时是 90 分钟的话，
+        # 整份课表的时长就全错了，而且**一眼看不出来**（预览里就是一片 60）。
+        # 所以认不出来时必须点名，不能只丢进 ignored_columns 了事。
+        used_idx = set(mapping.values())
+        suspect_dur = [
+            _s(v) for i, v in enumerate(hvals)
+            if i not in used_idx and _looks_like_duration_header(v)
+        ]
+
         # ---- 逐行读 ----
         rows: list[dict] = []
         notes: list[str] = []
         filled_year = 0
         from_range = 0
+        dur_default_rows: list[int] = []     # 时长按 60 兜底的行号（要在预览里说清楚）
         for r in range(hrow + 1, (ws.max_row or hrow) + 1):
             vals = [ws.cell(row=r, column=c).value for c in range(1, (ws.max_column or 1) + 1)]
             if all(_is_blank(v) for v in vals):
@@ -413,11 +477,17 @@ def parse_workbook(data: bytes, default_year: int | None = None) -> dict:
             dur, derr = parse_duration(cell("duration_min"))
             if derr:
                 errors.append(derr)
+            dur_defaulted = False
             if dur is None and mins_from_range:
                 dur = mins_from_range            # 「19:00-20:00」推出来的
                 from_range += 1
             if dur is None:
-                dur = 60                         # 与排课弹窗的默认值保持一致
+                # 兜底 60 —— 与排课弹窗的默认值保持一致。
+                # ⚠️ 但必须**标出来**：表里写 90 却因为列没认出来而变成 60，
+                # 是这个模块最危险的一种静默错误（用户 2026-10-20 踩过）。
+                dur = 60
+                dur_defaulted = True
+                dur_default_rows.append(r)
 
             mode, merr = parse_enum(cell("mode"), MODE_ALIASES, "上课形式")
             if merr:
@@ -442,6 +512,7 @@ def parse_workbook(data: bytes, default_year: int | None = None) -> dict:
                 "start_at": f"{d}T{t}" if (d and t) else None,
                 "student": student,
                 "duration_min": dur,
+                "duration_defaulted": dur_defaulted,
                 "topic": _s(cell("topic")),
                 "mode": mode,
                 "location": _s(cell("location")),
@@ -465,6 +536,7 @@ def parse_workbook(data: bytes, default_year: int | None = None) -> dict:
             "total": len(rows),
             "ok": sum(1 for x in rows if not x["errors"]),
             "problem": sum(1 for x in rows if x["errors"]),
+            "duration_defaulted": len(dur_default_rows),
         }
         if filled_year:
             notes.append(f"有 {filled_year} 行没写年份，按 {default_year} 年处理")
@@ -472,7 +544,26 @@ def parse_workbook(data: bytes, default_year: int | None = None) -> dict:
             notes.append(f"有 {from_range} 行的时长是从「19:00-20:00」这类区间里算出来的")
         if result["ignored_columns"]:
             notes.append("忽略了这几列：" + "、".join(result["ignored_columns"]))
-        result["notes"] = notes
+
+        # ---- 时长兜底：必须**排在最前面**说出来 ----
+        # 这一条是用户 2026-10-20 报「课表里写 90 分钟，导进去全是 60」的正面修复：
+        # 兜底本身没错（老师确实经常不填时长），错的是兜底了却一声不响。
+        loud: list[str] = []
+        if suspect_dur:
+            loud.append(
+                "这一块没读懂：表头看着像时长，但名字对不上 —— " +
+                "、".join(f"「{x}」" for x in suspect_dur) +
+                "。请把表头改成「时长（分钟）」（照「下载模板」），否则**所有课都会按 60 分钟**。"
+            )
+        if dur_default_rows:
+            shown = "、".join(str(x) for x in dur_default_rows[:10])
+            more = "…" if len(dur_default_rows) > 10 else ""
+            loud.append(
+                f"有 {len(dur_default_rows)} 行没读到时长（第 {shown}{more} 行），"
+                f"**已按 60 分钟**导入。如果这些课实际是 90 分钟，请回 Excel 的"
+                f"「时长（分钟）」列填上再导一次 —— 否则课时费也按 60 分钟算。"
+            )
+        result["notes"] = loud + notes
 
         # 排序：**没问题的排前面按时间排，有问题的沉到后面**（老师核对时先看能导的，
         # 有错的集中在一起也方便对着 Excel 改）。同级再按原行号，保证顺序稳定可预期。
