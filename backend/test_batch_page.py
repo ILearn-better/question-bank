@@ -1093,8 +1093,22 @@ def check_auto_figure(src: str) -> None:
           "归一化坐标" in bp and "0 到 1000" in bp)
     check("后端：提示词要求只框图形、不框题干文字",
           "不要**把题干文字" in bp or "不要把题干文字" in bp)
-    check("后端：提示词里的字段数与实际列出的字段数**一致**（说九个却给十个会误导模型）",
-          "下面十个" in bp and "十个字段**必须全部出现**" in bp)
+    # ---- 字段清单的守门人（以前这里写死「下面十个」，加字段时它照样绿）----
+    # 抄的是**唯一出处** PAGE_FIELDS，与提示词里真列出的那些字段行逐个比：
+    # 加字段忘了补描述、或描述补了忘了进元组，都会在这里红。
+    _m = re.search(r"^PAGE_FIELDS = \((.*?)^\)", bp, re.S | re.M)
+    declared = re.findall(r'"(\w+)"', _m.group(1)) if _m else []
+    listed = re.findall(r'^[ \t]*[\'"]\s{2}\\?"(\w+)\\?"', bp, re.M)
+    check("后端：提示词列出的字段与 PAGE_FIELDS **逐个对齐**（名字与顺序都算）",
+          declared and listed == declared, f"提示词 {listed} / PAGE_FIELDS {declared}")
+    check("后端：answer 与 analysis 在整页识别要的字段里",
+          "answer" in declared and "analysis" in declared, f"{declared}")
+    check("后端：字段数文案由 len(PAGE_FIELDS) 算出，不再手写「十个」",
+          "_N_FIELDS" in bp and "下面十个" not in bp and "十个字段" not in bp)
+    check("后端：提示词说清「本页没有答案就留空、不要自己解题」（否则模型会硬编一个）",
+          "本页没有就留空" in bp and "不要自己解题" in bp)
+    check("后端：提示词禁止把答案/解析混进 content（混了等于同一段文字存两遍）",
+          "题干里只放题目本身" in bp)
     check("后端：四个 figure_* flag 名前后端一致（前端 figureAuto 认它们）",
           "figure_snapped" in bp and "figure_rough" in bp
           and "figure_box_missing" in bp and "figure_only_candidate" in bp)
@@ -1198,6 +1212,37 @@ def check_auto_figure(src: str) -> None:
           "调整配图" in src)
     check("前端：提示文案区分「AI 没定位到」与「还没框」",
           "没能在这页上定位到它" in src)
+
+
+def check_answers(src: str) -> None:
+    """⑭ 答案与解析：识别出来、留得住、存得进（0035）。
+
+    盯的是**静默丢数据**：识别层收了字段、页面上也看得见，但只要任意一条
+    写入路径漏了它，老师补的答案就在那一步蒸发 —— 接口全 200，界面上看不出来。
+    三条路径各自独立，缺哪条都不会报错：
+      ① 模板里得有输入框（否则老师改不了、也看不见）
+      ② saveItem 要带上（「先保存再通过」那条路走的是它）
+      ③ REVIEW_FIELDS 要有（不列进去，轮询会把老师改的覆盖回模型初值）
+    """
+    print("\n  -- 前端：答案 / 解析两栏 --")
+    check("模板里有「答案」输入框，并标了 markEdited",
+          'v-model="it.answer"' in src and "markEdited(it, 'answer')" in src)
+    check("模板里有「解析」输入框，并标了 markEdited",
+          'v-model="it.analysis"' in src and "markEdited(it, 'analysis')" in src)
+    check("空栏说的是「本页没有，留空即可」—— 题目卷本来就没答案，不该当成异常",
+          "本页没有，留空即可" in src)
+
+    m = re.search(r"const REVIEW_FIELDS = \[(.*?)\];", src, re.S)
+    rf = m.group(1) if m else ""
+    check("REVIEW_FIELDS 含 answer / analysis（否则轮询把老师改的覆盖回模型值）",
+          "'answer'" in rf and "'analysis'" in rf, rf.replace("\n", " "))
+
+    i = src.find("async saveItem(it, silent)")
+    j = src.find("async approve(it)", i)
+    body = src[i:j] if 0 <= i < j else ""
+    check("saveItem 带上 answer / analysis（少了它，「改了一半点通过」改的那半就丢）",
+          "answer: it.answer" in body and "analysis: it.analysis" in body)
+    check("approveItem 之前**先**保存（body 取到了才说明顺序没被倒过来）", bool(body))
 
 
 def main() -> int:
@@ -1330,6 +1375,9 @@ def main() -> int:
 
     print("\n==== ⑬ 配图自动裁切 + 图片直接上传 ====")
     check_auto_figure(src)
+
+    print("\n==== ⑭ 待审：答案与解析两栏 ====")
+    check_answers(src)
 
     print("\n" + "=" * 60)
     if fails:

@@ -299,6 +299,13 @@ class BatchItem(Base):
     confidence: Mapped[str | None] = mapped_column(String)     # high | medium | low
     note: Mapped[str | None] = mapped_column(Text)             # 模型自述的不确定点
 
+    # ---- 答案与解析（0035 加）----
+    # 空串 = **本页没有**这道题的答案/解析，这是正常情况不是失败：
+    # 题目卷答案另成册、或者解析印在下一页（那半页由下一页识别另行给出）。
+    # 所以别拿「空」判断识别是否出问题 —— 判断失败的标记在 flags 里。
+    answer: Mapped[str] = mapped_column(Text, default="", server_default="")
+    analysis: Mapped[str] = mapped_column(Text, default="", server_default="")
+
     # 后端校验留下的痕迹。JSON 数组，例如 ["qtype_fallback","json_repaired"]。
     # 有它才能让审核页把「模型自己拿的主意」标出来 —— 没标的话老师看不出来
     # 这个「解答题」是模型判断的，还是枚举不合法被后端兜的。

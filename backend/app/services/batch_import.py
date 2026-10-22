@@ -293,6 +293,11 @@ def fields_from_obj(obj: dict, flags: list[str]) -> dict:
         "needs_figure": needs_figure,
         "figure_note": _as_str(obj.get("figure_note")),
         "note": _as_str(obj.get("note")),
+        # 答案与解析：模型没给（或给的是 null / 数字）就落空串。
+        # **不加 flag** —— 「这道题本页没有答案」是最常见的情况（题目卷、答案另册），
+        # 给它打标记只会让待审列表里每一条都挂个橙色标签，老师很快就学会无视标签了。
+        "answer": _as_str(obj.get("answer")),
+        "analysis": _as_str(obj.get("analysis")),
         "flags": flags,
     }
 
@@ -532,6 +537,8 @@ def _finish_item(item_id: str, result: dict | None, err: str | None) -> None:
             db.commit()
             return
         it.content = result["content"]
+        it.answer = result.get("answer") or ""
+        it.analysis = result.get("analysis") or ""
         it.qtype = result["qtype"]
         it.difficulty = result["difficulty"]
         it.knowledge_point = result["knowledge_point"] or None
@@ -622,8 +629,9 @@ def approve_item(db: Session, item: BatchItem) -> str:
         # 单独一列而不是拼进 image：文本形态出卷时，原貌图整张都不会用，
         # 而这张图仍然要印 —— 两件事必须能分开取。
         figure_image=item.figure_image or "",
-        answer="",
-        analysis="",
+        # 0035 起识别就带答案与解析；老条目这两列为空串，行为与以前一致。
+        answer=item.answer or "",
+        analysis=item.analysis or "",
         created_at=datetime.now().isoformat(timespec="seconds"),
         curriculum_id=curriculum_id,
         node_id=node_id,

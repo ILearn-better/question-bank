@@ -120,6 +120,9 @@ def _item_dict(db: Session, it: BatchItem) -> dict:
         "tags": _json_list(it.tags),
         "confidence": it.confidence or taxonomy.DEFAULT_CONFIDENCE,
         "note": it.note or "",
+        # 答案 / 解析。空串 = 本页没有（题目卷、解析在下一页），不是失败。
+        "answer": it.answer or "",
+        "analysis": it.analysis or "",
         # 配图三件套：前两个是「要不要图」的当前结论与模型原话，最后一个是框出来的图。
         # needs_figure 用 bool 出给前端（库里存 0/1，SQLite 没有布尔列）。
         "needs_figure": bool(it.needs_figure),
@@ -319,7 +322,7 @@ def patch_item(item_id: str, payload: BatchItemPatch, db: Session = Depends(get_
     if "difficulty" in data and data["difficulty"] not in taxonomy.DIFFICULTIES:
         raise HTTPException(422, f"难度只能是 {' / '.join(taxonomy.DIFFICULTIES)}")
 
-    for k in ("content", "qtype", "difficulty", "knowledge_point"):
+    for k in ("content", "answer", "analysis", "qtype", "difficulty", "knowledge_point"):
         if k in data:
             setattr(it, k, data[k])
     if "node_id" in data:
