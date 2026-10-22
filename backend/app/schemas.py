@@ -877,3 +877,37 @@ class ArchiveGenerateIn(BaseModel):
     archived_on: Optional[str] = None
     grader: str = ""
     note: str = ""
+
+
+# ============================================================ 答案与解析补录
+class AnswerBackfillIn(BaseModel):
+    """建一个补录任务。
+
+    两种选法二选一：
+      · `question_ids`：明确点名要补哪几道（前端勾选）
+      · `document_id`：整份文档里**还没有答案与解析**的题
+
+    ⚠️ `only_missing` 缺省 True。要重跑已有答案的题必须显式给
+       `only_missing=false` + `overwrite=true` —— 默认值不能是「覆盖」，
+       那等于把老师手写过的答案交出去。
+    """
+
+    question_ids: List[str] = Field(default_factory=list)
+    document_id: Optional[str] = None
+    only_missing: bool = True
+    overwrite: bool = False
+    limit: int = Field(default=300, ge=1, le=1000)
+
+
+class AnswerBackfillApply(BaseModel):
+    """把建议写进题库。不传 question_ids = 全部「已匹配」的都写。"""
+
+    question_ids: List[str] = Field(default_factory=list)
+    overwrite: Optional[bool] = None      # None = 用建任务时的口径
+
+
+class AnswerRecheckIn(BaseModel):
+    """单题同步重读。`pages` 可以指定页码（解析印在下一页时很有用）。"""
+
+    pages: List[int] = Field(default_factory=list)
+    hint: str = ""

@@ -1488,3 +1488,38 @@ class GradeArchive(Base):
         Index("idx_garachive_student", "student_id", "archived_on", "id"),
         Index("idx_garachive_grade", "grade_id"),
     )
+
+
+class AnswerBackfill(Base):
+    """答案与解析的**补录任务**：给已经在题库里的题重读原页，先出建议再应用。
+
+    为什么单独一张表、而不是复用 batch_jobs：
+        batch_jobs 的产物是 `batch_items`（待审条目 → 通过后**新建**题目）。
+        补录的产物是「修改已有题目的两列」，落点完全不同 —— 复用一张表就得让
+        approve 在两套语义之间分叉，那是本模块最不需要的复杂度。
+
+    `proposals` 直接存 JSON 字符串而不是拆成子表：它是**一次性的审阅稿**，
+    只被当前这次补录读，没有跨任务查询需求（对比 batch_items 要翻历史、
+    要按状态筛，才值得建表）。建议条目数上限 300，JSON 也就几百 KB。
+
+    适用范围 / 操作对象 / 预期效果写在 services/answer_backfill.py 的模块 docstring 里，
+    与前端提示文案是同一份口径。
+    """
+
+    __tablename__ = "answer_backfills"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    owner_id: Mapped[int] = mapped_column(Integer, nullable=False, default=OWNER_ID, server_default=str(OWNER_ID))
+    # queued 刚建好 / running 识别中 / done 全成 / partial 有对不上或失败 / failed 全失败
+    status: Mapped[str] = mapped_column(String, default="queued", server_default="queued")
+    total: Mapped[int] = mapped_column(Integer, default=0, server_default="0")     # 待补题数
+    done: Mapped[int] = mapped_column(Integer, default=0, server_default="0")      # 已处理页数
+    failed: Mapped[int] = mapped_column(Integer, default=0, server_default="0")    # 识别失败的页数
+    # 这次补录的范围（question_ids / document_id / only_missing / overwrite），
+    # 存下来是为了「应用」时还能判断用户当初勾没勾覆盖
+    scope: Mapped[str] = mapped_column(Text, default="{}", server_default="{}")
+    proposals: Mapped[str] = mapped_column(Text, default="[]", server_default="[]")
+    error: Mapped[str | None] = mapped_column(Text)
+    applied_at: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[str] = mapped_column(Text, default=_now, server_default=NOW)
+    finished_at: Mapped[str | None] = mapped_column(Text)
