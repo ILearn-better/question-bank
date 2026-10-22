@@ -386,6 +386,7 @@ _FIGURE_PAD_PT = 3.0        # 裁图时四周各留一点，别把图形边缘�
 _FIGURE_MIN_NORM = 15       # 归一化框最短边下限（0~1000 制）。比这还小的框不是图
 _SNAP_IOU = 0.10            # 与候选区 IoU 达到这个值 → 就是它
 _SNAP_NEAR = 0.25           # 或者中心点在这一比例内（页宽/页高）也算同一幅图
+_CLAIM_DECISIVE = 1.5       # 两题抢同一处图形时，「赢家明显更近」的倍数（见 plan_page_figures）
 
 
 def _box4(v) -> list[float] | None:
@@ -486,6 +487,13 @@ def resolve_figure_box(box_norm, cands, W, H, allow_only: bool = False):
        这条兜底的判断依据是「这一页有几道题要图」，单条调用者看不到。
        实测踩过：模型说 4 道题有图却没给框，兜底就把**同一幅图贴给了 4 道题** ——
        4 张一模一样的图挂在 4 道不相干的题上，比不配图还糟。
+
+    ⚠️⚠️ 但**只把 allow_only 算对还不够**：调用方必须**只对「这道题自己要图」的条目**
+       调这个函数（`needs_figure` 为真，或模型给了框）。实测踩过第二次 ——
+       p6 上只有一道题 `needs_figure=true`（allow_only 因此为真），可**每一条**都走了裁图，
+       于是另外 3 道 `needs_figure=false` 的题也落进这条兜底，
+       全拿到了同一张图（flags 是 `figure_only_candidate`、`figure_note` 还是空的）。
+       判断依据是页级的，授权却按条生效 —— 两个粒度混用就漏。
     """
     if cands:
         rects = [tuple(c["rect"]) for c in cands]
@@ -516,15 +524,105 @@ def resolve_figure_box(box_norm, cands, W, H, allow_only: bool = False):
     return None, ""
 
 
-def crop_figure_for_item(src: str, pno: int, box_norm, cands, W, H, flags: list[str],
-                         allow_only: bool = False):
-    """裁出配图。返回 (url | None, 实际用的归一化框 | None)，并把方式记进 flags。
+def _norm_box(rect, W, H) -> list[int]:
+    """点坐标框 → 归一化 0~1000 的整数框（落库用的就是它）。"""
+    return [int(round(rect[0] / W * 1000)), int(round(rect[1] / H * 1000)),
+            int(round(rect[2] / W * 1000)), int(round(rect[3] / H * 1000))]
+
+
+def _claim_score(box_norm, rect, W, H) -> tuple[float, float]:
+    """这道题「认领」这处图形的可信度。返回 `(是否不如图形高, 中心距离)`，越小越可信。
+
+    ⚠️ 只看中心距离**不够**，得先看「框在图形的上方还是下方」：
+       这类讲义的排版是**题目在上、图在下**，所以「框在图形上方」的那道题才可能是主人。
+       实测 p12：那处横排是「将下图中的立体图形分类」题的 8 个几何体，
+       可它的框整体偏上（距离 0.159），下面那道「分别观察下列几何体」的框指向答案段落、
+       反而更近（0.137）—— 光比距离就把图判给了下面那道。
+       加上「上下」这一维之后，两道题各归各位。
+
+    顺序这么做还解决了 p11：第 2 题（棱锥的四个选项）离**第 3 题**的实物图 0.235，
+    而第 3 题自己离它是 0.118 —— 距离和上下都指向第 3 题，判得对。
+    """
+    if not box_norm:
+        return (0.0, 0.0)     # 没给框却拿到候选，只可能是「整页仅此一题要图」
+    bcx = (box_norm[0] + box_norm[2]) / 2000.0
+    bcy = (box_norm[1] + box_norm[3]) / 2000.0
+    rcx = (rect[0] + rect[2]) / 2 / W
+    rcy = (rect[1] + rect[3]) / 2 / H
+    return (0.0 if bcy <= rcy else 1.0, abs(bcx - rcx) + abs(bcy - rcy))
+
+
+def plan_page_figures(items: list[dict], cands: list[dict], W: float, H: float) -> list[dict]:
+    """页级配图分配 —— **纯函数**，不裁图也不写库。返回与 `items` 等长的决策列表。
+
+    每项 `{"rect": 点坐标框 | None, "box": 归一化框 | None, "mode": 方式, "dup": 是否被别人占了}`。
+
+    为什么要单拎出来：配图的三件事（要不要图 / 框在哪 / 谁占哪一处）**全是几何判断**，
+    跟 AI 没关系。拎成纯函数之后，单测和「离线重放」都能直接调它 ——
+    不会出现「重放脚本自己抄一份逻辑、和真正跑的那份悄悄不一致」。
+
+    三条规则，每条都对应一次实测踩坑：
+    ① `needs_figure` 为假、也没给框 → 不配图。页级算出来的 `allow_only` **不借给**这类题。
+    ② `allow_only` 只在「这一页只有一道题要图、且只有一处候选」时为真。
+    ③ 一处几何位置一页只归一道题，**离得最近的那道赢**，其余留空并标 `dup`。
+
+    ⚠️ 第③条的「最近」只在**明显更近**时才敢下定论（`_CLAIM_DECISIVE`）。
+       实测 p12：那处横排确实是「将下图中的立体图形分类」题的 8 个几何体，
+       可它的框整体偏上（0.159），下面那道「分别观察下列几何体」的框指向答案段落、
+       反而更近（0.137）—— 光比距离会判错。所以差距不够大时不硬判：
+       图照给赢家，但**赢家也打上 `shared`**，让老师看一眼再决定。
+       宁可多一个待核对标记，也不要把「错了但看着像对的」塞进题库。
+    """
+    wanting = [(i, r) for i, r in enumerate(items)
+               if r.get("needs_figure") or r.get("figure_box")]
+    allow_only = (len(wanting) == 1 and len(cands) == 1)
+
+    claims = []
+    for i, r in wanting:
+        rect, mode = resolve_figure_box(r.get("figure_box"), cands, W, H,
+                                        allow_only=allow_only)
+        if rect is None:
+            continue
+        claims.append((_claim_score(r.get("figure_box"), rect, W, H), i, rect, mode))
+
+    # 同一处框有多道题要 → 只留一道；其余 `dup`，赢家如果赢得不干脆则 `shared`
+    by_key: dict[tuple, list] = {}
+    for score, i, rect, mode in claims:
+        by_key.setdefault(tuple(_norm_box(rect, W, H)), []).append((score, i, rect, mode))
+
+    best: dict[int, tuple] = {}
+    for lst in by_key.values():
+        lst.sort(key=lambda t: t[0])
+        score, i, rect, mode = lst[0]
+        shared = False
+        if len(lst) > 1:
+            (a0, d0), (a1, d1) = lst[0][0], lst[1][0]
+            # 一道在图形上方、一道在下方 → 上面那道才是主人，判得干脆；
+            # 同一侧就要看距离差得多不多，差得不多就不硬判（标 shared 请老师核）。
+            shared = not (a0 < a1 or (a0 == a1 and d0 * _CLAIM_DECISIVE < d1))
+        best[i] = (rect, mode, shared)
+
+    out: list[dict] = []
+    for i, r in enumerate(items):
+        if i in best:
+            rect, mode, shared = best[i]
+            out.append({"rect": rect, "box": _norm_box(rect, W, H),
+                        "mode": mode, "dup": False, "shared": shared})
+        elif r.get("needs_figure") or r.get("figure_box"):
+            out.append({"rect": None, "box": None, "mode": "", "dup": True, "shared": False})
+        else:
+            out.append({"rect": None, "box": None, "mode": "", "dup": False, "shared": False})
+    return out
+
+
+def crop_figure_for_item(src: str, pno: int, rect, mode: str, W: float, H: float,
+                         flags: list[str]):
+    """按 `plan_page_figures` 已定好的框裁图。返回 (url | None, 归一化框 | None)。
 
     落盘走 `pdf.crop_region` → `data/uploads/crops/`（**资产目录**：
     每张图都有数据库行引用它，删的时候靠引用计数回收，见 services/crops.py）。
     这张图被写进了 `batch_items.figure_image`，所以它是有主的，不是垃圾。
     """
-    rect, mode = resolve_figure_box(box_norm, cands, W, H, allow_only=allow_only)
     if rect is None:
         return None, None
     from ..adapters import pdf as pdf_adapter
@@ -533,9 +631,7 @@ def crop_figure_for_item(src: str, pno: int, box_norm, cands, W, H, flags: list[
         "snapped": "figure_snapped",
         "snapped_only": "figure_only_candidate",
     }.get(mode, "figure_rough"))
-    used = [int(round(rect[0] / W * 1000)), int(round(rect[1] / H * 1000)),
-            int(round(rect[2] / W * 1000)), int(round(rect[3] / H * 1000))]
-    return f"/api/crops/{name}", used
+    return f"/api/crops/{name}", _norm_box(rect, W, H)
 
 
 # ---------------------------------------------------------------- 单页识别
@@ -715,23 +811,31 @@ def _write_page_items(job_id: str, doc_id: str, pno: int, items: list[dict],
                 W = H = 0.0
                 cands = []
 
-        # 「整页只有一处图形」这条兜底**只能发给一道题** ——
-        # 它的依据是页级的（这一页有几道题在要图），所以必须在页级算。
-        # ⚠️ 实测踩过：模型说 4 道题有图却没给框，兜底把**同一幅图**贴给了这 4 道题 ——
-        #    待审列表里 4 张一模一样的图挂在 4 道不相干的题上，比不配图还糟。
-        unboxed = sum(1 for r in items
-                      if r.get("needs_figure") and not r.get("figure_box"))
-        allow_only = (unboxed == 1 and len(cands) == 1)
+        # 配图决定（要不要图 / 框在哪 / 哪一处归谁）全在 plan_page_figures 里 ——
+        # 纯几何、与 AI 无关，所以离线重放脚本也能直接调它，不会各抄一份。
+        # ⚠️ 实测踩过两次：①模型说 4 道题有图却没给框，兜底把同一幅图贴给 4 道题；
+        #    ②p6 只有一道题要图（allow_only 因此为真），可裁图是**逐条**跑的，
+        #      于是 `needs_figure=false` 的题也进兜底、一起拿走那处图形。
+        decisions = (plan_page_figures(items, cands, W, H) if (src and W)
+                     else [{"rect": None, "box": None, "mode": "", "dup": False,
+                            "shared": False} for _ in items])
 
         for idx, r in enumerate(items):
             flags = list(r["flags"])
             fig_url = None
             fig_box = None
-            if src and W:
+            d = decisions[idx]
+            if d["dup"]:
+                # 那处图形被同页更可信的一道题占了 —— **不能悄悄留空**，
+                # 否则老师以为这题压根不用配图（见图要自己框）。
+                flags.append("figure_dup_candidate")
+            elif d["rect"] is not None:
                 try:
                     fig_url, fig_box = crop_figure_for_item(
-                        src, pno, r.get("figure_box"), cands, W, H, flags,
-                        allow_only=allow_only)
+                        src, pno, d["rect"], d["mode"], W, H, flags)
+                    if d.get("shared"):
+                        # 同页还有别的题也指着这处图形，赢家赢得不干脆 → 让老师核一眼
+                        flags.append("figure_shared_candidate")
                 except Exception:                   # noqa: BLE001
                     # 裁不出来（区域退化、磁盘写不了）→ 留个标记，条目照常进待审。
                     # 配图是「锦上添花」，不能因为它丢掉整道题。

@@ -2079,6 +2079,10 @@ const app = createApp({
     /** 判「不用配图」、但题干里明明提到了图 —— 提醒老师自己看一眼。
      *  这是「模型判错时人工兜底」的那一半：不静默通过，也不替老师决定。 */
     figureWarn(it) {
+      // 同页还有别的题也指着这处图形 —— 图照给了，但赢家赢得不干脆（见 plan_page_figures）
+      if ((it.flags || []).indexOf('figure_shared_candidate') >= 0) {
+        return '这一页还有别的题也要这处图形，这张图请核对一眼';
+      }
       if (it.needs_figure || it.status === 'approved') return '';
       const text = String(it.content || '');
       const hit = (this.options.figure_keywords || []).find(k => text.indexOf(k) >= 0);
@@ -2102,10 +2106,16 @@ const app = createApp({
       if (f.indexOf('figure_rough') >= 0) return 'rough';
       return '';
     },
-    /** 模型说有图，但最终**没**产出图（没定位到 / 裁失败）→ 得让老师知道要自己框。 */
+    /** 模型说有图，但最终**没**产出图（没定位到 / 裁失败 / 那一处图形已被同页别的题占了）
+     *  → 得让老师知道要自己框。
+     *
+     *  `figure_dup_candidate`：页面上的图形候选常常把相邻两幅图并成一个区域，
+     *  两道题各自给框会都吸附到同一处、裁出两张一样的图。现在只放行第一道，
+     *  后面那道留空并打这个标记 —— **不能悄悄留空**，否则老师以为这题不用配图。 */
     figureLocateFailed(it) {
       const f = it.flags || [];
-      return f.indexOf('figure_box_missing') >= 0 || f.indexOf('figure_crop_failed') >= 0;
+      return f.indexOf('figure_box_missing') >= 0 || f.indexOf('figure_crop_failed') >= 0
+        || f.indexOf('figure_dup_candidate') >= 0;
     },
     async clearFigure(it) {
       try {

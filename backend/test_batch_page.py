@@ -1137,7 +1137,12 @@ def check_auto_figure(src: str) -> None:
     check("后端：提示词明确「只提到几何体名字不算有图」（实测那版把 4/5 道都判成有图）",
           "正三棱柱" in bp and "给 false" in bp)
     check("后端：「整页仅一处图形」的兜底由**页级**算（单条调用者看不到有几道题要图）",
-          "allow_only = (unboxed == 1 and len(cands) == 1)" in bp)
+          "allow_only = (len(wanting) == 1 and len(cands) == 1)" in bp)
+    check("后端：配图分配是**纯函数** plan_page_figures（离线重放/单测都调它，不各抄一份）",
+          "def plan_page_figures(" in bp
+          and "plan_page_figures(items, cands, W, H)" in bp)
+    check("后端：一处几何位置一页只归一道题（离得最近的赢）",
+          "_claim_score(" in bp and "_CLAIM_DECISIVE" in bp)
     check("后端：默认不允许「替你挑图」（不给授权时绝不猜）",
           "allow_only: bool = False" in bp)
 
