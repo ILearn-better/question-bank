@@ -513,6 +513,10 @@ class BatchItemPatch(BaseModel):
     figure_note: Optional[str] = None
     # 配图 URL。传空串 = 撤掉配图（服务端按引用计数回收那张图）。
     figure_image: Optional[str] = None
+    # 答案 / 解析。识别时给初值，老师可以改（改过的以老师为准），
+    # 通过时原样搬进 questions.answer / questions.analysis。空串是合法的。
+    answer: Optional[str] = None
+    analysis: Optional[str] = None
 
 
 class FigureCropIn(BaseModel):

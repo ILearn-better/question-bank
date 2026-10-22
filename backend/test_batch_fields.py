@@ -145,8 +145,8 @@ def test_good() -> None:
     check("标签是列表", r["tags"] == ["一元二次方程"])
     check("置信度高", r["confidence"] == "high")
     check("note 空串", r["note"] == "")
-    check("字段齐全（十个键）", set(r) == {
-        "content", "qtype", "difficulty", "knowledge_point",
+    check("字段齐全（十二个键）", set(r) == {
+        "content", "answer", "analysis", "qtype", "difficulty", "knowledge_point",
         "tags", "confidence", "needs_figure", "figure_note", "note", "flags"})
 
 
@@ -177,10 +177,10 @@ def test_dirty() -> None:
     r = bi.parse_fields("这张图我看不清，抱歉。")
     check("完全非 JSON：不抛异常", isinstance(r, dict))
     check("完全非 JSON：标 bad_json", "bad_json" in r["flags"])
-    check("完全非 JSON：九个字段都还在（键齐全）",
-          set(r) == {"content", "qtype", "difficulty", "knowledge_point",
-                     "tags", "confidence", "needs_figure", "figure_note",
-                     "note", "flags"})
+    check("完全非 JSON：十二个字段都还在（键齐全）",
+          set(r) == {"content", "answer", "analysis", "qtype", "difficulty",
+                     "knowledge_point", "tags", "confidence", "needs_figure",
+                     "figure_note", "note", "flags"})
     check("完全非 JSON：判不出有没有图 → 记 figure_unknown（不是静默 false）",
           r["needs_figure"] is False and "figure_unknown" in r["flags"])
     check("完全非 JSON：题型难度置信度全回落",
@@ -214,7 +214,10 @@ def test_dirty() -> None:
     check("空对象：全回落且不抛", r["qtype"] == taxonomy.DEFAULT_QTYPE
           and r["difficulty"] == taxonomy.DEFAULT_DIFFICULTY
           and r["confidence"] == taxonomy.DEFAULT_CONFIDENCE)
-    check("空对象：键仍齐全（九字段 + flags）", len(r) == 10)
+    # 数字会随着加字段漂移，但「answer / analysis 必须在」这条语义不会 ——
+    # 两者都断，才既守得住「键齐全」又不至于下次加字段时假红。
+    check("空对象：键仍齐全（十一个业务字段 + flags）",
+          len(r) == 12 and {"answer", "analysis"} <= set(r), f"{sorted(r)}")
     check("空对象：配图也判不出来 → figure_unknown",
           r["needs_figure"] is False and "figure_unknown" in r["flags"])
 

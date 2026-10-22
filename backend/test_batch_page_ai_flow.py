@@ -366,6 +366,69 @@ def main() -> int:
         finally:
             db.close()
 
+
+        # ---------------------------------------------------- ⑧ 答案与解析（0035）
+        print("\n==== ⑧ 答案 / 解析：识别 → 待审 → 入库 ====")
+        from app.models import Question
+        from app.services import batch_import as bi
+        from app.services.batch_import import fields_from_obj
+
+        # ① 解析层
+        r1 = fields_from_obj({"content": "求 $x^2=1$。", "answer": "B",
+                              "analysis": "因为 $x^2=1$，所以 $x=\\pm 1$。"}, [])
+        check("解析层：answer 原样带出", r1["answer"] == "B", repr(r1.get("answer")))
+        check("解析层：analysis 带出且 LaTeX 反斜杠没被吃",
+              "\\pm" in r1["analysis"], repr(r1.get("analysis")))
+        r2 = fields_from_obj({"content": "题目卷（答案另册）"}, [])
+        check("解析层：没有答案 → 空串（不是 None）",
+              r2["answer"] == "" and r2["analysis"] == "",
+              f"{r2.get('answer')!r} / {r2.get('analysis')!r}")
+        # 只关心「答案/解析」有没有被当成异常。其它 flag（题型回落之类）是**造数据时
+        # 只给了 content** 导致的，与本轮无关，拿它们判会假红。
+        check("解析层：没有答案**不打 flag**（本页没有是常态，打了每行都挂标签等于没标签）",
+              not any("answer" in f or "analysis" in f for f in r2["flags"]),
+              f"{r2['flags']}")
+
+        # ② 识别结果 → 待审条目
+        db = SessionLocal()
+        try:
+            ajob = batch_page.create_page_job(
+                db, [1], curriculum_id=cid, document_id="DOC_ANS", doc_filename="解析版.pdf")
+            batch_page._write_page_items(ajob.id, "DOC_ANS", 1, [
+                dict(fields_from_obj({"content": "第一题", "answer": "B",
+                                      "analysis": "第一题详解"}, []),
+                     raw=None, figure_box=None),
+                dict(fields_from_obj({"content": "第二题"}, []),
+                     raw=None, figure_box=None),
+            ])
+            rows = db.scalars(
+                select(BatchItem).where(BatchItem.job_id == ajob.id)
+                .order_by(BatchItem.seq)).all()
+            check("落库：答案进了待审条目", [x.answer for x in rows] == ["B", ""],
+                  f"{[x.answer for x in rows]}")
+            check("落库：解析也进了", [x.analysis for x in rows] == ["第一题详解", ""],
+                  f"{[x.analysis for x in rows]}")
+
+            # ③ 通过 → 正式题库（这正是用户要的「入库」）
+            qid = bi.approve_item(db, rows[0])
+            q = db.get(Question, qid)
+            check("入库：questions.answer 有值（0035 之前这里是写死的空串）",
+                  q.answer == "B", repr(q.answer))
+            check("入库：questions.analysis 有值", q.analysis == "第一题详解",
+                  repr(q.analysis))
+            check("入库：题干没被答案污染", q.content == "第一题", repr(q.content))
+            q2id = bi.approve_item(db, rows[1])
+            q2 = db.get(Question, q2id)
+            check("入库：本来就没有答案的题落空串、不报错",
+                  q2.answer == "" and q2.analysis == "")
+
+            db.execute(delete(Question).where(Question.id.in_([qid, q2id])))
+            db.execute(delete(BatchItem).where(BatchItem.job_id == ajob.id))
+            db.execute(delete(BatchJob).where(BatchJob.id == ajob.id))
+            db.commit()
+        finally:
+            db.close()
+
     finally:
         # 清理：只按本次的 job_id 删（绝不写「删掉库里所有 XX」那种）
         for jid in (job_id, fig_job_id):

@@ -624,6 +624,37 @@
                           </el-select>
                         </div>
 
+                        <!-- ---------- 答案与解析 ----------
+                             为什么要有这两栏：解析版讲义（题目后面紧跟【答案】
+                             【详解】【分析】）识别出来时，这两项以前**根本没收**，
+                             通过入库后 questions.answer 永远是空的。
+                             现在模型给初值、老师能改，通过时原样搬进题库。
+                             ⚠️ 空着是**正常**的：题目卷、答案另成册、解析印在下一页，
+                             这三种情况本来就收不到。所以空栏不报警、只提示。 -->
+                        <div style="margin-top:8px">
+                          <div class="hint">
+                            答案
+                            <span v-if="!it.answer" style="color:#909399">
+                              · 本页没有，留空即可
+                            </span>
+                          </div>
+                          <el-input v-model="it.answer" type="textarea" :rows="2"
+                                    @input="markEdited(it, 'answer')"
+                                    placeholder="只写最终答案，如 B / $x=1$ 或 $x=3$"></el-input>
+                        </div>
+
+                        <div style="margin-top:8px">
+                          <div class="hint">
+                            解析
+                            <span v-if="!it.analysis" style="color:#909399">
+                              · 本页没有，留空即可
+                            </span>
+                          </div>
+                          <el-input v-model="it.analysis" type="textarea" :rows="4"
+                                    @input="markEdited(it, 'analysis')"
+                                    placeholder="【分析】【详解】【点睛】照录，不用改写"></el-input>
+                        </div>
+
                         <div v-if="it.note" class="hint" style="margin-top:8px;color:#e6a23c">
                           模型备注：{{ it.note }}
                         </div>
@@ -796,7 +827,8 @@ const SUBMIT_MAX = 30;
  *  其余字段（status / flags / error / node_path / question_id…）一律以服务端为准。
  *  ⚠️ `figure_image` 刻意**不在列** —— 它只由服务端写（框选 / 撤掉），
  *     保留本地旧值会把刚框好的图覆盖回去（实测踩过）。 */
-const REVIEW_FIELDS = ['content', 'qtype', 'difficulty', 'knowledge_point', 'tags', 'needs_figure'];
+const REVIEW_FIELDS = ['content', 'answer', 'analysis',
+                       'qtype', 'difficulty', 'knowledge_point', 'tags', 'needs_figure'];
 
 /** 值算不算「空」：空串 / 纯空白 / 空数组 / null。
  *  注意布尔（有没有配图）与下拉（题型、难度）**永远有值** ——
@@ -1843,6 +1875,9 @@ const app = createApp({
           body: JSON.stringify({
             content: it.content, qtype: it.qtype, difficulty: it.difficulty,
             knowledge_point: it.knowledge_point, tags: it.tags,
+            // 答案 / 解析也必须一起存 —— 只存题干那几项的话，
+            // 老师补写的答案解析在「先保存再通过」那条路上会**静默丢掉**。
+            answer: it.answer || '', analysis: it.analysis || '',
             // 配图判断也一起存 —— 老师可能先勾了框、又改了题干再点「仅保存修改」
             needs_figure: !!it.needs_figure,
           }),
