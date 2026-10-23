@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import os
+import re
 import uuid
 
 import pymupdf
@@ -324,6 +325,134 @@ def _overlap_ratio(a, b) -> float:
         return 0.0
     small = min(a.width * a.height, b.width * b.height)
     return (inter.width * inter.height) / small if small > 0 else 0.0
+
+
+# ---------------------------------------------------------------- 题干定位（整题原貌图的兜底）
+_KEEP_CN = None          # 惰性编译，见 _flat()
+
+
+def _flat(s: str) -> str:
+    """只留汉字/字母/数字 —— 用于「同一句话在文字层里认不认得出」。
+
+    为什么要这样比：模型转出来的题干和 PDF 文字层**从来不是逐字节相等**的
+    （空格、全角半角、公式符号、`．` 与 `.`）。只比「有意义的字」，才认得出是同一句。
+    """
+    global _KEEP_CN
+    if _KEEP_CN is None:
+        import re as _re
+        _KEEP_CN = _re.compile(r"[^\u4e00-\u9fffA-Za-z0-9]")
+    return _KEEP_CN.sub("", s or "")
+
+
+# 段落**结束**标记 —— 见到就说明这道题在版面上到头了。
+# ⚠️ 一律按块的**开头**匹配，不是「包含」：题干正文里也会出现这些字
+#    （「请写出【答案】的格式」），按包含会把这道题从中间截断。
+_STOP_MARKS = (
+    "【答案】", "【详解】", "【解析】", "【解答】", "【分析】", "【点睛】", "【点评】",
+    "【注意】", "必记结论", "即学即练", "知识点",
+)
+
+# 页脚：页码 / 页眉水印。混进整题原貌图里，出卷就会印出「4 / 44」。
+_FOOTER_RES = (
+    re.compile(r"^\s*[-–—]?\s*\d+\s*[/／]\s*\d+\s*[-–—]?\s*$"),   # 4 / 44、- 4 -
+    re.compile(r"^\s*第\s*\d+\s*页\s*$"),                          # 第 4 页
+)
+
+# 认不出页码时按页高这个比例当正文下界。0.93 是实测出来的：
+# A4 高 842 磅，页码基线在 y≈778（= 0.924H），下面还有一行水印；
+# 原来取 0.96（=808）正好把页码和水印都裹进整题原貌图。
+_FOOTER_FALLBACK = 0.93
+
+
+def _text_blocks(page) -> list[tuple[float, float, float, str]]:
+    """页内**文字**块，按 y0 自上而下：(y0, y1, x0, 原文)。
+
+    图片块不参与 —— `blocks()` 第 7 位是块类型，0=文字，1=图片。
+    """
+    out: list[tuple[float, float, float, str]] = []
+    for b in page.get_text("blocks"):
+        if len(b) > 6 and b[6] != 0:
+            continue
+        t = b[4] or ""
+        if t.strip():
+            out.append((float(b[1]), float(b[3]), float(b[0]), t))
+    out.sort()
+    return out
+
+
+def _marks_from_blocks(blocks: list[tuple[float, float, float, str]],
+                       H: float) -> tuple[list[float], float]:
+    """从文字块里挑出 (段落结束标记 y 列表, 正文下界 y)。**纯函数**，好被测试守住。
+
+    `blocks` = `_text_blocks` 的输出 `(y0, y1, x0, 原文)`。
+    """
+    # ⚠️ 按块**开头**匹配，不用「包含」：题干正文里也会写「【答案】」这几个字
+    stops = [b[0] for b in blocks if (b[3] or "").lstrip().startswith(_STOP_MARKS)]
+    bottom = H * _FOOTER_FALLBACK
+    for y0, _y1, _x0, t in blocks:
+        # 只认贴着页底的那几块：正文里也可能有一行「4 / 44」这样的算式
+        if y0 < H * 0.88:
+            continue
+        first = (t or "").strip().split("\n")[0].strip()
+        if any(r.match(first) for r in _FOOTER_RES):
+            bottom = min(bottom, y0)
+    return stops, bottom
+
+
+def page_marks(path: str | os.PathLike, pno: int) -> tuple[list[float], float]:
+    """这一页的**版面收尾依据**：(段落结束标记的 y 列表, 正文下界 y)。
+
+    两个都要，因为整题原貌图有两条边界：
+      · 上边由「本题首行」定（见 `question_starts`），
+      · 下边不只是「下一题首行」——**页内最后一题后面还跟着答案、详解、知识点框**，
+        一路裁到页底就把答案印进卷子（实测 p6/p14/p29 三张全中）。
+        所以取「最近的结束标记」当硬边界。
+      · 页脚页码/水印也得躲开，否则卷子上印出「4 / 44」。
+    """
+    with pymupdf.open(path) as doc:
+        page = _page(doc, pno)
+        return _marks_from_blocks(_text_blocks(page), float(page.rect.height))
+
+
+def question_starts(path: str | os.PathLike, pno: int, heads: list[str]) -> list[float | None]:
+    """每个题干的**首行 y**（点坐标，自上而下）。认不出给 None。
+
+    为什么要这个：整页识别模式下条目**没有块坐标**（不进分块流程），
+    可「这道题在页面上占哪一段」是个纯几何问题 —— 文字层里本来就有答案，
+    反倒是模型给的坐标最飘。实测一份 44 页讲义 78 条：题干前 12 字能在本页
+    文字层里命中的 77 条（98.7%），而「要配图却没配到」的那 5 条 5/5 都能定位。
+
+    用法：拿到每道题的首行 y 之后，**下一道题的首行就是本题的下边界** ——
+    配图兜底（整题原貌图）就是靠这个把范围算出来的（见 batch_page.plan_whole_regions）。
+    下边界还要结合 `page_marks`（答案/详解、页脚）才完整。
+
+    ⚠️ 只在**数字版**（有文字层）才有结果；扫描页整页一张位图，全部 None，
+       调用方要能退化成「不兜底」。
+    ⚠️ 找不到就返回 None，**不猜**：猜出来的范围会把隔壁题裁进来，
+       而这张图是要印到卷子上的。
+    """
+    with pymupdf.open(path) as doc:
+        page = _page(doc, pno)
+        blocks: list[tuple[float, str]] = []
+        for y0, _y1, _x0, t in _text_blocks(page):
+            txt = _flat(t)
+            if txt:                          # 纯符号块（│ ─ 等）留不下东西，跳过
+                blocks.append((y0, txt))
+
+        out: list[float | None] = []
+        for head in heads:
+            flat = _flat(head)
+            y = None
+            # 由长到短试：能命中 12 字就不用 6 字 —— 愈短愈容易撞到别的题
+            for n in (12, 8, 6):
+                needle = flat[:n]
+                if len(needle) < 4:
+                    continue
+                y = next((yy for yy, txt in blocks if needle in txt), None)
+                if y is not None:
+                    break
+            out.append(y)
+        return out
 
 
 # ---------------------------------------------------------------- 内容块解析

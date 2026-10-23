@@ -634,6 +634,174 @@ def crop_figure_for_item(src: str, pno: int, rect, mode: str, W: float, H: float
     return f"/api/crops/{name}", _norm_box(rect, W, H)
 
 
+# ---------------------------------------------------------------- 兜底：整题原貌图
+# 有些题目配图**永远定位不到**：扫描页没有几何候选、纯线框图形不含斜线曲线、
+# 或者模型干脆没给框（库里实测这类占「要配图的题」的 15.7%）。
+# 与其让老师一张张手工框，不如把**整道题**裁成图 —— 图一定在里面，
+# 代价是这道题出卷改用图片形态（`render_prefer=image`，见 batch_import.approve_item），
+# 于是题干不能再编辑、题库里也搜不到。这个取舍是用户点名要的：
+# 「配图怎么都框不准就整题原貌图，零人工」。
+_WHOLE_FOOTER_CUT = 0.96     # 页底留一点：页码 / 水印别裁进来
+_WHOLE_MIN_H = 12.0          # 比这还矮说明定位串了（两道题的首行 y 几乎相同）
+
+# 这张图「还可疑 / 还没图」的几个标记。**唯一出处。**
+# 三个地方要用它：①审核页摘标记（routers/batches）、②界面分档（batch.html 的 figTierOf）、
+# ③自动导入判「能不能直接入库」（services/auto_import）。②是 JS 没法共享，
+# 靠 frontend/batch_fig_check.js 比对；①③必须都从这里取，否则会出现
+# 「界面显示可放心、自动导入却不肯入库」这种自相矛盾。
+#
+# 语义都是「这张图没人核过」，所以人核过一次就该全部消掉。
+DOUBT_FIGURE_FLAGS = (
+    "figure_rough",              # 框是模型估的，可能歪
+    "figure_shared_candidate",   # 同页还有别的题也要这处图形，赢家赢得不干脆
+    "figure_dup_candidate",      # 这处图形被判给了同页别的题，本条目因此没图
+    "figure_box_missing",        # 模型说有图但没给可用框
+    "figure_crop_failed",        # 按框裁图失败
+    "figure_cross_page",         # 图多半在下一页（跨页题的上半段）
+)
+
+
+def plan_whole_regions(starts: list, W: float, H: float,
+                       stops: list | None = None, bottom: float | None = None) -> list:
+    """每题首行 y → 每题的版面范围 `(x0, y0, x1, y1)`。**纯函数**，不裁图不写库。
+
+    下边界取三者里**最靠上**的那个：
+      ① 下一个认得出的题首行 —— 再往下就是别人的题
+      ② 本题之后最近的段落结束标记（`【答案】`/`【详解】`/`必记结论`，见 `pdf.page_marks`）
+      ③ 正文下界 `bottom`（已去掉页脚页码）
+    最后一题没有 ①，就靠 ②③ 收口。
+
+    为什么非要 ②：**页内最后一题后面紧跟答案和详解**。只按 ① 的话最后一题
+    一路裁到页底，答案就跟着印进卷子 —— 实测 p6/p14/p29 三张全中，
+    比留空更糟。③ 同理：原来按页高 96% 收，页码「4 / 44」正好卡在里面。
+
+    为什么上边界取首行、不再往上找：上一题的图常常贴在本页顶部、紧挨着本题首行；
+    再往上扩会把隔壁题的图裁进来 —— 而这张图要印在卷子上。
+
+    ⚠️ `starts[i]` 为 None（这题的首行没认出来）→ 本题**不兜底**，
+       但它的 y 也不参与别人的边界计算（见下一条）。
+    ⚠️ 下边界要找**第一个认得出**的后续题，不能只看 i+1：
+       中间的题认不出时，若退回页底，本题会把后面几道题一起裁进来。
+    ⚠️ 边界先取「任何比本题更靠下的首行」，再看算出来的高度够不够一道题 ——
+       不能要求「至少差 _WHOLE_MIN_H 才算边界」：那样两道题首行挨得极近时
+       （定位串到同一个文字块上）会直接退到页底，把整页后半段都裁进这一题里。
+    """
+    floor = H * _WHOLE_FOOTER_CUT if bottom is None else min(H * _WHOLE_FOOTER_CUT, float(bottom))
+    stops = sorted(s for s in (stops or []) if s is not None)
+    out: list = [None] * len(starts)
+    for i, y0 in enumerate(starts):
+        if y0 is None:
+            continue
+        end = None
+        for j in range(i + 1, len(starts)):
+            if starts[j] is not None and starts[j] > y0 + 0.5:
+                end = float(starts[j])
+                break
+        if end is None:
+            end = floor
+        # 答案/详解/知识点框：本题范围内第一个标记就是硬边界
+        for s in stops:
+            if s > y0 + 0.5:
+                end = min(end, s)
+                break
+        if end - y0 < _WHOLE_MIN_H:
+            continue
+        out[i] = (0.0, max(0.0, y0 - 2.0), W, min(H, end - 1.0))
+    return out
+
+
+def merge_row_candidates(cands: list[dict], W: float) -> list[dict]:
+    """把**同一横排**的候选并成一条「整排」。**纯函数**，只算矩形。
+
+    为什么需要：选择题的 A/B/C/D 常是四幅分开的小图，几何上就是四个独立候选。
+    老师要的是「四幅一起」那张 —— 只点其中一幅，卷子上就少三个选项。
+    自动配图以前也可能踩这个：吸附到 A 那一幅，看着像配好了，其实少了三个选项。
+
+    判据（两条都要满足）：
+      · 纵向区间重叠 ≥ 较矮那个的一半 —— 同一行（不是上下两道题的图）
+      · 横向间隙 ≤ 页宽 25% —— 隔太远的是两件事，不是一排选项
+
+    只返回**并了 2 个以上**的排：单张并出来的和原候选一模一样，多列一遍只会让人困惑。
+
+    ⚠️ **必须两段式**：先按纵向重叠「聚成排」，排内再按 x 排序判横向间隙。
+    一段式（先按 y0 全局排序、边扫边并）会漏并 —— 四幅选项图的 y0 天然错开几个点
+    （实测 100/110/120），排序后处理顺序变成「最左 → 最右 → 中间」，中间那幅被判成
+    横向隔太远，整排就从第二幅起算，卷面上还是少一个选项。
+    """
+    items = [tuple(c["rect"]) for c in cands if c.get("rect")]
+    if len(items) < 2:
+        return []
+
+    # ---- ① 纵向聚排：谁的纵向区间跟排里任一成员重叠够多，就进这一排 ----
+    clusters: list[list[tuple]] = []
+    for r in sorted(items, key=lambda r: (r[1], r[0])):
+        for cl in clusters:
+            if any(_same_row(o, r) for o in cl):
+                cl.append(r)
+                break
+        else:
+            clusters.append([r])
+
+    # ---- ② 排内按 x 扫，横向间隙够小就并成一段 ----
+    out: list[dict] = []
+    for cl in clusters:
+        if len(cl) < 2:
+            continue
+        cl.sort(key=lambda r: r[0])
+        cur = None
+        cnt = 0
+        for r in cl:
+            if cur is not None and r[0] - cur[2] <= W * 0.25:
+                cur = [min(cur[0], r[0]), min(cur[1], r[1]),
+                       max(cur[2], r[2]), max(cur[3], r[3])]
+                cnt += 1
+                continue
+            if cnt >= 2:
+                out.append({"kind": "row", "rect": (cur[0], cur[1], cur[2], cur[3])})
+            cur, cnt = [r[0], r[1], r[2], r[3]], 1
+        if cnt >= 2:
+            out.append({"kind": "row", "rect": (cur[0], cur[1], cur[2], cur[3])})
+    return out
+
+
+def _same_row(a, b) -> bool:
+    """两个矩形是不是「同一横排」——纵向重叠 ≥ 较矮那个的一半。"""
+    overlap = min(a[3], b[3]) - max(a[1], b[1])
+    shorter = min(a[3] - a[1], b[3] - b[1])
+    return shorter > 0 and overlap >= shorter * 0.5
+
+
+def _range_has_figure(rect, cands) -> bool:
+    """这段范围里**确实有一处图形候选** —— 兜底才有意义。
+
+    ⚠️ 不验这一步会出「假兜底」：跨页题的图在下一页，本题范围内只有题干文字，
+       裁出来的「整题图」里根本没有图。老师看到有图就放心了，卷子印出来还是缺图 ——
+       这比留空更糟（留空至少还挂着「没定位到图」的提示）。
+       实测一份 44 页讲义：没配到图的 14 条里，11 条都是这种跨页情况。
+    """
+    if rect is None or not cands:
+        return False
+    for c in cands:
+        r = c["rect"]
+        cx, cy = (r[0] + r[2]) / 2, (r[1] + r[3]) / 2
+        if rect[0] <= cx <= rect[2] and rect[1] <= cy <= rect[3]:
+            return True
+    return False
+
+
+def crop_whole_question(src: str, pno: int, rect, flags: list[str]) -> str:
+    """把整道题裁成原貌图，返回 URL（失败给空串）。"""
+    if rect is None:
+        return ""
+    from ..adapters import pdf as pdf_adapter
+    try:
+        name = pdf_adapter.crop_region(src, pno, list(rect), str(config.CROPS_DIR))
+    except Exception:                       # noqa: BLE001
+        return ""
+    flags.append("figure_whole_question")
+    return f"/api/crops/{name}"
+
+
 # ---------------------------------------------------------------- 单页识别
 def recognize_page(db: Session, image_path, hint: str = "") -> list[dict]:
     """识别**一整页**，返回该页的题目列表（0 到 N 道）。
@@ -820,6 +988,25 @@ def _write_page_items(job_id: str, doc_id: str, pno: int, items: list[dict],
                      else [{"rect": None, "box": None, "mode": "", "dup": False,
                             "shared": False} for _ in items])
 
+        # ---- 兜底：配图定位不到的题 → 整题原貌图（见 plan_whole_regions）----
+        # 只在真有这种题时才去解析文字层：多数页一条都不缺，没必要白读一遍。
+        whole: list = [None] * len(items)
+        need_whole = [k for k, d in enumerate(decisions)
+                      if d["rect"] is None
+                      and (items[k].get("needs_figure") or items[k].get("figure_box"))]
+        if src and W and need_whole:
+            try:
+                from ..adapters import pdf as pdf_adapter
+                starts = pdf_adapter.question_starts(
+                    src, pno, [items[k].get("content") or "" for k in range(len(items))])
+                # 下边界不能只靠「下一题首行」：页内最后一题后面跟着答案/详解/
+                # 知识点框，一路裁到页底就把答案印进卷子了。页脚页码同理。
+                stops, bottom = pdf_adapter.page_marks(src, pno)
+                whole = plan_whole_regions(starts, W, H, stops=stops, bottom=bottom)
+            except Exception:                        # noqa: BLE001
+                # 文字层读不到（扫描版 / 文件损坏）→ 不兜底，退回「等老师框」
+                whole = [None] * len(items)
+
         for idx, r in enumerate(items):
             flags = list(r["flags"])
             fig_url = None
@@ -850,6 +1037,20 @@ def _write_page_items(job_id: str, doc_id: str, pno: int, items: list[dict],
                 # 模型说有图，却没给出可用的框 → 明确标出来，别让老师以为「不用配图」。
                 flags.append("figure_box_missing")
 
+            # 兜底：配图没定位到，就把**整道题**裁下来当原貌图 —— 图一定在里面，
+            # 只是这道题出卷会改用图片形态（见 batch_import.approve_item）。
+            # ⚠️ 两个前提缺一不可：①范围算出来了 ②**范围内真的有一处图形**。
+            #    跨页题的图在下一页，只满足①的话裁出来是一张没图的「整题图」（见 _range_has_figure）。
+            # ⚠️ 只在 fig_url 为空时才做：配图已经拿到了就没必要再存一张大图。
+            whole_url = ""
+            if not fig_url and whole[idx] is not None:
+                if _range_has_figure(whole[idx], cands):
+                    whole_url = crop_whole_question(src, pno, whole[idx], flags)
+                elif whole[idx][3] >= H * 0.9:
+                    # 本题顶到页底、页内又没有图 → 图八成在下一页（跨页题的上半段）。
+                    # 打标记让界面能说清原因，并让「选现成的图」把下一页的也列出来。
+                    flags.append("figure_cross_page")
+
             it = BatchItem(
                 id=uuid.uuid4().hex[:12],
                 job_id=job_id,
@@ -858,9 +1059,11 @@ def _write_page_items(job_id: str, doc_id: str, pno: int, items: list[dict],
                 doc_filename=doc_name,
                 page_no=pno,
                 region=None,
-                # ⚠️ 整页模式**不裁原貌图**：题干文本模型直接给了，出卷走文本形态，
+                # ⚠️ 整页模式一般**不裁原貌图**：题干文本模型直接给了，出卷走文本形态，
                 #    原貌图没有下游用途，裁了只会往 crops/ 里攒没人引用的图。
-                image="",
+                #    唯一的例外是「配图定位不到」的兜底（见上面的 whole_url）——
+                #    那种题没有这张图就会丢图，非裁不可。
+                image=whole_url,
                 status="pending",
                 content=r["content"],
                 # 答案 / 解析：模型本页找不到就是空串（题目卷、解析在下一页）。

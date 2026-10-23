@@ -606,9 +606,19 @@ def approve_item(db: Session, item: BatchItem) -> str:
     两种形态都带上：`content`（模型识别 + 老师可能改过的文本）与 `image`（原貌图）。
     `render_prefer` 给 auto —— 有文本用文本。理由：**这一条已经被老师审核过了**，
     文本是被确认过的内容；而原貌图始终留着，需要时在出卷页整卷切「图片」即可。
+
+    ⚠️ 唯一的例外：整页识别里配图定位不到的题，`image` 存的是**整道题**的兜底图
+    （`figure_whole_question`）。那种题必须印图片 —— 印文本就丢图了。
+    判据只认这个标记，别的条目一个字都不改。
     """
     job = db.get(BatchJob, item.job_id)
     curriculum_id = job.curriculum_id if job else None
+    try:
+        item_flags = json.loads(item.flags or "[]")
+    except ValueError:
+        item_flags = []
+    if not isinstance(item_flags, list):
+        item_flags = []
     # fuzzy=True 与识别阶段保持一致 —— 否则老师手改过的知识点名又匹配不上了
     kps, node_id, curriculum_id = knowledge.resolve_kp(
         db, [item.knowledge_point] if item.knowledge_point else [], curriculum_id, fuzzy=True
@@ -635,7 +645,9 @@ def approve_item(db: Session, item: BatchItem) -> str:
         created_at=datetime.now().isoformat(timespec="seconds"),
         curriculum_id=curriculum_id,
         node_id=node_id,
-        render_prefer="auto",
+        # 兜底那条路裁的是**整道题**（配图定位不到时）→ 出卷必须印这张图，
+        # 印文本反而丢图。其余情况照旧 auto（有文本用文本）。
+        render_prefer=("image" if "figure_whole_question" in item_flags else "auto"),
     ))
     if node_id:
         db.add(QuestionNode(question_id=qid, node_id=node_id, weight=1.0))

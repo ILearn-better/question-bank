@@ -2,7 +2,7 @@
 """请求 / 响应模型。输入一律用 Pydantic 校验，输出为便于前端消费的字典结构。"""
 from __future__ import annotations
 
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -911,3 +911,17 @@ class AnswerRecheckIn(BaseModel):
 
     pages: List[int] = Field(default_factory=list)
     hint: str = ""
+
+
+class AutoImportIn(BaseModel):
+    """自动导入：传**本机路径**而不是上传（agent 手上通常就是路径）。
+
+    `curriculum` 认 id / code / name 三种写法，认不出会 422 并列出可选项 ——
+    刻意不做「自动判断体系」：一份卷子一套体系，猜错是整批知识点挂错树。
+
+    `pages` 不传 = 全部页；支持 `1-30,35`（也认中文逗号）与 `all`。
+    """
+
+    path: str
+    curriculum: Optional[str] = None
+    pages: Optional[Union[str, List[int]]] = None

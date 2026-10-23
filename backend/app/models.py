@@ -1523,3 +1523,46 @@ class AnswerBackfill(Base):
     applied_at: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[str] = mapped_column(Text, default=_now, server_default=NOW)
     finished_at: Mapped[str | None] = mapped_column(Text)
+
+
+class AutoTask(Base):
+    """一份讲义「一条命令跑完全程」的任务：录入 → 检查 → 问题处理 → 入库。
+
+    为什么单独一张表、而不是复用 batch_jobs（0037 迁移里写了同样的理由）：
+        batch_jobs 只表示「一次识别」（最多 MAX_PAGES 页），而一份讲义常常 40+ 页，
+        必须拆成好几个 job。老师关心的是「这份讲义怎么样了」，不是「第 2 批 job 怎么样了」。
+        于是 auto_tasks : batch_jobs = 1 : N（`job_ids` 存那批 id）。
+
+    为什么阶段放 `status` + `stage` 两个字段：
+        `status` 是**判断依据**（机器读，取值封闭），`stage` 是**给人看的一句话**
+        （「正在识别第 2/2 批（共 44 页）」）。把后者塞进 status 会让所有 if 都要解析字符串。
+
+    ⚠️ 自动入库的口径是**严格**的：拿不准就留在 needs_human，绝不「先入库再说」。
+       理由与 batch 模块一致 —— 错题会一路印到发给学生的卷子上，
+       而「少入库一条」老师看报告就知道。
+    """
+
+    __tablename__ = "auto_tasks"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    owner_id: Mapped[int] = mapped_column(Integer, nullable=False, default=OWNER_ID, server_default=str(OWNER_ID))
+    # queued 刚建好 / recognizing 识别中 / fixing 自动修图 / approving 入库中
+    # done 全部处理完（可能仍有 needs_human）/ partial 有页失败 / failed 整体失败
+    status: Mapped[str] = mapped_column(String, default="queued", server_default="queued")
+    stage: Mapped[str] = mapped_column(String, default="", server_default="")
+    src_filename: Mapped[str | None] = mapped_column(String)
+    document_id: Mapped[str | None] = mapped_column(String)
+    curriculum_id: Mapped[int | None] = mapped_column(Integer)
+    # 拆批后的 batch_job id（按页序）；pages 是**全部**要处理的页号（跨 job 合并）
+    job_ids: Mapped[str] = mapped_column(Text, default="[]", server_default="[]")
+    pages: Mapped[str] = mapped_column(Text, default="[]", server_default="[]")
+    total_pages: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    total_items: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    approved: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    needs_human: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    skipped: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    # 给 agent 读的完整报告（JSON）。落库而不是现算：需求是「事后还能查这批为什么没过」
+    report: Mapped[str | None] = mapped_column(Text)
+    error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[str] = mapped_column(Text, default=_now, server_default=NOW)
+    finished_at: Mapped[str | None] = mapped_column(Text)

@@ -69,6 +69,70 @@ def _doc_or_404(db: Session, doc_id: str) -> Document:
     return doc
 
 
+# ---------------------------------------------------------------- 文件 → 文档
+_ALLOWED_EXTS = (".pdf", ".docx", *PAGE_IMAGE_EXTS)
+
+
+def check_ext(ext: str) -> str:
+    """扩展名白名单。**唯一出处** —— 上传接口与自动导入都要过这一关。"""
+    if ext == ".doc":
+        raise HTTPException(422, "暂不支持旧版 .doc，请在 Word 中另存为 .docx 后重新上传")
+    if ext not in _ALLOWED_EXTS:
+        raise HTTPException(
+            422, "仅支持 PDF / Word(.docx) / 图片（png、jpg、jpeg、webp、bmp）文件"
+        )
+    return ext
+
+
+def register_document(db: Session, filename: str, ext: str, save_path: Path):
+    """把一个**已经落到 UPLOAD_DIR** 的文件登记成文档。返回 `(doc, blocks)`。
+
+    为什么抽出来：自动导入（routers/auto.py）拿到的是本地路径，也要建文档；
+    如果那边照抄一遍解析逻辑，「扫描版 PDF 要不要算 scanned」「.doc 给什么提示」
+    这两件事迟早两处不一致 —— 而不一致不报错，只是一份能用的文件被拒绝。
+    """
+    check_ext(ext)
+
+    try:
+        if ext == ".pdf":
+            blocks = pdf_adapter.parse_blocks(str(save_path))
+            # 无文字层但有页面 → 扫描版 PDF：允许上传，走纯截图模式
+            scanned = 0 if blocks else 1
+            if scanned and pdf_adapter.page_count(str(save_path)) == 0:
+                raise HTTPException(422, "PDF 无有效页面，文件可能已损坏")
+        elif ext in PAGE_IMAGE_EXTS:
+            # 一张图片 = 一页。没有文字层，所以一定是「截图模式」，
+            # 这也正是图片的用法：整页喂给 AI 整页识别（见 services/batch_page.py）。
+            blocks = []
+            scanned = 1
+            if pdf_adapter.page_count(str(save_path)) == 0:
+                raise HTTPException(422, "图片读不出页面，文件可能已损坏或格式不支持")
+        else:
+            from doc_parser import parse_docx  # 延迟导入，避免包外依赖影响导入期
+
+            # Word 不再强求有文字：整卷是图片的 Word 也能用（在页面视图里框选即可）
+            blocks = parse_docx(str(save_path))
+            scanned = 0
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(422, f"解析失败: {e}") from e
+
+    doc = Document(
+        id=uuid.uuid4().hex[:12],
+        filename=filename,
+        filetype=ext,
+        block_count=len(blocks),
+        blocks=json.dumps(blocks, ensure_ascii=False),
+        created_at=datetime.now().isoformat(timespec="seconds"),
+        file_path=config.rel_to_data(save_path),   # 库里只存相对路径
+        scanned=scanned,
+    )
+    db.add(doc)
+    db.commit()
+    return doc, blocks
+
+
 # ---------------------------------------------------------------- 路径解析
 def _source_file(db: Session, doc_id: str) -> Path:
     """原始上传文件（.pdf / .docx / 图片），必须真实存在。"""
@@ -166,62 +230,19 @@ def _preview_payload(db: Session, doc: Document) -> dict:
 @router.post("/documents")
 async def upload_document(file: UploadFile = File(...), db: Session = Depends(get_db)):
     ext = os.path.splitext(file.filename or "")[1].lower()
-    if ext == ".doc":
-        raise HTTPException(422, "暂不支持旧版 .doc，请在 Word 中另存为 .docx 后重新上传")
-    if ext not in (".pdf", ".docx", *PAGE_IMAGE_EXTS):
-        raise HTTPException(
-            422, "仅支持 PDF / Word(.docx) / 图片（png、jpg、jpeg、webp、bmp）文件"
-        )
+    check_ext(ext)                       # 先校验再落盘：别为一份 .doc 写一个垃圾文件
 
     save_path = config.UPLOAD_DIR / f"{uuid.uuid4().hex}{ext}"
     with open(save_path, "wb") as f:
         f.write(await file.read())
 
-    try:
-        if ext == ".pdf":
-            blocks = pdf_adapter.parse_blocks(str(save_path))
-            # 无文字层但有页面 → 扫描版 PDF：允许上传，走纯截图模式
-            scanned = 0 if blocks else 1
-            if scanned and pdf_adapter.page_count(str(save_path)) == 0:
-                raise HTTPException(422, "PDF 无有效页面，文件可能已损坏")
-        elif ext in PAGE_IMAGE_EXTS:
-            # 一张图片 = 一页。没有文字层，所以一定是「截图模式」，
-            # 这也正是图片的用法：整页喂给 AI 整页识别（见 services/batch_page.py）。
-            blocks = []
-            scanned = 1
-            if pdf_adapter.page_count(str(save_path)) == 0:
-                raise HTTPException(422, "图片读不出页面，文件可能已损坏或格式不支持")
-        else:
-            from doc_parser import parse_docx  # 延迟导入，避免包外依赖影响导入期
-
-            # Word 不再强求有文字：整卷是图片的 Word 也能用（在页面视图里框选即可）
-            blocks = parse_docx(str(save_path))
-            scanned = 0
-    except HTTPException:
-        raise
-    except Exception as e:  # noqa: BLE001
-        raise HTTPException(422, f"解析失败: {e}") from e
-
-    doc_id = uuid.uuid4().hex[:12]
-    db.add(
-        Document(
-            id=doc_id,
-            filename=file.filename,
-            filetype=ext,
-            block_count=len(blocks),
-            blocks=json.dumps(blocks, ensure_ascii=False),
-            created_at=datetime.now().isoformat(timespec="seconds"),
-            file_path=config.rel_to_data(save_path),   # 库里只存相对路径
-            scanned=scanned,
-        )
-    )
-    db.commit()
+    doc, blocks = register_document(db, file.filename, ext, save_path)
     # 这里刻意不转 Word：上传要快。页面视图由前端在进入时显式触发生成，
     # 转换耗时（秒级）落在用户看得见的地方，而不是卡在「上传中」。
     return {
-        "id": doc_id, "filename": file.filename, "filetype": ext,
-        "block_count": len(blocks), "blocks": blocks, "scanned": scanned,
-        "preview": _preview_payload(db, _doc_or_404(db, doc_id)),
+        "id": doc.id, "filename": doc.filename, "filetype": ext,
+        "block_count": doc.block_count, "blocks": blocks, "scanned": doc.scanned,
+        "preview": _preview_payload(db, doc),
     }
 
 
