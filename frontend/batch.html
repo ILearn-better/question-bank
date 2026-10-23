@@ -141,6 +141,21 @@
     border: 1px solid #dcdfe6; border-radius: 4px; background: #fff; cursor: zoom-in;
   }
   .fig-warn { color: #e6a23c; font-size: 12.5px; line-height: 1.7; margin-top: 6px; }
+  .fig-ack { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 6px; }
+  /* 本页候选图形：底图是**原页图**，靠 background-size/position 取景（见 candStyle），
+     所以这里只需要定一个容器尺寸，不额外裁图。 */
+  .fig-cands { margin-top: 8px; border-top: 1px dashed #dcdfe6; padding-top: 8px; }
+  .fig-cand-row { display: flex; gap: 8px; flex-wrap: wrap; }
+  .fig-cand {
+    width: 96px; height: 72px; border-radius: 4px; cursor: pointer; position: relative;
+    border: 2px solid #dcdfe6; background-color: #fff; background-repeat: no-repeat;
+  }
+  .fig-cand:hover { border-color: #409eff; }
+  /* 来自下一页的候选要标出来 —— 否则老师以为是本页的图，位置对不上就会怀疑自己 */
+  .fig-cand-tag {
+    position: absolute; left: 0; bottom: 0; padding: 0 4px; font-size: 11px;
+    color: #fff; background: rgba(230, 162, 60, .9); border-radius: 0 4px 0 4px;
+  }
 
   /* 框选配图的弹窗 */
   /* ⚠️ 滚动必须挂在**外层**、定位容器只包住图片本身（与左栏 .page-box 同一套）。
@@ -506,6 +521,26 @@
                     <template v-if="isAiPageJob">重跑失败的 {{ currentJob.failed }} 页</template>
                     <template v-else>重跑失败的 {{ currentJob.failed }} 条</template>
                   </el-button>
+                  <!-- 配图分档：自动配好的（可放心）/ 有图但不敢打包票（待核）/ 该有图却没配到（缺）。
+                       分档的意义是让老师只处理后两档 —— 全铺开的话 84% 已经对的图也要逐条看。 -->
+                  <el-tag v-if="figCounts.ok" size="small" type="success" effect="plain">
+                    配图可放心 {{ figCounts.ok }}
+                  </el-tag>
+                  <el-tag v-if="figCounts.check" size="small" type="warning" effect="plain">
+                    配图待核 {{ figCounts.check }}
+                  </el-tag>
+                  <el-tag v-if="figCounts.missing" size="small" type="danger" effect="plain">
+                    配图缺 {{ figCounts.missing }}
+                  </el-tag>
+                  <el-tag v-if="figCounts.covered" size="small" type="info" effect="plain">
+                    整题图兜底 {{ figCounts.covered }}
+                  </el-tag>
+                  <el-checkbox v-if="figTodoCount" v-model="onlyFigTodo" size="small">
+                    只看要处理的（{{ figTodoCount }}）
+                  </el-checkbox>
+                  <el-button v-if="figCounts.check" size="small" plain @click="ackAllCheck">
+                    待核的都确认
+                  </el-button>
                   <div style="flex:1"></div>
                   <!-- 手动同步：轮询在任务跑完/出错时就停了，之后服务端再变就看不到 -->
                   <el-button size="small" plain :loading="syncing" @click="syncModel">
@@ -522,7 +557,11 @@
                 </div>
 
                 <div style="max-height: 62vh; overflow: auto; padding-right: 4px;">
-                  <div v-for="it in items" :key="it.id" class="item-card"
+                  <div v-if="onlyFigTodo && !shownItems.length" class="hint"
+                       style="padding:12px;text-align:center">
+                    这批里没有要处理的配图了 —— 取消上面的「只看要处理的」可以看全部。
+                  </div>
+                  <div v-for="it in shownItems" :key="it.id" class="item-card"
                        :class="[it.status, it.error ? 'failed' : '']">
                     <div class="item-head">
                       <b>#{{ it.seq }}</b>
@@ -689,21 +728,69 @@
                                        @click="openFigurePick(it)">
                               {{ it.figure_image ? '调整配图' : '框选配图' }}
                             </el-button>
+                            <!-- 候选点选：这一页几何上「像一幅图」的地方早就算出来了
+                                 （自动配图用的就是同一份数据），只是以前老师看不到，
+                                 于是只能对着整页重画一遍。点一下 = 配好。 -->
+                            <el-button v-if="it.status !== 'approved'"
+                                       size="small" type="primary" plain @click="toggleCands(it)">
+                              {{ (figCandOf(it) && figCandOf(it).show) ? '收起候选' : '选现成的图' }}
+                            </el-button>
                             <el-button v-if="it.figure_image" size="small" text type="danger"
                                        @click="clearFigure(it)">撤掉</el-button>
                           </div>
                           <div v-if="figureWarn(it)" class="fig-warn">⚠ {{ figureWarn(it) }}</div>
                           <img v-if="it.figure_image" :src="it.figure_image" class="fig-thumb"
                                alt="题干配图" @click="zoom(it.figure_image)">
+                          <!-- 兜底：配图没定位到，整道题已经裁成图 → 出卷按图片印。
+                               不用人管，但要说清代价（这题不能再编辑题干、题库里搜不到）。 -->
+                          <div v-else-if="figTierOf(it) === 'covered'" class="hint"
+                               style="margin-top:6px;color:#909399">
+                            这幅图没能自动定位到 → 已把<b>整道题</b>裁成图兜底，
+                            出卷时这题按<b>图片</b>印（图一定在，但这题不能改题干、也搜不到）。
+                            想改回文本形态：用「选现成的图」或「框选配图」挑出那一幅即可。
+                          </div>
                           <div v-else-if="it.needs_figure" class="hint" style="margin-top:6px">
-                            <template v-if="figureLocateFailed(it)">
+                            <template v-if="(it.flags || []).indexOf('figure_cross_page') >= 0">
+                              这道题挤在本页末尾，<b>图和选项多半在下一页</b> ——
+                              点「选现成的图」，下一页上半页的图形会一起列出来，点一下就好。
+                            </template>
+                            <template v-else-if="figureLocateFailed(it)">
                               AI 判断这题有图，但没能在这页上定位到它（图可能画在别的页，
-                              或者模型没给出位置）—— 点「框选配图」自己框一下。
+                              或者模型没给出位置）—— 先试「选现成的图」，没有合适的再「框选配图」。
                             </template>
                             <template v-else>
-                              还没框图。点「框选配图」从原卷上把那一幅框出来 ——
-                              出卷走文本形态时原貌图整张不印，就靠这一张补上。
+                              还没框图。先试「选现成的图」（这一页已识别出的图形，点一下就配好）；
+                              都不对再「框选配图」自己框。
                             </template>
+                          </div>
+
+                          <!-- 待核：图有了，但 AI 不敢打包票 → 一个按钮确认，不必进弹窗 -->
+                          <div v-if="figTierOf(it) === 'check'" class="fig-ack">
+                            <span class="hint">这张是 AI 框的、不敢打包票 —— 对的话点一下就不用再管：</span>
+                            <el-button size="small" type="success" plain
+                                       :disabled="it.status === 'approved'"
+                                       @click="ackFigure(it)">对，就这么用</el-button>
+                          </div>
+
+                          <div v-if="figCandOf(it) && figCandOf(it).show" class="fig-cands">
+                            <div class="hint" style="margin-bottom:4px">
+                              这些是卷面上像图的地方（点一下就是它）<template
+                                v-if="figCandOf(it).cross_page">；跨页题的图和选项常被推到下一页，已一并列出</template>：
+                            </div>
+                            <div v-if="figCandOf(it).loading" class="hint">读取页面几何…</div>
+                            <div v-else-if="figCandOf(it).error" class="hint" style="color:#e6a23c">
+                              {{ figCandOf(it).error }}
+                            </div>
+                            <div v-else class="fig-cand-row">
+                              <div v-for="(c, ci) in figCandOf(it).list" :key="ci"
+                                   class="fig-cand" :style="candStyle(it, c)"
+                                   :title="(c.page !== figCandOf(it).page ? '第 ' + c.page + ' 页 · ' : '')
+                                           + '点击设为配图'"
+                                   @click="pickCand(it, c)">
+                                <span v-if="c.page !== figCandOf(it).page"
+                                      class="fig-cand-tag">下一页</span>
+                              </div>
+                            </div>
                           </div>
                         </div>
                       </div>
@@ -970,6 +1057,13 @@ const app = createApp({
       // 框选配图弹窗。rects 是**已确认的段**（跨页时会有多段，服务端竖拼成一张），
       // draft 是正在拖的那个矩形。
       figPick: { show: false, item: null, page: 1, rects: [], draft: null, saving: false },
+      // 只显示「配图要处理」的条目。含图题里真正要动手的只占少数（实测库里
+      // 84% 自动配好、16% 没配到），可列表一视同仁地铺开，老师只能全看一遍 ——
+      // 这个开关的作用就是把「可以放心的」折叠掉，让注意力只落在要处理的那批。
+      onlyFigTodo: false,
+      // 本页候选图形：{ 条目id: { show, loading, list, page, width, height, page_image, error } }
+      // 点「选现成的图」才去取（默认零请求 —— 一屏几十张卡片全去解析页面矢量会卡）。
+      figCands: {},
       // ---- AI 整页识别（实验流程，2026-10-08）----
       // 把**整页**交给模型，由它自己切成若干道题 —— 不画分界线、不裁题块。
       // aiPageScope: 'all' = 全部页；'custom' = 只识别 aiPages 里挑中的页。
@@ -1023,6 +1117,50 @@ const app = createApp({
     /** 当前任务是不是整页模式 —— 进度单位（页 / 块）与文案都要分叉。 */
     isAiPageJob() { return !!(this.currentJob && this.currentJob.ai_mode === 1); },
     maxPages() { return this.options.max_pages || 30; },
+    /** 配图分档：'ok' 可放心 / 'check' 有图但不敢打包票 / 'missing' 该有图却没配到。
+     *
+     *  为什么分档：`figure_snapped`（几何吸附到真实图形边界）和 `figure_rough`
+     *  （模型估的框）在列表里长得一样，老师只能逐条看。分成三档之后，
+     *  「可放心的」可以折起来批量跳过，注意力只给另外两档。
+     *
+     *  ⚠️ 判据只看 flags 与有没有图，**不看 needs_figure** —— 没勾「有配图」的题
+     *     再多标记也不该冒出来打扰人（老师已经表过态了）。 */
+    figTierOf() {
+      return (it) => {
+        const f = it.flags || [];
+        const doubtful = f.indexOf('figure_rough') >= 0
+          || f.indexOf('figure_shared_candidate') >= 0
+          || f.indexOf('figure_dup_candidate') >= 0
+          || f.indexOf('figure_box_missing') >= 0
+          || f.indexOf('figure_cross_page') >= 0
+          || f.indexOf('figure_crop_failed') >= 0;
+        if (it.figure_image) return doubtful ? 'check' : 'ok';
+        // 配图没定位到，但整道题已经裁成图兜底了 → 出卷时图一定在，不用人管。
+        // ⚠️ 排在 missing 前面：兜底的条目也带着 figure_box_missing，
+        //    顺序反了就会一直挂在「要处理」里，兜底等于白做。
+        if (f.indexOf('figure_whole_question') >= 0) return 'covered';
+        if (it.needs_figure || doubtful) return 'missing';
+        return '';
+      };
+    },
+    figCounts() {
+      const c = { ok: 0, check: 0, missing: 0, covered: 0 };
+      for (const it of this.items) {
+        const t = this.figTierOf(it);
+        if (t) c[t] += 1;
+      }
+      return c;
+    },
+    figTodoCount() { return this.figCounts.check + this.figCounts.missing; },
+    /** 列表实际渲染的条目。过滤只影响**显示** —— 排序/合并/通过都按条目自己的
+     *  id 与 seq 走（见 neighborOf 用 this.items 找相邻），不受过滤影响。 */
+    shownItems() {
+      if (!this.onlyFigTodo) return this.items;
+      return this.items.filter(it => {
+        const t = this.figTierOf(it);
+        return t === 'check' || t === 'missing';
+      });
+    },
   },
   mounted() { this.boot(); },
   beforeUnmount() { this.stopPoll(); this.teardownLazy(); },
@@ -2023,6 +2161,14 @@ const app = createApp({
         empty_stem: '题干为空',
         ai_failed: '识别失败',
         figure_unknown: '有没有图没判出来',
+        // 配图这几个以前显示的是原始 key（老师看不懂），补上中文。
+        figure_rough: '图框是估的',
+        figure_shared_candidate: '同页有别的题也要这图',
+        figure_dup_candidate: '这处图形判给了同页别的题',
+        figure_box_missing: '没定位到图',
+        figure_crop_failed: '按框裁图失败',
+        figure_cross_page: '图可能在下一页',
+        figure_whole_question: '整题图兜底',
       }[f] || f;
     },
     renderLabel() {
@@ -2079,6 +2225,10 @@ const app = createApp({
     /** 判「不用配图」、但题干里明明提到了图 —— 提醒老师自己看一眼。
      *  这是「模型判错时人工兜底」的那一半：不静默通过，也不替老师决定。 */
     figureWarn(it) {
+      // 同页还有别的题也指着这处图形 —— 图照给了，但赢家赢得不干脆（见 plan_page_figures）
+      if ((it.flags || []).indexOf('figure_shared_candidate') >= 0) {
+        return '这一页还有别的题也要这处图形，这张图请核对一眼';
+      }
       if (it.needs_figure || it.status === 'approved') return '';
       const text = String(it.content || '');
       const hit = (this.options.figure_keywords || []).find(k => text.indexOf(k) >= 0);
@@ -2102,10 +2252,119 @@ const app = createApp({
       if (f.indexOf('figure_rough') >= 0) return 'rough';
       return '';
     },
-    /** 模型说有图，但最终**没**产出图（没定位到 / 裁失败）→ 得让老师知道要自己框。 */
+    /** 模型说有图，但最终**没**产出图（没定位到 / 裁失败 / 那一处图形已被同页别的题占了）
+     *  → 得让老师知道要自己框。
+     *
+     *  `figure_dup_candidate`：页面上的图形候选常常把相邻两幅图并成一个区域，
+     *  两道题各自给框会都吸附到同一处、裁出两张一样的图。现在只放行第一道，
+     *  后面那道留空并打这个标记 —— **不能悄悄留空**，否则老师以为这题不用配图。 */
     figureLocateFailed(it) {
       const f = it.flags || [];
-      return f.indexOf('figure_box_missing') >= 0 || f.indexOf('figure_crop_failed') >= 0;
+      return f.indexOf('figure_box_missing') >= 0 || f.indexOf('figure_crop_failed') >= 0
+        || f.indexOf('figure_dup_candidate') >= 0;
+    },
+    /** 「这张图我核过了」—— 服务端摘掉可疑标记，卡片回到「可放心」档。 */
+    async ackFigure(it) {
+      try {
+        const r = await this.api('/api/batches/items/' + it.id + '/figure-ack', { method: 'POST' });
+        Object.assign(it, r.item);
+      } catch (e) {
+        ElementPlus.ElMessage.error('确认失败：' + e.message);
+      }
+    },
+    /** 把所有「待核」的一次确认掉。只处理 check 档 —— **缺失档没有图可确认**，
+     *  把它也算进来的话，老师会以为「点一下就配好了」，实际上那题还是空的。 */
+    async ackAllCheck() {
+      const list = this.items.filter(it => this.figTierOf(it) === 'check');
+      if (!list.length) { ElementPlus.ElMessage.info('没有待核对的配图'); return; }
+      try {
+        await ElementPlus.ElMessageBox.confirm(
+          `把 ${list.length} 张「AI 不敢保证」的图全部标记为已核对？\n确认后不再提示，图上内容不会变。`,
+          '确认配图', { type: 'warning', confirmButtonText: '都确认', cancelButtonText: '再看一眼' });
+      } catch (e) { return; }
+      let ok = 0;
+      for (const it of list) {
+        try {
+          const r = await this.api('/api/batches/items/' + it.id + '/figure-ack', { method: 'POST' });
+          Object.assign(it, r.item);
+          ok += 1;
+        } catch (e) { /* 单条失败不打断其余的 */ }
+      }
+      ElementPlus.ElMessage.success(`已确认 ${ok} / ${list.length} 张`);
+    },
+    figCandOf(it) { return this.figCands[it.id] || null; },
+    /** 点「选现成的图」才去取候选 —— 一屏几十张卡片**不能**自动都去解析页面矢量。 */
+    async toggleCands(it) {
+      const cur = this.figCands[it.id];
+      if (cur && cur.show) { cur.show = false; return; }
+      if (cur && cur.list && cur.list.length) { cur.show = true; return; }
+      this.figCands[it.id] = { show: true, loading: true, list: [], error: '' };
+      try {
+        const r = await this.api('/api/batches/items/' + it.id + '/figure-candidates');
+        const st = {
+          show: true, loading: false, error: '',
+          list: r.candidates || [], page: r.page, cross_page: !!r.cross_page,
+          width: r.width, height: r.height, page_image: r.page_image,
+        };
+        if (!st.list.length) {
+          st.error = '这一页没找到能当图形的区域（扫描版 / 纯文字页很常见）→ 只能用「框选配图」手工框';
+        }
+        this.figCands[it.id] = st;
+      } catch (e) {
+        this.figCands[it.id] = { show: true, loading: false, list: [], error: e.message };
+      }
+    },
+    /** 候选缩略图：底图直接用**原页图**按框取景。
+     *
+     *  为什么不给每个候选裁一张小图：那会往 crops/ 里攒一堆没人引用的图，还要管回收。
+     *  CSS 的 background-size/position 百分比正好能表达「取景框」：
+     *  先把图放大到「框宽 = 容器宽」（即放大 1000/w 倍），再平移到框的左上角。
+     *  ⚠️ 分母 (1000 - w) 在框满宽时为 0 → 那时给 0%（整张就是它，无处可移）。
+     *  ⚠️ 底图与尺寸取**候选自己的**（`c.page_image`），不能共用列表级的 ——
+     *     跨页题会把下一页的候选混进同一个列表，共用就会把下一页的框当本页坐标取景。
+     */
+    candStyle(it, c) {
+      const st = this.figCands[it.id];
+      const img = c.page_image || (st && st.page_image);
+      if (!img) return {};
+      const b = c.box || [0, 0, 0, 0];
+      const w = Math.max(1, b[2] - b[0]);
+      const h = Math.max(1, b[3] - b[1]);
+      const px = w >= 1000 ? 0 : (b[0] / (1000 - w)) * 100;
+      const py = h >= 1000 ? 0 : (b[1] / (1000 - h)) * 100;
+      return {
+        backgroundImage: 'url("' + img + '")',
+        backgroundSize: (1000 / w * 100) + '% ' + (1000 / h * 100) + '%',
+        backgroundPosition: px + '% ' + py + '%',
+      };
+    },
+    /** 点了某个候选 → 归一化框换成点坐标，走与「框选配图」**同一个**接口。
+     *  不新开一条写入路径：配图的写入口只有 figure-crop 一处，少一处就少一处不一致。 */
+    async pickCand(it, c) {
+      const st = this.figCands[it.id];
+      const b = c.box || [];
+      if (b.length !== 4) return;
+      // 页号/尺寸一律取候选自己的：跨页题选中的可能是下一页那块
+      const page = c.page || (st && st.page);
+      const W = c.width || (st && st.width);
+      const H = c.height || (st && st.height);
+      if (!page || !W || !H) return;
+      try {
+        const r = await this.api('/api/batches/items/' + it.id + '/figure-crop', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ regions: [{
+            page,
+            x0: b[0] / 1000 * W, y0: b[1] / 1000 * H,
+            x1: b[2] / 1000 * W, y1: b[3] / 1000 * H,
+          }] }),
+        });
+        Object.assign(it, r.item);
+        if (this.figCands[it.id]) this.figCands[it.id].show = false;
+        ElementPlus.ElMessage.success('配图已保存');
+      } catch (e) {
+        ElementPlus.ElMessage.error('存配图失败：' + e.message);
+      }
     },
     async clearFigure(it) {
       try {

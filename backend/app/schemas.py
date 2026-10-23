@@ -2,7 +2,7 @@
 """请求 / 响应模型。输入一律用 Pydantic 校验，输出为便于前端消费的字典结构。"""
 from __future__ import annotations
 
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -877,3 +877,51 @@ class ArchiveGenerateIn(BaseModel):
     archived_on: Optional[str] = None
     grader: str = ""
     note: str = ""
+
+
+# ============================================================ 答案与解析补录
+class AnswerBackfillIn(BaseModel):
+    """建一个补录任务。
+
+    两种选法二选一：
+      · `question_ids`：明确点名要补哪几道（前端勾选）
+      · `document_id`：整份文档里**还没有答案与解析**的题
+
+    ⚠️ `only_missing` 缺省 True。要重跑已有答案的题必须显式给
+       `only_missing=false` + `overwrite=true` —— 默认值不能是「覆盖」，
+       那等于把老师手写过的答案交出去。
+    """
+
+    question_ids: List[str] = Field(default_factory=list)
+    document_id: Optional[str] = None
+    only_missing: bool = True
+    overwrite: bool = False
+    limit: int = Field(default=300, ge=1, le=1000)
+
+
+class AnswerBackfillApply(BaseModel):
+    """把建议写进题库。不传 question_ids = 全部「已匹配」的都写。"""
+
+    question_ids: List[str] = Field(default_factory=list)
+    overwrite: Optional[bool] = None      # None = 用建任务时的口径
+
+
+class AnswerRecheckIn(BaseModel):
+    """单题同步重读。`pages` 可以指定页码（解析印在下一页时很有用）。"""
+
+    pages: List[int] = Field(default_factory=list)
+    hint: str = ""
+
+
+class AutoImportIn(BaseModel):
+    """自动导入：传**本机路径**而不是上传（agent 手上通常就是路径）。
+
+    `curriculum` 认 id / code / name 三种写法，认不出会 422 并列出可选项 ——
+    刻意不做「自动判断体系」：一份卷子一套体系，猜错是整批知识点挂错树。
+
+    `pages` 不传 = 全部页；支持 `1-30,35`（也认中文逗号）与 `all`。
+    """
+
+    path: str
+    curriculum: Optional[str] = None
+    pages: Optional[Union[str, List[int]]] = None

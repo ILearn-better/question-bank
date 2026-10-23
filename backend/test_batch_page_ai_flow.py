@@ -347,6 +347,106 @@ def main() -> int:
         finally:
             db.close()
 
+        # ⚠️⚠️ 第二次踩到的坑（p6，真卷上 47 道题受害）：**只有一道题要图**，同页还有几道
+        # 「不要图」的题。allow_only 因此为真 —— 但裁图是**逐条**跑的，那几道不要图的题
+        # 也落进「整页只有一处图形」的兜底，白拿了同一张图（还标成 figure_only_candidate，
+        # 看着像 AI 自动框的，最容易被当成对的）。
+        db = SessionLocal()
+        try:
+            xj = batch_page.create_page_job(
+                db, [1], curriculum_id=cid, document_id="DOC_MIX", doc_filename="混合.pdf")
+            batch_page._write_page_items(
+                xj.id, "DOC_MIX", 1,
+                [mkfig("要图甲", None, needs=True), mkfig("不要图乙", None, needs=False),
+                 mkfig("不要图丙", None, needs=False)], src=str(src))
+            rows = db.scalars(select(BatchItem).where(BatchItem.job_id == xj.id)
+                              .order_by(BatchItem.seq)).all()
+            check("只有「自己要图」的那道拿到了图",
+                  bool(rows[0].figure_image) and not rows[1].figure_image
+                  and not rows[2].figure_image, f"{[r.figure_image for r in rows]}")
+            check("「不要图」的题不许标 figure_only_candidate（页级授权串味了）",
+                  all("figure_only_candidate" not in (r.flags or "") for r in rows[1:]),
+                  f"{[r.flags for r in rows[1:]]}")
+            db.execute(delete(BatchItem).where(BatchItem.job_id == xj.id))
+            db.execute(delete(BatchJob).where(BatchJob.id == xj.id))
+            db.commit()
+        finally:
+            db.close()
+
+        # ⚠️ 两道题各自给了框，但页面只认出一处候选（相邻两幅图被并成一个区，p11/p12 就是这样）
+        #    → 只放行第一道，第二道留空并打 figure_dup_candidate。
+        #    「悄悄留空」是不行的：老师会以为这题压根不用配图。
+        db = SessionLocal()
+        try:
+            sj = batch_page.create_page_job(
+                db, [1], curriculum_id=cid, document_id="DOC_SAME", doc_filename="一处候选.pdf")
+            batch_page._write_page_items(
+                sj.id, "DOC_SAME", 1,
+                [mkfig("要图甲", [100, 300, 400, 480]),
+                 mkfig("要图乙", [110, 290, 410, 470])], src=str(src))
+            rows = db.scalars(select(BatchItem).where(BatchItem.job_id == sj.id)
+                              .order_by(BatchItem.seq)).all()
+            check("一处几何候选一页只归一道题（第二道不许再裁一张一模一样的）",
+                  bool(rows[0].figure_image) and rows[1].figure_image == "",
+                  f"{[r.figure_image for r in rows]}")
+            check("第二道标了 figure_dup_candidate（老师据此自己框）",
+                  "figure_dup_candidate" in (rows[1].flags or ""), f"{rows[1].flags}")
+            check("赢家赢得不干脆（两框几乎重合）→ 赢家也标 shared，让老师核一眼",
+                  "figure_shared_candidate" in (rows[0].flags or ""), f"{rows[0].flags}")
+            db.execute(delete(BatchItem).where(BatchItem.job_id == sj.id))
+            db.execute(delete(BatchJob).where(BatchJob.id == sj.id))
+            db.commit()
+        finally:
+            db.close()
+
+        # 一近一远：赢家赢得干脆（近 1.5 倍以上）→ 不给赢家添乱；
+        # 反过来，差距不够大时必须给赢家打 shared —— 实测 p12 就是这样判错的，
+        # 「将下图中的立体图形分类」那处横排被判给了下面那道题。
+        db = SessionLocal()
+        try:
+            kj = batch_page.create_page_job(
+                db, [1], curriculum_id=cid, document_id="DOC_FAR", doc_filename="远近.pdf")
+            batch_page._write_page_items(
+                kj.id, "DOC_FAR", 1,
+                [mkfig("要图甲", [100, 300, 400, 480]),
+                 mkfig("要图乙", [100, 530, 400, 630])], src=str(src))
+            rows = db.scalars(select(BatchItem).where(BatchItem.job_id == kj.id)
+                              .order_by(BatchItem.seq)).all()
+            check("离得近的那道赢",
+                  bool(rows[0].figure_image) and rows[1].figure_image == "",
+                  f"{[r.figure_image for r in rows]}")
+            check("赢得干脆 → 赢家不标 shared",
+                  "figure_shared_candidate" not in (rows[0].flags or ""), f"{rows[0].flags}")
+            db.execute(delete(BatchItem).where(BatchItem.job_id == kj.id))
+            db.execute(delete(BatchJob).where(BatchJob.id == kj.id))
+            db.commit()
+        finally:
+            db.close()
+
+        # 排版常识：图在**题干下方**才是常规，所以「框在图形上方」的那道题才是主人 ——
+        # 哪怕它离得比下面那道远。实测 p12 就是这么判错的：那处横排明明是上面那道
+        # 「将下图中的立体图形分类」的 8 个几何体，却被更近的下题拿走了。
+        db = SessionLocal()
+        try:
+            aj = batch_page.create_page_job(
+                db, [1], curriculum_id=cid, document_id="DOC_ABOVE", doc_filename="上下.pdf")
+            batch_page._write_page_items(
+                aj.id, "DOC_ABOVE", 1,
+                [mkfig("图上那道（远）", [100, 240, 400, 360]),
+                 mkfig("图下那道（近）", [100, 440, 400, 560])], src=str(src))
+            rows = db.scalars(select(BatchItem).where(BatchItem.job_id == aj.id)
+                              .order_by(BatchItem.seq)).all()
+            check("图归**题干在图形上方**的那道（哪怕它离得更远）",
+                  bool(rows[0].figure_image) and rows[1].figure_image == "",
+                  f"{[r.figure_image for r in rows]}")
+            check("上下分明 → 判得干脆，不标 shared",
+                  "figure_shared_candidate" not in (rows[0].flags or ""), f"{rows[0].flags}")
+            db.execute(delete(BatchItem).where(BatchItem.job_id == aj.id))
+            db.execute(delete(BatchJob).where(BatchJob.id == aj.id))
+            db.commit()
+        finally:
+            db.close()
+
         # 模型说有图、没给框，页面又**查不到**图形（扫描版）→ 不猜，留标记让老师自己框
         db = SessionLocal()
         try:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import uuid
 from datetime import datetime
 
@@ -12,9 +13,9 @@ from sqlalchemy.orm import Session
 
 from .. import config
 from ..db import get_db
-from ..models import Node, Question, QuestionNode
-from ..schemas import QuestionIn, QuestionPatch
-from ..services import crops
+from ..models import AnswerBackfill, Node, Question, QuestionNode
+from ..schemas import AnswerBackfillApply, AnswerBackfillIn, AnswerRecheckIn, QuestionIn, QuestionPatch
+from ..services import answer_backfill, crops
 # 知识点解析已抽到 services/knowledge.py —— 批量入库也要用同一套判断，
 # 与其让两个路由互相 import 私有函数（删文档那次的先例），不如共用一份。
 # 保留 `_` 前缀的局部名，是为了让本文件里原有的调用点一行都不用改。
@@ -391,3 +392,85 @@ def delete_question(qid: str, db: Session = Depends(get_db)):
 
     db.commit()
     return {"ok": True, "crops_removed": removed}
+
+
+# ============================================================ 答案与解析补录
+# 一句话口径（前端提示文案与 services/answer_backfill.py 的模块说明必须一致）：
+#   适用范围：题库里**已有**的题，且能定位到原文档的某一页
+#   操作对象：默认只碰「答案与解析都空」的题；要覆盖已有内容必须显式勾
+#   预期效果：只写 answer / analysis 两列，题干、配图、知识点、出卷结果都不动
+@router.post("/questions/answer-backfill")
+def create_answer_backfill(payload: AnswerBackfillIn, db: Session = Depends(get_db)):
+    """建补录任务：重读原页 → 把**建议**存起来（**不写题库**）。
+
+    刻意拆成「建任务 / 应用」两步：识别几十页要十几分钟，不可能挂在一次请求里；
+    更要紧的是**写库必须由人点一下** —— 答案写错比缺失更难发现。
+    """
+    # 三个都不给 = 全库；后端只放行「只补缺答案的」这一种（见 pick_targets）
+    try:
+        job = answer_backfill.create_job(
+            db,
+            question_ids=payload.question_ids or None,
+            document_id=payload.document_id,
+            only_missing=payload.only_missing,
+            overwrite=payload.overwrite,
+            limit=payload.limit,
+        )
+    except answer_backfill.BackfillError as e:
+        raise HTTPException(422, str(e))
+    threading.Thread(target=answer_backfill.run_job, args=(job.id,), daemon=True).start()
+    return answer_backfill.job_dict(db, job, with_proposals=False)
+
+
+@router.get("/questions/answer-backfill")
+def list_answer_backfills(limit: int = Query(10, ge=1, le=50), db: Session = Depends(get_db)):
+    """最近的补录任务（不带建议，列表用不着那么大的载荷）。"""
+    rows = db.scalars(
+        select(AnswerBackfill).order_by(AnswerBackfill.created_at.desc()).limit(limit)
+    ).all()
+    return [answer_backfill.job_dict(db, j, with_proposals=False) for j in rows]
+
+
+@router.get("/questions/answer-backfill/{job_id}")
+def get_answer_backfill(job_id: str, db: Session = Depends(get_db)):
+    """任务详情 + 全部建议。前端靠它显示进度和审阅表。"""
+    job = db.get(AnswerBackfill, job_id)
+    if job is None:
+        raise HTTPException(404, "补录任务不存在")
+    return answer_backfill.job_dict(db, job)
+
+
+@router.post("/questions/answer-backfill/{job_id}/apply")
+def apply_answer_backfill(job_id: str, payload: AnswerBackfillApply,
+                          db: Session = Depends(get_db)):
+    """把看过的建议写进题库。不传 question_ids = 全部「已匹配」的都写。
+
+    ⚠️ 只有 state = ready / empty 的建议能被应用 —— 对不上的（nomatch）
+       和识别失败的（error）一律拒绝，免得把隔壁题的答案写进来。
+    """
+    job = db.get(AnswerBackfill, job_id)
+    if job is None:
+        raise HTTPException(404, "补录任务不存在")
+    try:
+        return answer_backfill.apply_proposals(
+            db, job, payload.question_ids or None, payload.overwrite
+        )
+    except answer_backfill.BackfillError as e:
+        raise HTTPException(422, str(e))
+
+
+@router.post("/questions/{qid}/answer-recheck")
+def recheck_question_answer(qid: str, payload: AnswerRecheckIn,
+                            db: Session = Depends(get_db)):
+    """单题同步重读：读原页，返回建议（**不写库**）。
+
+    前端拿到建议后填进「补答案」表单，老师看一眼再点保存 ——
+    沿用既有的 PATCH /questions/{qid}，不为这条路新开写入口。
+    """
+    q = db.get(Question, qid)
+    if q is None:
+        raise HTTPException(404, "题目不存在")
+    try:
+        return {"items": answer_backfill.recheck_pages(db, q, payload.pages, payload.hint)}
+    except answer_backfill.BackfillError as e:
+        raise HTTPException(422, str(e))

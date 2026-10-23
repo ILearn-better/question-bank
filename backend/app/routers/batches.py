@@ -360,6 +360,137 @@ def patch_item(item_id: str, payload: BatchItemPatch, db: Session = Depends(get_
     return _item_dict(db, it)
 
 
+# 这张图「还可疑 / 还没图」的几个标记。**老师亲手框一次就该全部消掉** ——
+# 它们描述的是「这张图没人核过」，人核过了这句话就不成立了。
+# 留着会让老师下次进来又被提示一遍，久了就变成「提示我默认无视」。
+#
+# ⚠️ 定义在 services/batch_page.py（`DOUBT_FIGURE_FLAGS`），这里只是转出来给接口用。
+#    自动导入（services/auto_import.py）判「这条能不能自动入库」用的是**同一份**
+#    —— 两处各写一遍的话，界面说「可放心」而自动入库说「不放心」这种矛盾迟早出现。
+_FIGURE_DOUBT_FLAGS = batch_page.DOUBT_FIGURE_FLAGS
+
+
+def _drop_doubt_flags(it: BatchItem) -> None:
+    """把「可疑 / 缺失」标记从 flags 里摘掉（其余标记原样保留）。"""
+    flags = _json_list(it.flags)
+    kept = [f for f in flags if f not in _FIGURE_DOUBT_FLAGS]
+    if kept != flags:
+        it.flags = json.dumps(kept, ensure_ascii=False)
+
+
+@router.get("/batches/items/{item_id}/figure-candidates")
+def item_figure_candidates(item_id: str, db: Session = Depends(get_db)):
+    """这一页上**几何上像一幅图**的所有区域（归一化 0~1000 框）。
+
+    为什么要暴露它：自动配图之所以还要人工重截，一半原因是「模型指的那处不是图」。
+    可这一页到底有几幅图、边界在哪，`adapters/pdf.figure_candidates` 早就算出来了
+    （自动配图用的就是同一份数据）。只是以前它只喂给自动流程，老师看不到 ——
+    于是老师只能对着整页重新拖一遍。把候选摆到卡片上，改图就变成**点一下**。
+
+    返回里带 `page_image`：前端拿它当缩略图底图，用 `background-position`
+    按框取景就行，**不需要为每个候选再裁一张小图**（不占盘、不用回收）。
+    """
+    it = _item_or_404(db, item_id)
+    if not it.document_id:
+        raise HTTPException(422, "这条没有来源文档，读不到页面几何（请重新上传原卷后再试）")
+    try:
+        path = _page_source(db, it.document_id)
+    except HTTPException as e:
+        raise HTTPException(422, f"读不到原卷页面：{e.detail}") from e
+
+    pno = it.page_no or 1
+    try:
+        W, H = pdf_adapter.page_size(str(path), pno)
+        cands = pdf_adapter.figure_candidates(str(path), pno)
+    except Exception as e:                            # noqa: BLE001
+        # 取不到几何**不该让卡片报错**：前端会退回「只能手工框」那条路。
+        raise HTTPException(422, f"读不到这一页的图形几何：{e}") from e
+    if not W or not H:
+        raise HTTPException(422, "这一页没有可用的页面尺寸")
+
+    def _pack(rows, page, pw, ph):
+        """归一化并附上**每项自己的页号/页宽高/底图**。
+
+        为什么不共用一个 `page`：跨页题要混进下一页的候选（见下面），
+        共用会让前端把下一页的框当成这一页的坐标去取景 —— 图全错位。
+        """
+        got = []
+        for c in rows:
+            x0, y0, x1, y1 = c["rect"]
+            got.append({
+                "box": [int(round(x0 / pw * 1000)), int(round(y0 / ph * 1000)),
+                        int(round(x1 / pw * 1000)), int(round(y1 / ph * 1000))],
+                "kind": c.get("kind") or "",
+                "page": page,
+                "width": pw,
+                "height": ph,
+                "page_image": f"/api/documents/{it.document_id}/pages/{page}/image",
+            })
+        return got
+
+    out = _pack(cands, pno, W, H)
+    # 同一横排的几幅图（选择题的 A/B/C/D）另给一条「整排」候选：
+    # 老师要的是四幅一起那张，点单幅等于卷子上少三个选项。
+    out += _pack(batch_page.merge_row_candidates(cands, W), pno, W, H)
+
+    # 跨页题：**页内最后一题**的图和选项常被推到下一页去（题干挤在页末）。
+    # 只列本页候选的话，老师看到的全是「一幅都不对」，只能自己翻页、拖框 ——
+    # 而实测这类占了「没配到图」的 11/14。把下一页上半页的候选也列出来，
+    # 点一下就配好（选中的是下一页那块区域，figure-crop 本来就支持任意页）。
+    last_on_page = db.scalar(
+        select(func.count()).select_from(BatchItem).where(
+            BatchItem.job_id == it.job_id,
+            BatchItem.page_no == pno,
+            BatchItem.seq > it.seq)) == 0
+    cross = False
+    if last_on_page:
+        try:
+            if pno < pdf_adapter.page_count(str(path)):
+                W2, H2 = pdf_adapter.page_size(str(path), pno + 1)
+                nxt = [c for c in pdf_adapter.figure_candidates(str(path), pno + 1)
+                       # 只收**上半页**：下半页属于下一页自己的题
+                       if (c["rect"][1] + c["rect"][3]) / 2 < H2 * 0.5]
+                if nxt and W2 and H2:
+                    out += _pack(nxt, pno + 1, W2, H2)
+                    out += _pack(batch_page.merge_row_candidates(nxt, W2), pno + 1, W2, H2)
+                    cross = True
+        except Exception:                             # noqa: BLE001
+            cross = False
+
+    # 按「先页、再上下、同一行先左后右」排 —— 缩略图要与卷面观感一致，
+    # 老师是凭位置认图的（「第三行那个圆柱」），顺序乱了就认不出。
+    out.sort(key=lambda c: (c["page"], round(c["box"][1] / 40), c["box"][0]))
+    return {
+        "page": pno,
+        "width": W,
+        "height": H,
+        "page_image": f"/api/documents/{it.document_id}/pages/{pno}/image",
+        # 有没有把下一页的也列进来 —— 前端据此提示「跨页题，看下一页那几张」
+        "cross_page": cross,
+        # 现在这张图指哪一处（有就标出来，老师能看出「已经是它了」）
+        "current": _json_list(it.figure_box) if it.figure_box else None,
+        "candidates": out,
+    }
+
+
+@router.post("/batches/items/{item_id}/figure-ack")
+def ack_item_figure(item_id: str, db: Session = Depends(get_db)):
+    """「这张图我核过了」—— 把可疑标记摘掉，别再提示。
+
+    为什么单独一个动作而不是让老师改 flags：老师表达的是**判断**（对/不对），
+    不是「删掉某个内部标记」。标记名是内部实现，不该出现在操作里。
+
+    ⚠️ 只对**已经有图**的条目开放。没图的时候「确认」等于「这题不用图」，
+       那是另一件事（取消勾选 `needs_figure`），混在一起会让老师以为图配好了。
+    """
+    it = _item_or_404(db, item_id)
+    if not it.figure_image:
+        raise HTTPException(422, "这题还没有配图，没有可确认的图")
+    _drop_doubt_flags(it)
+    db.commit()
+    return {"ok": True, "item": _item_dict(db, it)}
+
+
 @router.post("/batches/items/{item_id}/figure-crop")
 def crop_item_figure(item_id: str, payload: FigureCropIn, db: Session = Depends(get_db)):
     """从原卷页面上框出一幅配图，挂到这条待审条目上。
@@ -402,6 +533,20 @@ def crop_item_figure(item_id: str, payload: FigureCropIn, db: Session = Depends(
     old = it.figure_image or ""
     it.figure_image = url
     it.needs_figure = 1
+    # 老师亲手的框 = 一定对 → 「框歪了 / 没定位到 / 被别人占了」这些标记同时失效。
+    # 不摘掉的话，老师刚框完，卡片上还在喊「AI 估的图框，容易歪，建议核对」。
+    _drop_doubt_flags(it)
+
+    # 老师自己把那幅图框出来了 → 之前「整题原貌图」的兜底不再需要。
+    # 必须连**图一起撤掉**：留着它出卷会「文本 + 整题图」印两遍；而且这张大图
+    # 只会永远占着盘（它的引用就在这一列上）。回收走引用计数，别处用了就留着。
+    stale_whole = ""
+    if "figure_whole_question" in _json_list(it.flags):
+        stale_whole = it.image or ""
+        it.image = ""
+        it.flags = json.dumps(
+            [f for f in _json_list(it.flags) if f != "figure_whole_question"],
+            ensure_ascii=False)
     # 记住老师这次框的框 —— 下次再进来（或换台机器、或过了几天）弹窗直接预填它，
     # 而不是从零开始画。跨页竖拼的图没法用一个矩形表示，那就清掉。
     if len(regions) == 1:
@@ -416,9 +561,12 @@ def crop_item_figure(item_id: str, payload: FigureCropIn, db: Session = Depends(
     else:
         it.figure_box = None
     db.flush()                       # 新值先落进事务，引用计数才数得对
-    replaced = 0
+    stale: set[str] = set()
     if old and old != url:
-        replaced = crops.purge(crops.crop_names(old) - crops.referenced_crops(db))
+        stale |= crops.crop_names(old)
+    if stale_whole:
+        stale |= crops.crop_names(stale_whole)
+    replaced = crops.purge(stale - crops.referenced_crops(db)) if stale else 0
     db.commit()
     return {"ok": True, "url": url, "replaced": replaced, "item": _item_dict(db, it)}
 

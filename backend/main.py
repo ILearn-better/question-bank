@@ -28,6 +28,7 @@ from app import __version__, config, migrate, seed          # noqa: E402
 from app.db import SessionLocal                             # noqa: E402
 from app.routers import (                                   # noqa: E402
     ai,
+    auto,
     batches,
     curriculum,
     dashboard,
@@ -189,6 +190,10 @@ app.include_router(questions.router)
 app.include_router(papers.router)
 app.include_router(batches.router)
 app.include_router(documents.router)
+# 自动导入（讲义一条命令跑完：录入 → 检查 → 问题处理 → 入库）。
+# 它是 batches 的**上层编排**，不新增识别/裁剪能力，所以放在 batches 之后也无妨；
+# 前缀 /api/auto/* 与 batches 的 /api/batches/* 不撞。
+app.include_router(auto.router)
 app.include_router(system.router)
 app.include_router(uploads.router)
 app.include_router(notes.router)

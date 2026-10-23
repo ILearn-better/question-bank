@@ -201,6 +201,22 @@
   .del-line .k { flex: 0 0 84px; color: #909399; white-space: nowrap; }
   .del-line .v { flex: 1; color: #303133; word-break: break-all; }
   .del-line .s { color: #909399; white-space: nowrap; }
+  /* 答案与解析补录（AI 从原页重读）：两块 —— 批量面板 + 单题建议列表 */
+  .ab-batch { border: 1px solid #ebeef5; border-radius: 6px; padding: 8px 10px; margin-bottom: 10px; background: #fafcff; }
+  .ab-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+  .ab-list { margin-top: 8px; display: flex; flex-direction: column; gap: 8px; }
+  .ab-item { border: 1px solid #ebeef5; border-radius: 6px; padding: 8px; background: #fff; }
+  .ab-meta { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .ab-msg { color: #e6a23c; font-size: 12px; margin-top: 4px; }
+  .ab-field { display: flex; gap: 8px; margin-top: 4px; font-size: 13px; }
+  .ab-field .k { flex: 0 0 36px; color: #909399; }
+  .ab-field .v { flex: 1; white-space: pre-wrap; word-break: break-word; max-height: 110px; overflow: auto; }
+  .ab-progress { font-size: 12px; color: #606266; margin: 6px 0; }
+  .ab-table { max-height: 300px; overflow: auto; border: 1px solid #ebeef5; border-radius: 4px; }
+  .ab-row { display: grid; grid-template-columns: 26px 40px 1fr 96px 130px; gap: 6px; align-items: center; padding: 4px 6px; font-size: 12px; border-bottom: 1px solid #f2f6fc; }
+  .ab-row-head { background: #f5f7fa; color: #909399; font-weight: bold; position: sticky; top: 0; z-index: 1; }
+  .ab-row .st, .ab-row .an, .ab-row .state { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ab-row .state em { font-style: normal; color: #909399; }
 </style>
 </head>
 <body>
@@ -416,6 +432,58 @@
                 <b>① 先选一道题</b> → <b>② 给它补答案</b>：可以在左侧页面里圈出答案（切到答案文档也能圈），
                 也可以直接「从电脑选图片」或「从已有截图选」。
               </div>
+              <div class="ab-batch">
+                <div class="ab-head" style="cursor:pointer" @click="abOpen = !abOpen">
+                  <b>🔁 批量补录答案与解析</b>
+                  <span class="muted-hint">给题库里已有的题重读原页，把答案与解析补齐</span>
+                  <div style="flex:1"></div>
+                  <span class="muted-hint">{{ abOpen ? '收起' : '展开' }}</span>
+                </div>
+                <div v-if="abOpen" style="margin-top:8px">
+                  <div class="hint">
+                    <b>适用范围</b>：题库里<b>已经录进来</b>的题，且能定位到原文档的某一页
+                    （整页识别进来的、按内容块录的、以及题干能在原页文字里找到的）。<br>
+                    <b>操作对象</b>：默认只碰「答案与解析<b>都空</b>」的题 ——
+                    老师手写过的内容不会被覆盖（要覆盖得先勾「覆盖已有」）。<br>
+                    <b>预期效果</b>：只写「答案」「解析」两列；题干、配图、知识点、出卷结果<b>一律不动</b>。
+                    识别完先出<b>建议</b>，看过了点「应用」才真正写库。
+                  </div>
+                  <div style="display:flex;gap:8px;flex-wrap:wrap;margin:8px 0">
+                    <el-button size="small" type="primary" :disabled="!doc" :loading="abStarting"
+                               @click="startBackfill('doc')">给当前文档的缺答案题补</el-button>
+                    <el-button size="small" :loading="abStarting"
+                               @click="startBackfill('all')">给全库缺答案的题补</el-button>
+                    <el-checkbox v-model="abOverwrite" size="small">覆盖已有答案（重读覆盖）</el-checkbox>
+                  </div>
+                  <div v-if="abJob" class="ab-progress">
+                    任务 {{ abJob.id }} · {{ abStatusText(abJob.status) }} ·
+                    已处理 {{ abJob.done }}/{{ abJob.total }} 页
+                    <span v-if="abJob.counts">· 可补 {{ abJob.counts.ready || 0 }} 条 ·
+                      本页无答案 {{ abJob.counts.empty || 0 }} ·
+                      对不上 {{ abJob.counts.nomatch || 0 }} ·
+                      失败 {{ abJob.counts.error || 0 }}</span>
+                  </div>
+                  <div v-if="abProposals.length" class="ab-table">
+                    <div class="ab-row ab-row-head">
+                      <span></span><span>页</span><span>题干</span><span>建议答案</span><span>状态</span>
+                    </div>
+                    <div v-for="p in abProposals" :key="p.qid" class="ab-row">
+                      <el-checkbox :model-value="abPicked.indexOf(p.qid) >= 0"
+                                   :disabled="p.state !== 'ready'"
+                                   @change="togglePick(p, $event)"></el-checkbox>
+                      <span>{{ p.page || '—' }}</span>
+                      <span class="st" :title="p.stem">{{ p.stem || '（图片题）' }}</span>
+                      <span class="an" :title="p.answer">{{ p.answer || '—' }}</span>
+                      <span class="state" :title="p.msg">{{ abStateText(p.state) }}<em v-if="p.msg"> · {{ p.msg }}</em></span>
+                    </div>
+                  </div>
+                  <div v-if="abProposals.length" style="display:flex;gap:8px;margin-top:8px;align-items:center">
+                    <el-button size="small" type="success" :loading="abApplying"
+                               :disabled="!abPicked.length" @click="applyBackfill">应用选中的 {{ abPicked.length }} 条</el-button>
+                    <span class="muted-hint">只有「可补」能勾；「对不上」和「失败」不会写入</span>
+                  </div>
+                </div>
+              </div>
               <div style="display:flex;gap:8px;margin-bottom:8px">
                 <el-input v-model="pickKeyword" placeholder="搜题干 / 答案关键字，留空列最近录入的"
                           clearable @keyup.enter="searchQuestions" @clear="searchQuestions"></el-input>
@@ -439,6 +507,34 @@
                 正在补答案：{{ briefQ({ content: editingStem }) }}
                 <img v-if="editingImage" :src="editingImage" alt="题目原貌图"
                      style="max-width:100%;margin-top:6px;border:1px solid #ebeef5;border-radius:4px">
+              </div>
+
+              <div v-if="editingId" class="ab-batch" style="margin-top:10px">
+                <div class="ab-head">
+                  <b>🔍 AI 从原页重读</b>
+                  <span class="muted-hint">读这道题所在的那一页，把【答案】【详解】抄回来（只填表单，点「保存答案」才写库）</span>
+                </div>
+                <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px">
+                  <el-button size="small" type="primary" plain :loading="abLoading"
+                             @click="recheckOne()">读这一页</el-button>
+                  <el-button v-if="abNextPage" size="small" :loading="abLoading"
+                             @click="recheckOne([abNextPage])">解析可能在下一页：读第 {{ abNextPage }} 页</el-button>
+                </div>
+                <div v-if="abItems.length" class="ab-list">
+                  <div v-for="(p, i) in abItems" :key="i" class="ab-item">
+                    <div class="ab-meta">
+                      <el-tag size="small" effect="plain">第 {{ p.page }} 页</el-tag>
+                      <el-tag size="small" :type="abTagType(p.state)" effect="plain">{{ abStateText(p.state) }}</el-tag>
+                      <span class="muted-hint">相似度 {{ Math.round(p.score * 100) }}% · 定位依据：{{ p.basis }}</span>
+                      <div style="flex:1"></div>
+                      <el-button size="small" text type="primary" :disabled="p.state !== 'ready'"
+                                 @click="useProposal(p)">填入表单</el-button>
+                    </div>
+                    <div v-if="p.msg" class="ab-msg">{{ p.msg }}</div>
+                    <div v-if="p.answer" class="ab-field"><span class="k">答案</span><span class="v">{{ p.answer }}</span></div>
+                    <div v-if="p.analysis" class="ab-field"><span class="k">解析</span><span class="v">{{ p.analysis }}</span></div>
+                  </div>
+                </div>
               </div>
             </template>
             <!-- 题目预览只在录新题模式下有意义；补答案模式下题干在题目列表里已经显示了 -->
@@ -884,6 +980,18 @@ const app = createApp({
       pickList: [],
       pickLoading: false,
       onlyMissing: false,           // 只看还没答案的（补答案时最常用）
+      // 答案与解析补录（AI 从原页重读）：建议只落表单/审阅表，写库要人点「应用」
+      abOpen: false,
+      abStarting: false,
+      abApplying: false,
+      abLoading: false,
+      abOverwrite: false,
+      abItems: [],                  // 单题重读出来的建议
+      abJob: null,                  // 批量补录任务
+      abProposals: [],              // 批量补录的建议表
+      abPicked: [],                 // 勾选的 qid
+      abPickedTouched: false,       // 老师动过勾选后，轮询不再自动重勾
+      abTimer: null,
       cropPicker: false,
       cropList: [],
       cropListLoading: false,
@@ -893,6 +1001,13 @@ const app = createApp({
     };
   },
   computed: {
+    /** 「读下一页」要的页码：上一条建议是「本页无答案」时给 page+1。
+     *  解析版讲义里答案紧跟题目，但也会有「答案印在下一页」的情况，
+     *  这时让老师补读一次，比让他自己找页码省事。 */
+    abNextPage() {
+      const empty = this.abItems.filter(p => p.state === 'empty' && p.page);
+      return empty.length ? empty[empty.length - 1].page + 1 : 0;
+    },
     /** 这份文档**本身就有页面视图**（PDF / 图片），不用 Word 转换。
      *  ⚠️ 不要写成 `filetype === '.pdf'` —— 图片(png/jpg…)被 pymupdf 打开就是
      *  **单页文档**，走的是同一套页面渲染 / 框选 / 图形探测。
@@ -1443,6 +1558,12 @@ const app = createApp({
 
     /* ===== 补答案：给已录的题补答案 ===== */
     onModeChange() {
+      if (this.abTimer) { clearTimeout(this.abTimer); this.abTimer = null; }
+      this.abItems = [];
+      this.abJob = null;
+      this.abProposals = [];
+      this.abPicked = [];
+      this.abPickedTouched = false;
       this.resetSel();
       this.editingId = null;
       this.editingStem = '';
@@ -1520,6 +1641,119 @@ const app = createApp({
         ElementPlus.ElMessage.error(e.message);
       } finally {
         this.saving = false;
+      }
+    },
+    /* ===== 答案与解析补录（AI 从原页重读） ===== */
+    abStateText(st) {
+      return { ready: '可补', empty: '本页无答案', nomatch: '对不上', error: '失败' }[st] || st || '';
+    },
+    abTagType(st) {
+      if (st === 'ready') return 'success';
+      return st === 'empty' ? 'warning' : 'danger';
+    },
+    abStatusText(st) {
+      return { queued: '排队中', running: '识别中', done: '完成', partial: '部分完成', failed: '失败' }[st] || st;
+    },
+    /** 单题重读：读这道题所在页，拿回建议（**不写库**）。 */
+    async recheckOne(pages) {
+      if (!this.editingId) { ElementPlus.ElMessage.warning('先在上面选一道题'); return; }
+      this.abLoading = true;
+      try {
+        const r = await this.api('/api/questions/' + this.editingId + '/answer-recheck', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ pages: pages || [], hint: '' })
+        });
+        const items = (r && r.items) || [];
+        this.abItems = items;
+        if (!items.length) ElementPlus.ElMessage.warning('这一页没读出内容');
+      } catch (e) {
+        ElementPlus.ElMessage.error(e.message);
+      } finally {
+        this.abLoading = false;
+      }
+    },
+    /** 把建议填进表单 —— 只填，保存仍然要老师点「保存答案」。 */
+    useProposal(p) {
+      if (p.answer) this.form.answer = p.answer;
+      if (p.analysis) this.form.analysis = p.analysis;
+      this.renderAnswerMath();
+      ElementPlus.ElMessage.success('已填入表单，核对无误后点「保存答案」');
+    },
+    /** 建批量补录任务。scope: 'doc' 当前文档 / 'all' 全库缺答案的题。 */
+    async startBackfill(scope) {
+      if (scope === 'doc' && !this.doc) { ElementPlus.ElMessage.warning('先打开一份文档'); return; }
+      this.abStarting = true;
+      try {
+        const body = { only_missing: !this.abOverwrite, overwrite: this.abOverwrite };
+        if (scope === 'doc') body.document_id = this.doc.id;
+        const r = await this.api('/api/questions/answer-backfill', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body)
+        });
+        this.abJob = r;
+        this.abProposals = [];
+        this.abPicked = [];
+        this.abPickedTouched = false;
+        ElementPlus.ElMessage.success('已开始重读原页，共 ' + r.total + ' 道题（逐页识别，要等一会儿）');
+        this.pollBackfill();
+      } catch (e) {
+        ElementPlus.ElMessage.error(e.message);
+      } finally {
+        this.abStarting = false;
+      }
+    },
+    /** 轮询任务。识别是按页跑的，进度单位是页不是题。 */
+    async pollBackfill() {
+      if (!this.abJob) return;
+      try {
+        const d = await this.api('/api/questions/answer-backfill/' + this.abJob.id);
+        this.abJob = d;
+        if (d.proposals) {
+          this.abProposals = d.proposals;
+          if (!this.abPickedTouched) {
+            this.abPicked = d.proposals.filter(p => p.state === 'ready').map(p => p.qid);
+          }
+        }
+        if (d.status === 'queued' || d.status === 'running') {
+          this.abTimer = setTimeout(() => this.pollBackfill(), 3000);
+        } else {
+          const n = (d.counts || {}).ready || 0;
+          ElementPlus.ElMessage.success('识别结束：可以补 ' + n + ' 条，勾好点「应用」');
+        }
+      } catch (e) {
+        ElementPlus.ElMessage.error(e.message);
+      }
+    },
+    togglePick(p, v) {
+      this.abPickedTouched = true;
+      const has = this.abPicked.indexOf(p.qid) >= 0;
+      if (v && !has) this.abPicked.push(p.qid);
+      if (!v && has) this.abPicked = this.abPicked.filter(x => x !== p.qid);
+    },
+    /** 应用：把勾中的建议写进 questions.answer / analysis（只这两列）。 */
+    async applyBackfill() {
+      if (!this.abJob || !this.abPicked.length) return;
+      this.abApplying = true;
+      try {
+        const r = await this.api('/api/questions/answer-backfill/' + this.abJob.id + '/apply', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ question_ids: this.abPicked, overwrite: this.abOverwrite })
+        });
+        let msg = '已写给 ' + r.questions + ' 道题';
+        if (r.fields_skipped) msg += '（跳过 ' + r.fields_skipped + ' 个已有内容的字段）';
+        ElementPlus.ElMessage.success(msg);
+        this.abPicked = [];
+        this.abPickedTouched = false;
+        await this.pollBackfill();
+        this.searchQuestions();
+        this.loadQuestions();
+      } catch (e) {
+        ElementPlus.ElMessage.error(e.message);
+      } finally {
+        this.abApplying = false;
       }
     },
     /** 从电脑里选一张图片当答案图 */
