@@ -69,6 +69,23 @@
     display: block; margin-top: 2px;
   }
   .prev-img.sm { max-height: 170px; }
+  /* 答案截图缩略图条（跨页答案：一张装不下时会有 2~3 张） */
+  .shot-strip { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+  .shot {
+    position: relative; border: 1px solid #dcdfe6; border-radius: 4px;
+    overflow: hidden; background: #fafafa;
+  }
+  .shot img { display: block; height: 74px; width: auto; max-width: 140px; object-fit: cover; }
+  .shot-no {
+    position: absolute; left: 0; top: 0; background: rgba(64,158,255,.88); color: #fff;
+    font-size: 11px; line-height: 1; padding: 3px 5px; border-bottom-right-radius: 4px;
+  }
+  .shot-del {
+    position: absolute; right: 0; top: 0; border: 0; cursor: pointer;
+    background: rgba(0,0,0,.45); color: #fff; font-size: 13px; line-height: 1;
+    padding: 3px 6px; border-bottom-left-radius: 4px;
+  }
+  .shot-del:hover { background: #f56c6c; }
   .preview-box.empty-hint { color: #c0c4cc; display: flex; align-items: center; }
   .saved-item {
     background: #fff; border: 1px solid #e4e7ed; border-radius: 6px;
@@ -651,21 +668,39 @@
                   <div v-if="form.answer_image" style="margin-top:6px">
                     <div class="prev-head" style="margin-bottom:4px">
                       <el-tag size="small" type="success" effect="plain">图片</el-tag>
-                      <span class="muted-hint">答案图</span>
+                      <span class="muted-hint">
+                        答案图{{ answerShots.length > 1 ? '（' + answerShots.length + ' 张截图竖拼）' : '' }}
+                      </span>
                       <div style="flex:1"></div>
                       <el-button size="small" text type="danger" @click="clearAnswerImage">清除</el-button>
                     </div>
                     <img :src="form.answer_image" class="prev-img sm" alt="答案图">
+                    <!-- 多张时把每张原图列出来：老师能看出拼的是哪几张，也能删掉贴错的那张 -->
+                    <div v-if="answerShots.length > 1" class="shot-strip">
+                      <div v-for="(s, i) in answerShots" :key="s.id" class="shot">
+                        <img :src="s.dataUrl" :alt="'第 ' + (i + 1) + ' 张'">
+                        <span class="shot-no">{{ i + 1 }}</span>
+                        <button type="button" class="shot-del" title="删掉这张，重新拼接"
+                                @click="removeShot(i)">×</button>
+                      </div>
+                    </div>
                   </div>
                 </div>
                 <div style="margin-top:6px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
-                  <el-button size="small" plain @click="pickLocalImage">📁 从电脑选图片</el-button>
+                  <el-button size="small" plain :loading="shotBusy" @click="pickLocalImage">
+                    📁 从电脑选图片{{ stage === 'answer' ? '（可多选）' : '' }}
+                  </el-button>
                   <el-button size="small" plain @click="openCropPicker">🖼 从已有截图选</el-button>
+                  <span v-if="stage === 'answer'" class="muted-hint">
+                    答案跨页就分两张截，或直接 Ctrl+V 粘贴
+                  </span>
                   <el-button v-if="form.image && !form.answer_image" size="small" text
                              @click="copyToAnswer(form.image)">用题目图</el-button>
                 </div>
-                <!-- 选本地图片：用隐藏 input 触发，不走 el-upload（这里不需要上传列表） -->
-                <input ref="localImg" type="file" accept="image/*" style="display:none" @change="onLocalImage">
+                <!-- 选本地图片：用隐藏 input 触发，不走 el-upload（这里不需要上传列表）。
+                     答案阶段允许多选 —— 跨页答案要一次贴两张。 -->
+                <input ref="localImg" type="file" accept="image/*" :multiple="stage === 'answer'"
+                       style="display:none" @change="onLocalImage">
               </el-form-item>
               <el-form-item label="解析">
                 <el-input v-model="form.analysis" type="textarea" :rows="2" placeholder="解题步骤（可选）"></el-input>
@@ -892,6 +927,49 @@ function normalizeMath(md) {
     .map((s, i) => (i % 2 ? s : inText(s))).join('');
 }
 
+/** 公式保护：`$…$` / `$$…$$` 先换成占位符，marked 解析完再放回去。
+ *
+ *  ⚠️ 这份是 `src/mathRender.js` 的同名实现的**零构建副本**（entry.html 不走 ES 模块，
+ *     没法 import）。两处必须一模一样 —— 行为漂了会出现「录题页渲染正常、笔记页公式坏掉」
+ *     这种只在某个页面复现的怪事。改一处就改另一处（math_render_check.js 盯着）。
+ *
+ *  为什么必须有它：公式内容过一遍 Markdown 会被吃掉 —— `$5\%$` 的 `\%` 变 `%`
+ *  （LaTeX 注释符，公式直接截断）、`$S=2*3*4$` 的 `*` 变 `<em>`（文本节点被切碎，
+ *  公式一个都不渲染）、`$$x&=1 \\ y&=2$$` 的 `&` 变 `&amp;`、`\\` 变 `\`。
+ *  详细实测表见 src/mathRender.js 的 protectMath 注释。
+ */
+const _PH_RE = /\uE000(\d+)\uE000/g;
+const _ph = (i) => '\uE000' + i + '\uE000';
+
+function protectMath(md) {
+  const store = [];
+  const keep = (tex, display) => {
+    store.push({ tex, display });
+    return _ph(store.length - 1);
+  };
+  const conv = (s) => s
+    .replace(/\\\[([\s\S]+?)\\\]/g, (m, tex) => keep(tex, true))
+    .replace(/\\\(([\s\S]+?)\\\)/g, (m, tex) => keep(tex, false))
+    .replace(/\$\$([\s\S]+?)\$\$/g, (m, tex) => keep(tex, true))
+    .replace(/\$([^$\n]+?)\$/g, (m, tex) => keep(tex, false));
+  const inText = (seg) => seg.split(/(`[^`\n]*`)/)
+    .map((p, i) => (i % 2 ? p : conv(p))).join('');
+  const out = String(md || '').split(/(```[\s\S]*?```)/)
+    .map((s, i) => (i % 2 ? s : inText(s))).join('');
+  return { md: out, store };
+}
+
+function restoreMath(html, store) {
+  if (!store || !store.length) return html;
+  return String(html || '').replace(_PH_RE, (m, n) => {
+    const it = store[Number(n)];
+    if (!it) return m;
+    const tex = String(it.tex)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    return it.display ? `$$${tex}$$` : `$${tex}$`;
+  });
+}
+
 /** 文本 → 渲染进 el：先按 Markdown 排版，再让 KaTeX 就地渲染 $…$。
  *
  *  必须写 innerHTML，**不能**交给 Vue 插值：KaTeX 的 auto-render 会把 Vue
@@ -904,8 +982,10 @@ function renderRich(el, text) {
   const t = text || '';
   if (!t) { el.textContent = ''; return; }
   if (window.marked) {
-    const raw = window.marked.parse(normalizeMath(t), { breaks: true, gfm: true });
-    el.innerHTML = window.DOMPurify ? window.DOMPurify.sanitize(raw) : raw;
+    // ① 公式摘出来 → ② marked → ③ 消毒 → ④ 放回去。顺序不能动（见 protectMath 注释）。
+    const p = protectMath(t);
+    const raw = window.marked.parse(p.md, { breaks: true, gfm: true });
+    el.innerHTML = restoreMath(window.DOMPurify ? window.DOMPurify.sanitize(raw) : raw, p.store);
   } else {
     el.textContent = t;
   }
@@ -963,6 +1043,11 @@ const app = createApp({
       aiUsage: null,                // 用量，面板右上角显示
       aiErr: '',                    // 失败原因（给用户看）
       aiHint: '',                   // 手写体读错时补一句，如「这是 a 不是 alpha」
+      // 答案截图可以有好几张（跨页答案：p10 下半页 + p11 上半页各截一张）。
+      // 它们只用于**识别**（每张各自压缩，字不会变小）和**拼图**；
+      // 拼好的那一张才写进 form.answer_image（数据库是单字段，不为多图改表）。
+      answerShots: [],              // [{id, dataUrl, name}]
+      shotBusy: false,              // 正在读图 / 拼图
       // 知识点选项：**所有**体系的节点（按体系分组）+ 题库里已用过的名字。
       // 刻意不跟着「体系」走 —— 目前只有国内高中数学有知识树，跟着走的话
       // 选了初中就是个空下拉，老师只能把知识点写进标签框（真发生过）
@@ -1066,6 +1151,13 @@ const app = createApp({
     this.loadCurricula().then(() => this.loadKpOptions());
     this.loadTags();
     this.loadQuestions();
+    // Ctrl+V 贴截图。绑在 document 上是因为「刚截完图、光标在哪儿」并不确定 ——
+    // 绑在某个输入框上的话，老师在页面空白处按 Ctrl+V 就没反应。
+    // onPaste 里只在「剪贴板确实是纯截图」时才接手，粘文字一概放行。
+    document.addEventListener('paste', this.onPaste);
+  },
+  beforeUnmount() {
+    document.removeEventListener('paste', this.onPaste);
   },
   methods: {
     async api(url, opt) {
@@ -1468,7 +1560,10 @@ const app = createApp({
         ElementPlus.ElMessage.error(e.message);
       }
     },
-    clearAnswerImage() { this.form.answer_image = ''; },
+    clearAnswerImage() {
+      this.form.answer_image = '';
+      this.answerShots = [];        // 图都清了，缩略图列表留着就成了幽灵
+    },
 
     /* ===== AI 识别：图 → 带 $LaTeX$ 的文本 ===== */
     /** 把当前阶段的图发给 AI 识别，结果先放进待确认面板，**不直接写表单**。
@@ -1486,26 +1581,37 @@ const app = createApp({
       this.aiErr = '';
       this.aiUsage = null;
       try {
-        // 图先读成 base64 再发。接口只收 base64，后端就完全不用关心
-        // 「这个 URL 对应磁盘上哪个文件」—— 截图可能还没落盘。
-        // 前端多走一步，换来少一处会错的地方。
-        const blob = await (await fetch(src)).blob();
-        const image = await new Promise((resolve, reject) => {
-          const fr = new FileReader();
-          fr.onload = () => resolve(fr.result);
-          fr.onerror = () => reject(new Error('图片读取失败，请重新框选'));
-          fr.readAsDataURL(blob);
-        });
+        const mode = this.stage === 'answer' ? 'answer' : 'question';
+        // 答案阶段可能有**多张**截图（跨页答案）→ 一次全发过去。
+        // 为什么发原图而不是发拼好的那张：服务端是「每张各自压缩到长边 1600」，
+        // 所以多图不会让字变小；先竖拼成一张再压，长边翻倍、字只剩一半高度。
+        // 模型同时看到几张，还能在接缝处自然衔接（不用猜「下一页开头是什么」）。
+        const useMulti = mode === 'answer' && this.answerShots.length > 1;
+        let payload;
+        if (useMulti) {
+          payload = {
+            images: this.answerShots.map(s => s.dataUrl),
+            mode, hint: this.aiHint || '',
+          };
+        } else {
+          // 图先读成 base64 再发。接口只收 base64，后端就完全不用关心
+          // 「这个 URL 对应磁盘上哪个文件」—— 截图可能还没落盘。
+          // 前端多走一步，换来少一处会错的地方。
+          const blob = await (await fetch(src)).blob();
+          const image = await new Promise((resolve, reject) => {
+            const fr = new FileReader();
+            fr.onload = () => resolve(fr.result);
+            fr.onerror = () => reject(new Error('图片读取失败，请重新框选'));
+            fr.readAsDataURL(blob);
+          });
+          // 答案有自己的提示词：答案往往是整段解题过程，要求保留换行与步骤顺序，
+          // 和「把题干转录成一段」是两回事。
+          payload = { image, mode, hint: this.aiHint || '' };
+        }
         const r = await this.api('/api/ai/recognize', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          // 答案有自己的提示词：答案往往是整段解题过程，要求保留换行与步骤顺序，
-          // 和「把题干转录成一段」是两回事。
-          body: JSON.stringify({
-            image,
-            mode: this.stage === 'answer' ? 'answer' : 'question',
-            hint: this.aiHint || '',
-          }),
+          body: JSON.stringify(payload),
         });
         this.aiResult = r.text || '';
         this.aiUsage = r.usage || null;
@@ -1756,21 +1862,110 @@ const app = createApp({
         this.abApplying = false;
       }
     },
-    /** 从电脑里选一张图片当答案图 */
+    /** 从电脑里选图片当答案图（答案阶段可多选：跨页答案要一次贴两张） */
     pickLocalImage() { this.$refs.localImg.click(); },
     async onLocalImage(e) {
-      const f = e.target.files && e.target.files[0];
+      const files = [...((e.target && e.target.files) || [])];
       e.target.value = '';                    // 清掉，否则同一个文件选第二次不触发
-      if (!f) return;
-      const fd = new FormData();
-      fd.append('file', f);
+      if (!files.length) return;
+      await this.addAnswerShots(files);
+    },
+    readAsDataUrl(file) {
+      return new Promise((resolve, reject) => {
+        const fr = new FileReader();
+        fr.onload = () => resolve(fr.result);
+        fr.onerror = () => reject(new Error('图片读取失败（文件可能已被移动或删除）'));
+        fr.readAsDataURL(file);
+      });
+    },
+    /** 把选中的 / 粘贴的图片收进答案截图列表，再统一落成一张答案图。
+     *
+     *  为什么留着原图不马上丢：老师可能贴错一张（截到了隔壁题），
+     *  删掉那一张重新拼即可，不用整批重选。 */
+    async addAnswerShots(files) {
+      const list = [...files].filter(f => f && f.type && f.type.indexOf('image/') === 0);
+      if (!list.length) { ElementPlus.ElMessage.warning('没找到可用的图片'); return; }
+      this.shotBusy = true;
       try {
-        const r = await this.api('/api/uploads/image', { method: 'POST', body: fd });
-        this.form.answer_image = r.url;
-        ElementPlus.ElMessage.success('已设为答案图');
+        for (const f of list) {
+          const dataUrl = await this.readAsDataUrl(f);
+          this.answerShots.push({
+            id: Date.now() + '_' + Math.random().toString(36).slice(2, 8),
+            dataUrl,
+            name: f.name || '截图',
+          });
+        }
+        await this.commitShots();
       } catch (err) {
         ElementPlus.ElMessage.error(err.message);
+      } finally {
+        this.shotBusy = false;
       }
+    },
+    /** 把当前这批截图落成**一张**答案图：单张直接上传，多张竖拼成一张。
+     *
+     *  竖拼在服务端做（Pillow）：前端 canvas 要处理 EXIF 方向、色彩空间、
+     *  以及 Safari 4096px 的画布上限，每个浏览器还不一样。
+     *  拼好的这张才是 `form.answer_image` —— 数据库是单字段，
+     *  出卷、批改、打印都按单图走，不为多图改表。 */
+    async commitShots() {
+      if (!this.answerShots.length) { this.form.answer_image = ''; return; }
+      if (this.answerShots.length === 1) {
+        // 单张走原来的上传接口：不重新编码，保留原格式与清晰度
+        const blob = await (await fetch(this.answerShots[0].dataUrl)).blob();
+        const fd = new FormData();
+        fd.append('file', new File([blob], 'answer.png', { type: blob.type || 'image/png' }));
+        const r = await this.api('/api/uploads/image', { method: 'POST', body: fd });
+        this.form.answer_image = r.url;
+        return;
+      }
+      const r = await this.api('/api/images/stitch', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ images: this.answerShots.map(s => s.dataUrl), gap: 0 })
+      });
+      this.form.answer_image = r.url;
+      if (r.scaled) {
+        ElementPlus.ElMessage.warning(
+          '截图总高度太大，拼出来的图被等比缩小了，字可能偏小 —— 建议分两次识别');
+      } else {
+        ElementPlus.ElMessage.success(
+          '已把 ' + this.answerShots.length + ' 张截图竖拼成一张答案图');
+      }
+    },
+    /** 删掉第 i 张并重新拼接（贴错一张不用整批重来） */
+    async removeShot(i) {
+      this.answerShots.splice(i, 1);
+      this.shotBusy = true;
+      try { await this.commitShots(); }
+      catch (err) { ElementPlus.ElMessage.error(err.message); }
+      finally { this.shotBusy = false; }
+    },
+    /** Ctrl+V 直接贴截图（Windows 截图工具 / 微信 / QQ 的图都是文件形态）。
+     *
+     *  ⚠️ 只在「剪贴板里确实是纯截图」时接手。判据是两条都满足：
+     *     ① 有 image/* 的文件；② text/plain 是空的。
+     *     只要还带着别的文字（粘一段带图的文章、往正文里粘参考链接），
+     *     就**什么都不做** —— 把老师已经选好的文字吞掉，比少贴一张图糟糕得多。
+     *     （同一条原则见 src/pasteAsset.js 里的长注释。）
+     */
+    onPaste(e) {
+      if (this.stage !== 'answer') return;
+      const dt = e.clipboardData;
+      if (!dt) return;
+      let text = '';
+      try { text = (dt.getData('text/plain') || '').trim(); } catch (err) { /* 有的环境不给读 */ }
+      if (text) return;                       // 带着文字 → 让默认粘贴照常发生
+      const files = [];
+      for (const it of (dt.items || [])) {
+        if (it.kind === 'file' && it.type && it.type.indexOf('image/') === 0) {
+          const f = it.getAsFile();
+          if (f) files.push(f);
+        }
+      }
+      if (!files.length) return;              // 没有图 → 不插手
+      e.preventDefault();
+      this.addAnswerShots(files);
     },
     /** 从库里已有的截图里挑一张当答案图（框选出来的、以前上传过的都在里面） */
     async openCropPicker() {
@@ -1787,12 +1982,14 @@ const app = createApp({
     },
     useCrop(url) {
       this.form.answer_image = url;
+      this.answerShots = [];        // 换成单张了，之前那批截图不能再参与拼接
       this.cropPicker = false;
       ElementPlus.ElMessage.success('已设为答案图');
     },
     copyToAnswer(imgUrl) {
       // 题干图直接拿来当答案图（有些题题干本身就是答案的载体）
       this.form.answer_image = imgUrl;
+      this.answerShots = [];        // 换成单张了，之前那批截图不能再参与拼接
       ElementPlus.ElMessage.success('已把题目图设为答案图');
     },
     /** 点「已录入题目」里某一题的「补答案」——直接切到补答案模式并选中它。 */

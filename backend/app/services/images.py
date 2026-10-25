@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import io
 import uuid
 from pathlib import Path
 
@@ -59,3 +60,72 @@ def save_image(data: bytes, dest_dir: Path, prefix: str = "img", stem: str | Non
         name = f"{base}_{n}{ext}"
     (dest_dir / name).write_bytes(data)
     return {"name": name, "size_bytes": len(data)}
+
+
+# 拼接后的总高度上限。超过就整体等比缩小 —— 
+# 一张 60000px 高的图浏览器的 <img> 也扛不住，而且识别时本来就会压到长边 1600。
+STITCH_MAX_H = 16000
+
+
+def stitch_vertical(blobs: list[bytes], dest_dir: Path, gap: int = 0,
+                    prefix: str = "stitch") -> dict:
+    """多张图**竖着拼成一张** —— 一道题的答案跨页时用（p10 下半页 + p11 上半页）。
+
+    为什么在服务端拼而不是前端 canvas 拼：
+        前端拼图要额外处理 EXIF 方向、色彩空间、超大画布的浏览器上限（Safari 是
+        4096px 见方），每个浏览器还不一样。服务端只有一份 Pillow 行为。
+
+    宽度取**最宽那张**，窄的居中、白底补齐。**不拉伸** —— 拉伸会让公式变形，
+    而这张图是老师要看着核对的。
+
+    ⚠️ 拼接结果仍然走 `save_image` 落盘：魔数校验和大小上限必须共用一份，
+       否则这里就成了「绕过校验往 crops 目录写任意文件」的后门。
+
+    @returns {{name, width, height, scaled}}  scaled=True 表示因为太高而等比缩过
+    """
+    from PIL import Image
+
+    if not blobs:
+        raise ImageRejected("没有图可以拼")
+    if len(blobs) > 20:
+        raise ImageRejected("一次最多拼 20 张（再多就不是「跨页」而是「整本」了）")
+
+    ims = []
+    for i, b in enumerate(blobs, 1):
+        if not b:
+            raise ImageRejected(f"第 {i} 张图是空的")
+        if len(b) > MAX_IMAGE_BYTES:
+            raise ImageRejected(f"第 {i} 张图超过 {MAX_IMAGE_BYTES // 1024 // 1024} MB")
+        if sniff_ext(b[:16]) is None:
+            raise ImageRejected(f"第 {i} 张不是可识别的图片")
+        try:
+            im = Image.open(io.BytesIO(b))
+            im.load()
+        except Exception as e:                     # noqa: BLE001  PIL 异常类型很杂
+            raise ImageRejected(f"第 {i} 张图读不出来") from e
+        ims.append(im.convert("RGB"))              # JPEG 不吃 alpha / 调色板
+
+    gap = max(0, min(int(gap), 60))
+    W = max(im.width for im in ims)
+    total_h = sum(im.height for im in ims) + gap * (len(ims) - 1)
+
+    scaled = False
+    if total_h > STITCH_MAX_H:
+        # 等比缩到上限内。只缩不改宽高比：答案里的公式一旦被压扁就会看错。
+        k = STITCH_MAX_H / float(total_h)
+        ims = [im.resize((max(1, round(im.width * k)), max(1, round(im.height * k))),
+                         Image.LANCZOS) for im in ims]
+        W = max(im.width for im in ims)
+        total_h = sum(im.height for im in ims) + gap * (len(ims) - 1)
+        scaled = True
+
+    canvas = Image.new("RGB", (W, total_h), "white")
+    y = 0
+    for im in ims:
+        canvas.paste(im, ((W - im.width) // 2, y))   # 居中，两侧留白
+        y += im.height + gap
+
+    buf = io.BytesIO()
+    canvas.save(buf, "PNG", optimize=True)
+    info = save_image(buf.getvalue(), dest_dir, prefix=prefix)
+    return {"name": info["name"], "width": W, "height": total_h, "scaled": scaled}

@@ -13,6 +13,7 @@
 """
 from __future__ import annotations
 
+import base64
 import json
 import mimetypes
 import os
@@ -32,8 +33,8 @@ from ..adapters import pdf as pdf_adapter
 from ..db import get_db
 from ..migrate import backup_db
 from ..models import Document, Question, QuestionNode
-from ..schemas import BatchCropIn, CropIn, CropStripIn
-from ..services import crops
+from ..schemas import BatchCropIn, CropIn, CropStripIn, StitchIn
+from ..services import crops, images
 
 router = APIRouter(prefix="/api", tags=["documents"])
 
@@ -366,6 +367,43 @@ def doc_crop_strip(doc_id: str, payload: CropStripIn, db: Session = Depends(get_
     except ValueError as e:
         raise HTTPException(422, str(e)) from e
     return {"url": f"/api/crops/{name}"}
+
+
+@router.post("/images/stitch")
+def images_stitch(payload: StitchIn):
+    """把多张**上传 / 粘贴**来的截图竖拼成一张 —— 答案跨页时用。
+
+    跟 `crop-strip` 的区别（两条都要，不能合并）：
+        那个拼的是「同一份原件上的几个区域」—— 服务端自己按页坐标去渲染，
+        要求 doc_id 和页号，精度到点；
+        这个拼的是「老师从屏幕 / 手机截来的图」—— 可能根本不是同一份文档，
+        只有像素，没有页坐标。
+
+    为什么路径不挂在 /documents/{id} 下面：它跟哪份文档无关，纯像素运算。
+    """
+    blobs: list[bytes] = []
+    for i, s in enumerate(payload.images or [], 1):
+        s = (s or "").strip()
+        if not s:
+            raise HTTPException(422, f"第 {i} 张图是空的")
+        if s.startswith("data:"):
+            _, _, s = s.partition(",")
+        s = "".join(s.split())          # FileReader 的输出可能带换行
+        try:
+            blobs.append(base64.b64decode(s, validate=True))
+        except Exception as e:          # noqa: BLE001  binascii.Error 等
+            raise HTTPException(422, f"第 {i} 张图不是合法的 base64") from e
+    try:
+        info = images.stitch_vertical(blobs, Path(CROPS_DIR), gap=int(payload.gap or 0))
+    except images.ImageRejected as e:
+        raise HTTPException(422, str(e)) from e
+    return {
+        "url": f"/api/crops/{info['name']}",
+        "width": info["width"],
+        "height": info["height"],
+        # 太高被等比缩过 —— 前端要提示一句，缩过的图字会小
+        "scaled": info["scaled"],
+    }
 
 
 @router.get("/documents/{doc_id}/region-image")

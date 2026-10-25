@@ -87,6 +87,71 @@ export function normalizeMath(md) {
     .map((s, i) => (i % 2 ? s : inText(s))).join('');
 }
 
+/* ------------------------------------------------------------------ 公式保护
+ *
+ * **公式内容一个字符都不该经过 Markdown。** 光把 `\(\)` 归一成 `$…$` 是不够的：
+ * marked 接着会按**它自己的**语法去读公式里的字符，实测（marked 12 + gfm）：
+ *
+ *     $5\%$        →  $5%$            反斜杠被吃；% 在 LaTeX 是注释符 → 公式被截断
+ *     $\{1,2\}$    →  ${1,2}$         \{ 命令没了，花括号语义全变
+ *     $a\_1$       →  $a_1$           凑巧还对，但那是运气，不是设计
+ *     $S=2*3*4$    →  $S=2<em>3</em>4$   乘号变斜体 → 文本节点被标签切碎 → **一个都不渲染**
+ *     $a**2**$     →  $a<strong>2</strong>$
+ *     $a~~b~~c$    →  $a<del>b</del>c$
+ *     $$x&=1 \\ y&=2$$  →  &amp; 与单个 \ → aligned 的 & 对齐点和 \\ 换行全坏
+ *
+ * 这些都不是「模型写错了」，是渲染管线自己吃掉的 —— 老师手打同样的公式也一样坏。
+ * 所以唯一可靠的做法：**先把公式摘出来换成占位符，解析完再放回去**。
+ *
+ * 占位符用 U+E000（Unicode 私有使用区）+ 序号：它不在正文里出现，
+ * HTML/DOMPurify 也当普通字符保留。别换成控制字符 —— 消毒器会把它们剥掉，
+ * 占位符一丢，公式就永远回不来了。
+ */
+const _PH_RE = /\uE000(\d+)\uE000/g;
+const _ph = (i) => '\uE000' + i + '\uE000';
+
+/** `$…$` / `$$…$$` / `\(…\)` / `\[…\]` → 占位符。**必须在 marked.parse 之前**。
+ *
+ *  @returns {{md: string, store: Array<{tex: string, display: boolean}>}}
+ *           把 `md` 喂给 marked，出结果后连同 `store` 一起交给 restoreMath()。
+ *  ⚠️ 代码块与行内代码整段跳过：那里的 `$` 是要展示的代码，不是公式。
+ */
+export function protectMath(md) {
+  const store = [];
+  const keep = (tex, display) => {
+    store.push({ tex, display });
+    return _ph(store.length - 1);
+  };
+  const conv = (s) => s
+    .replace(/\\\[([\s\S]+?)\\\]/g, (m, tex) => keep(tex, true))
+    .replace(/\\\(([\s\S]+?)\\\)/g, (m, tex) => keep(tex, false))
+    // $$…$$ 必须先于 $…$：反过来会把 `$$x$$` 拆成两个空公式
+    .replace(/\$\$([\s\S]+?)\$\$/g, (m, tex) => keep(tex, true))
+    .replace(/\$([^$\n]+?)\$/g, (m, tex) => keep(tex, false));
+  const inText = (seg) => seg.split(/(`[^`\n]*`)/)
+    .map((p, i) => (i % 2 ? p : conv(p))).join('');
+  const out = String(md || '').split(/(```[\s\S]*?```)/)
+    .map((s, i) => (i % 2 ? s : inText(s))).join('');
+  return { md: out, store };
+}
+
+/** 占位符 → 公式。**必须在 DOMPurify 之后**（否则 `$a<b$` 里的 `<` 会被当标签剥掉）。
+ *
+ *  还原时把公式内容做 HTML 转义（只转 `& < >`，不动引号）：浏览器会把 `&lt;`
+ *  解码回 `<`，KaTeX 读的是 textContent，所以转义只保护 HTML 结构、不改公式本身。
+ *  而 `&` 必须转成 `&amp;`，否则 aligned 环境里的对齐点 `&` 会被浏览器当实体开头。
+ */
+export function restoreMath(html, store) {
+  if (!store || !store.length) return html;
+  return String(html || '').replace(_PH_RE, (m, n) => {
+    const it = store[Number(n)];
+    if (!it) return m;
+    const tex = String(it.tex)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    return it.display ? `$$${tex}$$` : `$${tex}$`;
+  });
+}
+
 const DELIMITERS = [
   // 除 $…$ / $$…$$ 外，也认 LaTeX 惯用的 \(…\) 与 \[…\] —— 从别处（讲义/网页/PDF
   // 复制）粘过来常常是那种写法，只认 $ 的话用户看到的就是一段带反斜杠的原文。
@@ -114,8 +179,12 @@ export function renderRichEl(el, text) {
 
   const markedOk = !!window.marked;
   if (markedOk) {
-    const raw = window.marked.parse(normalizeMath(t), { breaks: true, gfm: true });
-    el.innerHTML = window.DOMPurify ? window.DOMPurify.sanitize(raw) : raw;
+    // ① 公式先摘出来（protectMath）→ ② 交给 marked → ③ 消毒 → ④ 公式放回去。
+    //    顺序不能动：公式内容过 Markdown 会被吃掉（见 protectMath 上面那张实测表），
+    //    而还原必须在消毒之后，否则公式里的 `<` `&` 会被当标签处理。
+    const p = protectMath(t);
+    const raw = window.marked.parse(p.md, { breaks: true, gfm: true });
+    el.innerHTML = restoreMath(window.DOMPurify ? window.DOMPurify.sanitize(raw) : raw, p.store);
   } else {
     el.textContent = t;      // 给**原文**：没渲染时不该连内容都被改写
   }
