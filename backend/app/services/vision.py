@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import base64
 import io
+import re
 from pathlib import Path
 
 from PIL import Image
@@ -89,16 +90,24 @@ _FORMULA_RULES = (
 
 _ANSWER_RULES = (
     "\n\n图中是一道题的标准答案（可能只是简短的结果，也可能是整段解题过程）。"
-    "请把它完整转录成文本：\n"
-    "1. 行内公式用 $...$ 包住；独立成行的公式用 $$...$$ 包住；\n"
-    "2. 分数用 \\frac{}{}、根式用 \\sqrt{}、上下标写 ^{} 和 _{}，"
-    "一律用标准 LaTeX 命令；\n"
-    "3. **保留原有的换行与步骤顺序** —— 解题过程是一步一行的，"
-    "挤成一整段就看不出推导到哪一步了，这是答案和题干最大的差别；\n"
-    "4. 分步书写时可以用 Markdown 有序列表（1. 2. 3.）把步骤标出来，"
-    "结论句单独一行；\n"
-    "5. 不要抄题号、分值标注（(3 marks) / （5 分））、页眉页脚、条形码这类东西；\n"
-    "6. 只输出答案文本本身 —— 不要解释、不要客套、不要用 Markdown 代码围栏包起来。"
+    "**如果给了多张图**，它们是同一道答案的前后几页（答案跨页了），"
+    "按给出的先后顺序连着读、连着写。\n"
+    "请把答案转录成 **合法的 Markdown** 文本：\n"
+    "1. **公式**：行内用 $...$，独立成行的用 $$...$$；分数写 \\frac{}{}、"
+    "根式写 \\sqrt{}、上下标写 ^{} 和 _{}，一律用标准 LaTeX 命令。\n"
+    "   乘号写 \\times 或 \\cdot，**不要写 * 或 ** —— 它们在 Markdown 里是强调语法**，"
+    "写进去公式会散架；\n"
+    "2. **步骤**：一步一行，保持原有的推导顺序。多个小问用 Markdown 有序列表"
+    "（行首写 `1. ` `2. `）；普通段落之间**空一行**"
+    "（Markdown 靠空行分段，只有单个换行会被折成空格，步骤就挤成一坨了）；\n"
+    "3. **表格**：要写完整的 GFM 表格 —— 第二行必须是 `|---|---|` 这样的分隔行。"
+    "缺了分隔行，整张表会退化成一串竖线文字，等于没表；\n"
+    "4. **不要抄**：【答案】【解析】【详解】【分析】这类小标题（字段本身就叫答案，"
+    "抄进来会重复）、题号、分值标注（(3 marks) / （5 分））、页眉页脚、条形码；\n"
+    "5. **多张图之间**：第 2 张接着第 1 张写下去，"
+    "**不要**重复已经写过的内容，也不要在接缝处插「第 2 页」「（续）」这种提示；\n"
+    "6. 只输出答案正文本身 —— 不要解释、不要客套、"
+    "**不要用 ``` 代码围栏把整段答案包起来**。"
 )
 
 PROMPTS = {
@@ -184,23 +193,72 @@ def _strip_fence(text: str) -> str:
     return t.strip()
 
 
+# 【答案】【详解】这类小标题。模型即使被要求「不要抄」，仍会习惯性带上第一行
+# （实测：答案模式的输出几乎总是以【答案】开头）。
+_LEAD_LABEL_RE = re.compile(
+    r"^\s*[【\[]\s*(答案|解析|详解|分析|解答|答|解)\s*[】\]]\s*[:：]?\s*"
+)
+
+
+def _strip_leading_labels(text: str) -> str:
+    """剥掉**开头**的【答案】【详解】小标题。
+
+    为什么必须剥：字段本身就叫「答案」，用户界面上看到的是
+    「答案：【答案】C」——重复且难看；导出卷子时也会原样印出来。
+    只在开头剥：正文里说「【详解】见上图」这类引用要留着。
+    """
+    t = text
+    for _ in range(3):                 # 可能连着两个：【答案】\n【详解】解：…
+        m = _LEAD_LABEL_RE.match(t)
+        if not m:
+            break
+        t = t[m.end():]
+    return t.lstrip()
+
+
 # ---------------------------------------------------------------- 主入口
+# 一次最多几张图。跨页答案一般是 2 张（最多 3 张：页底半页 + 整页 + 页首半页）；
+# 再往上不是「跨页」而是「整章」，那该走批量识别而不是这里。
+MAX_IMAGES = 6
+
+
 def recognize(
     db: Session,
-    image_b64: str,
+    image_b64: str = "",
     mode: str = "question",
     hint: str = "",
     timeout_cap: int | None = None,
+    images: list[str] | None = None,
 ) -> dict:
-    """识别一张图，返回 {text, mode, model, usage}。
+    """识别一张或**多张**图，返回 {text, mode, model, usage}。
 
     mode: question（题干）/ answer（答案，保留分步换行）/ formula（纯公式）
+    images: 多张图（答案跨页）。给了它就以它为准，忽略 image_b64。
+            **每张图各自压缩**（长边 1600），所以多图不会让字变小 ——
+            这正是「分别识别再拼文本」比「先拼图再识别」好的地方：
+            竖拼成一张后长边翻倍，压到 1600 会让字只剩一半高度。
     hint: 老师额外给的一句话提示（可空）。允许它存在，是因为模型偶尔会读错
           一个手写字母，而老师一眼就知道该是什么 —— 与其让他反复重试，
           不如让他直接说一句「这是 a 不是 alpha」。
     """
     if mode not in PROMPTS:
         raise VisionError(f"不支持的识别模式 {mode}（可选 {' / '.join(PROMPTS)}）")
+
+    raw_list = [x for x in (images or []) if (x or "").strip()]
+    if not raw_list and (image_b64 or "").strip():
+        raw_list = [image_b64]
+    if not raw_list:
+        raise VisionError("没有拿到图片 —— 请先框选出一道题，或上传 / 粘贴一张截图")
+    if len(raw_list) > MAX_IMAGES:
+        raise VisionError(
+            f"一次最多识别 {MAX_IMAGES} 张截图（跨页一般 2 张就够）；"
+            f"这次给了 {len(raw_list)} 张，请分两次识别"
+        )
+
+    # ⚠️ 先解码（只校验 base64 格式），再拿配置，最后才压缩。
+    #    顺序反过来的话，一张非法 base64 会先撞上「还没配置 AI 接口」——
+    #    那不是用户要解决的问题，会让他以为是自己没配好。
+    raws = [_decode_data_uri(x) for x in raw_list]
 
     cfg = ai_polish.get_config(db)
     if not cfg["configured"]:
@@ -209,9 +267,12 @@ def recognize(
             "公式识别和润色共用同一份配置。"
         )
 
-    uri, _size = prepare_image(_decode_data_uri(image_b64))
+    uris = [prepare_image(b)[0] for b in raws]
 
     prompt = PROMPTS[mode]
+    if len(uris) > 1:
+        # 不给这句的话，模型可能把第 2 张当成「另一道题」另起一段答案。
+        prompt += f"\n\n（本次共 {len(uris)} 张图，是同一份内容的先后几页，按顺序连着读。）"
     if (hint or "").strip():
         prompt += "\n\n老师的补充说明（以此为准）：" + hint.strip()
 
@@ -220,8 +281,9 @@ def recognize(
         "messages": [{
             "role": "user",
             # 图在前、要求在后：让模型先看清内容，再读该怎么输出。
+            # 多图时按给的先后顺序排列 —— 模型会按这个顺序理解「前后页」。
             "content": [
-                {"type": "image_url", "image_url": {"url": uri}},
+                *[{"type": "image_url", "image_url": {"url": u}} for u in uris],
                 {"type": "text", "text": prompt},
             ],
         }],
@@ -253,6 +315,9 @@ def recognize(
             raise
 
     text = _strip_fence(ai_polish.extract_content(data))
+    if mode == "answer":
+        # 答案模式额外剥标题：【答案】C → C（理由见 _strip_leading_labels）
+        text = _strip_leading_labels(text)
     if not text:
         raise VisionError(
             "模型返回了空内容。两个常见原因："

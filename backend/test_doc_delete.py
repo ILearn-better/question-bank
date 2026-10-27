@@ -25,21 +25,29 @@ import json
 import sys
 import urllib.error
 import urllib.request
+
 import uuid
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from app import config  # noqa: E402  只为拿 CROPS_DIR / PAGES_CACHE，不连数据库
+import os
 
-BASE = "http://127.0.0.1:8000"
+# 免代理 opener（契约第六节第 2 条）：本机 http_proxy 会把 127.0.0.1 的请求也送去代理，
+# 回来是 502 Bad Gateway —— 于是「服务没起」被误读成「服务坏了」，
+# 更坏的是 502 的响应体被当成数据往下跑（报 byte indices 之类，完全误导）。
+# 本机 HTTP 一律走这个 opener；连不上就该是 ConnectionRefused，红得明白。
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+BASE = os.environ.get("SHIKE_BASE") or (
+    "http://127.0.0.1:8010" if Path(__file__).resolve().parents[1].name == "question-bank-ai"
+    else "http://127.0.0.1:8000")   # 主仓 8000 / -ai 检出 8010，SHIKE_BASE 可覆盖
 fails: list[str] = []
-
 
 def check(name: str, ok: bool, extra: str = "") -> None:
     print(f"  [{'OK ' if ok else 'FAIL'}] {name}" + (f"  {extra}" if extra else ""))
     if not ok:
         fails.append(name)
-
 
 def req(method: str, path: str, body=None):
     """发请求。响应不是 JSON（比如页面图是 PNG 二进制）时原样返回 bytes 的文本形式。
@@ -51,19 +59,17 @@ def req(method: str, path: str, body=None):
     r = urllib.request.Request(BASE + path, data=data, method=method,
                                headers={"Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(r) as resp:
+        with _OPENER.open(r) as resp:
             raw = resp.read()
             return resp.status, _decode(raw)
     except urllib.error.HTTPError as e:
         return e.code, _decode(e.read())
-
 
 def _decode(raw: bytes):
     try:
         return json.loads(raw)
     except (json.JSONDecodeError, UnicodeDecodeError):
         return raw.decode("utf-8", "replace")
-
 
 def upload(data: bytes, filename: str):
     """multipart 上传（用标准库拼，不引第三方依赖）。"""
@@ -76,11 +82,10 @@ def upload(data: bytes, filename: str):
         BASE + "/api/documents", data=head + data + tail, method="POST",
         headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
     try:
-        with urllib.request.urlopen(r) as resp:
+        with _OPENER.open(r) as resp:
             return resp.status, json.loads(resp.read())
     except urllib.error.HTTPError as e:
         return e.code, e.read().decode("utf-8", "replace")
-
 
 def make_pdf() -> bytes:
     """造一份单页 PDF（真文件，能让后端解析出文字块与页数）。
@@ -94,7 +99,6 @@ def make_pdf() -> bytes:
     page.insert_text((72, 700), "shike doc-delete test")
     return doc.tobytes()
 
-
 def make_crop(name: str) -> Path:
     """造一张只属于本次测试的截图，返回磁盘路径。"""
     from PIL import Image
@@ -106,7 +110,6 @@ def make_crop(name: str) -> Path:
     path.write_bytes(buf.getvalue())
     return path
 
-
 def mk_question(doc_id: str, doc_name: str, image: str = "") -> str:
     st, r = req("POST", "/api/questions",
                 {"document_id": doc_id, "doc_filename": doc_name,
@@ -114,22 +117,18 @@ def mk_question(doc_id: str, doc_name: str, image: str = "") -> str:
     assert st == 200, (st, r)
     return r["id"]
 
-
 def fetch(qid: str) -> dict:
     """按 id 取题（没有单题接口，从列表里挑）。"""
     _, lst = req("GET", "/api/questions")
     return next((q for q in lst if q["id"] == qid), {})
 
-
 def doc_ids() -> set[str]:
     _, lst = req("GET", "/api/documents")
     return {d["id"] for d in lst}
 
-
 def cleanup_questions(qids: list[str]) -> None:
     for q in qids:
         req("DELETE", f"/api/questions/{q}")
-
 
 def main() -> int:
     shared = make_crop("t_doc_delete_shared.png")     # 会被「文档内」与「文档外」两道题共用
@@ -238,7 +237,6 @@ def main() -> int:
         return 1
     print("✅ 全部通过")
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())

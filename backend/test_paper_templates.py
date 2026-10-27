@@ -16,19 +16,29 @@ import json
 import sys
 import urllib.error
 import urllib.request
-from urllib.parse import quote
 
-BASE = "http://127.0.0.1:8000"
+from urllib.parse import quote
+import os
+from pathlib import Path
+
+# 免代理 opener（契约第六节第 2 条）：本机 http_proxy 会把 127.0.0.1 的请求也送去代理，
+# 回来是 502 Bad Gateway —— 于是「服务没起」被误读成「服务坏了」，
+# 更坏的是 502 的响应体被当成数据往下跑（报 byte indices 之类，完全误导）。
+# 本机 HTTP 一律走这个 opener；连不上就该是 ConnectionRefused，红得明白。
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+BASE = os.environ.get("SHIKE_BASE") or (
+    "http://127.0.0.1:8010" if Path(__file__).resolve().parents[1].name == "question-bank-ai"
+    else "http://127.0.0.1:8000")   # 主仓 8000 / -ai 检出 8010，SHIKE_BASE 可覆盖
 fails = []
 created = []
-
 
 def req(method, path, body=None, timeout=60):
     data = json.dumps(body).encode() if body is not None else None
     r = urllib.request.Request(BASE + path, data=data, method=method,
                                headers={"Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(r, timeout=timeout) as resp:
+        with _OPENER.open(r, timeout=timeout) as resp:
             raw = resp.read()
             if "json" in resp.headers.get("Content-Type", ""):
                 return resp.status, json.loads(raw)
@@ -44,13 +54,11 @@ def req(method, path, body=None, timeout=60):
               f"   原因：{e.reason}")
         sys.exit(2)
 
-
 def check(label, got, want):
     okk = got == want
     print(f"  [{'OK ' if okk else 'FAIL'}] {label}" + ("" if okk else f"  得到 {got!r} 期望 {want!r}"))
     if not okk:
         fails.append(label)
-
 
 def truthy(label, got):
     okk = bool(got)
@@ -58,13 +66,11 @@ def truthy(label, got):
     if not okk:
         fails.append(label)
 
-
 def export(ids, fmt="html", tid=None, title="测试卷"):
     p = f"/api/papers/export?ids={ids}&format={fmt}&title={quote(title)}"
     if tid:
         p += f"&template_id={tid}"
     return req("GET", p)
-
 
 try:
     # ------------------------------------------------------------ 列表

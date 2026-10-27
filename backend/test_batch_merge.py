@@ -22,12 +22,19 @@ import os
 import sys
 import urllib.error
 import urllib.request
+
 from pathlib import Path
 
 BACKEND_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(BACKEND_DIR))
 
 from app import config                                   # noqa: E402  只为 CROPS_DIR
+
+# 免代理 opener（契约第六节第 2 条）：本机 http_proxy 会把 127.0.0.1 的请求也送去代理，
+# 回来是 502 Bad Gateway —— 于是「服务没起」被误读成「服务坏了」，
+# 更坏的是 502 的响应体被当成数据往下跑（报 byte indices 之类，完全误导）。
+# 本机 HTTP 一律走这个 opener；连不上就该是 ConnectionRefused，红得明白。
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 BASE = os.environ.get(
     "SHIKE_BASE",
@@ -38,14 +45,12 @@ BASE = os.environ.get(
 fails: list[str] = []
 state: dict = {"jobs": [], "files": []}
 
-
 def check(name: str, ok: bool, detail: str = "") -> None:
     if ok:
         print(f"  [OK ] {name}")
     else:
         print(f"  [FAIL] {name}" + (f" —— {detail}" if detail else ""))
         fails.append(name)
-
 
 def req(method: str, path: str, body=None, timeout: int = 30):
     """返回 (status, data)。**4xx/5xx 不抛异常** —— 边界拒绝正是要断言的东西。"""
@@ -56,7 +61,7 @@ def req(method: str, path: str, body=None, timeout: int = 30):
         headers["Content-Type"] = "application/json"
     r = urllib.request.Request(BASE + path, data=data, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(r, timeout=timeout) as resp:
+        with _OPENER.open(r, timeout=timeout) as resp:
             raw, status = resp.read(), resp.status
     except urllib.error.HTTPError as e:
         raw, status = e.read(), e.code
@@ -65,10 +70,8 @@ def req(method: str, path: str, body=None, timeout: int = 30):
     except (json.JSONDecodeError, UnicodeDecodeError):
         return status, raw.decode("utf-8", "replace")[:200]
 
-
 def crop_file(url: str) -> Path:
     return config.CROPS_DIR / url.rsplit("/", 1)[-1]
-
 
 def make_png(name: str, w: int = 100, h: int = 80) -> str:
     """现造一张只属于本次测试的图，返回它的 URL。"""
@@ -82,14 +85,11 @@ def make_png(name: str, w: int = 100, h: int = 80) -> str:
     state["files"].append(name)
     return f"/api/crops/{name}"
 
-
 def ids_of(items: list[dict]) -> list[str]:
     return [i["id"] for i in items]
 
-
 def seqs_of(items: list[dict]) -> list[int]:
     return [i["seq"] for i in items]
-
 
 def cleanup() -> None:
     """收尾：按 id 删任务；再兜底删自己造的那几张图（已被回收的就不用删了）。"""
@@ -104,7 +104,6 @@ def cleanup() -> None:
                 p.unlink()
             except OSError:
                 pass
-
 
 def run() -> None:
     # ---------------------------------------------------------- ① 前置
@@ -266,7 +265,6 @@ def run() -> None:
     st, r = req("GET", f"/api/batches/{jid}")
     check("任务确实没了 -> 404", st == 404, f"实为 {st}")
 
-
 def main() -> int:
     print(f"目标服务：{BASE}")
     print(f"截图目录：{config.CROPS_DIR}")
@@ -293,7 +291,6 @@ def main() -> int:
     print("✅ 全部通过")
     print("=" * 60)
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())

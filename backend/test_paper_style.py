@@ -123,10 +123,14 @@ items = [
 ]
 groups = paper_style.layout(items, sections)
 flat = [it["n"] for g in groups for it in g["items"]]
-check("四道题全在（顺序保持）", sorted(flat), [1, 2, 3, 4])
-check("选择题进第一组", [it["n"] for it in groups[0]["items"]], [1, 4])
-check("解答题进第二组", [it["n"] for it in groups[1]["items"]], [2])
-check("证明题进兜底组（无标题）", [it["n"] for it in groups[2]["items"]], [3])
+# ⚠️ R5（2026-10-27）之后：`n` 是 layout() 按**最终卷面顺序**重编的，不再等于入参的 n。
+# 下面两条原来钉的是入参编号（`sorted(flat)==[1,2,3,4]`、`[1,4]`/`[2]`/`[3]`），
+# 而 `[1,4]`/`[2]`/`[3]` 正是「题号乱序」这个 bug 的值 —— 也就是说这个文件当年是**绿的**，
+# 绿在钉着一个错的行为上。这是「测试绿 ≠ 行为对」最标准的例子，别再把值改回去。
+check("印出来的题号从 1 起连续（不是「数字没丢」——是「谁该是几号」）", flat, [1, 2, 3, 4])
+check("选择题进第一组（重编后 1、2）", [it["n"] for it in groups[0]["items"]], [1, 2])
+check("解答题进第二组（重编后 3）", [it["n"] for it in groups[1]["items"]], [3])
+check("证明题进兜底组（重编后 4）", [it["n"] for it in groups[2]["items"]], [4])
 check("兜底组不带标题", groups[2]["title"], "")
 
 check("没有 sections → 单个无标题组（= 老行为）",

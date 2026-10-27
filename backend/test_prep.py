@@ -22,15 +22,23 @@ import sqlite3
 import urllib.error
 import urllib.parse
 import urllib.request
+
 from pathlib import Path
 
+# 免代理 opener（契约第六节第 2 条）：本机 http_proxy 会把 127.0.0.1 的请求也送去代理，
+# 回来是 502 Bad Gateway —— 于是「服务没起」被误读成「服务坏了」，
+# 更坏的是 502 的响应体被当成数据往下跑（报 byte indices 之类，完全误导）。
+# 本机 HTTP 一律走这个 opener；连不上就该是 ConnectionRefused，红得明白。
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
 REAL = "http://127.0.0.1:8000"
-S = "http://127.0.0.1:8001"
+# 8001 = 独立临库，故意不跟 8000/8010 对齐：这些用例会写库，跑真库等于毁老师的题
+# （要换端口用 SHIKE_SCRATCH 覆盖，默认仍是 8001 —— 默认值必须指向隔离环境）
+S = os.environ.get("SHIKE_SCRATCH") or "http://127.0.0.1:8001"
 SCRATCH = Path(os.environ["TEMP"]) / "notes_scratch"
 DB = SCRATCH / "notes.db"
 
 fails = []
-
 
 def call(base, method, path, body=None):
     data = json.dumps(body).encode() if body is not None else None
@@ -38,11 +46,10 @@ def call(base, method, path, body=None):
                                  data=data, method=method,
                                  headers={"Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(req, timeout=30) as r:
+        with _OPENER.open(req, timeout=30) as r:
             return r.status, r.read(), r.headers
     except urllib.error.HTTPError as e:
         return e.code, e.read(), e.headers
-
 
 def js(base, method, path, body=None):
     st, raw, hdr = call(base, method, path, body)
@@ -51,13 +58,11 @@ def js(base, method, path, body=None):
     except Exception:
         return st, raw, hdr
 
-
 def check(label, got, want):
     okk = got == want
     print(("  OK  " if okk else "  FAIL") + f"  {label}: {got!r}" + ("" if okk else f"  期望 {want!r}"))
     if not okk:
         fails.append(label)
-
 
 print("⓪ 清空临时库，再造两道题")
 con = sqlite3.connect(str(DB))
@@ -202,7 +207,6 @@ check("真库没有我造的学生", any(s.get("name") == "备课测试生" for 
 
 print()
 print("ALL PASS" if not fails else f"{len(fails)} 项失败: {fails}")
-
 
 # 退出码即结果（0 = 全过）。
 raise SystemExit(1 if fails else 0)

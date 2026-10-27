@@ -78,9 +78,12 @@ def _match_student(db: Session, name: str, cache: dict) -> Student | None:
 
 
 @router.post("/preview")
-async def preview(file: UploadFile = File(...), db: Session = Depends(get_db)):
+# 同步 def（不是 async）：parse_workbook 解析 Excel 是同步 CPU 活。
+# ⚠️ 这里的读法没有大小参数，仍必须写成 file.file.read() —— 只删 await、留着 file.read()
+#    会让 parse_workbook 收到一个协程对象，报的错埋在很深的调用栈里，极难定位。
+def preview(file: UploadFile = File(...), db: Session = Depends(get_db)):
     """解析 Excel 并做匹配/查重，**不写库**。返回逐行的可导入性与问题清单。"""
-    raw = await file.read()
+    raw = file.file.read()
     if not raw:
         raise HTTPException(422, "没收到文件内容")
     if len(raw) > MAX_UPLOAD:

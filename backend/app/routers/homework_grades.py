@@ -95,17 +95,24 @@ def patch_grade_setup(gid: int, payload: GradeSetupPatch, db: Session = Depends(
 
 
 @router.post("/homework-grades/{gid}/run")
-def run_grade(gid: int, db: Session = Depends(get_db)):
+def run_grade(gid: int,
+              force: bool = Query(False, description="已确认 / 复核过 / 画过批注时，"
+                                                    "确认要覆盖这些记录才带 true"),
+              db: Session = Depends(get_db)):
     """开始（或重跑）批改。**幂等**：已经在跑就直接返回当前进度，不会再起一个线程。
 
     返回的是立刻可用的详情：`status` 可能是 `queued`（刚认领）或 `running`，
     前端拿它开始轮询 `GET /{gid}` 即可。
+
+    ⚠️ 不传 `force` 时，若这一份上还有老师的劳动（已确认 / 逐题复核过 / 画过批注），
+       返回 **409** 并说明会清掉什么 —— 前端应该弹二次确认，用户点"仍然重跑"再带
+       `force=true` 重发。这是**唯一**会把这些记录换掉的操作，不该一键就发生。
     """
     try:
         grade = store.get_grade(db, gid)
         # ⚠️ launch 里有一道「按我的答案判，但依据已经被删了」的校验（会抛 GradeError）。
         #    不接住的话它会变成 500，老师看到的是一句「服务器内部错误」。
-        store.launch(db, grade)      # 已在跑时 launch 自己会什么都不做
+        store.launch(db, grade, force=force)   # 已在跑时 launch 自己会什么都不做
     except store.GradeError as e:
         raise _fail(e) from e
     return store.detail(db, grade)
@@ -197,9 +204,11 @@ _INLINE_OK = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".pdf"}
 
 
 @router.post("/homework-grades/{gid}/basis")
-async def upload_basis(gid: int, file: UploadFile = File(...),
-                       role: str = Query("answer", description="answer / rubric"),
-                       db: Session = Depends(get_db)):
+# 同步 def（不是 async）：add_basis_file 里 grade_basis.extract 会解析 PDF / Word / Excel
+# 抽文字，几百毫秒起。async def 会占住事件循环，单进程服务整站跟着卡。
+def upload_basis(gid: int, file: UploadFile = File(...),
+                 role: str = Query("answer", description="answer / rubric"),
+                 db: Session = Depends(get_db)):
     """传一份判定依据。
 
     `role`：`answer` = 答案，`rubric` = 评分细则（两条模式各用一份）。
@@ -210,7 +219,7 @@ async def upload_basis(gid: int, file: UploadFile = File(...),
     """
     # 多读 1 字节用来判「超了」：读满整个文件再报错，等于让一个 500MB 的
     # 文件先进内存。
-    data = await file.read(grade_basis.MAX_BASIS_BYTES + 1)
+    data = file.file.read(grade_basis.MAX_BASIS_BYTES + 1)
     try:
         return store.add_basis_file(db, gid, role, file.filename or "", data)
     except store.GradeError as e:

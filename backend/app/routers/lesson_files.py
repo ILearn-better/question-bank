@@ -139,9 +139,11 @@ def list_files(lid: int,
 
 
 @router.post("/lessons/{lid}/files")
-async def upload_file(lid: int, file: UploadFile = File(...),
-                      role: str = Query("material", description="material / homework / prep"),
-                      db: Session = Depends(get_db)):
+# 同步 def（不是 async）：file_text.extract 是 PDF/docx/pptx 的同步解析（还可能是 Word COM），
+# 几百毫秒到几十秒。async def 会把它按在事件循环上，单进程服务整站跟着卡。
+def upload_file(lid: int, file: UploadFile = File(...),
+                role: str = Query("material", description="material / homework / prep"),
+                db: Session = Depends(get_db)):
     """上传并**当场抽文字**。
 
     抽不出来也照样把行存下来（status=failed + reason）：这样界面能一直显示
@@ -165,7 +167,7 @@ async def upload_file(lid: int, file: UploadFile = File(...),
         raise HTTPException(422, f"暂不支持这种格式（{Path(name).suffix or '无扩展名'}）。"
                                  f"{file_text.SUPPORTED_NOTE}")
 
-    data = await file.read(MAX_BYTES + 1)
+    data = file.file.read(MAX_BYTES + 1)
     if len(data) > MAX_BYTES:
         raise HTTPException(422, f"文件太大了（超过 {MAX_BYTES // 1024 // 1024}MB）。"
                                  "课件一般不会这么大，确认一下选错文件没有？")

@@ -25,27 +25,32 @@ import re
 import sys
 import urllib.error
 import urllib.request
+
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from app import config  # noqa: E402  只为拿 CROPS_DIR，不连数据库
 
+# 免代理 opener（契约第六节第 2 条）：本机 http_proxy 会把 127.0.0.1 的请求也送去代理，
+# 回来是 502 Bad Gateway —— 于是「服务没起」被误读成「服务坏了」，
+# 更坏的是 502 的响应体被当成数据往下跑（报 byte indices 之类，完全误导）。
+# 本机 HTTP 一律走这个 opener；连不上就该是 ConnectionRefused，红得明白。
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
 BASE = "http://127.0.0.1:8000"
 fails: list[str] = []
-
 
 def check(name: str, ok: bool, extra: str = "") -> None:
     print(f"  [{'OK ' if ok else 'FAIL'}] {name}" + (f"  {extra}" if extra else ""))
     if not ok:
         fails.append(name)
 
-
 def req(method: str, path: str, body=None):
     data = json.dumps(body).encode("utf-8") if body is not None else None
     r = urllib.request.Request(BASE + path, data=data, method=method,
                                headers={"Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(r) as resp:
+        with _OPENER.open(r) as resp:
             raw = resp.read()
             try:
                 return resp.status, json.loads(raw)
@@ -58,18 +63,15 @@ def req(method: str, path: str, body=None):
         except json.JSONDecodeError:
             return e.code, raw.decode("utf-8", "replace")
 
-
 def strip_tags(html: str) -> str:
     """剥标签只看正文 —— 判断「这段字到底印没印出来」，直接子串匹配会被
     <style> 里的样式文本误伤。"""
     return re.sub(r"<[^>]+>", " ", html)
 
-
 def fetch(qid: str) -> dict:
     """按 id 取一道题。路由里没有单题查询接口，从列表里挑。"""
     _, lst = req("GET", "/api/questions")
     return next((q for q in lst if q["id"] == qid), {})
-
 
 def mk(content: str, image: str, prefer: str | None = None) -> str:
     body = {"document_id": "t-render-prefer", "doc_filename": "测试用",
@@ -80,13 +82,11 @@ def mk(content: str, image: str, prefer: str | None = None) -> str:
     assert st == 200, (st, r)
     return r["id"]
 
-
 def export(qid: str, **kw) -> str:
     qs = "".join(f"&{k}={v}" for k, v in kw.items())
     st, html = req("GET", f"/api/papers/export?ids={qid}&format=html{qs}")
     assert st == 200, (st, html)
     return html
-
 
 def make_test_image() -> tuple[str, Path]:
     """造一张只属于本次测试的图，返回 (url, 磁盘路径)。"""
@@ -99,7 +99,6 @@ def make_test_image() -> tuple[str, Path]:
     Image.new("RGB", (80, 50), (255, 255, 255)).save(buf, "PNG")
     path.write_bytes(buf.getvalue())
     return f"/api/crops/{name}", path
-
 
 def main() -> int:
     img, img_path = make_test_image()
@@ -174,7 +173,6 @@ def main() -> int:
         return 1
     print("✅ 全部通过")
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())

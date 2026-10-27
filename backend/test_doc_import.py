@@ -30,7 +30,20 @@ import uuid
 import zipfile
 from pathlib import Path
 
-SCRATCH = "http://127.0.0.1:8001"
+# 8001 = 独立临库，故意不跟 8000/8010 对齐：这些用例会写库，跑真库等于毁老师的题
+# （要换端口用 SHIKE_SCRATCH 覆盖，默认仍是 8001 —— 默认值必须指向隔离环境）
+SCRATCH = os.environ.get("SHIKE_SCRATCH") or "http://127.0.0.1:8001"
+# ⚠️ 8001 是**故意**跟真服务不同的一个数字，不是打错了端口。
+#
+# 「端口按检出目录名」那条规则（目录名含 question-bank-ai → 8010，否则 → 8000）说的是
+# **真服务**。而这个测试要写库、还要往 uploads 里落图片 —— 它必须跑在自己那套
+# 临时 DB + 临时 uploads 上（见文件头那三行命令），绝不能连 8000 去动老师的真库。
+# 所以它天生需要一个**另外起**的临时服务，那个服务的端口就得跟真服务岔开 → 8001。
+# 历史来源：56a1d79「笔记能直接导入文档」引入，当初就是这个用意。
+#
+# 本机 shell 带 http_proxy：裸 urlopen 探 127.0.0.1 会被送进代理回 **502**
+# （看着像服务坏了，其实是代理）。这里一律走「不代理」的 opener —— 契约第六节第 2 条。
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 ROOT = Path(__file__).resolve().parent.parent
 SCRATCH_DIR = Path(os.environ["TEMP"]) / "notes_scratch"
 SCRATCH_DB = SCRATCH_DIR / "notes.db"
@@ -53,7 +66,7 @@ def req(method, path, body=None):
     r = urllib.request.Request(url, data=data, method=method,
                                headers={"Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(r, timeout=60) as resp:
+        with _OPENER.open(r, timeout=60) as resp:
             return resp.status, json.loads(resp.read())
     except urllib.error.HTTPError as e:
         raw = e.read()
@@ -73,7 +86,7 @@ def import_doc(path: Path, folder_id=None, filename=None):
     r = urllib.request.Request(SCRATCH + "/api/notes/import-doc" + q, data=body, method="POST",
                                headers={"Content-Type": f"multipart/form-data; boundary={b}"})
     try:
-        with urllib.request.urlopen(r, timeout=180) as resp:
+        with _OPENER.open(r, timeout=180) as resp:
             return resp.status, json.loads(resp.read())
     except urllib.error.HTTPError as e:
         raw = e.read()
@@ -86,7 +99,7 @@ def import_doc(path: Path, folder_id=None, filename=None):
 def raw_status(path):
     """取二进制文件（原件/图片）只看状态码 —— 别拿 JSON 去解它。"""
     try:
-        with urllib.request.urlopen(SCRATCH + urllib.parse.quote(path, safe="/?=&"), timeout=30) as r:
+        with _OPENER.open(SCRATCH + urllib.parse.quote(path, safe="/?=&"), timeout=30) as r:
             return r.status, r.headers.get("content-type"), len(r.read())
     except urllib.error.HTTPError as e:
         return e.code, "", 0
@@ -105,7 +118,7 @@ def upload_image(filename: str):
             f"Content-Type: image/png\r\n\r\n").encode() + blob + f"\r\n--{b}--\r\n".encode()
     r = urllib.request.Request(SCRATCH + "/api/notes/image", data=body, method="POST",
                                headers={"Content-Type": f"multipart/form-data; boundary={b}"})
-    with urllib.request.urlopen(r, timeout=60) as resp:
+    with _OPENER.open(r, timeout=60) as resp:
         return resp.status, json.loads(resp.read())["name"]
 
 

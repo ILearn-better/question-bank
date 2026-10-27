@@ -29,9 +29,10 @@ LIST_LIMIT = 300
 
 
 @router.post("/uploads/image")
-async def upload_image(file: UploadFile = File(...)):
+# 同步 def：同步句柄读 + 同步落盘（几百 KB~几 MB 的读写）不该占事件循环。
+def upload_image(file: UploadFile = File(...)):
     """上传一张本地图片，返回可直接当 image / answer_image 用的 URL。"""
-    data = await file.read(images.MAX_IMAGE_BYTES + 1)
+    data = file.file.read(images.MAX_IMAGE_BYTES + 1)
     try:
         saved = images.save_image(data, config.CROPS_DIR, prefix="up")
     except images.ImageRejected as e:

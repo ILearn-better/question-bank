@@ -25,25 +25,32 @@ import sqlite3
 import urllib.error
 import urllib.parse
 import urllib.request
+
 import uuid
 import zipfile
 from pathlib import Path
 
+# 免代理 opener（契约第六节第 2 条）：本机 http_proxy 会把 127.0.0.1 的请求也送去代理，
+# 回来是 502 Bad Gateway —— 于是「服务没起」被误读成「服务坏了」，
+# 更坏的是 502 的响应体被当成数据往下跑（报 byte indices 之类，完全误导）。
+# 本机 HTTP 一律走这个 opener；连不上就该是 ConnectionRefused，红得明白。
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
 REAL = "http://127.0.0.1:8000"
-SCRATCH = "http://127.0.0.1:8001"
+# 8001 = 独立临库，故意不跟 8000/8010 对齐：这些用例会写库，跑真库等于毁老师的题
+# （要换端口用 SHIKE_SCRATCH 覆盖，默认仍是 8001 —— 默认值必须指向隔离环境）
+SCRATCH = os.environ.get("SHIKE_SCRATCH") or "http://127.0.0.1:8001"
 SCRATCH_DIR = Path(os.environ["TEMP"]) / "notes_scratch"
 SCRATCH_DB = SCRATCH_DIR / "notes.db"
 SCRATCH_NOTES = SCRATCH_DIR / "uploads" / "notes"
 
 fails = []
 
-
 def check(label, got, want=True):
     okk = got == want
     print(f"  [{'OK ' if okk else 'FAIL'}] {label}: {got!r}" + ("" if okk else f"  期望 {want!r}"))
     if not okk:
         fails.append(label)
-
 
 def req(base, method, path, body=None, raw=False, timeout=60):
     url = base + urllib.parse.quote(path, safe="/?=&")
@@ -54,7 +61,7 @@ def req(base, method, path, body=None, raw=False, timeout=60):
         r = urllib.request.Request(url, data=data, method=method,
                                    headers={"Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(r, timeout=timeout) as resp:
+        with _OPENER.open(r, timeout=timeout) as resp:
             payload = resp.read()
             return resp.status, (payload if raw else (json.loads(payload) if payload else None)), resp
     except urllib.error.HTTPError as e:
@@ -64,7 +71,6 @@ def req(base, method, path, body=None, raw=False, timeout=60):
         except Exception:
             return e.code, payload.decode("utf-8", "replace"), e
 
-
 def upload(base, path, filename, blob, extra_query=""):
     b = uuid.uuid4().hex
     body = (f"--{b}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\n"
@@ -72,7 +78,7 @@ def upload(base, path, filename, blob, extra_query=""):
     r = urllib.request.Request(base + path + extra_query, data=body, method="POST",
                                headers={"Content-Type": f"multipart/form-data; boundary={b}"})
     try:
-        with urllib.request.urlopen(r, timeout=120) as resp:
+        with _OPENER.open(r, timeout=120) as resp:
             return resp.status, json.loads(resp.read())
     except urllib.error.HTTPError as e:
         payload = e.read()
@@ -80,7 +86,6 @@ def upload(base, path, filename, blob, extra_query=""):
             return e.code, json.loads(payload)
         except Exception:
             return e.code, payload.decode("utf-8", "replace")
-
 
 def notes_of(base):
     _, t, _ = req(base, "GET", "/api/note-folders/tree")
@@ -94,7 +99,6 @@ def notes_of(base):
         walk(r, r["name"])
     return t, out
 
-
 def png_bytes():
     """造一张真 PNG（必须是真图：服务端按魔数校验）。"""
     import pymupdf
@@ -104,7 +108,6 @@ def png_bytes():
     data = pg.get_pixmap().tobytes("png")
     doc.close()
     return data
-
 
 print("==== ⓪ 先把临时库清干净（这个测试必须可以反复跑） ====")
 con = sqlite3.connect(str(SCRATCH_DB))
@@ -119,7 +122,6 @@ if SCRATCH_NOTES.is_dir():
         p.unlink()
 t0, _ = notes_of(SCRATCH)
 check("临时库起点为空", t0["total"], 0)
-
 
 print("==== ① 从真库导出（只读） ====")
 st, blob, resp = req(REAL, "GET", "/api/notes-backup/export", raw=True)
@@ -325,7 +327,6 @@ check("已有分组不会被重复建", names.count("IB 数学"), 1)
 check("分组顺序跟着包走", names[:2], ["IB 数学", "空分组"])
 
 print("\n" + ("ALL PASS" if not fails else f"{len(fails)} 项失败: {fails}"))
-
 
 # 退出码即结果（0 = 全过）。以前这里只打印不设码 —— 单跑时人看得出来，
 # 但脚本化批量回归会把失败当成通过，静默漏掉一整轮。

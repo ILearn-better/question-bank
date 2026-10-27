@@ -366,17 +366,33 @@ class AiTestIn(BaseModel):
 
 
 class RecognizeIn(BaseModel):
-    """公式 / 题干识别请求。
+    """公式 / 题干 / 答案识别请求。
 
     image 收 base64（`data:image/png;base64,...` 或裸 base64 都行），**不收 URL**。
     理由：要识别的图可能还没落盘 —— 老师刚框选完、题还没保存；即便已落盘，
     让后端去反查「这个 URL 对应磁盘上哪个文件」也只是多一处会错的地方。
     前端多走一步 fetch → FileReader，换来后端完全不关心图片从哪来。
+
+    `images` 是**答案跨页**用的：一张截图装不下整段答案时，一次传多张，
+    模型按顺序连着转录（第 2 张的开头自然接第 1 张的结尾）。
+    两个字段都给了以 `images` 为准；一个都没给 → 422。
     """
 
-    image: str
-    mode: str = "question"          # question（题干）/ formula（纯公式）
+    image: str = ""
+    images: Optional[List[str]] = None   # 多图（跨页答案）；给了就忽略 image
+    mode: str = "question"          # question（题干）/ answer（答案）/ formula（纯公式）
     hint: Optional[str] = None      # 老师额外给的一句话提示，可空
+
+
+class StitchIn(BaseModel):
+    """把多张**上传/粘贴**的截图竖拼成一张（答案跨页用）。
+
+    与 `CropStripIn` 的区别：那个拼的是「同一份原件上的几个区域」（服务端自己渲染），
+    这个拼的是「老师从屏幕/手机截来的图」—— 可能根本不是同一份文档，只有像素。
+    """
+
+    images: List[str]              # base64 数组（data URI 或裸 base64）
+    gap: int = 0                   # 两张之间留几像素白条，默认 0（紧贴）
 
 
 class DimIn(BaseModel):

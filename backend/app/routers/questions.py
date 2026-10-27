@@ -237,6 +237,11 @@ def list_questions(
     document_id: str | None = None,
     curriculum_id: int | None = None,
     node_id: int | None = None,
+    # 只取前 N 条。**默认 None = 全部**，与改动前完全一样（别的调用方零影响）。
+    # 存在的理由：录题页在没有选中文档时也要列一批题，而那时没有 document_id 可用 ——
+    # 不带 limit 就是把整个题库传一遍（题库大了以后每次进页面都是几 MB JSON）。
+    limit: int | None = Query(None, ge=1, le=2000,
+                             description="只取前 N 条（不传 = 全部）"),
     db: Session = Depends(get_db),
 ):
     stmt = select(Question)
@@ -253,6 +258,10 @@ def list_questions(
         stmt = stmt.order_by(Question.created_at.desc())
     if curriculum_id:
         stmt = stmt.where(Question.curriculum_id == curriculum_id)
+    if limit:
+        # 必须 order_by 之后才 limit：无文档那条分支是 `created_at desc`，
+        # 所以拿到的是「最近 N 条」；按文档取时是升序，前 N 条 = 这份文档最前面那几题。
+        stmt = stmt.limit(limit)
     return [_serialize(q) for q in db.scalars(stmt).all()]
 
 

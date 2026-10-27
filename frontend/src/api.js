@@ -376,7 +376,11 @@ export const gradeApi = {
    *  ⚠️ 已经批出结果的不能再改，只能「重新批改」—— 否则旧判定是按旧依据批的。 */
   patchSetup: (gid, body) => api.patch(`/api/homework-grades/${gid}`, body),
   /** 开始/重跑。**幂等**：已经在跑时返回当前进度，不会重复开一个任务。 */
-  run: (gid) => api.post(`/api/homework-grades/${gid}/run`),
+  // force：确认要覆盖老师已有的劳动（已确认 / 逐题复核 / 批注）时才带。
+  // 不带时服务端会对这种情况返回 409 并说明会清掉什么 —— 让这个决定必须经过一次确认，
+  // 而不是点一下按钮就没了。
+  run: (gid, force) =>
+    api.post(`/api/homework-grades/${gid}/run${force ? '?force=true' : ''}`),
   /** 终止。**只受理「真的在跑」的那一批**，没在跑时后端给 409（detail 里是理由）。
    *  ⚠️ 语义是「受理」而不是「立刻停」—— 在跑的那几页 AI 调用掐不断，
    *     拿到 200 之后要继续轮询，等状态落到 reviewing。 */

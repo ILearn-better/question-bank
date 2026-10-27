@@ -140,6 +140,12 @@ def run_real() -> None:
     import time
     import urllib.error
     import urllib.request
+
+    # 免代理 opener（契约第六节第 2 条）：本机 http_proxy 会把 127.0.0.1 的请求也送去代理，
+    # 回来是 502 Bad Gateway —— 于是「服务没起」被误读成「服务坏了」，
+    # 更坏的是 502 的响应体被当成数据往下跑（报 byte indices 之类，完全误导）。
+    # 本机 HTTP 一律走这个 opener；连不上就该是 ConnectionRefused，红得明白。
+    _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     from pathlib import Path
 
     print("\n[6] 真实识别（--real）")
@@ -165,7 +171,7 @@ def run_real() -> None:
     )
     t0 = time.time()
     try:
-        with urllib.request.urlopen(req, timeout=300) as resp:
+        with _OPENER.open(req, timeout=300) as resp:
             data = json.loads(resp.read().decode("utf-8"))
     except urllib.error.URLError as e:
         print(f"  – 跳过：接口不可达（{e.reason}）—— 服务起了吗？")

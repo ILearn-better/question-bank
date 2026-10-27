@@ -23,11 +23,20 @@ import sqlite3
 import urllib.error
 import urllib.parse
 import urllib.request
+
 import uuid
 import zipfile
 from pathlib import Path
 
-S = "http://127.0.0.1:8001"
+# 免代理 opener（契约第六节第 2 条）：本机 http_proxy 会把 127.0.0.1 的请求也送去代理，
+# 回来是 502 Bad Gateway —— 于是「服务没起」被误读成「服务坏了」，
+# 更坏的是 502 的响应体被当成数据往下跑（报 byte indices 之类，完全误导）。
+# 本机 HTTP 一律走这个 opener；连不上就该是 ConnectionRefused，红得明白。
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+# 8001 = 独立临库，故意不跟 8000/8010 对齐：这些用例会写库，跑真库等于毁老师的题
+# （要换端口用 SHIKE_SCRATCH 覆盖，默认仍是 8001 —— 默认值必须指向隔离环境）
+S = os.environ.get("SHIKE_SCRATCH") or "http://127.0.0.1:8001"
 SCRATCH = Path(os.environ["TEMP"]) / "notes_scratch"
 DB = SCRATCH / "notes.db"
 NOTES_DIR = SCRATCH / "uploads" / "notes"
@@ -40,13 +49,11 @@ STEM_TEXT = "解方程 x^2-5x+6=0"
 
 fails = []
 
-
 def check(label, got, want=True):
     okk = got == want
     print(f"  [{'OK ' if okk else 'FAIL'}] {label}: {got!r}" + ("" if okk else f"  期望 {want!r}"))
     if not okk:
         fails.append(label)
-
 
 def req(method, path, body=None):
     data = json.dumps(body).encode() if body is not None else None
@@ -54,7 +61,7 @@ def req(method, path, body=None):
                                data=data, method=method,
                                headers={"Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(r, timeout=120) as resp:
+        with _OPENER.open(r, timeout=120) as resp:
             return resp.status, json.loads(resp.read())
     except urllib.error.HTTPError as e:
         raw = e.read()
@@ -63,15 +70,13 @@ def req(method, path, body=None):
         except Exception:
             return e.code, raw.decode("utf-8", "replace")
 
-
 def raw(path):
     """拿二进制（导出文件 / 图片）：只看状态码与字节数，别拿 JSON 去解。"""
     try:
-        with urllib.request.urlopen(S + urllib.parse.quote(path, safe="/?=&"), timeout=120) as r:
+        with _OPENER.open(S + urllib.parse.quote(path, safe="/?=&"), timeout=120) as r:
             return r.status, r.read()
     except urllib.error.HTTPError as e:
         return e.code, e.read()
-
 
 def png_bytes(tag="q"):
     """造一张真 PNG（用 pymupdf 渲染，不手写魔数 —— 服务端按魔数校验）。"""
@@ -83,14 +88,12 @@ def png_bytes(tag="q"):
     doc.close()
     return blob
 
-
 def docx_text(blob: bytes) -> str:
     """从 docx 里抠出正文文字（去标签），用来断言答案到底在不在文件里。"""
     with zipfile.ZipFile(io.BytesIO(blob)) as z:
         xml = z.read("word/document.xml").decode("utf-8", "replace")
     xml = re.sub(r"</w:p>", "\n", xml)
     return re.sub(r"<[^>]+>", "", xml)
-
 
 print("==== ⓪ 清空临时库，造题（一道带图带答案，一道纯文字） ====")
 CROPS_DIR.mkdir(parents=True, exist_ok=True)
@@ -226,7 +229,6 @@ if fails:
     print(f"❌ {len(fails)} 项没过：" + "；".join(fails))
 else:
     print("✅ ALL PASS")
-
 
 # 退出码即结果（0 = 全过）。以前这里只打印不设码 —— 单跑时人看得出来，
 # 但脚本化批量回归会把失败当成通过，静默漏掉一整轮。

@@ -56,20 +56,25 @@ def test_ai(payload: Optional[AiTestIn] = None, db: Session = Depends(get_db)):
 # ---------------------------------------------------------------- 识别
 @router.post("/ai/recognize")
 def recognize_image(payload: RecognizeIn, db: Session = Depends(get_db)):
-    """把一张图识别成带 $LaTeX$ 的文本。
+    """把一张（或**多张**）图识别成带 $LaTeX$ 的文本。
+
+    多张图是给「答案跨页」用的：p10 下半页 + p11 上半页分开截，
+    一次发过去让模型按顺序连着转录 —— 比先竖拼成一张再识别更清楚，
+    因为每张图各自压缩，字不会因为长边翻倍而变小。
 
     返回的是**候选**，不是最终结果：前端必须让老师过目、可编辑、确认后才写进题干。
     这一点和润色是同一条原则 —— 识别偶尔会看错一个手写字母或正负号，
     悄悄替他决定了，错误就会一路带到印出来的卷子上。
 
-    ⚠️ 会联网把这张图发到配置的 AI 服务商。必须由老师主动点按钮触发。
+    ⚠️ 会联网把这些图发到配置的 AI 服务商。必须由老师主动点按钮触发。
     """
     try:
         return vision.recognize(
             db,
-            payload.image,
+            payload.image or "",
             mode=payload.mode or "question",
             hint=payload.hint or "",
+            images=payload.images,
         )
     except ai_polish.AiError as e:
         # VisionError 继承自 AiError，所以超时 / 空正文 / 参数错误都在这里统一成 502：

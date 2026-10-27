@@ -336,7 +336,11 @@ def detail(db: Session, grade: HomeworkGrade) -> dict:
     out = brief(grade)
     items = db.scalars(
         select(HomeworkGradeItem)
-        .where(HomeworkGradeItem.grade_id == grade.id)
+        # 只给**显示中的那一代**（0038）。重批期间库里会同时躺着上一代与这一轮，
+        # 不筛就会两批题并排出现；而筛的依据是 grade.item_run 这个指针，不是"最新的"，
+        # 所以重批没成功之前，老师看到的始终是上一次那份完整结果。
+        .where(HomeworkGradeItem.grade_id == grade.id,
+               HomeworkGradeItem.run_no == int(grade.item_run or 0))
         .order_by(HomeworkGradeItem.seq, HomeworkGradeItem.id)
     ).all()
     files = db.scalars(
@@ -1653,7 +1657,7 @@ def _recognize_region(png: str, ctx: dict) -> tuple[list[dict], str]:
 
 
 # ---------------------------------------------------------------- 逐页写入
-def _item_row(r: dict, gid: int, pno: int, seq: int) -> HomeworkGradeItem:
+def _item_row(r: dict, gid: int, pno: int, seq: int, run_no: int = 0) -> HomeworkGradeItem:
     raw = r.get("raw")
     if isinstance(raw, str):
         raw_txt = raw
@@ -1691,20 +1695,23 @@ def _item_row(r: dict, gid: int, pno: int, seq: int) -> HomeworkGradeItem:
         raw=raw_txt,
         transcription_version=1,
         status="pending",                          # AI 初稿，等老师看
+        run_no=run_no,                             # 属于第几轮重批（0038）
         created_at=_now(),
     )
 
 
-def _write_page_items(gid: int, pno: int, items: list[dict], curriculum_id: int | None) -> None:
+def _write_page_items(gid: int, pno: int, items: list[dict], curriculum_id: int | None,
+                      run_no: int) -> None:
     """把一页的结果落库。**只在批改主线程里调**（SQLite 单写者，写必须串行）。"""
     db = SessionLocal()
     try:
-        # 重跑时这一页的旧题先清掉（挂在这些题上的标注随外键 CASCADE 一起走）。
-        # 不清会在重批后把同一道题留成两行，seq 重排后就并排显示两遍。
+        # 同一轮里这一页若被写过两次（重试），清掉本轮这一页的旧行 —— 不清会留成两行，
+        # seq 重排后就并排显示两遍。**只清本轮**：上一代那一页的题是老师正在看的，动不得。
         db.execute(delete(HomeworkGradeItem).where(
-            HomeworkGradeItem.grade_id == gid, HomeworkGradeItem.page_no == pno))
+            HomeworkGradeItem.grade_id == gid, HomeworkGradeItem.page_no == pno,
+            HomeworkGradeItem.run_no == run_no))
         for idx, r in enumerate(items):
-            it = _item_row(r, gid, pno, pno * 1000 + idx)
+            it = _item_row(r, gid, pno, pno * 1000 + idx, run_no)
             # 考点尽力挂到知识树上 —— 挂不上不是错误（多数体系根本没有知识树），
             # 只是掌握度那边会少一根线。与 batch_page 同一套处理。
             if it.kp_name:
@@ -1720,12 +1727,21 @@ def _write_page_items(gid: int, pno: int, items: list[dict], curriculum_id: int 
 
 
 def _renumber(gid: int) -> None:
-    """seq 收口成 1..N（按「页号 → 页内顺序」）。页是并行回来的，完成顺序不等于卷面顺序。"""
+    """seq 收口成 1..N（按「页号 → 页内顺序」）。页是并行回来的，完成顺序不等于卷面顺序。
+
+    **只排显示中的那一代**：重批没成功时库里还躺着这一轮的半截题行，一起排会把它们的
+    seq 也算进 1..N，等下次换代时旧行早被删了 —— 但更糟的是「排完发现 N 变大了」这种
+    只在特定失败顺序下才出现的怪现象。可见代由 `grade.item_run` 定，与 detail() 同一口径。
+    """
     db = SessionLocal()
     try:
+        g = db.get(HomeworkGrade, gid)
+        if g is None:
+            return
         rows = db.scalars(
             select(HomeworkGradeItem)
-            .where(HomeworkGradeItem.grade_id == gid)
+            .where(HomeworkGradeItem.grade_id == gid,
+                   HomeworkGradeItem.run_no == int(g.item_run or 0))
             .order_by(HomeworkGradeItem.page_no, HomeworkGradeItem.seq, HomeworkGradeItem.id)
         ).all()
         for i, it in enumerate(rows, start=1):
@@ -1733,6 +1749,42 @@ def _renumber(gid: int) -> None:
         db.commit()
     finally:
         db.close()
+
+
+def _settle_run(db: Session, g: HomeworkGrade, run_no: int, keep: bool) -> None:
+    """把「这一轮」（run_no）跟「显示中的那一代」（g.item_run）结账 —— 唯一决定留谁的地方。
+
+    keep=True （新一轮全成）：指针换到这一轮，其它代的题行全删。挂在旧题上的标注随
+                外键 `ON DELETE CASCADE` 一起走（`db.py` 每个连接都开了
+                 `PRAGMA foreign_keys=ON`）；页级标注 `item_id` 为空，不在这次删除里，
+                那是老师画在纸上的话，与哪一轮 AI 结果无关。
+    keep=False（没全成 / 被终止）：删掉这一轮写进去的题行，**指针不动** —— 老师上一次
+                看到的逐题判读、逐题复核状态、批注一个字都不变。这正是本次要修的东西：
+                以前的实现一进门就删，AI 一失败就再也拿不回来。
+
+    ⚠️ 例外：**根本没有上一代**（第一次批改就失败/终止）时不能把结果丢掉 ——
+       那时把这一轮直接当显示中的那一代，与改动前完全一致（批到几页就能看几页、能复核）。
+       判据是「有没有属于 item_run 的题行」，不是「item_run 是不是 0」：迁移来的老数据
+       item_run=0 且有题行，那是真的上一代。
+    """
+    old = int(g.item_run or 0)
+    has_old = bool(db.scalar(
+        select(func.count()).select_from(HomeworkGradeItem).where(
+            HomeworkGradeItem.grade_id == g.id, HomeworkGradeItem.run_no == old)
+    ) or 0)
+    if keep or not has_old:
+        if keep and old != run_no:
+            db.execute(delete(HomeworkGradeItem).where(
+                HomeworkGradeItem.grade_id == g.id, HomeworkGradeItem.run_no != run_no))
+        g.item_run = run_no
+        if keep:
+            # 新一代是**没人复核过**的 AI 初稿：上一次那个「整份已确认」必须作废，
+            # 否则统计口径会读到一份没人看过就被标成已确认的结果。
+            # 只在成功换代时清 —— 失败时旧结果还在，那份确认也还有效（见 launch 的注释）。
+            g.reviewed_at = None
+    else:
+        db.execute(delete(HomeworkGradeItem).where(
+            HomeworkGradeItem.grade_id == g.id, HomeworkGradeItem.run_no == run_no))
 
 
 def _bump(gid: int, done: int, failed: int) -> None:
@@ -1747,7 +1799,7 @@ def _bump(gid: int, done: int, failed: int) -> None:
 
 
 def _finalize(gid: int, done: int, first_err: str = "", abort: str = "",
-              canceled: bool = False) -> None:
+              canceled: bool = False, run_no: int = 0) -> None:
     """收尾。状态机与 `batch_page._finalize` 同一套（前端不用分叉）：
 
     全成 → reviewing（**不是 done**：等人看）；全失败 → failed；一半 → partial。
@@ -1758,6 +1810,9 @@ def _finalize(gid: int, done: int, first_err: str = "", abort: str = "",
     是他要的结果 —— 所以批到几页就留几页，状态给 `reviewing` 让他照常复核，
     只在 error 里写清「只批了 N/M 页」。把它标成 failed 的话，那些结果在列表里
     会显示成失败、还要重新批一遍，等于白等。
+
+    `run_no` 是这一轮写进的是哪一代（0038）。>0 时在这里结账：全成才换代、否则把
+    这一轮丢掉。默认 0 = 不结账（历史调用方 / 单测直接调它时没有"轮"的概念）。
     """
     db = SessionLocal()
     try:
@@ -1767,6 +1822,10 @@ def _finalize(gid: int, done: int, first_err: str = "", abort: str = "",
         failed = max(0, int(g.total or 0) - done)
         g.done, g.failed = done, failed
         g.finished_at = _now()
+        # ★ 换代结账**先于**写状态：这个 session 里一次 commit，不会出现
+        #   「状态已经是 reviewing、界面上还是上一代」的中间态。
+        if run_no > 0:
+            _settle_run(db, g, run_no, keep=(not canceled) and done > 0 and failed == 0)
         if canceled:
             g.status = "reviewing" if done > 0 else "failed"
             g.error = (f"已手动终止：只批了 {done}/{int(g.total or 0)} 页"
@@ -1821,12 +1880,50 @@ def request_cancel(gid: int) -> bool:
         return True
 
 
-def launch(db: Session, grade: HomeworkGrade) -> bool:
+def _human_work_on(db: Session, grade: HomeworkGrade) -> str:
+    """这份批改上还有没有「老师亲手做过、重批会覆盖掉」的东西。返回人话，空串 = 没有。
+
+    为什么判据是这四条而不是「批过没有」：重批**失败时旧结果会保留**（0038 的换代口径），
+    所以「批过一次」本身不该拦人 —— 老师对 AI 草稿不满意、想重跑，那是正常流程。
+    真正会被（成功后的）换代清掉的是**老师的劳动**：
+
+      · status=done / reviewed_at → 整份已经确认过；
+      · 有 reviewed_at 的题           → 逐题复核过（改判、写错因、挂知识点）；
+      · created_by=teacher 的标注     → 在原件上画过批注。
+
+    只统计**当前显示那一代**的题：上一代之外的残留世代本来就不在界面上，
+    为它弹一次「你复核过 N 道题」会让老师莫名其妙。
+    """
+    if grade.status == "done" or grade.reviewed_at:
+        return "这份作业已经确认过了"
+    reviewed = int(db.scalar(
+        select(func.count()).select_from(HomeworkGradeItem).where(
+            HomeworkGradeItem.grade_id == grade.id,
+            HomeworkGradeItem.run_no == int(grade.item_run or 0),
+            HomeworkGradeItem.reviewed_at.is_not(None))
+    ) or 0)
+    if reviewed:
+        return f"你已经逐题复核过 {reviewed} 道题"
+    marked = int(db.scalar(
+        select(func.count()).select_from(HomeworkGradeMark).where(
+            HomeworkGradeMark.grade_id == grade.id,
+            HomeworkGradeMark.created_by == "teacher")
+    ) or 0)
+    if marked:
+        return f"你在这份作业上画过 {marked} 处批注"
+    return ""
+
+
+def launch(db: Session, grade: HomeworkGrade, force: bool = False) -> bool:
     """认领 + 起后台线程。**已在跑就什么都不做**（前端连点两下不该跑两遍）。
 
     为什么用进程内的集合而不是只看 `status`：进程崩过之后库里会留下一个
     永远 `running` 的僵尸（没人写它了）。以「本进程里真的有这么个线程」为准，
     僵尸就能被重新认领 —— 否则这份作业再也批不了。
+
+    `force=False` 时，若这份上还有老师亲手做过的东西，抛 409 让人先确认
+    （见 `_human_work_on`）。**必须是关键字/默认值**，不能占位置参数 ——
+    调用方一直是 `launch(db, grade)` 两个参数。
     """
     # ★ 开批前最后一道门：依据是**可以被单独删掉**的（DELETE /basis/{fid}），
     #   删完库里 mode 还是 key/rubric。没有这道门，一份「按我的答案判」的任务会在
@@ -1836,6 +1933,17 @@ def launch(db: Session, grade: HomeworkGrade) -> bool:
     missing = _missing_basis(db, grade)
     if missing:
         raise GradeError(422, _missing_basis_msg(missing))
+    # ★ 第二道门（0038）：这一份上已经有老师的劳动时，重批（成功后）会连题带标注一起
+    #   换掉，所以要先问过。**抛在线程之前** —— 被拦下时不能已经起了一个后台任务。
+    #   failed / partial / 没复核过的 reviewing 一律直接放行：那是「重试」，不是「覆盖」。
+    if not force:
+        why = _human_work_on(db, grade)
+        if why:
+            raise GradeError(
+                409,
+                f"{why} —— 重新批改会清掉逐题复核记录与批注"
+                "（旧结果会在新一轮全部成功后才被替换，失败则原样保留）。"
+                "确认要重跑请带 force=true 再来一次。")
     with _run_lock:
         if grade.id in _running:
             return False
@@ -1844,13 +1952,14 @@ def launch(db: Session, grade: HomeworkGrade) -> bool:
         #    但线程被强杀 / 上次 _finalize 没走到时会留下 —— 不清的话新的一开批
         #    就立刻自我终止，现象是「点开始 → 一秒钟就失败」。
         _cancel.discard(grade.id)
-    # 重跑＝重来：进度清零，**并且把上一次的"确认"作废**（reviewed_at 清空、回到 queued）。
-    # 不这么做的话，重批中的结果会挂着一个旧的"已确认"，统计口径会读到半截数据。
+    # 重跑＝重来：进度清零、回到 queued。
+    # ⚠️ 这里**不动 reviewed_at**。以前开批就把它清空，于是"重批失败"也会把
+    #    "已确认"一起抹掉 —— 而失败时旧结果其实原样留着（见 _settle_run）。
+    #    现在由换代成功那一刻作废（_settle_run 的 keep 分支），语义与数据才对得上。
     grade.status = "queued"
     grade.done = grade.failed = 0
     grade.error = ""
     grade.finished_at = None
-    grade.reviewed_at = None
     db.commit()
     threading.Thread(target=run_grade, args=(grade.id,), daemon=True).start()
     return True
@@ -1871,6 +1980,7 @@ def run_grade(gid: int) -> None:
 
 
 def _run_grade(gid: int) -> None:
+    run_no = 0            # 先给个 0：异常路径也要能安全地传给 _finalize（0 = 不结账）
     db = SessionLocal()
     try:
         grade = db.get(HomeworkGrade, gid)
@@ -1897,10 +2007,14 @@ def _run_grade(gid: int) -> None:
             grade.finished_at = _now()
             db.commit()
             return
-        # 重跑：旧题全清（连同挂在上面的标注）。页级标注（item_id 为空）保留 ——
-        # 那些是老师画在纸上的话，与这一遍的 AI 结果无关。
-        db.execute(delete(HomeworkGradeItem).where(HomeworkGradeItem.grade_id == gid))
-        db.commit()
+        # 这一轮写进哪一代（0038）：只增，绝不覆盖上一代。
+        # ⚠️ 这里**不再删旧题**。以前一进门就 delete + commit，然后才起线程调 AI ——
+        #    中途任何一页失败，上一次的逐题判读连同挂在上面的批注就再也拿不回来了。
+        #    现在旧代一直在，"留谁"由 _finalize → _settle_run 在收尾时一次性决定：
+        #    新一轮**全部成功**才换指针并删旧代。
+        run_no = int(db.scalar(
+            select(func.max(HomeworkGradeItem.run_no))
+            .where(HomeworkGradeItem.grade_id == gid)) or 0) + 1
         base_ctx = _ctx_base(db, grade)
         curriculum_id = grade.curriculum_id
         # 框必须在关 session 之前读成纯 dict —— 线程里不许碰 ORM 对象。
@@ -1953,7 +2067,7 @@ def _run_grade(gid: int) -> None:
                 first_err = first_err or f"第 {pno} 页：{err}"
             else:
                 try:
-                    _write_page_items(gid, pno, items, curriculum_id)
+                    _write_page_items(gid, pno, items, curriculum_id, run_no)
                     # ⚠️ 一页 0 道题也算 done：空白页/纯页眉确实被读完了。
                     #    done 是页数，不是题目数 —— 别在这里改成 len(items)。
                     done += 1
@@ -1962,16 +2076,21 @@ def _run_grade(gid: int) -> None:
                     first_err = first_err or f"第 {pno} 页写库失败：{e}"
             _bump(gid, done, failed)
     except Exception as e:                           # noqa: BLE001
-        _finalize(gid, done, first_err, abort=f"批改线程异常终止：{e}")
+        _finalize(gid, done, first_err, abort=f"批改线程异常终止：{e}", run_no=run_no)
+        _renumber(gid)
         return
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
+    # ⚠️ 顺序是 **先 _finalize（结账/换代）再 _renumber**：
+    #    只有结完账才知道该给哪一代排 seq。反过来的话，重批成功时排的是旧代，
+    #    新一代的 seq 会一直停在 pno*1000+idx —— 顺序看着还对，但"1..N 收口"这条
+    #    保证就没了。
     if canceled:
+        _finalize(gid, done, first_err, canceled=True, run_no=run_no)
         _renumber(gid)
-        _finalize(gid, done, first_err, canceled=True)
         return
+    _finalize(gid, done, first_err, run_no=run_no)
     _renumber(gid)
-    _finalize(gid, done, first_err)
 
 
 def _run_one_page(gid: int, slot: dict, ctx_base: dict,
@@ -2406,6 +2525,9 @@ def confirm_grade(db: Session, gid: int, payload: GradeConfirmIn) -> HomeworkGra
     pending = db.scalars(
         select(HomeworkGradeItem).where(
             HomeworkGradeItem.grade_id == grade.id,
+            # 只确认**显示中的那一代**（0038）。崩溃/重批留下的残留世代若在这里被一起
+            # 置成 approved，就成了"没人看过却已确认"的结果，而界面上根本看不到它。
+            HomeworkGradeItem.run_no == int(grade.item_run or 0),
             HomeworkGradeItem.status == "pending",
         )
     ).all()

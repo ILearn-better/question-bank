@@ -2,11 +2,20 @@
 """端到端测试：PDF 视觉分割接口链路。"""
 import json
 import urllib.request
+import os
+from pathlib import Path
 
-BASE = "http://127.0.0.1:8000"
+# 免代理 opener（契约第六节第 2 条）：本机 http_proxy 会把 127.0.0.1 的请求也送去代理，
+# 回来是 502 Bad Gateway —— 于是「服务没起」被误读成「服务坏了」，
+# 更坏的是 502 的响应体被当成数据往下跑（报 byte indices 之类，完全误导）。
+# 本机 HTTP 一律走这个 opener；连不上就该是 ConnectionRefused，红得明白。
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+BASE = os.environ.get("SHIKE_BASE") or (
+    "http://127.0.0.1:8010" if Path(__file__).resolve().parents[1].name == "question-bank-ai"
+    else "http://127.0.0.1:8000")   # 主仓 8000 / -ai 检出 8010，SHIKE_BASE 可覆盖
 SAMPLE = "../samples/高二数学专项测试卷.pdf"
 BOUNDARY = "----testboundary"
-
 
 def multipart(path):
     with open(path, "rb") as f:
@@ -18,17 +27,14 @@ def multipart(path):
     ).encode() + data + f"\r\n--{BOUNDARY}--\r\n".encode()
     return body
 
-
 def post(url, body, ctype):
     req = urllib.request.Request(url, data=body, headers={"Content-Type": ctype}, method="POST")
-    with urllib.request.urlopen(req) as r:
+    with _OPENER.open(req) as r:
         return json.loads(r.read())
 
-
 def get(url):
-    with urllib.request.urlopen(url) as r:
+    with _OPENER.open(url) as r:
         return r.status, r.read()
-
 
 # 1. 上传
 d = post(BASE + "/api/documents", multipart(SAMPLE), f"multipart/form-data; boundary={BOUNDARY}")

@@ -29,10 +29,17 @@ import sys
 import traceback
 import urllib.error
 import urllib.request
+
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from app import config                                   # noqa: E402  只为 CROPS_DIR
+
+# 免代理 opener（契约第六节第 2 条）：本机 http_proxy 会把 127.0.0.1 的请求也送去代理，
+# 回来是 502 Bad Gateway —— 于是「服务没起」被误读成「服务坏了」，
+# 更坏的是 502 的响应体被当成数据往下跑（报 byte indices 之类，完全误导）。
+# 本机 HTTP 一律走这个 opener；连不上就该是 ConnectionRefused，红得明白。
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 # 默认打哪个端口，**按检出目录名判定** —— 这个仓库曾经有一份实验副本
 # （目录名 `question-bank-ai`，端口 8010），副本里的测试必须验副本自己的代码。
@@ -54,23 +61,20 @@ CURRICULUM_WITH_TREE = 3
 
 fails: list[str] = []
 
-
 def check(name: str, ok: bool, extra: str = "") -> None:
     print(f"  [{'OK ' if ok else 'FAIL'}] {name}" + (f"  {extra}" if extra else ""))
     if not ok:
         fails.append(name)
 
-
 def skip(name: str, why: str) -> None:
     print(f"  [skip] {name}：{why}")
-
 
 def req(method: str, path: str, body=None):
     data = json.dumps(body).encode("utf-8") if body is not None else None
     r = urllib.request.Request(BASE + path, data=data, method=method,
                                headers={"Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(r) as resp:
+        with _OPENER.open(r) as resp:
             raw = resp.read()
             try:
                 return resp.status, json.loads(raw)
@@ -83,15 +87,12 @@ def req(method: str, path: str, body=None):
         except json.JSONDecodeError:
             return e.code, raw.decode("utf-8", "replace")
 
-
 def crop_file(url: str) -> Path:
     """把 /api/crops/xxx.png 换算成磁盘路径 —— 判断「文件到底还在不在」只能看盘。"""
     return config.CROPS_DIR / url.rsplit("/", 1)[-1]
 
-
 def crop_count() -> int:
     return len(list(config.CROPS_DIR.glob("*"))) if config.CROPS_DIR.exists() else 0
-
 
 def req_raw(method: str, path: str):
     """拿**原始字节**（区域预览返回的是 PNG，不是 JSON）。返回 (状态码, 字节, Content-Type)。
@@ -101,11 +102,10 @@ def req_raw(method: str, path: str):
     """
     r = urllib.request.Request(BASE + path, method=method)
     try:
-        with urllib.request.urlopen(r) as resp:
+        with _OPENER.open(r) as resp:
             return resp.status, resp.read(), resp.headers.get("Content-Type")
     except urllib.error.HTTPError as e:
         return e.code, e.read(), e.headers.get("Content-Type")
-
 
 def pdf_page_count(doc_id: str) -> int | None:
     st, r = req("GET", f"/api/documents/{doc_id}/pages")
@@ -115,7 +115,6 @@ def pdf_page_count(doc_id: str) -> int | None:
         return int(r.get("page_count") or 0)
     except (TypeError, ValueError):
         return None
-
 
 def pick_pdf_doc() -> dict | None:
     """挑一份能进「页面视图」的 PDF 文档来试 batch-crop。
@@ -143,7 +142,6 @@ def pick_pdf_doc() -> dict | None:
         return None
     return dict(first, page_count=pdf_page_count(first["id"]) or 1)
 
-
 def make_own_crops(n: int, state: dict) -> list[str]:
     """自造 n 张只属于本次测试的原貌图（不裁真实文档）。"""
     from PIL import Image
@@ -159,7 +157,6 @@ def make_own_crops(n: int, state: dict) -> list[str]:
         state["crops"].append(name)
         out.append(f"/api/crops/{name}")
     return out
-
 
 # ==================================================================== 主体
 def run(state: dict) -> None:
@@ -543,7 +540,6 @@ def run(state: dict) -> None:
     check("任务列表长度回到测试之前", st == 200 and len(r) == state["jobs_before"],
           f"{len(r)} vs 之前 {state['jobs_before']}")
 
-
 # ==================================================================== 收尾
 def cleanup(state: dict) -> None:
     print("\n==== ⑪ 收尾与对账 ====")
@@ -599,7 +595,6 @@ def cleanup(state: dict) -> None:
     else:
         print("✅ 全部通过")
 
-
 def main() -> int:
     st, jobs = req("GET", "/api/batches")
     st2, qs = req("GET", "/api/questions")
@@ -621,7 +616,6 @@ def main() -> int:
         cleanup(state)
 
     return 1 if fails else 0
-
 
 if __name__ == "__main__":
     sys.exit(main())

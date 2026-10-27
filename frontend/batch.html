@@ -969,6 +969,50 @@ function normalizeMath(md) {
     .map((s, i) => (i % 2 ? s : inText(s))).join('');
 }
 
+/** 公式保护：`$…$` / `$$…$$` 先换成占位符，marked 解析完再放回去。
+ *
+ *  ⚠️ 这份是 `src/mathRender.js` 的同名实现的**零构建副本**（batch.html 不走 ES 模块，
+ *     没法 import），与 `entry.html` 那份逐字同逻辑。几处必须一模一样 —— 行为漂了会
+ *     出现「录题页渲染正常、批量导入页公式坏掉」这种只在某一页复现的怪事。
+ *     math_render_check.js 对这四份做的是**行为对比**（同一组输入逐字比输出），不是文本对比。
+ *
+ *  为什么必须有它：公式内容过一遍 Markdown 会被吃掉 —— `$5\%$` 的 `\%` 变 `%`
+ *  （LaTeX 注释符，公式直接截断）、`$S=2*3*4$` 的 `*` 变 `<em>`（文本节点被切碎，
+ *  公式一个都不渲染）、`$$x&=1 \\ y&=2$$` 的 `&` 变 `&amp;`、`\\` 变 `\`。
+ *  详细实测表见 src/mathRender.js 的 protectMath 注释。
+ */
+const _PH_RE = /\uE000(\d+)\uE000/g;
+const _ph = (i) => '\uE000' + i + '\uE000';
+
+function protectMath(md) {
+  const store = [];
+  const keep = (tex, display) => {
+    store.push({ tex, display });
+    return _ph(store.length - 1);
+  };
+  const conv = (s) => s
+    .replace(/\\\[([\s\S]+?)\\\]/g, (m, tex) => keep(tex, true))
+    .replace(/\\\(([\s\S]+?)\\\)/g, (m, tex) => keep(tex, false))
+    .replace(/\$\$([\s\S]+?)\$\$/g, (m, tex) => keep(tex, true))
+    .replace(/\$([^$\n]+?)\$/g, (m, tex) => keep(tex, false));
+  const inText = (seg) => seg.split(/(`[^`\n]*`)/)
+    .map((p, i) => (i % 2 ? p : conv(p))).join('');
+  const out = String(md || '').split(/(```[\s\S]*?```)/)
+    .map((s, i) => (i % 2 ? s : inText(s))).join('');
+  return { md: out, store };
+}
+
+function restoreMath(html, store) {
+  if (!store || !store.length) return html;
+  return String(html || '').replace(_PH_RE, (m, n) => {
+    const it = store[Number(n)];
+    if (!it) return m;
+    const tex = String(it.tex)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    return it.display ? `$$${tex}$$` : `$${tex}$`;
+  });
+}
+
 /** 文本 → 渲染进 el。写 innerHTML 不交给 Vue 插值 —— KaTeX 的 auto-render
  *  会把 Vue 管理的文本节点换掉，插值的话预览会停在第一次那一版（录题页踩过）。 */
 function renderRich(el, text) {
@@ -976,8 +1020,13 @@ function renderRich(el, text) {
   const t = text || '';
   if (!t) { el.textContent = ''; return; }
   if (window.marked) {
-    const raw = window.marked.parse(normalizeMath(t), { breaks: true, gfm: true });
-    el.innerHTML = window.DOMPurify ? window.DOMPurify.sanitize(raw) : raw;
+    // ① 公式摘出来 → ② marked → ③ 消毒 → ④ 放回去。顺序不能动（见 protectMath 注释）：
+    //   公式先进 marked 会被吃掉；还原跑到消毒之前，公式里的 `<` `&` 会被当 HTML 洗掉。
+    //   normalizeMath 不再在这里调 —— `\(…\)` / `\[…\]` 由 protectMath 自己归一，
+    //   先归一反而会把这些公式变成 `$…$` 再过一遍 Markdown。
+    const p = protectMath(t);
+    const raw = window.marked.parse(p.md, { breaks: true, gfm: true });
+    el.innerHTML = restoreMath(window.DOMPurify ? window.DOMPurify.sanitize(raw) : raw, p.store);
   } else {
     el.textContent = t;
   }

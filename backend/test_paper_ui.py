@@ -97,7 +97,8 @@ def t_pipeline() -> None:
         return
     src = read(mr)
 
-    for fn in ("LIBS", "ensureLibs", "resetLibs", "normalizeMath", "renderRichEl"):
+    for fn in ("LIBS", "ensureLibs", "resetLibs", "normalizeMath",
+               "protectMath", "restoreMath", "renderRichEl"):
         check(f"mathRender.js 导出 {fn}",
               re.search(rf"export\s+(const|function)\s+{fn}\b", src) is not None)
 
@@ -111,9 +112,16 @@ def t_pipeline() -> None:
               "/vendor/katex/katex.min.js", "/vendor/katex/auto-render.min.js")))
 
     # ⚠️ 这两条是踩过的坑，别被「看起来等价」的重构改回去
-    check("normalizeMath 排在 marked.parse **之前**（放后面公式必挂）",
-          re.search(r"marked\.parse\(\s*normalizeMath\(", src) is not None,
-          "marked.parse 的入参必须是 normalizeMath 的结果")
+    #    公式**先摘出来**再交给 marked（protectMath），否则 Markdown 会把公式里
+    #    的 `\%` `\{` `*` `~~` `&` `\\` 当自己的语法吃掉 —— 实测会让公式整条不渲染。
+    check("公式保护排在 marked.parse **之前**（公式内容一个字符都不该过 Markdown）",
+          re.search(r"marked\.parse\(\s*p\.md", src) is not None
+          and 0 <= src.find("protectMath(t)") < src.find("marked.parse("),
+          "marked.parse 的入参必须是「公式已摘出」那一份")
+    check("公式还原在消毒之后（restoreMath 包着 DOMPurify 的结果）",
+          re.search(r"restoreMath\(\s*window\.DOMPurify\s*\?\s*window\.DOMPurify\.sanitize\(raw\)",
+                    src) is not None,
+          "还原放前面的话，公式里的 < & 会被当 HTML 处理")
     i_all = src.find("await Promise.all(")
     i_auto = src.find("await loadScript(LIBS.autoRender)")
     check("auto-render 在 katex 之后单独加载（并行会抓到 undefined 的 window.katex）",
@@ -464,11 +472,16 @@ globalThis.window = {
 const el = { innerHTML: '', textContent: '' };
 returned = renderRichEl(el, '设 $a>0$，求 \\(\\frac{a}{b}\\)');
 
-check('★ 喂给 marked 的是**归一化之后**的文本（\(...\) 已经变成 $...$）',
-      seen !== null && seen.indexOf('\\(') < 0 && seen.indexOf('$\\frac{a}{b}$') >= 0, String(seen));
-check('★ 写的是 innerHTML，不是 textContent',
-      el.innerHTML === '<p>' + seen + '</p>' && el.textContent === '', el.innerHTML);
-check('渲染结果过了 DOMPurify（marked 自己不管消毒）', sawHtml === el.innerHTML, String(sawHtml));
+check('★ 喂给 marked 的文本里公式已被摘出（公式内容一个字符都不该过 Markdown）',
+      seen !== null && seen.indexOf('a>0') < 0 && seen.indexOf('\\frac') < 0
+      && seen.indexOf('\uE000') >= 0, String(seen));
+check('★ 写的是 innerHTML，且公式原文完整回来了（不是 textContent）',
+      el.innerHTML.indexOf('$a&gt;0$') >= 0
+      && el.innerHTML.indexOf('$\\frac{a}{b}$') >= 0
+      && el.textContent === '', el.innerHTML);
+check('消毒在还原之前：DOMPurify 收到的是含占位符的 HTML（公式还没放回去）',
+      sawHtml !== null && sawHtml.indexOf('\uE000') >= 0
+      && sawHtml.indexOf('\\frac') < 0, String(sawHtml));
 check('renderMathInElement 被调用，且给了 4 个定界符（含 \( \) 与 \[ \]）',
       Array.isArray(delims) && delims.length === 4, JSON.stringify(delims));
 check('公式渲染 throwOnError=false（错一条公式不该让整块内容消失）',
