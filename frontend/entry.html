@@ -1302,8 +1302,18 @@ const app = createApp({
       this.tagOptions = r.items.map(i => i.tag);
     },
     async loadQuestions() {
-      const qs = await this.api('/api/questions');
-      this.questions = this.doc ? qs.filter(q => q.document_id === this.doc.id) : qs;
+      // 有文档时**让后端按 document_id 筛**，不在前端 filter：
+      //  ① 前端筛等于每次都把整个题库拉回来 —— 题库越大，切文档越慢；
+      //  ② 更麻烦的是错得没声音：前端筛一遍，界面上看起来永远「只有这份文档的题」，
+      //     所以 document_id 参数写错、后端没筛，全都被这层 filter 掩盖掉了。
+      // 没有文档时只取最近 200 条：这一栏是「已录入题目」，没有文档时列全库没有意义，
+      // 而不带上限就是每次进页面都把整个题库传给浏览器（攒到几千题就是几 MB JSON）。
+      // 200 是**这一栏的展示上限**，不是业务口径（要看更多去「题库」页，那边有搜索与分页）。
+      // ⚠️ 无文档时**不要**拼空的 document_id= —— 空值会被后端当成一个过滤条件。
+      const RECENT_Q = 200;
+      this.questions = await this.api(this.doc
+        ? '/api/questions?document_id=' + encodeURIComponent(this.doc.id)
+        : '/api/questions?limit=' + RECENT_Q);
     },
     async uploadFile(opt) {
       const fd = new FormData();

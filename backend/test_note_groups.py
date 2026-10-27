@@ -21,14 +21,22 @@ import sqlite3
 import urllib.error
 import urllib.parse
 import urllib.request
+
 from pathlib import Path
 
+# 免代理 opener（契约第六节第 2 条）：本机 http_proxy 会把 127.0.0.1 的请求也送去代理，
+# 回来是 502 Bad Gateway —— 于是「服务没起」被误读成「服务坏了」，
+# 更坏的是 502 的响应体被当成数据往下跑（报 byte indices 之类，完全误导）。
+# 本机 HTTP 一律走这个 opener；连不上就该是 ConnectionRefused，红得明白。
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
 REAL = "http://127.0.0.1:8000"
-S = "http://127.0.0.1:8001"
+# 8001 = 独立临库，故意不跟 8000/8010 对齐：这些用例会写库，跑真库等于毁老师的题
+# （要换端口用 SHIKE_SCRATCH 覆盖，默认仍是 8001 —— 默认值必须指向隔离环境）
+S = os.environ.get("SHIKE_SCRATCH") or "http://127.0.0.1:8001"
 SCRATCH_DB = Path(os.environ["TEMP"]) / "notes_scratch" / "notes.db"
 
 fails = []
-
 
 def call(base, method, path, body=None):
     data = json.dumps(body).encode() if body is not None else None
@@ -36,7 +44,7 @@ def call(base, method, path, body=None):
                                  data=data, method=method,
                                  headers={"Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(req, timeout=20) as r:
+        with _OPENER.open(req, timeout=20) as r:
             return r.status, json.loads(r.read() or "null")
     except urllib.error.HTTPError as e:
         raw = e.read().decode("utf-8", "replace")
@@ -45,25 +53,20 @@ def call(base, method, path, body=None):
         except Exception:
             return e.code, raw
 
-
 def check(label, got, want):
     okk = got == want
     print(f"  [{'OK ' if okk else 'FAIL'}] {label}: {got!r}" + ("" if okk else f"  期望 {want!r}"))
     if not okk:
         fails.append(label)
 
-
 def roots(base=S):
     return call(base, "GET", "/api/note-folders/tree")[1]["roots"]
-
 
 def root_id(name, base=S):
     return next((r["id"] for r in roots(base) if r["name"] == name), None)
 
-
 def notes(base=S):
     return {x["id"]: x for x in call(base, "GET", "/api/notes")[1]["items"]}
-
 
 print("⓪ 先把临时库清干净（这个测试必须能反复跑）")
 # 真库基线：这个套件对真库只发 GET，所以开始与结束时的数字必须一样。
@@ -186,7 +189,6 @@ check("真库笔记数没变（全程只读过它）",
 
 print()
 print("ALL PASS" if not fails else f"{len(fails)} 项失败: {fails}")
-
 
 # 退出码即结果（0 = 全过）。以前这里只打印不设码 —— 单跑时人看得出来，
 # 但脚本化批量回归会把失败当成通过，静默漏掉一整轮。

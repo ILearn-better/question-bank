@@ -236,14 +236,17 @@ def parse_pages(spec, total: int) -> list[int]:
     return sorted(p for p in out if p > 0)
 
 
-def build_report(task: AutoTask, rows: list[dict]) -> dict:
+def build_report(task: AutoTask, rows: list[dict], failed_pages: list[dict] | None = None) -> dict:
     """把逐条判定结果拼成**机器可读**的报告。**纯函数**。
 
     `rows` 每项：{item_id, seq, page_no, verdict, reason, note, job_id}
+    `failed_pages`：`_failed_pages()` 的结果。**必须传**，否则 `next` 里说不出
+    「这些页的题不会出现」—— 报告会变成「全部处理完」，而内容其实是缺的。
 
     报告要能被 agent 直接消费，所以：①计数和清单都有；②每条待处理项带
     `open`（人能点）+ `fix_with`（agent 能调）+ 一句 `message`（人话）。
     """
+    failed_pages = failed_pages or []
     jobs = _as_list(task.job_ids)
     counts = {"total": len(rows), "approved": 0, "needs_human": 0, "skipped": 0}
     for r in rows:
@@ -280,7 +283,25 @@ def build_report(task: AutoTask, rows: list[dict]) -> dict:
     # 不用靠「删掉今天所有题」这种危险动作。
     approved_ids = [r["question_id"] for r in rows if r.get("question_id")]
 
-    if not todo:
+    # 缺了多少页用 `pages_total - done`，**不是** `failed` 求和：整批没跑成的那批
+    # `failed` 是 0（异常终止只保证写了 error），求和会把它的页数漏掉 ——
+    # 两批同时出事时会说「共 2 页」，实际缺 4 页。
+    # `max(0, ...)` 是防御：某批若 done > pages_total（重跑/并发写脏），别印负数。
+    # ⚠️ 只在这里算一次，`next` 与 CLI 摘要都读这个值，别各算一遍。
+    pages_lost = sum(max(0, int(f.get("pages_total") or 0) - int(f.get("done") or 0))
+                     for f in failed_pages)
+
+    if failed_pages:
+        # 判据是 `pages_lost`（真的有页数），不是 `failed_pages` 非空 ——
+        # 整批没跑成那种情况页数只能从 pages_total - done 得到。
+        if pages_lost:
+            nxt = ("有 %d 批 / 共 %d 页没识别成，这些页的题**不会**出现。"
+                   "先决定重跑还是手工补，再看下面待处理条目。"
+                   % (len(failed_pages), pages_lost))
+        else:
+            nxt = ("有 %d 批**整批没跑成**（一条都没出），不是没有题。"
+                   "先看这些批次的错误，再决定重跑。" % len(failed_pages))
+    elif not todo:
         nxt = "全部处理完，%d 条已入库。" % counts["approved"]
     else:
         nxt = ("%d 条需要处理：打开 /batch.html?job=%s 逐条看；处理完再调 "
@@ -298,6 +319,8 @@ def build_report(task: AutoTask, rows: list[dict]) -> dict:
         "reasons": reasons,
         "needs_human": todo,
         "skipped": skipped,
+        "failed_pages": failed_pages,
+        "pages_lost": pages_lost,
         "approved_question_ids": approved_ids,
         "next": nxt,
     }
@@ -402,11 +425,13 @@ def run_task(task_id: str) -> None:
         db = SessionLocal()
         try:
             task = db.get(AutoTask, task_id)
-            report = build_report(task, rows)
+            # ⚠️ 先定 status 再 build_report：`build_report` 读的是 `task.status`，
+            #    顺序反了报告的 status 就是中间值（"approving"）—— agent 会以为
+            #    任务还没结束，而 `done` 字段却说结束了。
             failed = _failed_pages(db, job_ids)
-            report["failed_pages"] = failed
             task.status = "partial" if failed else "done"
-            task.stage = ("完成，%d 条有页失败" % len(failed)) if failed else "完成"
+            task.stage = ("完成，%d 批有页没识别成" % len(failed)) if failed else "完成"
+            report = build_report(task, rows, failed)
             task.total_items = len(rows)
             task.approved = report["counts"]["approved"]
             task.needs_human = report["counts"]["needs_human"]
@@ -425,14 +450,37 @@ def run_task(task_id: str) -> None:
 
 
 def _failed_pages(db: Session, job_ids: list[str]) -> list[dict]:
-    """哪些页没识别成（job.failed 是页数，不是条目数，所以要说清是哪几页）。"""
+    """哪些页没识别成（`job.failed` 是**页数**，不是条目数，所以要说清是哪几页）。
+
+    两个条件**都要**判，且故意留有重叠：
+      · `failed > 0` —— 一批里**部分**页挂了。`batch_page._finalize` 走 else 分支时
+        只把 status 写成 `"partial"`，`error` **保持 None**。所以只判 `error`
+        会整批漏掉：44 页里 2 页没识别成，报告会说「全部完成」、退出码 0。
+      · `error` 且 `done == 0` —— 整批没跑成，`failed` 计数未必落得下来
+        （异常终止那支只保证写了 error）。
+    两种情形对调用方是同一件事：这些页的题**不会**出现在结果里。
+
+    ⚠️ 与 `report.skipped` 不是一回事，别互相替代：
+       · `skipped` 是**条目级**「模型确实没读出题 / 这页是空白页」——
+         内容没丢，只是这一类本来就不该入库。
+       · `failed_pages` 是**页级**「这一页根本没进结果」——
+         内容缺了，多等一会儿也不会自己补上。
+    """
     out = []
     for jid in job_ids:
         job = db.get(BatchJob, jid)
         if job is None:
             continue
-        if job.error and not (job.done or 0):
-            out.append({"job_id": jid, "error": job.error[:300]})
+        failed = int(job.failed or 0)
+        done = int(job.done or 0)
+        if failed > 0 or (job.error and not done):
+            out.append({
+                "job_id": jid,
+                "error": (job.error or "")[:300],
+                "done": done,
+                "failed": failed,
+                "pages_total": len(_as_list(job.pages)),
+            })
     return out
 
 
@@ -567,9 +615,14 @@ def resume(task_id: str) -> dict:
         rows = _judge_all(db, task_id, job_ids)
         rows = _pass_and_approve(db, task_id, rows)
         task = db.get(AutoTask, task_id)
-        report = build_report(task, rows)
-        task.status = "done"
-        task.stage = "完成"
+        # ⚠️ resume **不能**无条件写 `done`：页失败是识别阶段定下的事实，
+        #    人工把待审条目处理完之后它依然存在（那些页的题从来就没进过结果）。
+        #    无条件写 done 的后果是 `ok=true` + 退出码 0 —— 等于替失败的页
+        #    宣布「这活干完了」，而缺的那几页题没人知道。
+        failed = _failed_pages(db, job_ids)
+        task.status = "partial" if failed else "done"
+        task.stage = ("完成，%d 批有页没识别成" % len(failed)) if failed else "完成"
+        report = build_report(task, rows, failed)   # status 必须先定，否则报告里是中间值
         task.total_items = len(rows)
         task.approved = report["counts"]["approved"]
         task.needs_human = report["counts"]["needs_human"]

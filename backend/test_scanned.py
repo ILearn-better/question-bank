@@ -3,13 +3,23 @@
 import json
 import time
 import urllib.request
+import os
+from pathlib import Path
 
-BASE = "http://127.0.0.1:8000"
+# 免代理 opener（契约第六节第 2 条）：本机 http_proxy 会把 127.0.0.1 的请求也送去代理，
+# 回来是 502 Bad Gateway —— 于是「服务没起」被误读成「服务坏了」，
+# 更坏的是 502 的响应体被当成数据往下跑（报 byte indices 之类，完全误导）。
+# 本机 HTTP 一律走这个 opener；连不上就该是 ConnectionRefused，红得明白。
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+BASE = os.environ.get("SHIKE_BASE") or (
+    "http://127.0.0.1:8010" if Path(__file__).resolve().parents[1].name == "question-bank-ai"
+    else "http://127.0.0.1:8000")   # 主仓 8000 / -ai 检出 8010，SHIKE_BASE 可覆盖
 PY = "C:/Users/6/.workbuddy/binaries/python/envs/default/Scripts/python.exe"
 
 for i in range(15):
     try:
-        urllib.request.urlopen(BASE + "/api/tree"); break
+        _OPENER.open(BASE + "/api/tree"); break
     except Exception:
         time.sleep(1)
 
@@ -22,15 +32,15 @@ def multipart(path, field="file"):
             f"Content-Type: application/octet-stream\r\n\r\n").encode() + content + f"\r\n--{boundary}--\r\n".encode()
     req = urllib.request.Request(BASE + "/api/documents", data=body,
                                  headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
-    return json.loads(urllib.request.urlopen(req).read())
+    return json.loads(_OPENER.open(req).read())
 
 def post_json(url, obj):
     req = urllib.request.Request(url, data=json.dumps(obj).encode(),
                                  headers={"Content-Type": "application/json"})
-    return json.loads(urllib.request.urlopen(req).read())
+    return json.loads(_OPENER.open(req).read())
 
 def get(url):
-    return urllib.request.urlopen(url)
+    return _OPENER.open(url)
 
 # 1. 上传扫描版 PDF
 SAMPLES = "Q:/Program Files/workbuddy/2026-08-15-01-58-43/question-bank/samples"

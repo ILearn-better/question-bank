@@ -265,9 +265,10 @@ def delete_note(nid: str, db: Session = Depends(get_db)):
 
 # ---------------------------------------------------------------- 配图
 @router.post("/image")
-async def upload_image(file: UploadFile = File(...)):
+# 同步 def：同步句柄读 + 同步落盘，不该占事件循环。
+def upload_image(file: UploadFile = File(...)):
     """笔记配图上传。返回可直接写进 Markdown 的 URL。"""
-    data = await file.read(images.MAX_IMAGE_BYTES + 1)
+    data = file.file.read(images.MAX_IMAGE_BYTES + 1)
     try:
         saved = images.save_image(data, config.NOTES_DIR, prefix="nb")
     except images.ImageRejected as e:
@@ -291,7 +292,9 @@ MAX_DOC_BYTES = 60 * 1024 * 1024
 
 
 @router.post("/import-doc")
-async def import_document(
+# 同步 def（不是 async）：doc_to_note.to_markdown 会拉 Word COM / PyMuPDF 做真转码，
+# 秒级到几十秒的同步活；放在 async def 里会把事件循环按住，单进程服务整站一起卡。
+def import_document(
     file: UploadFile = File(...),
     folder_id: int | None = Query(None, description="放进哪个目录；不传落「未归档」"),
     db: Session = Depends(get_db),
@@ -310,7 +313,7 @@ async def import_document(
         raise HTTPException(422, f"这篇笔记暂时不能从这种文件导入（{Path(name).suffix or '无扩展名'}）。"
                                  f"{file_text.SUPPORTED_NOTE}"
                                  "图片请直接贴进笔记（Ctrl+V）。")
-    data = await file.read(MAX_DOC_BYTES + 1)
+    data = file.file.read(MAX_DOC_BYTES + 1)
     if len(data) > MAX_DOC_BYTES:
         raise HTTPException(422, f"文件太大了（超过 {MAX_DOC_BYTES // 1024 // 1024}MB）")
     if not data:

@@ -23,8 +23,17 @@ import time
 import urllib.request
 
 import websockets
+from pathlib import Path
 
-BASE = "http://127.0.0.1:8000"
+# 免代理 opener（契约第六节第 2 条）：本机 http_proxy 会把 127.0.0.1 的请求也送去代理，
+# 回来是 502 Bad Gateway —— 于是「服务没起」被误读成「服务坏了」，
+# 更坏的是 502 的响应体被当成数据往下跑（报 byte indices 之类，完全误导）。
+# 本机 HTTP 一律走这个 opener；连不上就该是 ConnectionRefused，红得明白。
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+BASE = os.environ.get("SHIKE_BASE") or (
+    "http://127.0.0.1:8010" if Path(__file__).resolve().parents[1].name == "question-bank-ai"
+    else "http://127.0.0.1:8000")   # 主仓 8000 / -ai 检出 8010，SHIKE_BASE 可覆盖
 JOB = "2fcc24d666c7"
 DOC = "a5fa3c1a50fb"
 JOB_CREATED = "2026-10-22T23:01:51"
@@ -40,20 +49,19 @@ DOUBT = ("figure_rough", "figure_shared_candidate", "figure_dup_candidate",
          "figure_box_missing", "figure_cross_page", "figure_crop_failed")
 
 fails = []
-
+# SKIP 不是通过：结束时必须印出来，绝不能混进「全部通过」。
+skipped: list[str] = []
 
 def check(name, ok, detail=""):
     print("  [%s] %s%s" % ("OK " if ok else "FAIL", name, ("  " + str(detail)) if detail else ""))
     if not ok:
         fails.append(name)
 
-
 def api(path, method="GET"):
     req = urllib.request.Request(BASE + path, method=method)
-    with urllib.request.urlopen(req, timeout=20) as r:
+    with _OPENER.open(req, timeout=20) as r:
         body = r.read().decode("utf-8")
     return json.loads(body) if body else None
-
 
 def item_flags(item_id):
     """服务端真实状态（不信界面）。"""
@@ -65,7 +73,6 @@ def item_flags(item_id):
             return it
     return None
 
-
 async def send(ws, mid, method, **params):
     await ws.send(json.dumps({"id": mid, "method": method, "params": params}))
     while True:
@@ -75,21 +82,21 @@ async def send(ws, mid, method, **params):
                 raise RuntimeError("%s: %s" % (method, msg["error"]))
             return msg.get("result", {})
 
-
 async def ev(ws, expr, mid):
     r = await send(ws, mid, "Runtime.evaluate", expression=expr,
                    returnByValue=True, awaitPromise=True)
     return r.get("result", {}).get("value")
-
 
 def probe():
     """服务在不在、目标数据还在不在。不在就 SKIP。"""
     try:
         jobs = api("/api/batches")
     except Exception as e:                                  # noqa: BLE001
+        skipped.append("服务没在跑（%s）" % e)
         print("SKIP: 服务没在跑（%s）—— 先双击「启动拾课.bat」" % e)
         return None
     if not any(j.get("id") == JOB for j in jobs or []):
+        skipped.append("库里已经没有 job %s" % JOB)
         print("SKIP: 库里已经没有 job %s（测试数据被清理了）" % JOB)
         return None
     items = api("/api/batches/%s/items" % JOB)
@@ -98,18 +105,17 @@ def probe():
     todo = [it for it in items if it.get("figure_image")
             and any(x in (it.get("flags") or []) for x in DOUBT)]
     if not todo:
+        skipped.append("job 里已经没有待核条目")
         print("SKIP: 这个 job 已经没有「待核」条目了（老师自己处理完了）")
         return None
     print("服务在跑；待核条目 %d 条，可验" % len(todo))
     return {"items": items, "todo": todo}
-
 
 def snapshot(todo):
     return [{"id": it["id"], "flags": it.get("flags") or [],
              "image": it.get("figure_image") or "",
              "box": it.get("figure_box") or [0, 0, 1000, 1000],
              "page": it.get("page_no")} for it in todo]
-
 
 def restore(snap):
     """把验证碰过的条目改回去。**必须无条件跑**，异常路径也要跑。"""
@@ -140,7 +146,7 @@ def restore(snap):
                     BASE + "/api/batches/items/%s/figure-crop" % s0["id"],
                     data=body, method="POST",
                     headers={"Content-Type": "application/json"})
-                with urllib.request.urlopen(req, timeout=30) as r:
+                with _OPENER.open(req, timeout=30) as r:
                     assert r.status == 200
             except Exception as e:                          # noqa: BLE001
                 print("  ⚠️ 还原图失败（%s）：%s" % (s0["id"], e))
@@ -151,7 +157,6 @@ def restore(snap):
             db.commit()
             db.close()
     print("已还原 %d 条待核条目" % len(snap))
-
 
 async def main():
     print("==== 0 打开页面 ====")
@@ -176,7 +181,7 @@ async def main():
         ws_url = None
         for _ in range(60):
             try:
-                with urllib.request.urlopen("http://127.0.0.1:%d/json/list" % PORT, timeout=1) as r:
+                with _OPENER.open("http://127.0.0.1:%d/json/list" % PORT, timeout=1) as r:
                     tabs = json.load(r)
                 pages = [t for t in tabs if t.get("type") == "page"]
                 if pages:
@@ -491,8 +496,15 @@ async def main():
         print("\n（Edge 已关闭）")
         restore(snap)
 
-
 if __name__ == "__main__":
     code = asyncio.run(main())
-    print("\n%s" % ("全部通过" if not fails else "失败 %d 项：%s" % (len(fails), fails)))
+    if skipped:
+        # 这里原来是**无条件**印「全部通过」—— 于是根本没跑的断言在报告里看起来是绿的。
+        # SKIP 必须印成 SKIP，且要说清「一条断言都没跑」。
+        print("\n[SKIP] 跳过 %d 项（%s）—— 不等于通过：本脚本的断言一条都没跑"
+              % (len(skipped), skipped[0]))
+    elif not fails:
+        print("\n全部通过")
+    else:
+        print("\n失败 %d 项：%s" % (len(fails), fails))
     sys.exit(code)

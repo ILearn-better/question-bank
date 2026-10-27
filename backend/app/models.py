@@ -1206,6 +1206,13 @@ class HomeworkGrade(Base):
     finished_at: Mapped[str | None] = mapped_column(Text)
     reviewed_at: Mapped[str | None] = mapped_column(Text)     # 老师点「确认」的时间
 
+    # 「界面上显示的是哪一代逐题结果」（0038）。`detail()` 只返回这一代的题行。
+    # 为什么需要两个世代并存：重批**不能**先把旧题删掉再起 AI —— 一页没批成就等于把
+    # 上一次的判读连同挂在上面的批注一起抹掉，且不可回退。现在的口径是「新一轮**全部
+    # 成功**才换指针并删旧代，失败就把这一轮丢掉、旧代原样保留」，所以两代必须有编号可
+    # 区分。0 = 迁移前的历史数据（就是当时唯一那一代，不需要回填）。
+    item_run: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+
     files: Mapped[list["HomeworkGradeFile"]] = relationship(
         back_populates="grade", cascade="all, delete-orphan"
     )
@@ -1324,6 +1331,11 @@ class HomeworkGradeItem(Base):
     status: Mapped[str] = mapped_column(String, default="pending", server_default="pending")
     question_id: Mapped[str | None] = mapped_column(ForeignKey("questions.id", ondelete="SET NULL"))
     reviewed_at: Mapped[str | None] = mapped_column(Text)
+    # 这条题是哪一轮重批写进来的（0038）。同一个 grade 可以同时躺着两代：
+    # 上一代（老师正在看的）与这一轮（还没批完的）。哪一代可见由 `HomeworkGrade.item_run`
+    # 决定 —— 只有一个指针，读路径就不会出现「有的地方筛了、有的地方没筛」。
+    # 0 = 迁移前的历史行。
+    run_no: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     created_at: Mapped[str] = mapped_column(Text, default=_now, server_default=NOW)
 
     __table_args__ = (Index("idx_hwgrade_items_grade", "grade_id", "seq"),)

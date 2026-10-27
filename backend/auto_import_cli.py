@@ -12,15 +12,27 @@
     python auto_import_cli.py --resume <task_id>                  # 老师处理完 → 补入库
     python auto_import_cli.py --list-curricula                    # 有哪些体系可选
 
-退出码（**这就是结果**，agent 直接看它）
+退出码（**这就是结果**，agent 直接看它；判据只在 `exit_code_of()` 一处定义）
 ----
     0  全部入库，没有遗留
-    2  跑完了，但还有 needs_human 需要人看（报告里有直达链接）
-    1  失败（服务没起 / 文件不认 / 后台出错）
+    2  跑完了，成果是**全的**，但还有 needs_human 需要人看（报告里有直达链接）
+    3  **有页没识别成**：内容缺了，得决定重跑还是手工补（看报告 failed_pages）
+    1  失败（服务没起 / 文件不认 / 页范围认不出 / 后台整批挂了 /
+       **跑完了但一条都没出来**）
 
-为什么退出码要区分 0 和 2：
-    「跑完了但有 5 条要人看」和「跑完了干净」在自动化里是完全不同的结局 ——
-    前者要停下来找人，后者可以继续下一份。混成一个 0，agent 只能去解析 JSON。
+为什么 0、2、3 必须分开：
+    「跑完了干净」「成果全但有几条要人点头」「内容本身就缺了」在自动化里是
+    三种不同的结局，对应的下一步动作完全不同（继续下一份 / 停下来找人 /
+    先决定重跑）。混成一个 0，agent 只能去解析 JSON。
+
+    2 和 3 **尤其**不能合并。走 2 的批次，`needs_human` 列表里是有东西可点的；
+    走 3 的批次，那份列表**通常是空的**（页挂了，条目压根没生成）。合进 2 的话
+    agent 会照着 2 的语义去读 `needs_human`，读到空，然后回过头告诉用户
+    「没有待处理的，已完成」—— 那只是把静默失败从 CLI 搬进了 agent 嘴里。
+    新增一个码的代价，远低于一句说错的结论。
+
+为什么 3 优先于 2：两者同时成立时（有页挂了、也有条目待审），页失败更严重
+    ——「内容缺了」比「内容全但要人点头」更该被先看见。优先级 1 > 3 > 2 > 0。
 
 ⚠️ 这个脚本**不自己算路径/端口**以外的事：所有业务判断都在服务端。
    它只是 HTTP 的薄壳 —— 否则 CLI 和接口会各有一套判据，迟早对不上。
@@ -108,6 +120,62 @@ def _upload(path: Path, curriculum: str, pages: str | None) -> dict:
                headers={"Content-Type": "multipart/form-data; boundary=%s" % boundary})
 
 
+def exit_code_of(task: dict | None) -> int:
+    """任务字典 → 退出码。**唯一的判定处**（上传 / --status / --resume 三处共用）。
+
+    入参故意收**整个任务字典**而不是 `report`：`report` 可能是 `null`
+    （任务刚建、还没跑到写报告那一步，`t.report` 是空串），
+    而 `counts` / `status` / `done` 在顶层一直有。
+
+    四档判据（顺序不能换）：
+      1  `status == "failed"` —— 后台整体挂了（错误在 `error` 字段）
+      1  `approved == 0` 且 `needs_human == 0` —— **跑完了但一条都没出来**
+      3  有页没识别成 —— `report.failed_pages` 非空，或任一 `jobs[].failed > 0`
+         （两者取或：报告缺失时还有 jobs 兜底，`failed` 是**页数**）
+      2  `counts.needs_human > 0` —— 成果是全的，但要人点头
+      0  其余
+
+    「一条都没出来」为什么必须是 1、且必须判在 3 前面：
+      30 页全识别成功（`done=30, failed=0`），但模型把 30 页全判成 `no_content`
+      （扫描件糊了 / 本来就是空白页）—— `_failed_pages()` 是空的（页确实跑完了），
+      所以那道闸门抓不住它。此时 `approved=0, needs_human=0, skipped=30`，
+      没有这一档就会落到最后的 `return 0`，对 agent 说「全部入库，没有遗留」，
+      而真相是一条都没入库。
+      而 `approved=0` 且**有**页失败时也不能报 3：3 的语义是「成果是全的、
+      只差这几页」，`approved=0` 根本没有成果，agent 会照着去「补那几页」，
+      方向就错了 —— 该说「这活没成」。
+
+    `done == false`（还在跑）返回 0：既不是失败也不是完成，别误报成 1。
+    注意 `approved == 0` 且 `needs_human == 3` 是**码 2，不是 1** ——
+    那是「跑完了，三条要人看」，不是「跑失败了」。
+    """
+    if not task:
+        return 1
+    if task.get("status") == "failed":
+        return 1
+    if not task.get("done"):
+        return 0
+
+    counts = task.get("counts") or {}
+    approved = int(counts.get("approved") or 0)
+    needs_human = int(counts.get("needs_human") or 0)
+    # 「一条都没出来」必须先于码 3 判，理由见 docstring。
+    # 判据是 approved == 0 **且** needs_human == 0：只要有东西可点（needs_human>0），
+    # 那就是「跑完了、有人要看的」，还是 2。
+    if approved == 0 and needs_human == 0:
+        return 1
+
+    report = task.get("report") or {}
+    failed_pages = report.get("failed_pages") or []
+    jobs_failed = sum(int(j.get("failed") or 0) for j in (task.get("jobs") or []))
+    if failed_pages or jobs_failed > 0:
+        return 3
+
+    if needs_human > 0:
+        return 2
+    return 0
+
+
 def _print_report(d: dict, wait_seconds: float) -> None:
     c = d.get("counts") or {}
     print("=" * 66)
@@ -122,6 +190,28 @@ def _print_report(d: dict, wait_seconds: float) -> None:
              c.get("needs_human", 0), c.get("skipped", 0)))
 
     rep = d.get("report") or {}
+    # 页失败必须印出来：退出码 3 只有脚本看得见，人看的是这几行。
+    # 不印的话「44 页里 2 页没识别成」在人眼里跟「全部完成」一模一样。
+    lost_pages = rep.get("failed_pages") or []
+    if lost_pages:
+        # 页数只读报告里的 `pages_lost`（由 build_report 算好），这里不再重算 ——
+        # 同一件事两个出处，迟早一个改了另一个没改。
+        lost = rep.get("pages_lost")
+        if lost is None:
+            # 旧任务（本轮之前的报告）没有这个键。回退到 Σ failed 只能数到
+            # 「页跑过但挂了」的那部分，整批没跑成的批贡献 0 —— 印出来是个
+            # **已知偏小**的数。宁可说「页数不详」，也不要把少报的数当事实说；
+            # 每行下面还有「完成 X 页 / 共 Y 页」，需要细节的人能自己看。
+            print("\n--- 有 %d 批没识别成（旧任务，页数不详）---" % len(lost_pages))
+        else:
+            print("\n--- 有 %d 批没识别成（共 %d 页）---" % (len(lost_pages), lost))
+        for f in lost_pages:
+            print("  批次 %s  完成 %s 页 / 失败 %s 页 / 共 %s 页  %s" % (
+                f.get("job_id"), f.get("done"), f.get("failed"),
+                f.get("pages_total"), f.get("error") or ""))
+        print("  这些页的题**不会**出现在结果里：要补齐只能把这几个页范围"
+              "重新导入一次（或手工补录）。--resume 只补入库，不会重新识别。")
+
     todo = rep.get("needs_human") or []
     if todo:
         print("\n--- 需要你看一眼的 %d 条 ---" % len(todo))
@@ -140,7 +230,11 @@ def _print_report(d: dict, wait_seconds: float) -> None:
               % (len(skipped), "、".join("%s×%d" % (k, v) for k, v in cnt.items())))
 
     if d.get("error"):
-        print("\n错误：%s" % d["error"])
+        # status 已经不是 failed 时，这条 error 是**之前**那轮的残留（resume 不清它）。
+        # 必须标出来，否则「错误：整批识别都失败了」会被读成本轮失败 —— 而本轮
+        # 刚刚跑完，只是前面那次挂过。
+        stale = d.get("status") != "failed"
+        print("\n%s：%s" % ("之前的错误（本轮已重跑）" if stale else "错误", d["error"]))
     print("=" * 66)
 
 
@@ -191,14 +285,14 @@ def main() -> int:
     if args.status:
         d = api("/api/auto/imports/%s" % args.status)
         print(json.dumps(d, ensure_ascii=False, indent=2))
-        return 0 if d.get("ok") else (2 if d.get("done") else 0)
+        return exit_code_of(d)
 
     if args.resume:
         d = api("/api/auto/imports/%s/resume" % args.resume, body={})
         print(json.dumps(d, ensure_ascii=False, indent=2) if args.json else "")
         if not args.json:
             _print_report(d, 0)
-        return 0 if (d.get("counts") or {}).get("needs_human", 0) == 0 else 2
+        return exit_code_of(d)
 
     if not args.file:
         ap.print_help()
@@ -228,9 +322,7 @@ def main() -> int:
     else:
         _print_report(d, elapsed)
 
-    if d.get("status") == "failed":
-        return 1
-    return 0 if (d.get("counts") or {}).get("needs_human", 0) == 0 else 2
+    return exit_code_of(d)
 
 
 if __name__ == "__main__":

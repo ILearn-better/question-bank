@@ -440,7 +440,9 @@ def convert_to_markdown(path: Path, name: str) -> tuple[str, str]:
 
 
 @router.post("/plans/upload")
-async def upload_plan_file(file: UploadFile = File(...)):
+# 同步 def（不是 async）：下面那句 convert_to_markdown 走 Word COM / PyMuPDF 真转码，
+# 秒级同步活。async def 会把它按在事件循环上，单进程服务整站跟着卡。
+def upload_plan_file(file: UploadFile = File(...)):
     """传一份文件到规划的暂存区，**顺手转一次 Markdown** 返回给前端。
 
     为什么上传时就转（而不是保存时才转）：老师要**当场**看见「这份 Word 转出了什么」，
@@ -451,7 +453,7 @@ async def upload_plan_file(file: UploadFile = File(...)):
     """
     _prune_cache()                       # 顺手清过期暂存，不做后台任务
     name = Path(file.filename or "未命名").name         # 只取文件名，防路径穿越
-    data = await file.read(MAX_BYTES + 1)
+    data = file.file.read(MAX_BYTES + 1)
     if len(data) > MAX_BYTES:
         raise HTTPException(422, f"文件太大了（超过 {MAX_BYTES // 1024 // 1024}MB）。"
                                  "规划是文档，确认一下选错文件没有？")

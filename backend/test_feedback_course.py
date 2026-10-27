@@ -27,7 +27,14 @@ import urllib.request
 from pathlib import Path
 
 REAL = "http://127.0.0.1:8000"
-S = "http://127.0.0.1:8001"
+# 8001 = **另外起**的那套临时服务（自己的 DB + uploads），不是打错端口：
+# ③ 会建学生/课时/反馈并删数据，④ 还要读真库核对 —— 写操作一律只落在临时库上，
+# 「端口按目录名」（question-bank-ai → 8010，否则 8000）那条规则说的是真服务。
+# 8001 = 独立临库，故意不跟 8000/8010 对齐：这些用例会写库，跑真库等于毁老师的题
+# （要换端口用 SHIKE_SCRATCH 覆盖，默认仍是 8001 —— 默认值必须指向隔离环境）
+S = os.environ.get("SHIKE_SCRATCH") or "http://127.0.0.1:8001"
+# 本机 shell 带 http_proxy：裸 urlopen 探 127.0.0.1 会被送进代理回 502（看着像服务坏了）。
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 SCRATCH = Path(os.environ["TEMP"]) / "notes_scratch"
 DB = SCRATCH / "notes.db"
 
@@ -47,7 +54,7 @@ def call(base, method, path, body=None):
                                  data=data, method=method,
                                  headers={"Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(req, timeout=30) as r:
+        with _OPENER.open(req, timeout=30) as r:
             return r.status, r.read(), r.headers
     except urllib.error.HTTPError as e:
         return e.code, e.read(), e.headers

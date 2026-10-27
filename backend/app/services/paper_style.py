@@ -230,7 +230,31 @@ def layout(items: list[dict], sections: list[dict]) -> list[dict]:
     if fallback:
         # 兜底组不带标题：它接的是模板没覆盖到的题型，硬起个名字会误导
         groups.append({"title": "", "note": "", "page_break": False, "items": fallback})
-    return groups
+
+    # 题号重编：`n` 是导出时按**请求顺序**赋的，而上面按 qtypes 把题重新聚合过，
+    # 两者不一致时渲染层只会照 n 印 → 带分区模板下题号必乱（2. 3. 1.），
+    # 且导出成功、不报错。所以在返回前按**最终顺序**重编一次。
+    # 必须造新 dict：buckets 里存的是原 dict 引用，原地改会污染调用方的 items。
+    n = 0
+    out = []
+    for g in groups:
+        items2 = []
+        for it in g["items"]:
+            n += 1
+            d = dict(it)
+            d["n"] = n
+            items2.append(d)
+        out.append(dict(g, items=items2))
+    return out
+
+
+def flat(items: list[dict], sections: list[dict]) -> list[dict]:
+    """按**最终卷面顺序**展平。
+
+    卷面与答案区必须用同一个顺序来源：两边各算一遍，一旦有一边忘了，
+    表现是「卷子上的题号在答案册里查不到」—— 不报错、导出成功。
+    """
+    return [it for g in layout(items, sections) for it in g["items"]]
 
 
 def section_note(note: str, items: list[dict], style: dict) -> str:

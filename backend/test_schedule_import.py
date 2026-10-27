@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import io
 import os
 import re
@@ -111,6 +112,16 @@ HEAD = ["日期", "开始时间", "学生", "时长（分钟）", "本次内容"
 
 def upload(data: bytes, filename: str = "t.xlsx") -> UploadFile:
     return UploadFile(file=io.BytesIO(data), filename=filename)
+
+
+def call(r):
+    """端点可能是 `async def` 也可能已改成同步 `def`：统一落地成返回值。
+
+    为什么需要它：R3 把上传/预览端点从 `async def` 改成 `def` 之后，直接
+    `asyncio.run(preview(...))` 会以 `ValueError: a coroutine was expected` 崩在
+    **测试脚手架**里 —— 预览本身跑通了，结果就在那个 dict 里。
+    """
+    return asyncio.run(r) if inspect.isawaitable(r) else r
 
 
 # ================================================================ ① 日期
@@ -497,7 +508,7 @@ def t_preview(sid_a: int, sid_b: int) -> dict:
     data = mk_xlsx(rows)
     db = SessionLocal()
     try:
-        res = asyncio.run(preview(file=upload(data), db=db))
+        res = call(preview(file=upload(data), db=db))
     finally:
         db.close()
 
@@ -544,8 +555,8 @@ def t_preview(sid_a: int, sid_b: int) -> dict:
     check("notes 说明「这些学生系统里没有」", "系统里没有" in notes, notes)
 
     # 缺列 / 非 Excel 也走同一个函数，返回 ok=False 而不是抛
-    bad = asyncio.run(preview(file=upload(mk_xlsx([["日期", "学生"], ["2026-10-01", "小明"]])),
-                              db=SessionLocal()))
+    bad = call(preview(file=upload(mk_xlsx([["日期", "学生"], ["2026-10-01", "小明"]])),
+                       db=SessionLocal()))
     check("缺列时返回 ok=False（不抛异常）", bad["ok"] is False, str(bad.get("ok")))
     return res
 
@@ -1060,7 +1071,7 @@ def t_create_student_then_import() -> None:
     data = mk_xlsx([HEAD, ["2026-10-12", "10:00", "小刚", 60, "第一次课", "线下", "", "", "scheduled"]])
     db = SessionLocal()
     try:
-        res1 = asyncio.run(preview(file=upload(data), db=db))
+        res1 = call(preview(file=upload(data), db=db))
         r0 = res1["rows"][0]
         check("① 预览：小刚对不上 → action=no_student", r0["action"] == "no_student", str(r0["action"]))
         check("① unknown_students = ['小刚']（前端就拿它去建）",
@@ -1076,7 +1087,7 @@ def t_create_student_then_import() -> None:
               made["name"] == "小刚" and made["hourly_rate"] == 500.0, str(made))
 
         # 前端 refresh()：拿同一份文件重新解析/匹配
-        res2 = asyncio.run(preview(file=upload(data), db=db))
+        res2 = call(preview(file=upload(data), db=db))
         r1 = res2["rows"][0]
         check("★ ③ 重新预览：同一行变成「可导入」（不用回 Excel 改）",
               r1["action"] == "import", str(r1["action"]))
@@ -1104,7 +1115,7 @@ def t_create_student_then_import() -> None:
 
         # 反例：名字写错（Excel 里是「小刚刚」）→ 建完学生也照样对不上，绝不放行
         bad = mk_xlsx([HEAD, ["2026-10-13", "10:00", "小刚刚", 60, "", "", "", "", "scheduled"]])
-        res3 = asyncio.run(preview(file=upload(bad), db=db))
+        res3 = call(preview(file=upload(bad), db=db))
         check("★ 名字写错（小刚刚）仍然对不上 → 不会被悄悄放行",
               res3["rows"][0]["action"] == "no_student", str(res3["rows"][0]["action"]))
 

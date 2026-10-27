@@ -322,7 +322,9 @@ def build_html(title: str, items: list[dict], opts: dict, tpl=None) -> str:
     if opts.get("show_answer"):
         out.append('<div class="ans">')
         out.append('<h1 class="title" style="font-size:14pt">参考答案与解析</h1>')
-        for it in items:
+        # 顺序与题号必须跟卷面同源（都是 layout() 的最终顺序），否则卷子上的
+        # 题号在答案册里查不到 —— 不报错、导出成功。
+        for it in paper_style.flat(items, t["sections"]):
             out.append(f'<div class="item"><b>{it["n"]}.</b>')
             if answer_form(it, opts.get("render_mode")) == "image":
                 ap = image_path(it.get("answer_image"))
@@ -472,7 +474,8 @@ def build_docx(title: str, items: list[dict], opts: dict, tpl=None) -> bytes:
     if opts.get("show_answer"):
         doc.add_page_break()
         para("参考答案与解析", size=14, center=True, bold=True)
-        for it in items:
+        # 同 HTML：答案区的顺序与题号必须跟卷面同源
+        for it in paper_style.flat(items, t["sections"]):
             if answer_form(it, opts.get("render_mode")) == "image":
                 doc.add_paragraph(f'{it["n"]}.')
                 p = image_path(it.get("answer_image"))
@@ -647,7 +650,8 @@ def build_pdf(title: str, items: list[dict], opts: dict, tpl=None) -> bytes:
     if opts.get("show_answer"):
         new_page()
         write("参考答案与解析", size=14, gap=12, center=True)
-        for it in items:
+        # 同 HTML / docx：答案区的顺序与题号必须跟卷面同源
+        for it in paper_style.flat(items, t["sections"]):
             if answer_form(it, opts.get("render_mode")) == "image":
                 write(f'{it["n"]}.')
                 p = image_path(it.get("answer_image"))

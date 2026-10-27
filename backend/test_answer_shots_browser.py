@@ -29,8 +29,11 @@ from pathlib import Path
 
 import websockets
 from PIL import Image
+import os
 
-BASE = "http://127.0.0.1:8000"
+BASE = os.environ.get("SHIKE_BASE") or (
+    "http://127.0.0.1:8010" if Path(__file__).resolve().parents[1].name == "question-bank-ai"
+    else "http://127.0.0.1:8000")   # 主仓 8000 / -ai 检出 8010，SHIKE_BASE 可覆盖
 EDGE = r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
 PORT = 9334
 CROPS = Path(__file__).resolve().parent / "data" / "uploads" / "crops"

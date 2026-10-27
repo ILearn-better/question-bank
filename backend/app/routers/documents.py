@@ -229,13 +229,16 @@ def _preview_payload(db: Session, doc: Document) -> dict:
 
 # ---------------------------------------------------------------- 上传 / 列表
 @router.post("/documents")
-async def upload_document(file: UploadFile = File(...), db: Session = Depends(get_db)):
+# 同步 def（不是 async）：register_document 里是 PyMuPDF / docx 的**同步解析**，几十毫秒到
+# 几十秒。写成 async def 它就占着事件循环跑，单进程服务下整站（含所有轮询）一起卡住；
+# 同步端点由 FastAPI 丢进线程池，只卡这一个请求。读上传要写 file.file.read（同步句柄）。
+def upload_document(file: UploadFile = File(...), db: Session = Depends(get_db)):
     ext = os.path.splitext(file.filename or "")[1].lower()
     check_ext(ext)                       # 先校验再落盘：别为一份 .doc 写一个垃圾文件
 
     save_path = config.UPLOAD_DIR / f"{uuid.uuid4().hex}{ext}"
     with open(save_path, "wb") as f:
-        f.write(await file.read())
+        f.write(file.file.read())
 
     doc, blocks = register_document(db, file.filename, ext, save_path)
     # 这里刻意不转 Word：上传要快。页面视图由前端在进入时显式触发生成，

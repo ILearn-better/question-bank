@@ -1446,6 +1446,50 @@ const num = (v, d = 0) => { const n = Number(v); return Number.isFinite(n) ? n :
 const clampUnit = (v) => Math.min(1000, Math.max(0, num(v)));
 const bodyText = (s) => String(s === null || s === undefined ? '' : s);
 
+/** 公式保护：`$…$` / `$$…$$` 先换成占位符，marked 解析完再放回去。
+ *
+ *  ⚠️ 这份是 `src/mathRender.js` 的同名实现的**零构建副本**（workbench.html 不走 ES
+ *     模块，没法 import），与 `entry.html` 那份逐字同逻辑。几处必须一模一样 ——
+ *     行为漂了会出现「录题页渲染正常、工作台里题干公式坏掉」这种只在某一页复现的怪事。
+ *     math_render_check.js 对这四份做的是**行为对比**（同一组输入逐字比输出），不是文本对比。
+ *
+ *  为什么必须有它：公式内容过一遍 Markdown 会被吃掉 —— `$5\%$` 的 `\%` 变 `%`
+ *  （LaTeX 注释符，公式直接截断）、`$S=2*3*4$` 的 `*` 变 `<em>`（文本节点被切碎，
+ *  公式一个都不渲染）、`$$x&=1 \\ y&=2$$` 的 `&` 变 `&amp;`、`\\` 变 `\`。
+ *  详细实测表见 src/mathRender.js 的 protectMath 注释。
+ */
+const _PH_RE = /\uE000(\d+)\uE000/g;
+const _ph = (i) => '\uE000' + i + '\uE000';
+
+function protectMath(md) {
+  const store = [];
+  const keep = (tex, display) => {
+    store.push({ tex, display });
+    return _ph(store.length - 1);
+  };
+  const conv = (s) => s
+    .replace(/\\\[([\s\S]+?)\\\]/g, (m, tex) => keep(tex, true))
+    .replace(/\\\(([\s\S]+?)\\\)/g, (m, tex) => keep(tex, false))
+    .replace(/\$\$([\s\S]+?)\$\$/g, (m, tex) => keep(tex, true))
+    .replace(/\$([^$\n]+?)\$/g, (m, tex) => keep(tex, false));
+  const inText = (seg) => seg.split(/(`[^`\n]*`)/)
+    .map((p, i) => (i % 2 ? p : conv(p))).join('');
+  const out = String(md || '').split(/(```[\s\S]*?```)/)
+    .map((s, i) => (i % 2 ? s : inText(s))).join('');
+  return { md: out, store };
+}
+
+function restoreMath(html, store) {
+  if (!store || !store.length) return html;
+  return String(html || '').replace(_PH_RE, (m, n) => {
+    const it = store[Number(n)];
+    if (!it) return m;
+    const tex = String(it.tex)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    return it.display ? `$$${tex}$$` : `$${tex}$`;
+  });
+}
+
 const app = createApp({
   data() {
     return {
@@ -1756,7 +1800,9 @@ const app = createApp({
       if (!res.ok) {
         let msg = '请求失败 ' + res.status;
         try { msg = (await res.json()).detail || msg; } catch (e) { /* 非 JSON 就算了 */ }
-        throw new Error(msg);
+        const err = new Error(msg);
+        err.status = res.status;   /* 调用方要能区分「409 = 要先确认」与普通失败 */
+        throw err;
       }
       return res.json();
     },
@@ -3226,6 +3272,26 @@ const app = createApp({
        *   立刻清掉的话按钮马上变回可点，老师会再点 → 后端已经在收尾 → 409
        *   甚至更糟的错误提示 —— 这就是「终止不顺畅」最直观的样子。 */
     },
+    /** 开批（带「会不会覆盖老师劳动」那道确认）。
+     *
+     *  服务端在「这一份已确认 / 你逐题复核过 / 画过批注」时返回 **409** 并说明会清掉什么。
+     *  判据只在服务端一处，这里只负责问一句，用户确认后带 `force=true` 重发。
+     *  返回 null = 用户放弃（调用方要把按钮旗放下，否则按钮永远灰）。
+     */
+    async runOrConfirm() {
+      try {
+        return await this.api('/api/homework-grades/' + this.gid + '/run', { method: 'POST' });
+      } catch (e) {
+        if (e.status !== 409) throw e;
+        try {
+          await ElementPlus.ElMessageBox.confirm(e.message, '重新批改', {
+            confirmButtonText: '仍然重跑', cancelButtonText: '取消', type: 'warning',
+          });
+        } catch (c) { return null; }      // 点了取消（ElMessageBox 用 reject 表示取消）
+        return await this.api('/api/homework-grades/' + this.gid + '/run?force=true',
+          { method: 'POST' });
+      }
+    },
     async runGrade() {
       /* ★ 勾了条件却缺那一类依据 —— **别提交**。
        *   让服务端 422 回来再弹红字也能拦住，但那时候老师已经点了「开始批改」、
@@ -3254,7 +3320,8 @@ const app = createApp({
       // 先立「点过了」的旗：服务端写 running 之前按钮就该进「批改中」，否则连点两次。
       this.runAsked = true;
       try {
-        const d = await this.api('/api/homework-grades/' + this.gid + '/run', { method: 'POST' });
+        const d = await this.runOrConfirm();
+        if (!d) { this.runAsked = false; return; }   // 用户放弃了覆盖老师已做的复核/批注
         // ⚠️ 只合并**进度字段**：整份 Object.assign 会把 regions 一起换掉，
         //    而老师可能刚画了线还没保存（那一下就被冲没了）。
         if (this.g) this.g = Object.assign({}, this.g, {
@@ -3363,18 +3430,31 @@ const app = createApp({
       if (!text) { el.innerHTML = '<span style="color:#c0c4cc">（空）</span>'; return; }
       el.innerHTML = this.renderRich(text);
     },
-    /** 渲染管线（与项目里 mathRender.js 同一套顺序）：先 marked 出 HTML → DOMPurify 洗 →
-     *  最后 auto-render 把 $…$ 变成公式。顺序反了公式里的下划线会被当成强调。 */
+    /** 渲染管线（与项目里 mathRender.js 同一套顺序）：先 protectMath 把公式摘成占位符 →
+     *  marked 出 HTML → DOMPurify 洗 → restoreMath 把公式放回去 → 最后 auto-render
+     *  把 `$…$` 变成真正的公式。
+     *
+     *  每一段的顺序都是判据，不是风格：
+     *   · 保护必须在 marked **之前** —— 公式过一遍 Markdown 会被吃掉（`$a*b$` 变 `<em>`、
+     *     `5\%` 丢反斜杠、aligned 的 `&` 变实体），顺序反了公式就一个字都不渲染；
+     *   · 还原必须在消毒**之后** —— 反了的话公式里的 `<` `&` 会被当 HTML 标签洗掉。
+     */
     renderRich(text) {
       try {
         const md = String(text || '');
-        const html = (window.marked && window.marked.parse) ? window.marked.parse(md)
-          : md.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/\n/g, '<br>');
-        const safe = (window.DOMPurify && window.DOMPurify.sanitize)
-          ? window.DOMPurify.sanitize(html) : html;
+        if (!(window.marked && window.marked.parse)) {
+          return md.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/\n/g, '<br>');
+        }
+        const p = protectMath(md);
+        // breaks/gfm 与录题页、批量导入页同一份口径：三页渲染同一段题干必须长得一样，
+        // 而且学生作答里的换行本来就该显出来（不写 breaks 会被并成一段）。
+        const html = window.marked.parse(p.md, { breaks: true, gfm: true });
+        const restored = restoreMath(
+          (window.DOMPurify && window.DOMPurify.sanitize)
+            ? window.DOMPurify.sanitize(html) : html, p.store);
         if (window.renderMathInElement) {
           const wrap = document.createElement('div');
-          wrap.innerHTML = safe;
+          wrap.innerHTML = restored;
           try {
             window.renderMathInElement(wrap, { delimiters: [
               { left: '$$', right: '$$', display: true },
@@ -3385,7 +3465,7 @@ const app = createApp({
           } catch (e) { /* 公式挂了正文照常显示 */ }
           return wrap.innerHTML;
         }
-        return safe;
+        return restored;
       } catch (e) { return String(text || ''); }
     },
   },

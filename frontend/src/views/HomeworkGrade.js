@@ -1114,7 +1114,23 @@ export default {
       busy.value = 'run';
       runAsked.value = true;             // 服务端写 running 之前，先让按钮进入「批改中」
       try {
-        const d = await gradeApi.run(gid);
+        let d;
+        try {
+          d = await gradeApi.run(gid);
+        } catch (e) {
+          // 409 = 这一份上已经有老师的劳动（整份确认过 / 逐题复核过 / 画过批注）。
+          // 重批会把这些换掉，所以**由服务端决定要不要问**，前端只负责问 ——
+          // 判据只写在服务端一处，这里再抄一份"什么算复核过"迟早会走偏。
+          if (e.status !== 409) throw e;
+          runAsked.value = false;        // 先放下旗：用户可能点"取消"，按钮要能再点
+          if (!window.confirm(e.message + '\n\n仍要重新批改吗？')) {
+            busy.value = '';
+            return;
+          }
+          busy.value = 'run';
+          runAsked.value = true;
+          d = await gradeApi.run(gid, true);
+        }
         if (d && d.id) { detail.value = d; await paintAll(); } else { await load(true); }
         startPolling();
         if (!running.value) runAsked.value = false;   // 已经批完了，不用留着这个标记

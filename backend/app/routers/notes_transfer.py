@@ -410,14 +410,16 @@ def export_notes(db: Session = Depends(get_db)):
 
 
 @router.post("/import")
-async def import_notes(
+# 同步 def（不是 async）：import_zip 要解 zip、逐篇写笔记（含图片落盘），同步活。
+# 放在 async def 里会把事件循环按住，单进程服务整站跟着卡。
+def import_notes(
     file: UploadFile = File(...),
     overwrite: bool = Query(False, description="同 id 的笔记是否用备份里的覆盖（默认跳过）"),
     dry_run: bool = Query(False, description="只试算不写入"),
     db: Session = Depends(get_db),
 ):
     """导入备份包。返回一份「干了什么」的报告（试算时是「会干什么」）。"""
-    data = await file.read(MAX_ZIP_BYTES + 1)
+    data = file.file.read(MAX_ZIP_BYTES + 1)
     if len(data) > MAX_ZIP_BYTES:
         raise HTTPException(422, f"备份包太大了（超过 {MAX_ZIP_BYTES // 1024 // 1024}MB）。")
     if not data:

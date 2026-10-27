@@ -468,8 +468,9 @@ def delete_doc_template(tid: int, db: Session = Depends(get_db)):
 
 # ---------------------------------------------------------------- 反馈配图
 @router.post("/feedbacks/image")
-async def upload_feedback_image(file: UploadFile = File(...), lesson_id: int = Query(...),
-                               db: Session = Depends(get_db)):
+# 同步 def：同步句柄读 + 同步落盘，不该占事件循环。
+def upload_feedback_image(file: UploadFile = File(...), lesson_id: int = Query(...),
+                          db: Session = Depends(get_db)):
     """反馈配图上传。返回可直接写进 images 数组的 URL。
 
     **必须带 lesson_id**：图片要归到「学生 / 上课日期」目录下（storage.py 那套布局），
@@ -480,7 +481,7 @@ async def upload_feedback_image(file: UploadFile = File(...), lesson_id: int = Q
     stu = db.get(Student, ls.student_id)
     if stu is None:
         raise HTTPException(404, "这节课的学生不存在")
-    data = await file.read(images.MAX_IMAGE_BYTES + 1)
+    data = file.file.read(images.MAX_IMAGE_BYTES + 1)
     # 图片名用「学生_日期」（同一天多张自动 _2、_3）。
     # 图片是要被转发出去的东西：粘在微信里、存到相册里，脱离了这个目录之后
     # 还得能自证是谁的、哪天的 —— 叫 fb_ab12cd34.png 就完全认不出来了。

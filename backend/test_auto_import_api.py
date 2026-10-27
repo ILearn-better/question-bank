@@ -18,7 +18,14 @@ import os
 import sys
 import urllib.error
 import urllib.request
+
 from pathlib import Path
+
+# 免代理 opener（契约第六节第 2 条）：本机 http_proxy 会把 127.0.0.1 的请求也送去代理，
+# 回来是 502 Bad Gateway —— 于是「服务没起」被误读成「服务坏了」，
+# 更坏的是 502 的响应体被当成数据往下跑（报 byte indices 之类，完全误导）。
+# 本机 HTTP 一律走这个 opener；连不上就该是 ConnectionRefused，红得明白。
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 # 与 auto_import_cli 同一套端口判定（写死任一个会在另一份检出上假通过）
 BASE = os.getenv("SHIKE_BASE") or (
@@ -27,14 +34,12 @@ BASE = os.getenv("SHIKE_BASE") or (
 
 fails: list[str] = []
 
-
 def check(name: str, ok: bool, detail="") -> None:
     if ok:
         print("  [OK ] %s" % name)
     else:
         print("  [FAIL] %s   %s" % (name, detail))
         fails.append(name)
-
 
 def call(path: str, body=None, method: str | None = None) -> tuple[int, dict]:
     """返回 (状态码, 响应体)。**4xx 不当异常抛** —— 那些正是要验的东西。"""
@@ -46,7 +51,7 @@ def call(path: str, body=None, method: str | None = None) -> tuple[int, dict]:
     req = urllib.request.Request(BASE + path, data=data, headers=hdrs,
                                  method=method or ("POST" if data is not None else "GET"))
     try:
-        with urllib.request.urlopen(req, timeout=30) as r:
+        with _OPENER.open(req, timeout=30) as r:
             raw = r.read().decode("utf-8")
             return r.status, (json.loads(raw) if raw.strip() else {})
     except urllib.error.HTTPError as e:
@@ -59,7 +64,6 @@ def call(path: str, body=None, method: str | None = None) -> tuple[int, dict]:
             return e.code, json.loads(raw) if raw.strip() else {"detail": e.reason}
         except ValueError:
             return e.code, {"detail": raw[:200]}
-
 
 def main() -> int:
     print("自动导入接口契约测试（不跑识别、不烧 AI）  目标 %s" % BASE)
@@ -127,7 +131,6 @@ def main() -> int:
         return 1
     print("全部通过")
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())

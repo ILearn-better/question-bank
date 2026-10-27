@@ -19,13 +19,21 @@ import sqlite3
 import urllib.error
 import urllib.parse
 import urllib.request
+
 from pathlib import Path
 
-S = "http://127.0.0.1:8001"
+# 免代理 opener（契约第六节第 2 条）：本机 http_proxy 会把 127.0.0.1 的请求也送去代理，
+# 回来是 502 Bad Gateway —— 于是「服务没起」被误读成「服务坏了」，
+# 更坏的是 502 的响应体被当成数据往下跑（报 byte indices 之类，完全误导）。
+# 本机 HTTP 一律走这个 opener；连不上就该是 ConnectionRefused，红得明白。
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+# 8001 = 独立临库，故意不跟 8000/8010 对齐：这些用例会写库，跑真库等于毁老师的题
+# （要换端口用 SHIKE_SCRATCH 覆盖，默认仍是 8001 —— 默认值必须指向隔离环境）
+S = os.environ.get("SHIKE_SCRATCH") or "http://127.0.0.1:8001"
 DB = Path(os.environ["TEMP"]) / "notes_scratch" / "notes.db"
 
 fails = []
-
 
 def check(label, got, want=True):
     okk = got == want
@@ -33,15 +41,13 @@ def check(label, got, want=True):
     if not okk:
         fails.append(label)
 
-
 def get(path):
     r = urllib.request.Request(S + urllib.parse.quote(path, safe="/?=&"), method="GET")
     try:
-        with urllib.request.urlopen(r, timeout=30) as resp:
+        with _OPENER.open(r, timeout=30) as resp:
             return json.loads(resp.read())
     except urllib.error.HTTPError as e:
         return {"status": e.code, "body": e.read().decode("utf-8", "replace")}
-
 
 print("==== ⓪ 用现成的两个体系造题：DSE 侧 2 道、另一个体系 1 道 ====")
 con = sqlite3.connect(str(DB))
@@ -110,7 +116,6 @@ if fails:
     print(f"❌ {len(fails)} 项没过：" + "；".join(fails))
 else:
     print("✅ ALL PASS")
-
 
 # 退出码即结果（0 = 全过）。以前这里只打印不设码 —— 单跑时人看得出来，
 # 但脚本化批量回归会把失败当成通过，静默漏掉一整轮。

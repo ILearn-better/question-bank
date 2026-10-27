@@ -362,9 +362,12 @@ def detail(db: Session, aid: int) -> dict:
                 "reviewed_at": g.reviewed_at,
             }
             # 逐判定计数：一条 SQL 拿完，不把 items 全捞进内存（一份卷子几十题 × 字段一堆）
+            # ⚠️ 只数显示中的那一代（0038）：重批期间库里同时有上一代和这一轮，
+            #    不筛会把两代一起数进去，存档页上的「对/半对/错」会比题目数还多。
             rows = db.execute(
                 select(HomeworkGradeItem.verdict, func.count())
-                .where(HomeworkGradeItem.grade_id == g.id)
+                .where(HomeworkGradeItem.grade_id == g.id,
+                       HomeworkGradeItem.run_no == int(g.item_run or 0))
                 .group_by(HomeworkGradeItem.verdict)
             ).all()
             out["verdicts"] = {str(v or "unknown"): int(n) for v, n in rows}

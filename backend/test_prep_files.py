@@ -24,6 +24,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import io
 import os
 import re
@@ -108,8 +109,18 @@ def uf(filename: str, data: bytes = b"x") -> UploadFile:
     return UploadFile(io.BytesIO(data), filename=filename)
 
 
+def call(r):
+    """端点可能是 `async def` 也可能已改成同步 `def`：统一落地成返回值。
+
+    为什么需要它：R3 把上传端点从 `async def` 改成 `def` 之后，直接
+    `asyncio.run(端点(...))` 会以 `ValueError: a coroutine was expected` 崩在
+    **测试脚手架**里 —— 端点本身是好的，它已经正常返回了那个 dict。
+    """
+    return asyncio.run(r) if inspect.isawaitable(r) else r
+
+
 def up(lid: int, filename: str, data: bytes = b"x", role: str = "prep", db=None) -> dict:
-    return asyncio.run(LF.upload_file(lid, file=uf(filename, data), role=role, db=db))
+    return call(LF.upload_file(lid, file=uf(filename, data), role=role, db=db))
 
 
 def expect_422(fn) -> tuple[bool, str]:

@@ -93,7 +93,14 @@ def _precheck_pages(db: Session, doc: Document, spec) -> list[int]:
     if not total:
         raise HTTPException(422, "这份文档一页都没有")
 
-    pages = auto_import.parse_pages(spec, total)
+    try:
+        pages = auto_import.parse_pages(spec, total)
+    except ValueError as e:
+        # 页范围写法认不出（"1-30页"、"第一到三十页" 这类）是**调用方输入错**，
+        # 不是服务端故障：必须 422，否则 agent 看到 500 会当成「服务挂了」去重试，
+        # 而这条输入永远不会自己变好。两个上传入口（/import 与 /import-path）
+        # 都走这里，所以只在这一处转，别在各自的端点里再套一层。
+        raise HTTPException(422, str(e)) from e
     if not pages:
         raise HTTPException(422, "没有要处理的页面（共 %d 页）" % total)
     bad = [p for p in pages if p > total]
@@ -173,7 +180,9 @@ def _kickoff(db: Session, doc: Document, pages: list[int], curriculum: Curriculu
 
 
 @router.post("/auto/import")
-async def auto_import_upload(
+# 同步 def（不是 async）：下面 register_document 走 PyMuPDF / docx 的同步解析，是几百毫秒
+# 到几十秒的纯 CPU 活；async def 会把它按在事件循环上，单进程服务整站跟着卡。
+def auto_import_upload(
     file: UploadFile = File(...),
     curriculum: str | None = Form(None, description="体系：id / code / name 任一"),
     pages: str | None = Form(None, description="页范围，如 '1-30,35'；不传 = 全部"),
@@ -191,13 +200,18 @@ async def auto_import_upload(
 
     save_path = config.UPLOAD_DIR / f"{uuid.uuid4().hex}{ext}"
     with open(save_path, "wb") as f:
-        f.write(await file.read())
+        f.write(file.file.read())
 
-    doc, _blocks = register_document(db, filename, ext, save_path)
     try:
-        ps = _precheck_pages(db, doc, pages)
-    except HTTPException:
+        doc, _blocks = register_document(db, filename, ext, save_path)
+    except Exception:
+        # register_document 抛错 = 这一个 Document **没落库**，但文件已经写进
+        # uploads 了。文件名是 uuid，事后谁也判断不出能不能删，于是永久占着盘。
+        # 这一处才是真孤儿；下面预检失败时文档已经存在、文件归它所有，不能删。
+        save_path.unlink(missing_ok=True)
         raise
+
+    ps = _precheck_pages(db, doc, pages)
     return _kickoff(db, doc, ps, spec)
 
 
@@ -216,9 +230,15 @@ def auto_import_path(payload: AutoImportIn, db: Session = Depends(get_db)):
     check_ext(ext)
 
     save_path = config.UPLOAD_DIR / f"{uuid.uuid4().hex}{ext}"
-    shutil.copy2(src, save_path)
+    try:
+        # copy2 半途失败会留下半个文件，register_document 抛错时 Document 没落库、
+        # 文件却已经在了 —— 两种都是没人认领的 uuid 文件名，就地清掉。
+        shutil.copy2(src, save_path)
+        doc, _blocks = register_document(db, src.name, ext, save_path)
+    except Exception:
+        save_path.unlink(missing_ok=True)
+        raise
 
-    doc, _blocks = register_document(db, src.name, ext, save_path)
     ps = _precheck_pages(db, doc, payload.pages)
     return _kickoff(db, doc, ps, spec)
 
