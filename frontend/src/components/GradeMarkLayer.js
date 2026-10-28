@@ -40,7 +40,7 @@
 //    被实际踩过：想加线却把刚画好的那条删了，非常难用。
 //    ⚠️ line 模式下**段（region rect）不接收指针事件**：段是整页宽的，
 //       收事件等于「页面任何地方都点不了新线」。段的删除走右栏面板。
-import { ref, watch } from 'vue';
+import { computed, ref, watch } from 'vue';
 
 import { UNIT, bboxOf, clampUnit as clamp, flatPoints, pagePoint, segDist, shiftGeo } from '../markGeom.js';
 
@@ -162,7 +162,13 @@ function buildShape(mark, off) {
       w: r1(hitW),
       h: r1(hitH),
     },
-    label: { left: pct(x), top: pct(y) },
+    // 文本框的宽高也走这里：w/h 是 geo 矩形的尺寸（0~1000）。
+    // 老的文字标注存的是零面积点（geo = [x,y,x,y]）→ w/h 都是 0 → 模板里不给宽高，
+    // 退回 CSS 按内容自适应，老数据照旧能看，不会突然变成 0 宽的一条。
+    label: { left: pct(x), top: pct(y), w: w > 0 ? pct(w) : '', h: h > 0 ? pct(h) : '',
+             // 有宽高 = 新口径（矩形，top 就是左上角）→ 模板里去掉 translate(0,-100%)；
+             // 零面积点 = 老口径（一个点、文字往上浮）→ 保留 translate，老标注观感不变。
+             sized: w > 0 && h > 0 },
   };
 }
 
@@ -170,7 +176,14 @@ function buildShape(mark, off) {
 
 const ERASE_PAD = 18;      // 包围盒外扩多少还算点中
 const ERASE_LINE = 22;     // 手绘线本身多粗算擦到（要大于笔画视觉宽度）
-const MIN_STEP = 2.2;      // 抽稀：两点距离小于这个就不记（一张 A4 画一笔几百点足够）
+/* ⚠️ 抽稀阈值**不在这里**：它是屏幕像素（MIN_STEP_PX，见「采样」那段）。
+   以前这里放过一个 MIN_STEP = 2.2，那是 0~1000 归一化单位 —— 页图越窄越丢点、
+   x/y 比例不同还各向异性。留着只会让下一个人误以为是同一件事，已删。 */
+/* 一笔最多存多少点。只防「涂满整页把 JSON 撑爆」这一件事。
+   ⚠️ 到上限后必须**替换最后一个点**，不能像以前那样直接 return ——
+      直接丢会让笔尖停在半路不动，正是用户报的「写着一半笔尖消失」。
+      4000 点约 30KB，正常一笔到不了。 */
+const MAX_POINTS = 4000;
 
 /** 能拖的只有「四个数就说完」的框类标注。笔迹 ink 不在里面 —— 见文件头 ⑥。 */
 const MOVE_KINDS = ['box', 'ellipse', 'check', 'cross', 'arrow', 'text'];
@@ -259,10 +272,18 @@ export default {
     const same = (a, b) => a !== null && a !== undefined && b !== null && b !== undefined
       && String(a) === String(b);
 
-    // 读 offsets.value 建立响应依赖：拖动时每帧重算，形状跟手走
-    const shapesFor = (list) => (list || []).map(
-      (m) => buildShape(m, offsets.value[String(m.id)]),
-    );
+    /* 每帧只算一次。以前模板里调两遍（SVG 列表 + 文字标签），hitTest 里还要再调一遍，
+       页上标注一多就是每帧 O(3 × 全页点数) 的字符串重建 —— 这是书写时「抖」的主因之一。
+       computed 的依赖：props.marks（父组件整体换数组）+ offsets + resizing，任一变了才重算。 */
+    const allShapes = computed(() => (props.marks || []).map((m) => {
+      const ov = resizing.value[String(m.id)];
+      // 调大小只换 geo（四个数），不叠加平移 —— 与拖动同一套渲染，但状态分开存
+      return buildShape(ov ? Object.assign({}, m, { geo: ov }) : m, offsets.value[String(m.id)]);
+    }));
+    /** 兼容原来的调用姿势：传进来就是 props.marks 时直接用缓存，别的列表才现算。 */
+    const shapesFor = (list) => (list === undefined || list === props.marks
+      ? allShapes.value
+      : (list || []).map((m) => buildShape(m, offsets.value[String(m.id)])));
     const isPicked = (s) => same(s.itemId, props.selectedItemId);
     const isLinked = (s) => s.itemId !== null && s.itemId !== undefined;
     const isGone = (s) => erasing.value.includes(String(s.mark.id));
@@ -365,6 +386,73 @@ export default {
     /** 父组件提交失败时把界面退回去 —— 不能停在「看着拖走了、库里没变」。 */
     function clearOffsets() {
       offsets.value = {};
+      resizing.value = {};      // 调大小的临时尺寸一起退，否则会停在「看着变大了、库里没变」
+    }
+
+    /* ---------------- 调文本框大小（2026-10-27：文本框要能自由调宽高） ----------------
+       与「拖动位置」是两套状态：拖动是平移（offsets 存 dx/dy），调大小是改 geo 的右下角。
+       两者松手都 emit('move')，父组件复用同一条 PATCH（geo 是同一个字段）——
+       所以后端、接口、表结构零改动，`homework_grade_marks.geo` 本来就是 4 个 0~1000 整数。
+       ⚠️ 宽高存在 geo 里，**不能借 width 字段**：那个字段是笔迹粗细（grade_store 里
+          clamp 0~200），混用会让笔迹粗细跟着一起坏。 */
+    const resizing = ref({});     // { [id]: [x1,y1,x2,y2] } 拖动中的实时 geo
+    let resizeState = null;       // { id, mark, x1, y1 }
+
+    /** 只有「已入库的文本框」能调大小；画笔/橡皮模式下不给（那两个模式按下去是落笔）。 */
+    const canResize = (s) => s.kind === 'text'
+      && s.mark.id !== null && s.mark.id !== undefined
+      && !isGone(s)
+      && MOVE_MODES.indexOf(props.mode) >= 0;
+
+    function startResize(e, s) {
+      if (!canResize(s)) return;
+      if (e.pointerType === 'mouse' && e.button !== 0) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const g = numList(s.mark.geo);
+      const x1 = g.length >= 4 ? Math.min(g[0], g[2]) : 0;
+      const y1 = g.length >= 4 ? Math.min(g[1], g[3]) : 0;
+      resizeState = { id: String(s.mark.id), mark: s.mark, x1, y1 };
+      const el = e.currentTarget;
+      if (el && el.setPointerCapture) {
+        try { el.setPointerCapture(e.pointerId); } catch (err) { /* 老浏览器 */ }
+      }
+    }
+
+    function resizeTo(e) {
+      const st = resizeState;
+      if (!st) return;
+      const pt = toPt(e);
+      if (!pt) return;
+      // 右下角不许越过左上角；最小 40x30 单位（约页宽 4%、页高 3%），再小就读不了了
+      const x2 = clamp(Math.max(pt[0], st.x1 + 40));
+      const y2 = clamp(Math.max(pt[1], st.y1 + 30));
+      const next = Object.assign({}, resizing.value);
+      next[st.id] = [Math.round(st.x1), Math.round(st.y1), Math.round(x2), Math.round(y2)];
+      resizing.value = next;
+    }
+
+    function endResize(e) {
+      const st = resizeState;
+      if (!st) return;
+      resizeState = null;
+      const el = e && e.currentTarget;
+      if (el && el.releasePointerCapture && e.pointerId !== undefined) {
+        try { el.releasePointerCapture(e.pointerId); } catch (err) { /* 同上 */ }
+      }
+      const geo = resizing.value[st.id];
+      if (!geo) return;
+      suppressPickUntil = Date.now() + 400;   // 拖完那一下的 click 不该把右栏跳走
+      emit('move', { mark: st.mark, geo });   // 一次松手只发一个 PATCH
+    }
+
+    function cancelResize() {
+      if (!resizeState) return;
+      const id = resizeState.id;
+      resizeState = null;
+      const next = Object.assign({}, resizing.value);
+      delete next[id];                 // 被打断就退回原尺寸
+      resizing.value = next;
     }
 
     /** 屏幕坐标 → 0~1000 的页坐标。换算本身在 ../markGeom.js（那边有 node 单测）。 */
@@ -402,6 +490,43 @@ export default {
       erasing.value = erasing.value.concat([id]);
     }
 
+    /* ---------------- 采样：合帧 + 取中间点（第 2 条「笔尖不消失、不闪烁」） ----------------
+       三件事，缺一件手感就变差：
+       ① requestAnimationFrame 合帧 —— 120Hz 笔 / 高回报率鼠标一帧能来 4~8 次 pointermove，
+          每次都改响应式 draft 就等于每次都整层重渲染。攒到下一帧一次写完。
+       ② getCoalescedEvents —— 浏览器会把一帧内的多个点合并成一个事件，不主动取中间点，
+          快写时笔迹就被切成折线弦（看着「不跟手」）。
+       ③ 抽稀按**屏幕像素**（MIN_STEP_PX），不再用 0~1000 的归一化单位 ——
+          后者在 A4 页上 x/y 比例不同 → 各向异性，页图渲染得越大丢点越狠。 */
+    const MIN_STEP_PX = 1.6;         // 屏幕像素；比这更近的点不记
+    const raf = typeof requestAnimationFrame === 'function'
+      ? requestAnimationFrame : (fn) => setTimeout(fn, 16);
+    const caf = typeof cancelAnimationFrame === 'function'
+      ? cancelAnimationFrame : (id) => clearTimeout(id);
+    let rafId = 0;
+    let pendingPts = [];
+    let inkLastPx = null;
+
+    /** 把攒着的点一次写进 draft。到上限后**替换最后一个点**，保证笔尖继续跟手。 */
+    function flushDraft() {
+      rafId = 0;
+      if (!pendingPts.length) return;
+      const add = pendingPts;
+      pendingPts = [];
+      let cur = draft.value;
+      for (let i = 0; i < add.length; i += 1) {
+        cur = cur.length >= MAX_POINTS ? cur.slice(0, -1).concat([add[i]]) : cur.concat([add[i]]);
+      }
+      draft.value = cur;
+    }
+
+    /** 收笔 / 被打断时清干净：没刷出去的点一并丢掉（被打断的那一笔本来就不该提交）。 */
+    function resetInk() {
+      if (rafId) { caf(rafId); rafId = 0; }
+      pendingPts = [];
+      inkLastPx = null;
+    }
+
     function onDown(e) {
       if (props.mode === 'view') return;
       const pt = toPt(e);
@@ -411,7 +536,9 @@ export default {
 
       if (props.mode === 'ink') {
         drawing.value = true;
+        resetInk();                            // 兜底：万一上一笔被异常收尾，残留点不许漏进这一笔
         draft.value = [[x, y]];
+        inkLastPx = [e.clientX, e.clientY];   // 抽稀的像素基准（client 差值就是屏幕像素差）
         try { svgEl.value.setPointerCapture(e.pointerId); } catch (err) { /* 老浏览器 */ }
         return;
       }
@@ -475,17 +602,39 @@ export default {
 
     function onMove(e) {
       if (!drawing.value) return;
+
+      if (props.mode === 'ink') {
+        // ① 取出被浏览器合并掉的中间点（老浏览器没这个 API 就退化成单点）
+        const raw = typeof e.getCoalescedEvents === 'function' ? e.getCoalescedEvents() : null;
+        const list = raw && raw.length ? raw : [e];
+        const el = svgEl.value;
+        if (!el) return;
+        // rect 一次算完整批共用 —— 原来每个点各算一次 getBoundingClientRect
+        const rect = el.getBoundingClientRect();
+        if (!rect.width || !rect.height) return;
+
+        const fresh = [];
+        for (let i = 0; i < list.length; i += 1) {
+          const ev = list[i];
+          // ② 抽稀按屏幕像素判（各向同性的几何距离），不再用归一化单位
+          if (inkLastPx && Math.hypot(ev.clientX - inkLastPx[0], ev.clientY - inkLastPx[1]) < MIN_STEP_PX) continue;
+          inkLastPx = [ev.clientX, ev.clientY];
+          fresh.push([
+            clamp((ev.clientX - rect.left) / rect.width * UNIT),
+            clamp((ev.clientY - rect.top) / rect.height * UNIT),
+          ]);
+        }
+        if (!fresh.length) return;
+        pendingPts = pendingPts.concat(fresh);
+        // ③ 合帧：一帧里来 8 次 move 也只改一次响应式 draft
+        if (!rafId) rafId = raf(flushDraft);
+        return;
+      }
+
       const pt = toPt(e);
       if (!pt) return;
       const [x, y] = pt;
 
-      if (props.mode === 'ink') {
-        const last = draft.value[draft.value.length - 1];
-        if (last && Math.hypot(x - last[0], y - last[1]) < MIN_STEP) return;
-        if (draft.value.length > 900) return;      // 一页画满一条也别把 JSON 撑爆
-        draft.value = draft.value.concat([[x, y]]);
-        return;
-      }
       if (props.mode === 'erase') {
         const m = hitTest(x, y);
         if (m) markErased(m);
@@ -516,6 +665,10 @@ export default {
     function onUp() {
       if (!drawing.value) return;
       drawing.value = false;
+
+      // 合帧是有延迟的：松手那一刻，最后一帧攒下的点还躺在 pendingPts 里没进 draft。
+      // **必须同步刷完再提交** —— 直接清掉的话，每一笔的尾巴都缺一小截。
+      if (props.mode === 'ink') flushDraft();
 
       if (props.mode === 'region') {
         const box = draftBox();
@@ -555,12 +708,36 @@ export default {
         });
       }
       draft.value = [];
+      // 采样状态与 draft 一起清。**inkLastPx 一定要清**：留着的话，下一笔的第一点
+      // 若落在上一笔收笔处附近（老师连着写两个字很常见）会被判成「太近」直接丢掉，
+      // 表现就是「新起笔前 2 个像素不显形」。resetInk 只碰这几个本地变量，别的模式调也安全。
+      resetInk();
 
       if (props.mode === 'erase' && erasing.value.length) {
         const ids = erasing.value.slice();
         erasing.value = [];
         emit('erase', ids);      // 一次松手只发一个请求（父组件串行删）
       }
+    }
+
+    /** 指针被系统收走（掌托误触、系统手势、切窗口、来电）：**什么都不提交**。
+     *
+     *  以前模板里 @pointercancel 直接复用 onUp —— 等于把「被打断」当成「写完了」：
+     *  正在写的那一笔会被当成完整的一笔存进去，正在擦的那几条会被真的删掉。
+     *  用户报的「笔尖消失」有一部分就是它：掌托一碰，半条笔迹被提前收走。
+     *  被打断的正确语义是「这一笔没写完，丢掉」—— 与拖动那边的 cancelDrag 同一条原则。 */
+    function onCancel() {
+      if (!drawing.value) return;
+      drawing.value = false;
+      // 顺序要紧：先掐掉待执行的 rAF，再清 draft。
+      // 反过来的话 rAF 在下一帧照样跑，把 pendingPts 又写回 draft —— 界面上会冒出
+      // 一条「已经被判定为丢弃」的残留笔迹（下一笔才开始写它才消失）。
+      resetInk();
+      draft.value = [];
+      erasing.value = [];
+      regionDraft.value = null;
+      lineDrag.value = null;
+      pending.value = null;
     }
 
     expose({ clearOffsets });   // 父组件 PATCH 失败时调它，界面退回原位
@@ -594,7 +771,8 @@ export default {
     return {
       svgEl, drawing, draft, erasing, regionDraft, lineDrag, pending,
       shapesFor, isPicked, isLinked, isGone, canMove, isDragging, pick, onPickClick,
-      onDown, onMove, onUp, startDrag, dragTo, endDrag, cancelDrag,
+      onDown, onMove, onUp, onCancel, startDrag, dragTo, endDrag, cancelDrag,
+      canResize, startResize, resizeTo, endResize, cancelResize,
       lineList, bandList, lineTip,
       draftPoly: (pts) => pts.map((p) => `${r1(p[0])},${r1(p[1])}`).join(' '),
       /** 框 → 画图要用的四个数 + 标签位置。**永不返回 null**（模板里直接取属性）。 */
@@ -621,7 +799,7 @@ export default {
          根节点默认 pointer-events:none，只有「标注」在 view 模式下可点（空白处穿透到图片）；
          画笔/橡皮/文字模式下由 CSS 反向打开整层的事件，同时让标注失去指针。 -->
     <svg class="gmark-svg" ref="svgEl" viewBox="0 0 1000 1000" preserveAspectRatio="none"
-         @pointerdown="onDown" @pointermove="onMove" @pointerup="onUp" @pointercancel="onUp">
+         @pointerdown="onDown" @pointermove="onMove" @pointerup="onUp" @pointercancel="onCancel">
       <!-- 一题一区域：**只在「框题」与「分割线」模式下显示**。平时也画出来的话
            整页都是虚线框，老师就看不 clean 自己批到哪儿了。
            line 模式下这些框只作参考（不收事件，见 app.css 的 .mode-line 规则）。 -->
@@ -698,7 +876,9 @@ export default {
       </g>
 
       <!-- 正在画的这一笔：不进库、不落后端，松手才提交（拖到一半网断了不至于留半条） -->
-      <polyline v-if="draft.length > 1" class="gmark-draft" :points="draftPoly(draft)"
+      <!-- ⚠️ 判据是 >= 1 而不是 > 1：落笔的第一个点就要画出来（一个点靠 linecap:round 显示成圆点）。
+           写成 > 1 的话，按下到第一次移动之间屏幕上是空的 —— 这就是「笔尖消失」最直接的一条。 -->
+      <polyline v-if="draft.length >= 1" class="gmark-draft" :points="draftPoly(draft)"
                 :stroke="color" :style="penWidth > 0 ? { strokeWidth: penWidth + 'px' } : null"
                 fill="none" stroke-linecap="round" stroke-linejoin="round" />
     </svg>
@@ -707,11 +887,17 @@ export default {
          「选择」模式下可以直接按住拖走（父组件松手时 PATCH geo）。 -->
     <span v-for="s in shapesFor(marks).filter(x => x.text)" :key="'tx-' + s.key"
           class="gmark-label"
-          :class="{ sel: isPicked(s), linked: isLinked(s), drag: isDragging(s) }"
-          :style="{ left: s.label.left, top: s.label.top, borderColor: s.color, color: s.color }"
+          :class="{ sel: isPicked(s), linked: isLinked(s), drag: isDragging(s), sized: s.label.sized }"
+          :style="{ left: s.label.left, top: s.label.top, borderColor: s.color, color: s.color,
+                    width: s.label.w, height: s.label.h }"
           @pointerdown="startDrag($event, s)" @pointermove="dragTo"
           @pointerup="endDrag" @pointercancel="cancelDrag"
-          @click.stop="onPickClick(s)">{{ s.text }}</span>
+          @click.stop="onPickClick(s)">{{ s.text
+          }}<i v-if="canResize(s)" class="gmark-resize" title="拖动调整文本框大小"
+             @pointerdown.stop="startResize($event, s)"
+             @pointermove.stop="resizeTo"
+             @pointerup.stop="endResize"
+             @pointercancel.stop="cancelResize"></i></span>
 
     <!-- 分割线：段序号 + 线上的 ×。
          ⚠️ 点线本身**不删**（只拖），删除只走这个 × —— 见文件头 ⑦。 -->
