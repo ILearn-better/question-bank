@@ -28,7 +28,7 @@
 // ⑥ **分割线只是「生成整页宽框」的快捷方式**，不是新的数据类型（`src/gradeLines.js`）。
 //    线切出来的段 `box = [0,y0,1000,y1]`，与框选出来的段在库里长一个样 ——
 //    所以裁切 / 跨页竖拼 / 逐题批改 / 沿用上一份，全都走已有那套，后端零改动。
-import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue';
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import { useRoute } from 'vue-router';
 import { gradeApi, lessonFilesApi } from '../api.js';
 import { FROM } from '../backTarget.js';
@@ -40,7 +40,9 @@ import {
   LINE_MIN_GAP, endOfPageFromSegs, isFullWidth, lineToDropFor, linesFromSegs,
   reslicePage, sortBlocksByGeometry,
 } from '../gradeLines.js';
+import { installGradeKeys } from '../gradeKeys.js';
 import { clampUnit } from '../markGeom.js';
+import { activeSeqAt } from '../gradeNav.js';
 
 const POLL_MS = 2000;
 /** 轮询要继续的两个状态。⚠️ **只用于「停不停轮询」**，别拿它判断按钮禁不禁用（见 `running`）。
@@ -108,6 +110,13 @@ export default {
   setup() {
     const route = useRoute();
     const gid = route.params.id;
+
+    /** 查看模式：链接带 `?view=1` 时进来的是只读视图。
+     *
+     *  ⚠️ **不根据 status 自动推断**。老师确认完之后往往还想补两笔，自动锁死会打断他；
+     *     要只读就显式带参数进来（从存档、从学生页回顾时用）。
+     *     判据只在这一处 —— 别处不许再用 status 自己猜「能不能改」。 */
+    const readOnly = computed(() => String(route.query.view || '') === '1');
 
     /* 本页是被谁打开的 —— 决定「新版工作台」按钮把哪个来源继续往下传。
      * 学生信息 / 主控制台进来时会带 `?from=`；什么都没带的（直接打开 /grade/7、
@@ -307,6 +316,88 @@ export default {
     );
     /** 草稿里的**框**（段）总数 —— 与「题数」不是一个数，跨页题是 1 题 2 框。 */
     const draftSegCount = computed(() => allDraftSegs().length);
+
+    /* ---------------- 题目导航（右栏）：点击定位 + 当前题高亮 ---------------- */
+    const leftCol = ref(null);
+    const navActive = ref(null);
+    const navLock = ref(false);
+    const navBlock = computed(() => regionBlocks.value.find((b) => b.seq === navActive.value) || null);
+
+    // 编辑态兜底选中第一题：卷面很短（一页装得下、根本不用滚）时 scroll 事件不触发，
+    // navActive 会一直是 null →「这块不判 / 并入上一题 / 删」永远不出现。
+    // 只在还没选中时兜底，不覆盖用户点出来的选择。
+    // `regionBlocks` 依赖 `editingRegions`，所以进/出分割模式都会重算，watch 它一处就够。
+    watch(regionBlocks, (list) => {
+      if (navActive.value !== null) return;          // 用户已经选过了，别抢
+      if (!editingRegions.value || !list.length) return;
+      navActive.value = list[0].seq;
+    }, { immediate: true });
+
+    // 判题线的图片坐标：viewTopPx = 滚动容器可视区顶 + 吸顶 head 高（head 在容器内 sticky top:0）
+    function navLinePx(img) {
+      const col = leftCol.value;
+      const isWide = window.innerWidth > 1180;
+      const colRect = isWide && col ? col.getBoundingClientRect() : { top: 0 };
+      const head = document.querySelector('.grade-head');
+      const headH = head ? head.offsetHeight : 0;
+      const viewTopPx = colRect.top + headH;
+      const imgTopPx = img.getBoundingClientRect().top;
+      return { linePx: viewTopPx - imgTopPx, imgH: img.offsetHeight || img.getBoundingClientRect().height };
+    }
+
+    function updateNavSpy() {
+      if (navLock.value) return;
+      const img = document.querySelector('.grade-page-img');
+      if (!img) return;
+      const { linePx, imgH } = navLinePx(img);
+      if (!imgH) return;
+      navActive.value = activeSeqAt(regionBlocks.value, pageNo.value, linePx, imgH);
+    }
+
+    // 滚起来一帧最多算一次高亮：scroll 事件能在一帧里连发几十次，全算一遍是浪费。
+    let navRaf = 0;
+    function scheduleNavSpy() {
+      if (navRaf) return;
+      navRaf = requestAnimationFrame(() => { navRaf = 0; updateNavSpy(); });
+    }
+
+    function waitImg() {
+      return new Promise((resolve) => {
+        const img = document.querySelector('.grade-page-img');
+        if (img && img.offsetHeight > 0) return resolve();
+        if (!img) return resolve();
+        const onload = () => { img.removeEventListener('load', onload); resolve(); };
+        img.addEventListener('load', onload);
+        setTimeout(resolve, 300);
+      });
+    }
+
+    async function navJump(b) {
+      navActive.value = b.seq;
+      navLock.value = true;
+      const firstPage = Number((b.pages && b.pages[0]) || 1);
+      if (firstPage !== pageNo.value) goPage(firstPage);
+      await nextTick();
+      await waitImg();
+      const img = document.querySelector('.grade-page-img');
+      const seg = (b.segs || []).find((s) => Number(s.page_no || 1) === pageNo.value) || (b.segs || [])[0] || b;
+      const y0 = Number((seg.box && seg.box[1]) || 0);
+      const { imgH } = navLinePx(img);
+      if (!imgH) { navLock.value = false; return; }
+      const col = leftCol.value;
+      const isWide = window.innerWidth > 1180;
+      const head = document.querySelector('.grade-head');
+      const headH = head ? head.offsetHeight : 0;
+      const rect = img.getBoundingClientRect();
+      if (isWide && col) {
+        const target = col.scrollTop + (rect.top - col.getBoundingClientRect().top) + rect.height * y0 / 1000 - headH;
+        col.scrollTo({ top: Math.max(0, target), behavior: 'smooth' });
+      } else {
+        const target = (window.scrollY || document.documentElement.scrollTop) + rect.top + rect.height * y0 / 1000 - headH;
+        window.scrollTo({ top: Math.max(0, target), behavior: 'smooth' });
+      }
+      setTimeout(() => { navLock.value = false; }, 900);
+    }
 
     /** 交给标注层画的框：每段一个框，label 用**它所属那道题**的标签（跨页两段同号）。 */
     const layerRegions = computed(() => {
@@ -1307,6 +1398,25 @@ export default {
       }
     }
 
+    /* ---------------- 快捷键（第 3 条：橡皮、撤销不该只能一个个点） ----------------
+       键位表在 ../gradeKeys.js（两个批改页共用的唯一出处），这里只提供「动作」。 */
+
+    /** 快捷键专用：**直接切**到某个工具。
+     *  setTool 是「再点一次退出」的 toggle，那是给鼠标点按钮设计的；
+     *  键盘上按 E 就该是橡皮，连按两下还是橡皮 —— 不能按第二下把自己送回「选择」。 */
+    function useTool(t) {
+      if (tool.value === t) return;
+      setTool(t);
+    }
+
+    /** Esc：先关掉弹着的文字框，再退回「选择」。 */
+    function onEscape() {
+      if (textDraft.value) { textDraft.value = null; return; }
+      if (tool.value !== 'view') setTool('view');
+    }
+
+    let keysOff = null;      // 卸载函数，onBeforeUnmount 里调用
+
     function onTextAt({ x, y }) {
       textDraft.value = { x, y, text: '' };
     }
@@ -1317,7 +1427,21 @@ export default {
       const text = (d.text || '').trim();
       textDraft.value = null;
       if (!text) return;                             // 空着就当没点
-      await addMark({ kind: 'text', geo: [d.x, d.y, d.x, d.y], text, color: inkColor.value });
+      // 给一个能装下字的默认框（2026-10-27）：以前存的是零面积点 [x,y,x,y]，
+      // 于是文字只能靠 CSS 的 nowrap + 省略号收场 —— 长批注被截掉且界面不提示。
+      // 现在按页宽 30% 给宽、按字数估高（下限 60 单位 ≈ 页高 6%），存进 geo 的四个数里，
+      // 渲染时就能换行显示，老师还能再拖右下角改大小。
+      const w = 300;
+      const lines = Math.max(1, Math.ceil(text.length / 14));
+      const h = Math.min(400, Math.max(60, lines * 40));
+      // 落点右下方展开，但贴到页边时往回收，别让框跑到纸外
+      const x1 = Math.min(d.x, 1000 - w);
+      const y1 = Math.min(d.y, 1000 - h);
+      await addMark({
+        kind: 'text',
+        geo: [Math.round(x1), Math.round(y1), Math.round(x1 + w), Math.round(y1 + h)],
+        text, color: inkColor.value,
+      });
     }
 
     /** 撤销：先退**本机还没传上去的**最后一笔，再退服务端的。
@@ -1585,6 +1709,17 @@ export default {
       // 全局粘贴只服务于「判定依据传图」：贴文字时 onPaste 会立刻返回，
       // 不抢 textarea 的正常粘贴（见 onPaste 的说明）。
       window.addEventListener('paste', onPaste);
+      // 快捷键：B/E/V/T/C/X/L/R 切工具、Ctrl+Z 撤销、Esc 回选择。
+      // 查看模式下 canEdit 返回 false，工具键与撤销一律不响应（输入框里也不会抢键）。
+      keysOff = installGradeKeys({
+        canEdit: () => !readOnly.value,
+        tool: useTool,
+        undo: undoLast,
+        escape: onEscape,
+      });
+      // 导航高亮：宽屏滚 .grade-left，窄屏滚 window，两条都要听。
+      if (leftCol.value) leftCol.value.addEventListener('scroll', scheduleNavSpy);
+      window.addEventListener('scroll', scheduleNavSpy);
       await load();
       startPolling();
     });
@@ -1592,6 +1727,10 @@ export default {
       // 页面被路由切走时把草稿冲掉 —— 防抖窗口里那两百毫秒不能成为"丢一笔"的口子
       localDraft.flush();
       window.removeEventListener('paste', onPaste);
+      if (leftCol.value) leftCol.value.removeEventListener('scroll', scheduleNavSpy);
+      window.removeEventListener('scroll', scheduleNavSpy);
+      if (navRaf) { cancelAnimationFrame(navRaf); navRaf = 0; }
+      if (keysOff) { keysOff(); keysOff = null; }   // 不摘掉的话切走之后还在抢 B/E 这些键
       stopPolling();
       richEls.clear();
       painted.clear();
@@ -1614,7 +1753,7 @@ export default {
       setupAnswerFiles, setupImages, answerImgCount, uploadAnswerImage, clearAnswerImages,
       touchSetup, saveSetup, onAnswerDrop, onPaste,
       // 手写批改
-      tool, inkColor, textDraft, exporting, INK_COLORS, teacherMarks, layerEl,
+      tool, inkColor, textDraft, exporting, INK_COLORS, teacherMarks, layerEl, readOnly,
       setTool, addMark, eraseMarks, onTextAt, saveText, moveMark,
       undoLast, clearPageMarks, exportFile, archiveGrade,
       // 本机草稿：待发笔迹 / 补发
@@ -1629,6 +1768,8 @@ export default {
       toggleBlockSkip, skippedPages, pageSkipped, togglePageSkip,
       pageEnd, pageTail, setPageEnd, resetPageEnd, blockPreview, openPreview,
       saveRegions, copyRegions, syncRegions, clearRegions,
+      // 题目导航（右栏）：点击定位 + 当前题高亮
+      leftCol, navActive, navBlock, navJump,
     };
   },
   template: `
@@ -1782,7 +1923,13 @@ export default {
 
       <div class="grade-wrap">
         <!-- ==================== 左：页图 + 标注层 ==================== -->
-        <div class="card grade-left">
+        <div class="card grade-left" ref="leftCol">
+          <!-- 工具栏吸顶（2026-10-27）：这三块原来和卷面一起装在 .grade-left 这个
+               overflow:auto 容器里，往下滚就把工具条一起卷走了 —— 换橡皮得先滚回顶部。
+               现在包一层 sticky，只有卷面从它下面滚过去。
+               ⚠️ 别把 .grade-page 也包进来：卷面必须能滚，包进来等于给它限高，
+                  而标注层是按容器等比铺的，限高会让标注和卷面对不上。 -->
+          <div class="grade-head">
           <div class="grade-pagebar">
             <button class="btn ghost sm" :disabled="pageNo <= 1" @click="prevPage">← 上一页</button>
             <span class="small">第 {{ pageNo }} / {{ pageCount }} 页</span>
@@ -1798,11 +1945,13 @@ export default {
             <div class="spacer"></div>
             <span class="small muted" v-if="pageMarks.length">这一页 {{ pageMarks.length }} 处标注</span>
             <span class="small muted" v-else>这一页没有标注</span>
+            <!-- 查看模式（?view=1）：只读，工具栏禁用但不隐藏。说一句，别让老师以为按钮坏了。 -->
+            <span v-if="readOnly" class="tag orange" title="链接带 ?view=1 进来的是只读视图，去不掉这个参数就能改">查看模式 · 不可修改</span>
           </div>
 
           <!-- 手写批改工具条。笔迹 / 文字 / √× 都落进 homework_grade_marks，
                和 AI 给的框同源 —— 所以「擦」可以连 AI 的框一起擦，撤销只退老师自己的。 -->
-          <div class="grade-tools">
+          <div class="grade-tools" :class="{ readonly: readOnly }">
             <button class="g-tool" :class="{ on: tool === 'view' }" @click="tool = 'view'">选择</button>
             <button class="g-tool" :class="{ on: tool === 'ink' }" @click="setTool('ink')">画笔</button>
             <button class="g-tool" :class="{ on: tool === 'erase' }" @click="setTool('erase')">橡皮</button>
@@ -1832,98 +1981,19 @@ export default {
               : tool === 'region' ? '按住拖出一个框，把一道题（题干 + 作答）整个框进去。框宁大勿小 —— 切掉笔画就再也读不回来了。'
               : '在要判的地方点一下，就放一个 ' + (tool === 'check' ? '√' : '×') + '。' }}
           </div>
+          </div><!-- /grade-head -->
 
-          <!-- ============ 分割 / 框题面板：两种画法共用一块 ============ -->
-          <!-- 数据上它们是同一件事（线切出来就是整页宽的框），所以面板也共用：
-               一行 = 一道题，跨页题显示成「跨第 1 + 2 页 · 2 段」。 -->
-          <div v-if="editingRegions" class="grade-regions">
-            <div class="gr-head">
-              <b>{{ tool === 'line' ? '逐题分割' : '框题' }}</b>
-              <span class="small muted">
-                {{ regionBlocks.length }} 题 · {{ draftSegCount }} 段<template v-if="lineCount"> · {{ lineCount }} 条分割线</template>
-              </span>
-              <span v-if="regionsDirty" class="small" style="color:var(--warning)">未保存</span>
-              <div class="spacer"></div>
-              <button class="btn ghost sm" :disabled="busy === 'copy'" @click="copyRegions">
-                {{ busy === 'copy' ? '沿用中…' : '沿用上一份' }}
-              </button>
-              <button class="btn ghost sm" :disabled="!draftSegCount && !lineCount" @click="clearRegions">全清</button>
-              <button class="btn sm" :disabled="busy === 'regions'" @click="saveRegions">
-                {{ busy === 'regions' ? '保存中…' : '保存分割' }}
-              </button>
-            </div>
-            <div v-if="!regionBlocks.length" class="small muted" style="padding:6px 0">
-              <template v-if="tool === 'line'">
-                还没分割线 —— 在卷面上<b>逐题点一下</b>，线之间就是一道题。
-                第一条线以上也算一段（学生可能从页顶就开始写），多出来的页眉段点「删」就行。
-              </template>
-              <template v-else>
-                还没画框 —— 在卷面上拖出一个框，把一道题（题干 + 作答）整个框进去。
-              </template>
-              有段的页<b>一段一次</b>判（切得越准，读得越清），没段的页仍然整页判一次。
-            </div>
-            <div v-else class="gr-list">
-              <!-- 一行 = 一道题。**必须带缩略图**：以前这里只有「第 1 页 / 跨第 1+2 页」两句话，
-                   切歪了只能等模型判完才知道哪块不对 —— 这就是用户说的「分割截图完后看不到图」。
-                   图走 /region-image 现裁（不落盘），**保存前就能看**，改一下坐标 URL 就变。 -->
-              <div v-for="b in regionBlocks" :key="'b-' + b.seq" class="gr-row"
-                   :class="{ off: b.skipped }">
-                <div class="gr-row-top">
-                  <span class="gr-no">{{ b.seq + 1 }}</span>
-                  <label class="small">题号</label>
-                  <input class="gr-q" :value="b.q_no" placeholder="留空就按顺序"
-                         @input="setRegionQNo(b, $event.target.value)">
-                  <span v-if="b.pages.length > 1" class="gr-span" :title="'两段会竖拼成一张图再判'">
-                    跨第 {{ b.pages.join(' + ') }} 页 · {{ b.pages.length }} 段
-                  </span>
-                  <span v-else class="small muted">第 {{ b.pages[0] }} 页</span>
-                  <div class="spacer"></div>
-                  <button class="btn ghost sm" :class="{ on: b.skipped }" @click="toggleBlockSkip(b)"
-                          :title="b.skipped ? '恢复：这块会重新送去批改' : '这块不送 AI（卷头、结构说明段、重复页上的段）——框还留着'">
-                    {{ b.skipped ? '不判 · 恢复' : '这块不判' }}
-                  </button>
-                  <button v-if="b.seq > 0" class="btn ghost sm" @click="mergeRegion(b)"
-                          title="跨页题：并到上一题，两段竖拼成一张图再判">并入上一题</button>
-                  <button class="btn ghost sm" @click="dropBlock(b)">删</button>
-                </div>
-                <div class="gr-thumb">
-                  <img :src="blockPreview(b)" loading="lazy" alt="这块切出来的样子"
-                       @click="openPreview(b)" title="点一下看大图">
-                  <span v-if="b.skipped" class="gr-off-tag">不送 AI</span>
-                </div>
-              </div>
-            </div>
-            <!-- 每页尾部：末段切到哪为止。默认到页底（历史行为），
-                 拖到 96% 就把页脚 / 页码那一截排除在块之外。 -->
-            <div v-if="tool === 'line'" class="gr-tail">
-              <span class="small">末段底边</span>
-              <input type="range" min="50" max="100" step="1" :value="pageEnd / 10"
-                     @input="setPageEnd($event.target.value * 10)">
-              <span class="small" :class="{ muted: pageEnd >= 1000 }">{{ pageEnd / 10 }}%</span>
-              <span v-if="pageEnd < 1000" class="small muted">
-                下面 {{ (1000 - pageEnd) / 10 }}% 不进任何块、不送 AI
-              </span>
-              <span v-else class="small muted">一直切到页底</span>
-              <div class="spacer"></div>
-              <button class="btn ghost sm" @click="setPageEnd(960)"
-                      title="页脚 / 页码通常在底部 4% 内">截掉页脚（96%）</button>
-              <button v-if="pageEnd < 1000" class="btn ghost sm" @click="resetPageEnd">到页底</button>
-            </div>
-            <div class="small muted" style="margin-top:6px">
-              题号由段绑定 —— 学生把「第 3 题」写成「第 8 题」也不会判错归属。
-              <b>跨页题</b>：在第 1 页切上半段、翻到第 2 页切下半段，再点下面那行的
-              「并入上一题」合成一道（两段会竖拼成一张图）。
-              <b>弄完一定要点「保存分割」</b>，然后重新批改。
-              没保存的也不会丢 —— 已经存在本机，退出再回来还在。
-            </div>
-          </div>
-
+          <!-- 文档查看器观感（2026-10-27）：灰底 + 页图投影 + 页边距，
+               和「批改后作业查看」那种嵌在查看器里的观感一致。
+               ⚠️ 这层只是观感，**不要**在这里写 height / max-height ——
+                  高度统一由 .grade-left 管，在这层限高会让标注层与卷面对不上。 -->
+          <div class="grade-viewer">
           <div class="grade-page">
             <img class="grade-page-img" :src="pageUrl" loading="lazy" alt="作业原图" draggable="false"
                  @load="pageBroken = false" @error="pageBroken = true">
             <!-- ⚠️ 成对写，别写成自闭合：零构建的模板里自闭合会把后面的节点吞掉 -->
             <GradeMarkLayer ref="layerEl" :marks="pageMarks" :selected-item-id="selectedItemId"
-                            :mode="tool" :color="inkColor"
+                            :mode="readOnly ? 'view' : tool" :color="inkColor"
                             :regions="layerRegions" :lines="layerLines" :bands="pageBands"
                             :tail="pageTail"
                             @pick="onPick" @create="addMark" @erase="eraseMarks"
@@ -1935,6 +2005,7 @@ export default {
               这一页的图还没生成出来（点「开始批改」之后才有），或者这一页渲染失败了
             </div>
           </div>
+          </div><!-- /grade-viewer -->
           <div class="small muted" style="margin-top:8px">
             「选择」模式下：点标注跳到对应题目；<b>按住文本框 / √ × / 方框可以拖动挪位置</b>（笔迹不动）。
             坐标按页归一化（0~1000），换窗口大小也不会跑位。
@@ -1943,6 +2014,81 @@ export default {
 
         <!-- ==================== 右：逐题卡片 ==================== -->
         <div class="card grade-right">
+          <!-- 题目导航（从文档上方搬下来 + 点击定位 + 当前题高亮）。
+               只在有块（框题/分割过）时出现；编辑操作选中后出现在底部，不占每行。 -->
+          <div v-if="regionBlocks.length || editingRegions" class="grade-nav card">
+            <div class="grade-nav-head">
+              <b>题目导航</b>
+              <span class="small muted">{{ regionBlocks.length }} 题<template v-if="lineCount"> · {{ lineCount }} 条分割线</template></span>
+              <span v-if="regionsDirty" class="small" style="color:var(--warning)">未保存</span>
+              <div class="spacer"></div>
+              <template v-if="editingRegions">
+                <button class="btn ghost sm" :disabled="busy === 'copy'" @click="copyRegions">{{ busy === 'copy' ? '沿用中…' : '沿用上一份' }}</button>
+                <button class="btn ghost sm" :disabled="!draftSegCount && !lineCount" @click="clearRegions">全清</button>
+                <button class="btn sm" :disabled="busy === 'regions'" @click="saveRegions">{{ busy === 'regions' ? '保存中…' : '保存分割' }}</button>
+              </template>
+            </div>
+
+            <!-- 一块都没有时也要显示卡片：老师想「先把末段底边调到 96% 再画线」，
+                 这正是最需要 .gr-tail 的时刻，卡片整块消失等于把入口藏了。 -->
+            <div v-if="!regionBlocks.length" class="small muted" style="padding:6px 0">
+              <template v-if="tool === 'line'">
+                还没分割线 —— 在卷面上<b>逐题点一下</b>，线之间就是一道题。
+                第一条线以上也算一段（学生可能从页顶就开始写），多出来的页眉段点「删」就行。
+              </template>
+              <template v-else>
+                还没画框 —— 在卷面上拖出一个框，把一道题（题干 + 作答）整个框进去。
+              </template>
+              有段的页<b>一段一次</b>判（切得越准，读得越清），没段的页仍然整页判一次。
+            </div>
+
+            <!-- ⚠️ 这一行的开标签必须保持字面写法：div + class="grade-nav-list" +
+                 右尖括号，中间不插任何属性 —— tester 的断言按这个串切「题项行」区域。
+                 要给列表加条件就把 v-if 放在里层的 template 上，别加在这个标签里。 -->
+            <div class="grade-nav-list">
+              <template v-if="regionBlocks.length">
+              <div v-for="b in regionBlocks" :key="'nav-' + b.seq" class="grade-nav-item"
+                   :class="{ on: navActive === b.seq, off: b.skipped }" @click="navJump(b)">
+                <span class="gr-no">{{ b.seq + 1 }}</span>
+                <div class="grade-nav-meta">
+                  <template v-if="editingRegions">
+                    <input class="gr-q" :value="b.q_no" placeholder="留空就按顺序"
+                           @input="setRegionQNo(b, $event.target.value)" @click.stop>
+                  </template>
+                  <template v-else><span class="small">{{ b.q_no || ('第 ' + (b.seq + 1) + ' 题') }}</span></template>
+                  <span v-if="b.pages.length > 1" class="small muted">跨第 {{ b.pages.join(' + ') }} 页 · {{ b.pages.length }} 段</span>
+                  <span v-else class="small muted">第 {{ b.pages[0] }} 页</span>
+                </div>
+                <img class="grade-nav-thumb" :src="blockPreview(b)" loading="lazy" alt=""
+                     @click.stop="openPreview(b)" title="点一下看大图">
+              </div>
+              </template>
+            </div>
+
+            <div v-if="editingRegions && navBlock" class="grade-nav-actions">
+              <span class="small muted">选中：第 {{ navBlock.seq + 1 }} 题</span>
+              <div class="spacer"></div>
+              <button class="btn ghost sm" :class="{ on: navBlock.skipped }" @click="toggleBlockSkip(navBlock)"
+                      :title="navBlock.skipped ? '恢复：这块会重新送去批改' : '这块不送 AI（卷头、结构说明段）——框还留着'">
+                {{ navBlock.skipped ? '不判 · 恢复' : '这块不判' }}</button>
+              <button v-if="navBlock.seq > 0" class="btn ghost sm" @click="mergeRegion(navBlock)">并入上一题</button>
+              <button class="btn ghost sm" @click="dropBlock(navBlock)">删</button>
+            </div>
+
+            <div v-if="tool === 'line' && editingRegions" class="gr-tail">
+              <span class="small">末段底边</span>
+              <input type="range" min="50" max="100" step="1" :value="pageEnd / 10" @input="setPageEnd($event.target.value * 10)">
+              <span class="small" :class="{ muted: pageEnd >= 1000 }">{{ pageEnd / 10 }}%</span>
+              <span v-if="pageEnd < 1000" class="small muted">下面 {{ (1000 - pageEnd) / 10 }}% 不进任何块、不送 AI</span>
+              <span v-else class="small muted">一直切到页底</span>
+              <div class="spacer"></div>
+              <button class="btn ghost sm" @click="setPageEnd(960)" title="页脚 / 页码通常在底部 4% 内">截掉页脚（96%）</button>
+              <button v-if="pageEnd < 1000" class="btn ghost sm" @click="resetPageEnd">到页底</button>
+            </div>
+
+            <div class="small muted" style="margin-top:6px">题号由段绑定。跨页题在第 1 页切上半段、翻到第 2 页切下半段再「并入上一题」。弄完点「保存分割」再重新批改。</div>
+          </div>
+
           <div class="grade-side-head">
             <b>逐题</b>
             <span class="small muted">共 {{ items.length }} 题</span>
