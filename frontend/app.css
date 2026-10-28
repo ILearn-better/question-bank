@@ -726,10 +726,32 @@ table.tbl td.pending { color: var(--warning); font-weight: 600; }
    ⚠️ 高度只在左栏内部滚，**不要**给图片设 max-height —— 标注层是按容器等比铺的，
    给图片单独限高会让标注和卷面对不上。 */
 .grade-left { position: sticky; top: 12px; max-height: calc(100vh - 24px); overflow: auto; }
+/* 工具栏吸顶（2026-10-27）：翻页条 + 工具条 + 操作提示包成一块，滚动时停在左栏顶部。
+   没有它的话，滚到卷面下半页想换橡皮就得先滚回顶部 —— 老师明确提的就是这条。
+   ⚠️ **别把 .grade-page 也包进来**：卷面必须能滚，包进来等于给它限高，
+      而标注层是按容器等比铺的，限高会让标注和卷面对不上（见上面那条注释）。 */
+.grade-head {
+  position: sticky; top: 0; z-index: 6;
+  background: var(--panel);
+  margin: -2px 0 8px; padding: 2px 0 6px;
+  box-shadow: 0 3px 8px rgba(16, 24, 40, .07);
+}
+/* 查看模式（?view=1）：工具条**禁用而不是隐藏** —— 隐藏会让视口高度突变、
+   卷面跳位，老师还会以为功能坏了。只禁写，不禁看（标注照常渲染、照常能点）。 */
+.grade-tools.readonly { opacity: .55; pointer-events: none; }
 .grade-pagebar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
 .grade-pagebar .spacer { flex: 1; }
+/* 文档查看器观感（2026-10-27）：灰底把页图衬出来，页图带一圈投影和页边距 ——
+   与「批改后作业查看」里那种嵌在阅读器里的样子对齐。
+   ⚠️ 这一层**绝不写 height / max-height**：高度统一由 .grade-left 管，
+      在这层限高会让标注层（按 .grade-page 的尺寸等比铺）和卷面对不上。 */
+.grade-viewer {
+  background: #e9ebef; border-radius: var(--radius-sm);
+  padding: 14px 14px 20px;
+}
 .grade-page { position: relative; line-height: 0; border-radius: var(--radius-sm); overflow: hidden;
-              background: var(--panel-2); border: 1px solid var(--border); }
+              background: var(--panel-2); border: 1px solid var(--border);
+              box-shadow: 0 2px 10px rgba(16, 24, 40, .12); }
 .grade-page-img { display: block; width: 100%; height: auto; }
 .grade-page-miss { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
                    line-height: 1.6; color: var(--text-3); text-align: center; padding: 20px; }
@@ -753,13 +775,39 @@ table.tbl td.pending { color: var(--warning); font-weight: 600; }
 .gmark.mv { cursor: grab; }
 .gmark.mv.drag { cursor: grabbing; }
 /* 文字标注走 HTML：SVG 的 <text> 在非等比 viewBox 里会被横向压扁 */
-.gmark-label { position: absolute; transform: translate(0, -100%); max-width: 46%;
+.gmark-label { position: absolute; transform: translate(0, -100%);
                pointer-events: auto; cursor: grab; font-size: 11px; line-height: 1.4;
                padding: 0 5px; border: 1px solid currentColor; border-radius: 4px;
-               background: rgba(255, 255, 255, .92); white-space: nowrap;
-               overflow: hidden; text-overflow: ellipsis;
+               background: rgba(255, 255, 255, .92);
+               /* ⚠️ 2026-10-27 去掉了 white-space:nowrap + max-width:46% + text-overflow:ellipsis：
+                  长批注会被省略号吃掉，而界面一个字都不提示 —— 老师以为存进去了，其实看不见。
+                  现在宽高由 geo 的 [x1,y1,x2,y2] 给（0~1000），模板里换算成百分比设在 style 上；
+                  文字超出就在框内换行，再超出就滚动，**绝不静默截断**。
+                  老数据（geo 是零面积点、w/h 都是 0）→ style 里不给宽高，退回按内容自适应，
+                  与改动前观感一致，不会突然变成 0 宽的一条。 */
+               white-space: pre-wrap; word-break: break-word; overflow: auto;
+               box-sizing: border-box;
                /* 拖动时别让浏览器顺手选中文字 / 触发滚动，否则一按就变成框选 */
                user-select: none; touch-action: none; }
+/* 新口径（有宽高的文本框）：top 就是左上角，不能再上浮一格。
+   老数据是零面积点，保留 .gmark-label 上的 translate(0,-100%) 才不会变样。 */
+.gmark-label.sized { transform: none; }
+/* 右下角调大小的手柄。**不用 CSS 原生 resize**：那个在 absolute + transform:translate(0,-100%)
+   的元素上行为不稳，而且它给的是 CSS px，还得再折回归一化坐标（0~1000）。
+   自己画一个手柄，拖拽换算直接复用 markGeom.pagePoint，与笔迹同一套口径。 */
+.gmark-label .gmark-resize {
+  position: absolute; right: 1px; bottom: 1px; width: 11px; height: 11px;
+  border-right: 2px solid currentColor; border-bottom: 2px solid currentColor;
+  border-radius: 1px; cursor: nwse-resize; pointer-events: auto; opacity: .75;
+  /* transform 别加：label 自身已经有 translate(0,-100%)，这里再加会错位 */
+}
+.gmark-label .gmark-resize:hover { opacity: 1; }
+/* 画笔/橡皮/框题模式下文字标签不收指针（见下面 .mode-* 那组），手柄跟着一起关，
+   否则「想落笔」会变成「在调框大小」。 */
+.gmark-layer.mode-ink .gmark-label .gmark-resize,
+.gmark-layer.mode-erase .gmark-label .gmark-resize,
+.gmark-layer.mode-region .gmark-label .gmark-resize,
+.gmark-layer.mode-line .gmark-label .gmark-resize { display: none; }
 .gmark-label.sel { font-weight: 600; box-shadow: 0 0 0 2px var(--primary-weak); }
 .gmark-label.drag { cursor: grabbing; box-shadow: 0 3px 12px rgba(0, 0, 0, .2); z-index: 3; }
 
@@ -1016,6 +1064,11 @@ table.tbl td.pending { color: var(--warning); font-weight: 600; }
 .gmark-draft {
   stroke-width: 3; stroke-linecap: round; stroke-linejoin: round; opacity: .85;
   pointer-events: none;
+  /* ⚠️ 必须和成品同一条口径：`.gmark .shape` 是 non-scaling-stroke（恒定 3 CSS px），
+     草稿以前没有这一条，3 就成了 viewBox 用户单位 —— 在非等比 viewBox 里被拉伸
+     （640px 宽的页上横向约 1.9px、纵向约 2.7px）。于是**松手那一刻线宽会跳一下**，
+     看着就像「笔尖变了」。加这一条，落笔到存盘全程都是 3 CSS px。 */
+  vector-effect: non-scaling-stroke;
 }
 
 /* 文字框浮层（零构建，不引第三方弹窗） */
@@ -1034,3 +1087,15 @@ table.tbl td.pending { color: var(--warning); font-weight: 600; }
 }
 .g-textbox textarea:focus { outline: none; border-color: var(--primary); }
 .g-textbox-foot { display: flex; align-items: center; gap: 8px; margin-top: 10px; }
+
+/* 题目导航（右栏）：从文档上方搬下来，可点击跳转 + 当前题高亮 */
+.grade-nav { margin-bottom: 12px; }
+.grade-nav-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 6px; }
+.grade-nav-list { max-height: 340px; overflow: auto; display: flex; flex-direction: column; gap: 4px; padding-right: 2px; }
+.grade-nav-item { display: flex; align-items: center; gap: 8px; padding: 5px 7px; border: 1px solid var(--border); border-radius: var(--radius-sm); cursor: pointer; }
+.grade-nav-item:hover { border-color: var(--primary); }
+.grade-nav-item.on { border-color: var(--primary); box-shadow: 0 0 0 3px var(--primary-weak); background: var(--panel-2, #f7f8fa); }
+.grade-nav-item.off { opacity: .6; }
+.grade-nav-meta { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.grade-nav-thumb { flex: none; width: 48px; height: auto; border-radius: 3px; border: 1px solid var(--border); }
+.grade-nav-actions { display: flex; align-items: center; gap: 6px; margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--border); }

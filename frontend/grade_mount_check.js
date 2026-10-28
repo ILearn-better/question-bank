@@ -293,8 +293,14 @@ async function main() {
     // 桩掉就等于「只验了有没有调用，没验算得对不对」。
     copy('src/gradeDraft.js');
     copy('src/gradeLines.js');
+    // 快捷键唯一出处（2026-10-27 新增）。**不搬的话** HomeworkGrade.js 里的 import
+    // 直接 ERR_MODULE_NOT_FOUND，整个挂载检查连跑都跑不起来 —— 加新模块时记得同步这里。
+    copy('src/gradeKeys.js');
     // 「返回」目标的唯一出处：视图要 import 它（漏拷 = 挂载直接 ERR_MODULE_NOT_FOUND）
     copy('src/backTarget.js');
+    // 题目导航「卷到哪题亮哪题」的唯一出处：HomeworkGrade.js 要 import activeSeqAt
+    //（漏拷 = 挂载直接 ERR_MODULE_NOT_FOUND —— 2026-10-27 导航栏改造新增的模块）
+    copy('src/gradeNav.js');
     fs.writeFileSync(path.join(tmp, 'src', 'calls.js'), CALLS_STUB);
     fs.writeFileSync(path.join(tmp, 'src', 'api.js'), API_STUB);
     fs.writeFileSync(path.join(tmp, 'src', 'store.js'), STORE_STUB);
@@ -444,7 +450,10 @@ async function main() {
       .find((b) => (b.textContent || '').trim() === '框题');
     btnRegion.click();
     await sleep(150);
-    checkTrue('★ 点「框题」后框题面板出现', !!D.querySelector('.grade-regions'));
+    checkTrue('★ 点「框题」后框题编辑面板出现（导航栏 + 保存分割按钮）',
+      !!D.querySelector('.grade-nav')
+      && !!Array.from(D.querySelectorAll('.grade-nav button'))
+        .find((b) => /保存(框|分割)/.test((b.textContent || '').trim())));
     checkTrue('提示文案说了「宁大勿小」（切掉笔画读不回来）',
       body().includes('框宁大勿小') || (D.querySelector('.grade-toolhint') || {}).textContent.includes('宁大勿小'),
       (D.querySelector('.grade-toolhint') || {}).textContent);
@@ -453,7 +462,48 @@ async function main() {
     check('编号按 q_no 显示',
       Array.from(D.querySelectorAll('.gmark-rlabel')).map((e) => (e.textContent || '').trim()),
       ['1 ×', '2 ×']);
-    check('面板里 2 行可改题号', D.querySelectorAll('.gr-row').length, 2);
+    check('面板里 2 行可改题号', D.querySelectorAll('.grade-nav-item .gr-q').length, 2);
+    // 编辑态兜底自动选中第一题（watch regionBlocks）：不滚动也要有操作区，
+    // 否则卷面短、scroll 不触发时「这块不判/并入上一题/删」永远不出现。
+    // 注意「并入上一题」本身是 v-if="navBlock.seq > 0"：自动选中的是 seq 0 时它本就不该有。
+    {
+      const acts = D.querySelector('.grade-nav-actions');
+      const btnTexts = acts
+        ? Array.from(acts.querySelectorAll('button')).map((b) => (b.textContent || '').trim())
+        : [];
+      const selSeq = vm.navBlock ? vm.navBlock.seq : null;
+      checkTrue('★ 编辑态自动选中第一题（不做任何滚动，操作区已在屏上）',
+        !!acts && selSeq !== null, 'actions=' + !!acts + ' 选中seq=' + selSeq);
+      checkTrue('★ 操作区含「这块不判」「删」（选中任一题都该有）',
+        btnTexts.includes('这块不判') && btnTexts.includes('删'), btnTexts);
+      checkTrue('★ 「并入上一题」按 seq>0 条件出现（seq 0 本来就不该有）',
+        selSeq === 0 ? !btnTexts.includes('并入上一题') : btnTexts.includes('并入上一题'),
+        '选中 seq=' + selSeq + ' 按钮=' + JSON.stringify(btnTexts));
+      // 选中 seq>0 的题 → 三个按钮齐全（「并入上一题」的 v-if 只在 seq>0 时给）
+      if (vm.regionBlocks.length > 1) {
+        const savedNav = vm.navActive;
+        const secondSeq = vm.regionBlocks[1].seq;
+        vm.navActive = secondSeq;
+        await sleep(120);
+        const t2 = Array.from(D.querySelectorAll('.grade-nav-actions button'))
+          .map((b) => (b.textContent || '').trim());
+        checkTrue('★ 选中 seq>0 的题 → 「这块不判 / 并入上一题 / 删」三个按钮齐全',
+          ['这块不判', '并入上一题', '删'].every((x) => t2.includes(x)),
+          'seq=' + secondSeq + ' 按钮=' + JSON.stringify(t2));
+        vm.navActive = savedNav;
+        await sleep(80);
+      }
+    }
+    // 位置：题目导航栏搬到了右栏，在左栏的 .grade-viewer 之后（不能插进左栏滚动区）
+    {
+      const viewerEl = D.querySelector('.grade-viewer');
+      const navEl = D.querySelector('.grade-nav');
+      checkTrue('★ .grade-nav 在 .grade-viewer 之后（右栏导航，不抢左栏滚动）',
+        !!(viewerEl && navEl) && (viewerEl.compareDocumentPosition(navEl) & 4) !== 0,
+        viewerEl && navEl
+          ? 'viewer 在 nav ' + ((viewerEl.compareDocumentPosition(navEl) & 4) ? '之前' : '之后')
+          : '缺元素');
+    }
     check('框的坐标按 0~1000 直接铺（不是像素）',
       [D.querySelectorAll('.rg-rect')[0].getAttribute('x'),
         D.querySelectorAll('.rg-rect')[0].getAttribute('width')],
@@ -492,7 +542,7 @@ async function main() {
 
     /* ============ 9. 保存：整页替换，发的是这一份的完整列表 ============ */
     // 按钮文案是「保存分割」（框选与分割线共用同一块面板，2026-10-19 起）。
-    const saveBtn = Array.from(D.querySelectorAll('.grade-regions button'))
+    const saveBtn = Array.from(D.querySelectorAll('.grade-nav button'))
       .find((b) => /保存(框|分割)/.test((b.textContent || '').trim()));
     checkTrue('面板上有保存按钮（框选/分割线共用）', !!saveBtn);
     saveBtn.click();
@@ -584,7 +634,7 @@ async function main() {
     asked.length = 0;
     vm.setTool('region');
     await sleep(150);
-    const copyBtn = Array.from(D.querySelectorAll('.grade-regions button'))
+    const copyBtn = Array.from(D.querySelectorAll('.grade-nav button'))
       .find((b) => (b.textContent || '').trim() === '沿用上一份');
     checkTrue('面板上有「沿用上一份」按钮', !!copyBtn);
     copyBtn.click();
@@ -671,8 +721,13 @@ async function main() {
     vm.setTool('line');
     await sleep(160);
     check('工具条上切到「逐题分割」', vm.tool, 'line');
-    checkTrue('分割线面板出现（与框题共用一块）', !!D.querySelector('.grade-regions'));
-    checkTrue('面板文案说了「逐题点一下」', body().includes('逐题点一下'));
+    // 无块时卡片常驻（修复：v-if = regionBlocks.length || editingRegions）。
+    // 必须同时断言「块数=0」，否则有块时这条也会绿，证不出「空态也常驻」。
+    checkTrue('★ 无块时卡片常驻：清空后进「逐题分割」，.grade-nav 在屏且末段底边滑块可见',
+      vm.regionBlocks.length === 0
+      && !!D.querySelector('.grade-nav') && !!D.querySelector('.gr-tail'),
+      '块数=' + vm.regionBlocks.length);
+    checkTrue('提示文案说了「空隙点一下」', body().includes('空隙点一下'));
     check('还没画线 → 一条线都没有', D.querySelectorAll('.gl-line').length, 0);
     check('还没画线 → 也不该凭空出现段（幽灵段 bug 的现场）', vm.draftSegCount, 0);
 
@@ -733,14 +788,14 @@ async function main() {
      * 所以这一节刻意留在「还没保存分割」的状态里断言。 */
     checkTrue('★ 每一块都有缩略图（以前这里只有一行字 —— 切歪了看不出来）',
       vm.regionBlocks.length > 0
-      && D.querySelectorAll('.gr-thumb img').length === vm.regionBlocks.length,
-      D.querySelectorAll('.gr-thumb img').length + ' / ' + vm.regionBlocks.length);
-    const thumbSrcs = Array.from(D.querySelectorAll('.gr-thumb img'))
+      && D.querySelectorAll('.grade-nav-thumb').length === vm.regionBlocks.length,
+      D.querySelectorAll('.grade-nav-thumb').length + ' / ' + vm.regionBlocks.length);
+    const thumbSrcs = Array.from(D.querySelectorAll('.grade-nav-thumb'))
       .map((el) => String(el.getAttribute('src')));
     checkTrue('★ 缩略图走 /region-image 现裁（不是先把图存下来再引用）',
       thumbSrcs.length > 0 && thumbSrcs.every((u) => u.includes('/region-image?spec=')), thumbSrcs);
     checkTrue('缩略图懒加载（一页七八十块不能一起裁）',
-      Array.from(D.querySelectorAll('.gr-thumb img'))
+      Array.from(D.querySelectorAll('.grade-nav-thumb'))
         .every((el) => el.getAttribute('loading') === 'lazy'));
 
     // `spec` 是前后端唯一的契约：`页号:x0,y0,x1,y1`，多段用 `;` 连（后端按它裁图 + 竖拼）
@@ -756,11 +811,11 @@ async function main() {
     // 点缩略图看大图：不引弹窗库，新开页签看原尺寸
     const opened = [];
     W.open = (u) => { opened.push(String(u)); return null; };
-    D.querySelectorAll('.gr-thumb img')[0].click();
+    D.querySelectorAll('.grade-nav-thumb')[0].click();
     await sleep(150);
     check('★ 点缩略图能看大图', opened.length, 1);
     check('看的就是这一块（与缩略图同一个 URL）',
-      opened[0], String(D.querySelectorAll('.gr-thumb img')[0].getAttribute('src')));
+      opened[0], String(D.querySelectorAll('.grade-nav-thumb')[0].getAttribute('src')));
 
     /* ---- 按块不送 AI ----
      * ⚠️ 只改草稿、**不删框**：老师常是先怀疑「这块判错了」，回头又想要 ——
@@ -769,6 +824,15 @@ async function main() {
      * ⚠️ 必须验到「上传的 body 里有它」，只在界面上标着不算。 */
     const segN = vm.draftSegCount;
     if (crossB) {
+      // ⚠️ 断言必须在手动设 navActive **之前**：这里证的是「不点导航项、不滚动，
+      //    watch 也把第一题选中了 → 操作区已上屏」。一旦先手动设 navActive，这条路径就被绕过，
+      //    删掉 watch 也不会红（team-lead 抓到的正是这个缺口）。
+      checkTrue('★ 未点导航项 / 未滚动：操作区已自动出现（watch 兜底选中）',
+        !!D.querySelector('.grade-nav-actions'),
+        'navActive=' + JSON.stringify(vm.navActive));
+      // 后续流程要操作 crossB（跨页块），这里才手动选中它 —— 不影响上面那条自动选中断言。
+      vm.navActive = crossB.seq;
+      await sleep(80);
       vm.toggleBlockSkip(crossB);
       await sleep(180);
       const now = vm.regionBlocks.find((b) => b.seq === crossB.seq) || {};
@@ -779,7 +843,7 @@ async function main() {
       check('别的块不受影响（一次只跳这一块）',
         vm.regionBlocks.filter((b) => b.skipped).length, 1);
       check('界面上标出「不送 AI」（老师看得见哪块没送）',
-        D.querySelectorAll('.gr-off-tag').length, 1);
+        D.querySelectorAll('.grade-nav-item.off').length, 1);
       checkTrue('按钮变成「不判 · 恢复」（点完得看出成功了）',
         body().includes('不判 · 恢复'), body().includes('这块不判'));
 
@@ -802,7 +866,7 @@ async function main() {
       check('★ 再点一下 → 两段都恢复（这块重新送去批改）',
         (vm.regionBlocks.find((b) => b.seq === crossB.seq) || {}).segs.map((s) => !!s.skipped),
         [false, false]);
-      check('恢复后「不送 AI」标签消失', D.querySelectorAll('.gr-off-tag').length, 0);
+      check('恢复后「不送 AI」标签消失', D.querySelectorAll('.grade-nav-item.off').length, 0);
     }
 
     /* ---- 按页不送 AI（整页）----

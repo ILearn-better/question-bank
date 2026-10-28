@@ -388,7 +388,7 @@ else:
     # 0 是**合法值**：必须走「共 0 页」，绝不能因为真值判断落进「页数不详」那支。
     # 这跟断言层那条 `pages_lost == 0` 是同一个坑的两个面（`is None` vs `or`）。
     out_zero = printed({**PRINT_DICT, "report": {**PRINT_DICT["report"], "pages_lost": 0}})
-    check("pages_lost=0 → 印「共 0 页」", "共 0 页" in out_zero, True)
+    check("pages_lost=0 → 印「（共 0 页）」", "（共 0 页）" in out_zero, True)
     check("pages_lost=0 不许落进「页数不详」", "页数不详" in out_zero, False)
 
 # ---------------------------------------------------------------- 结果
