@@ -40,9 +40,12 @@
 //    被实际踩过：想加线却把刚画好的那条删了，非常难用。
 //    ⚠️ line 模式下**段（region rect）不接收指针事件**：段是整页宽的，
 //       收事件等于「页面任何地方都点不了新线」。段的删除走右栏面板。
-import { computed, ref, watch } from 'vue';
+import { computed, onMounted, ref, watch } from 'vue';
 
 import { UNIT, bboxOf, clampUnit as clamp, flatPoints, pagePoint, segDist, shiftGeo } from '../markGeom.js';
+import { isLocalMarkId } from '../gradeDraft.js';
+import { renderLabelHtml } from '../gradeLabelMath.js';
+import { ensureLibs } from '../mathRender.js';
 
 const COLORS = {
   box: '#dc2626',
@@ -294,9 +297,17 @@ export default {
      * ⚠️ 画笔/橡皮必须保持纯画/纯擦：那两个模式下按住标注是「落笔」，不是「抓东西」，
      *    混在一起会变成「想写一笔，结果把上一笔拖跑了」。 */
     const MOVE_MODES = ['view', 'text'];
+    /* ⚠️ 还没传上去的（本机队列里，id 带 `local:` 前缀）**不给拖** —— 2026-11-01 查出来的。
+       拖动松手走 `PATCH /api/grade-marks/{id}`，而那个路由的 mid 是 int，
+       `local:xxx` 必然 422 → 父组件 catch → `clearOffsets()` → **界面弹回原位**。
+       这就是「莫名跳回原位」的第三条路径：刚落笔/刚写完批注的那一两秒里拖它，
+       一定失败、一定弹回，网络越慢窗口越长。
+       拦在这里比让它发一次注定 422 的请求好：那 1~2 秒里按下去没反应（很快就正常），
+       而不是「拖走了又被拽回去」。判据函数与父组件用同一个（gradeDraft.isLocalMarkId）。 */
     const canMove = (s) => MOVE_MODES.indexOf(props.mode) >= 0
       && MOVE_KINDS.includes(s.kind)
-      && s.mark.id !== null && s.mark.id !== undefined;
+      && s.mark.id !== null && s.mark.id !== undefined
+      && !isLocalMarkId(s.mark.id);
     const isDragging = (s) => !!dragState.value && dragState.value.id === String(s.mark.id);
 
     function pick(s) {
@@ -389,6 +400,31 @@ export default {
       resizing.value = {};      // 调大小的临时尺寸一起退，否则会停在「看着变大了、库里没变」
     }
 
+    /* ---------------- 文本框里的 LaTeX（2026-11-01） ----------------
+     * 老师要在批注里写公式（「这里应得 $\frac{1}{2}$」），所以文字标注按公式渲染。
+     *
+     * 为什么是 `v-html` 而不是继续用 `{{ s.text }}` 插值：
+     *   插值只能出纯文本。而 KaTeX 的产物是一棵标签树，必须当 HTML 塞进去。
+     *   ⚠️ 反过来，`renderRichEl` 那种「先挂容器再让 KaTeX 就地改写」的做法在这里**不行** ——
+     *      标注是靠 `offsets` 每帧重算的，节点会被 Vue 反复 patch，KaTeX 改过的那棵子树
+     *      一旦被 Vue 摸到就会冲突（mathRender.js 文件头第 166 行记着同一件事）。
+     *      所以这里走「纯函数出 HTML 串」的路子，Vue 每次整块替换 innerHTML，互不干扰。
+     *
+     * 库是懒加载的：`ensureLibs()` 与页面题干渲染**共用同一个 promise**（重复调用不重复拉）。
+     * 库没到之前 `mathReady` 为 false，公式显示原文（带 $），到了之后这张牌自动翻过来。
+     */
+    const mathReady = ref(false);
+    onMounted(() => {
+      // 失败就保持 false：公式退回原文，绝不让整个标注层因为库挂了而不显示
+      ensureLibs().then(() => { mathReady.value = true; }).catch(() => {});
+    });
+
+    /** 文本框内容 → HTML。读 `mathReady` 是为了让它参与依赖收集（库到了要重画）。 */
+    function labelHtml(s) {
+      const kx = mathReady.value && typeof window !== 'undefined' ? window.katex : null;
+      return renderLabelHtml(s && s.text, kx);
+    }
+
     /* ---------------- 调文本框大小（2026-10-27：文本框要能自由调宽高） ----------------
        与「拖动位置」是两套状态：拖动是平移（offsets 存 dx/dy），调大小是改 geo 的右下角。
        两者松手都 emit('move')，父组件复用同一条 PATCH（geo 是同一个字段）——
@@ -401,6 +437,7 @@ export default {
     /** 只有「已入库的文本框」能调大小；画笔/橡皮模式下不给（那两个模式按下去是落笔）。 */
     const canResize = (s) => s.kind === 'text'
       && s.mark.id !== null && s.mark.id !== undefined
+      && !isLocalMarkId(s.mark.id)      // 同上：还没传上去的改不了，改了也 422
       && !isGone(s)
       && MOVE_MODES.indexOf(props.mode) >= 0;
 
@@ -771,6 +808,7 @@ export default {
     return {
       svgEl, drawing, draft, erasing, regionDraft, lineDrag, pending,
       shapesFor, isPicked, isLinked, isGone, canMove, isDragging, pick, onPickClick,
+      labelHtml, mathReady,
       onDown, onMove, onUp, onCancel, startDrag, dragTo, endDrag, cancelDrag,
       canResize, startResize, resizeTo, endResize, cancelResize,
       lineList, bandList, lineTip,
@@ -892,8 +930,7 @@ export default {
                     width: s.label.w, height: s.label.h }"
           @pointerdown="startDrag($event, s)" @pointermove="dragTo"
           @pointerup="endDrag" @pointercancel="cancelDrag"
-          @click.stop="onPickClick(s)">{{ s.text
-          }}<i v-if="canResize(s)" class="gmark-resize" title="拖动调整文本框大小"
+          @click.stop="onPickClick(s)"><span class="gmark-label-body" v-html="labelHtml(s)"></span><i v-if="canResize(s)" class="gmark-resize" title="拖动调整文本框大小"
              @pointerdown.stop="startResize($event, s)"
              @pointermove.stop="resizeTo"
              @pointerup.stop="endResize"

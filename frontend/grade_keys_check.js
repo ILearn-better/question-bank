@@ -341,6 +341,78 @@ async function main() {
   }
 
   // ============================================================
+  console.log('\n==== ⑪ 静态：文本框能拖 / 不被压扁（2026-11-01） ====');
+  // ============================================================
+  {
+    /* ⚠️ 两条**顺序相关**的断言，别改成只看「存在」：
+       ① CSS 里 `.mode-text .gmark-label{pointer-events:none}` 那条组规则在前，
+          覆盖规则必须排在它**后面**（同特异性靠顺序取胜）—— 只搜字符串的话，
+          谁把它挪到前面也照样绿，而实际已经失效。
+       ② 模板里 `v-html` 必须在**内层** body 上，不能挂到 `.gmark-label` 自己身上：
+          挂外层会把右下角的 resize 手柄一起 innerHTML 覆盖掉（手柄永远消失）。 */
+    const groupRule = csv.indexOf('.gmark-layer.mode-cross .gmark-label { pointer-events: none; }');
+    const textOverride = csv.indexOf('.gmark-layer.mode-text .gmark-label { pointer-events: auto;');
+    check('★ 文字模式下文本框重新接收指针（不然「刚写完想挪一下」按下去毫无反应）',
+      textOverride > 0, textOverride);
+    check('★★ 这条覆盖规则必须排在那组 pointer-events:none **之后**（同特异性靠顺序取胜）',
+      groupRule > 0 && textOverride > groupRule, { groupRule, textOverride });
+
+    const labelOpenTag = (layer.match(/class="gmark-label"[\s\S]*?>/) || [''])[0];
+    check('★ 文本框内容走内层 .gmark-label-body + v-html',
+      /class="gmark-label-body" v-html="labelHtml\(s\)"/.test(layer), labelOpenTag.slice(0, 120));
+    check('★★ v-html **不在** .gmark-label 自己的开标签上（挂外层会把 resize 手柄覆盖掉）',
+      labelOpenTag.length > 0 && !/v-html/.test(labelOpenTag), labelOpenTag.slice(0, 160));
+    /* ⚠️ 判据只看**模板段**（`template:` 之后）。全文件搜会把上面解释原因的注释
+       也算成「还留着插值」—— 反面断言被注释误伤，是这套脚本里反复踩的坑。 */
+    const tplSrc = layer.split('template: `')[1] || '';
+    check('★ 模板里旧的 {{ s.text }} 插值已移除（留着会和 v-html 重复显示一遍）',
+      tplSrc.length > 0 && !/\{\{\s*s\.text/.test(tplSrc), null);
+    check('resize 手柄仍在（v-html 改造不能把它弄丢）',
+      /<i v-if="canResize\(s\)" class="gmark-resize"/.test(layer), null);
+
+    check('★ 公式库是懒加载且失败不冒泡（库挂了公式退回原文，标注层照常显示）',
+      /ensureLibs\(\)\.then\(\(\) => \{ mathReady\.value = true; \}\)\.catch\(/.test(layer), null);
+    check('★ labelHtml 读 mathReady（否则库到了也不会重画，公式永远停在原文）',
+      /function labelHtml\(s\) \{[\s\S]{0,160}mathReady\.value/.test(layer), null);
+    check('labelHtml 取 window.katex 传下去（不在组件里自己渲染 KaTeX）',
+      /window\.katex/.test(layer) && /renderLabelHtml\(s && s\.text, kx\)/.test(layer), null);
+
+    check('★ 内容层是 block（与 resize 手柄分属两层，各占各的位置）',
+      /\.gmark-label-body \{ display: block; \}/.test(csv), null);
+    check('★ 公式层改回 white-space: normal（pre-wrap 会把 \\text 里的空格按 pre 保留）',
+      /\.gmark-label-body \.gm-math \{ white-space: normal; \}/.test(csv), null);
+    check('★ 公式库没加载时原文照显示（不隐藏，让人看得出没渲染）',
+      /\.gmark-label-body \.gm-math-raw \{ opacity: /.test(csv), null);
+
+    /* 「莫名跳回原位」的第三条路径（2026-11-01）：还没传上去的标注 id 是 `local:xxx`，
+       拖动松手会 PATCH 这个 id，而后端 mid 是 int → 必然 422 → 父组件 catch →
+       clearOffsets() → 界面弹回原位。窗口 = 从落笔到 settle 完成那 1~2 秒。
+       所以 canMove / canResize 都必须把它挡掉。 */
+    check('★ 还没传上去的标注（local: 前缀）不给拖 —— 否则 PATCH 必 422、界面弹回原位',
+      /const canMove = \(s\) =>[\s\S]{0,320}!isLocalMarkId\(s\.mark\.id\)/.test(layer), null);
+    check('★ 同理不给调大小（走同一条 PATCH，一样会 422）',
+      /const canResize = \(s\) =>[\s\S]{0,320}!isLocalMarkId\(s\.mark\.id\)/.test(layer), null);
+    check('isLocalMarkId 用的是 gradeDraft 的导出（前缀口径只有一处）',
+      /import \{ isLocalMarkId \} from '\.\.\/gradeDraft\.js'/.test(layer), null);
+  }
+
+  // ============================================================
+  console.log('\n==== ⑫ 静态：拖到页边不再压扁框（刚性平移） ====');
+  // ============================================================
+  {
+    /* 数值断言在 mark_geom_check.js（那里才是唯一出处）。
+       这里只钉一件**代码里看不出来**的事：夹的必须是平移量，不能是逐坐标夹。 */
+    const geom = read('src/markGeom.js');
+    check('★ shiftGeo 先算整组 min/max，再夹平移量（不是逐个坐标 clampUnit）',
+      /let minX = Infinity, maxX = -Infinity/.test(geom)
+      && /UNIT - maxX/.test(geom) && /UNIT - maxY/.test(geom), null);
+    check('★ 不再出现「每个坐标各自夹」的旧写法（那会让框在页边塌成一个点）',
+      !/out\.push\(Math\.round\(clampUnit\(v \+ \(i % 2 \? dy : dx\)\)\)\)/.test(geom), null);
+    check('整组比页面还宽时不给平移（避免算出 上限 < 下限 的负数区间）',
+      /UNIT - maxX < -minX \? 0/.test(geom), null);
+  }
+
+  // ============================================================
   console.log('\n' + '='.repeat(60));
   if (fails.length === 0) {
     console.log('✅ 全部通过（' + total + ' 项）');

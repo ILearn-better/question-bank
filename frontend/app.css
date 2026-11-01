@@ -792,6 +792,16 @@ table.tbl td.pending { color: var(--warning); font-weight: 600; }
 /* 新口径（有宽高的文本框）：top 就是左上角，不能再上浮一格。
    老数据是零面积点，保留 .gmark-label 上的 translate(0,-100%) 才不会变样。 */
 .gmark-label.sized { transform: none; }
+/* 文本框内容层：**必须**套一层再 v-html（2026-11-01）。
+   同一个 label 里还有右下角的调大小手柄，直接在外层 v-html 会把它整块 innerHTML 覆盖掉，
+   手柄就永远看不见；文字归这层，手柄留在外层。 */
+.gmark-label-body { display: block; }
+/* KaTeX 的排版不能被外层的 white-space:pre-wrap 影响 —— 那个 pre-wrap 是为「批注里的换行」留的，
+   而公式这一层要 normal：否则 \text{a b} 的空格会按 pre 保留、行高也跟着乱。
+   ⚠️ 别把 pre-wrap 从 .gmark-label 上删掉来"解决"—— 那会让老批注的换行全塌成一行。 */
+.gmark-label-body .gm-math { white-space: normal; }
+/* 公式库没加载到 / 渲染失败时显示原文：弱化一点，但**不隐藏**，一眼能看出「这里没渲染」 */
+.gmark-label-body .gm-math-raw { opacity: .72; }
 /* 右下角调大小的手柄。**不用 CSS 原生 resize**：那个在 absolute + transform:translate(0,-100%)
    的元素上行为不稳，而且它给的是 CSS px，还得再折回归一化坐标（0~1000）。
    自己画一个手柄，拖拽换算直接复用 markGeom.pagePoint，与笔迹同一套口径。 */
@@ -1007,6 +1017,15 @@ table.tbl td.pending { color: var(--warning); font-weight: 600; }
 .gmark-layer.mode-ink .gmark-label, .gmark-layer.mode-erase .gmark-label,
 .gmark-layer.mode-text .gmark-label, .gmark-layer.mode-check .gmark-label,
 .gmark-layer.mode-cross .gmark-label { pointer-events: none; }
+
+/* ⚠️ 文字模式是**例外**：上面那组把 .gmark-label 的指针关掉了，但文本框要能拖。
+   判据在 JS 侧（GradeMarkLayer.js 的 MOVE_MODES 含 'text'）：文字模式下
+   「点空白 = 写新批注、点已有文本框 = 挪它」是最朴素的直觉；关掉指针的话
+   老师刚写完一个框（工具还停在 text）、想挪一下，会发现按下去毫无反应 ——
+   2026-11-01 用户报的就是这个（真浏览器实测：命中元素是 svg、不是 span）。
+   为什么只放开 label 不放开 .gmark：v/x/框这些形状收事件会把「在这里写批注」的落点抢走。
+   注意这条**必须排在上面那组之后**（同特异性，靠顺序取胜）。 */
+.gmark-layer.mode-text .gmark-label { pointer-events: auto; cursor: grab; }
 
 /* ---------------- 一题一区域（框题）----------------
    与标注同一条 svg、同一套 0~1000 坐标，但语义不同：
