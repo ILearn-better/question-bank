@@ -902,8 +902,11 @@ def t_frontend() -> None:
     check("标注层把笔迹 / 删除 / 文字 / 快放交出去",
           all(k in layer for k in ("emit('create'", "emit('erase'",
                                    "emit('text-at'", "emit('stamp'")))
+    # 模式现在可能是表达式（只读时传 'view'），所以判「:mode 的属性值里必须出现 tool」，
+    # 别写死整串 ':mode="tool"' —— 加只读模式后这条会假红（2026-10-28 踩到）。
     check("父组件把模式与颜色传给标注层",
-          ':mode="tool"' in tpl_code and ':color="inkColor"' in tpl_code)
+          re.search(r':mode="[^"]*\btool\b[^"]*"', tpl_code) is not None
+          and ':color="inkColor"' in tpl_code)
     check("父组件接住那四个事件",
           all(k in tpl_code for k in ('@create="addMark"', '@erase="eraseMarks"',
                                       '@text-at="onTextAt"', '@stamp="addMark"')))
@@ -946,9 +949,11 @@ def t_frontend() -> None:
     check("拖动位移走 markGeom.shiftGeo（组件里再写一套 map 加 dx，x/y 会串）",
           "shiftGeo(" in layer_code
           and not re.search(r"geo\.map\(\s*\(?\w+\)?\s*=>", layer_code), "")
-    check("拖动中只改本地 offsets，松手才 emit 一次（每帧一个请求会拖垮 SQLite）",
-          "offsets.value = next" in layer_code and layer_code.count("emit('move'") == 1,
-          layer_code.count("emit('move'"))
+    # 现在有两个手势（拖动标注 / 调整文本框大小），各自松手发一次 PATCH ——
+    # 所以是 1~2 处 emit，而不是写死 1。真正要守的是：**移动过程中只改本地 offsets**。
+    n_move_emit = layer_code.count("emit('move'")
+    check("拖动 / 调大小都只改本地 offsets，松手才 emit（每帧一个请求会拖垮 SQLite）",
+          "offsets.value = next" in layer_code and 1 <= n_move_emit <= 2, n_move_emit)
     check("手抖阈值：没动够 DRAG_MIN 不算拖动（否则点一下标注就被挪走）",
           "DRAG_MIN" in layer_code and "Math.hypot(px, py) < DRAG_MIN" in layer_code)
     check("拖完紧跟的那一下 click 要被吞掉（不然拖个框顺手把右栏跳走）",
