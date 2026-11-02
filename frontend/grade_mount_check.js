@@ -116,6 +116,10 @@ const DETAIL = {
       points: [], text: '', color: '#dc2626', created_by: 'ai' },
     { id: 202, item_id: 102, page_no: 1, kind: 'text', geo: [300, 520],
       points: [], text: '缺全等', color: '#dc2626', created_by: 'teacher' },
+    /* 2026-11-01：带 LaTeX 的批注。留一条纯文字的（202）在上面，
+       是为了同时守住「渲染改造没有把老数据弄坏」——两条都要在。 */
+    { id: 203, item_id: 102, page_no: 1, kind: 'text', geo: [420, 700, 760, 780],
+      points: [], text: '这一步错在 $a^2$ 写成 $a^3$', color: '#2563eb', created_by: 'teacher' },
   ],
   skipped_pages: [],
   regions: [
@@ -301,6 +305,10 @@ async function main() {
     // 题目导航「卷到哪题亮哪题」的唯一出处：HomeworkGrade.js 要 import activeSeqAt
     //（漏拷 = 挂载直接 ERR_MODULE_NOT_FOUND —— 2026-10-27 导航栏改造新增的模块）
     copy('src/gradeNav.js');
+    // 文本框里的 LaTeX（2026-11-01）：标注层 import 它出 v-html 串。
+    // ⚠️ 加新模块时这份清单**必须同步**，否则整个挂载检查在 import 阶段就崩，
+    //    一条断言都跑不到（这已经是第三次踩，前两次是 gradeKeys.js / gradeNav.js）。
+    copy('src/gradeLabelMath.js');
     fs.writeFileSync(path.join(tmp, 'src', 'calls.js'), CALLS_STUB);
     fs.writeFileSync(path.join(tmp, 'src', 'api.js'), API_STUB);
     fs.writeFileSync(path.join(tmp, 'src', 'store.js'), STORE_STUB);
@@ -441,6 +449,32 @@ async function main() {
     /* ============ 7. 框题：默认不显示，切过去才显示 ============ */
     const layer = () => D.querySelector('.gmark-layer');
     checkTrue('标注层挂上了', !!layer());
+
+    /* ---- 7b. 文本框里的 LaTeX（2026-11-01）----
+       ⚠️ 这个 harness 把 vendor 用 eval 喂进了 window（见上面 VENDOR 那段），
+       所以 `ensureLibs()` 立刻兑现、`mathReady` 变 true —— 这里量的是**真 KaTeX**
+       渲染出来的节点，不是降级分支。降级分支（库挂了显示原文）在
+       grade_label_math_check.js 里用 null 当 katex 単独验。 */
+    {
+      const labs = Array.from(D.querySelectorAll('.gmark-label'));
+      check('文本框 2 个（纯文字 1 + 带公式 1）', labs.length, 2);
+      const withMath = labs.find((e) => /a\^2/.test(e.textContent || ''));
+      checkTrue('★ 文本框内容走 .gmark-label-body（v-html 的内容层）',
+        !!withMath && !!withMath.querySelector('.gmark-label-body'), labs.length);
+      check('★★ 公式真的渲染成 KaTeX 节点（$a^2$ / $a^3$ 各一个）',
+        withMath ? withMath.querySelectorAll('.katex').length : 0, 2);
+      checkTrue('★★ 渲染成公式后不再露出 LaTeX 原文（否则等于没渲染）',
+        !!withMath && !/\$a\^2\$/.test(withMath.textContent || ''),
+        withMath && withMath.textContent);
+      check('没有落进「原文回退」分支',
+        withMath ? withMath.querySelectorAll('.gm-math-raw').length : -1, 0);
+      checkTrue('★★ v-html 没有把右下角的调大小手柄覆盖掉（挂错层就会丢）',
+        !!withMath && !!withMath.querySelector('.gmark-resize'),
+        withMath && withMath.innerHTML.slice(0, 140));
+      const plain = labs.find((e) => /缺全等/.test(e.textContent || ''));
+      checkTrue('纯文字批注照旧显示（渲染改造没把老数据弄坏）',
+        !!plain && !!plain.querySelector('.gmark-label-body'), plain && plain.textContent);
+    }
     check('默认「选择」模式下不画框（平时不该满页虚线框）',
       D.querySelectorAll('.gmark-regions').length, 0);
     checkTrue('工具条上有「框题」按钮', !!Array.from(D.querySelectorAll('.g-tool'))

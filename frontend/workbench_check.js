@@ -420,6 +420,12 @@ async function loadLayerModules(root, W) {
     copy('src/components/GradeMarkLayer.js');
     copy('src/markGeom.js');       // 坐标几何：标注层靠它算包围盒与命中
     copy('src/gradeDraft.js');     // 本机草稿队列（画到一半退出不丢笔迹）
+    /* 标注层在 2026-11-01 起还要两个模块（文本框渲染 LaTeX）：
+       `gradeLabelMath` 出 v-html 串、`mathRender` 提供 ensureLibs。
+       漏拷的表现不是报错退出，而是 `import()` 被 catch 住 → 模块变 null →
+       下面一片「标注层没挂上」的假红（第一次跑就撞了 17 条）。 */
+    copy('src/gradeLabelMath.js');
+    copy('src/mathRender.js');
     fs.mkdirSync(path.join(tmp, 'node_modules', 'vue'), { recursive: true });
     fs.writeFileSync(path.join(tmp, 'node_modules', 'vue', 'package.json'), VUE_PKG);
     fs.writeFileSync(path.join(tmp, 'node_modules', 'vue', 'index.js'), VUE_SHIM);

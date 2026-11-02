@@ -42,18 +42,36 @@ export function segDist(px, py, x1, y1, x2, y2) {
  *
  * ⚠️ 平移**必须**走这里，不要在组件里 `geo.map(v => v + dx)` 图省事 ——
  *    那样 y 也会加上 dx（x/y 是交替的），拖一下框就斜着跑。
- * ⚠️ 结果当场夹紧到 0~1000：拖出页面的部分留在库里只会在导出时被裁掉，
- *    界面上却看着还在，等于给老师留了个够不着的标注。
+ *
+ * ⚠️⚠️ 夹的是**平移量**，不是夹每个坐标 —— 这一点 2026-11-01 用真浏览器量出来后改的。
+ *    原实现逐个坐标夹到 0~1000，于是「把文本框拖到右边」（x1+x2 都超 1000）时：
+ *      [829,666,1000,719] 再往右拖 400 → [1000,666,1000,719]
+ *    宽度从 92 直接归零，框被**压扁**、`sized` 判据失效 → 文字退回零面积点样式往上一跳。
+ *    用户的描述是「莫名跳回原位」，但真因是形状被压没了。
+ *    现在先按整组的 min/max 算出允许的平移范围，整组**刚性平移** —— 形状永远不变形，
+ *    顶多停在页边拖不动（这才是拖动该有的手感）。
  */
 export function shiftGeo(geo, dx, dy) {
   const list = Array.isArray(geo) ? geo : [];
-  const out = [];
-  for (let i = 0; i < list.length; i += 1) {
-    const v = Number(list[i]);
-    if (!Number.isFinite(v)) return [];
-    out.push(Math.round(clampUnit(v + (i % 2 ? dy : dx))));
+  if (!list.length) return [];
+  const nums = list.map(Number);
+  if (nums.some((v) => !Number.isFinite(v))) return [];
+
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  for (let i = 0; i < nums.length; i += 1) {
+    if (i % 2) {
+      if (nums[i] < minY) minY = nums[i];
+      if (nums[i] > maxY) maxY = nums[i];
+    } else {
+      if (nums[i] < minX) minX = nums[i];
+      if (nums[i] > maxX) maxX = nums[i];
+    }
   }
-  return out;
+  // 整组本来就比页面宽（理论上进不来）→ 不给平移，免得算出 上限 < 下限
+  const sx = UNIT - maxX < -minX ? 0 : Math.min(Math.max(Number(dx) || 0, -minX), UNIT - maxX);
+  const sy = UNIT - maxY < -minY ? 0 : Math.min(Math.max(Number(dy) || 0, -minY), UNIT - maxY);
+
+  return nums.map((v, i) => Math.round(clampUnit(v + (i % 2 ? sy : sx))));
 }
 
 /** 包围盒（取整）。笔迹的 geo 只用于命中/统计，真正的形状靠 points。 */
