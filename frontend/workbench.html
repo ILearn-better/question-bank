@@ -93,13 +93,52 @@
 .gmark.mv { cursor: grab; }
 .gmark.mv.drag { cursor: grabbing; }
 /* 文字标注走 HTML：SVG 的 <text> 在非等比 viewBox 里会被横向压扁 */
-.gmark-label { position: absolute; transform: translate(0, -100%); max-width: 46%;
+.gmark-label { position: absolute; transform: translate(0, -100%);
                pointer-events: auto; cursor: grab; font-size: 11px; line-height: 1.4;
                padding: 0 5px; border: 1px solid currentColor; border-radius: 4px;
-               background: rgba(255, 255, 255, .92); white-space: nowrap;
-               overflow: hidden; text-overflow: ellipsis;
+               background: rgba(255, 255, 255, .92);
+               /* ⚠️ 2026-10-27 去掉了 white-space:nowrap + max-width:46% + text-overflow:ellipsis：
+                  长批注会被省略号吃掉，而界面一个字都不提示 —— 老师以为存进去了，其实看不见。
+                  现在宽高由 geo 的 [x1,y1,x2,y2] 给（0~1000），模板里换算成百分比设在 style 上；
+                  文字超出就在框内换行，再超出就滚动，**绝不静默截断**。
+                  老数据（geo 是零面积点、w/h 都是 0）→ style 里不给宽高，退回按内容自适应，
+                  与改动前观感一致，不会突然变成 0 宽的一条。 */
+               white-space: pre-wrap; word-break: break-word; overflow: auto;
+               box-sizing: border-box;
                /* 拖动时别让浏览器顺手选中文字 / 触发滚动，否则一按就变成框选 */
                user-select: none; touch-action: none; }
+/* 新口径（有宽高的文本框）：top 就是左上角，不能再上浮一格。
+   老数据是零面积点，保留 .gmark-label 上的 translate(0,-100%) 才不会变样。 */
+.gmark-label.sized { transform: none; }
+/* 文本框内容层：**必须**套一层再 v-html（2026-11-01）。
+   同一个 label 里还有右下角的调大小手柄，直接在外层 v-html 会把它整块 innerHTML 覆盖掉，
+   手柄就永远看不见；文字归这层，手柄留在外层。 */
+.gmark-label-body { display: block; }
+/* KaTeX 的排版不能被外层的 white-space:pre-wrap 影响 —— 那个 pre-wrap 是为「批注里的换行」留的，
+   而公式这一层要 normal：否则数学命令里的空格会按 pre 保留、行高也跟着乱。
+   ⚠️ 别把 pre-wrap 从 .gmark-label 上删掉来"解决"—— 那会让老批注的换行全塌成一行。 */
+.gmark-label-body .gm-math { white-space: normal; }
+/* 公式库没加载到 / 渲染失败时显示原文：弱化一点，但**不隐藏**，一眼能看出「这里没渲染」 */
+.gmark-label-body .gm-math-raw { opacity: .72; }
+/* 右下角调大小的手柄。**不用 CSS 原生 resize**：那个在 absolute + transform:translate(0,-100%)
+   的元素上行为不稳，而且它给的是 CSS px，还得再折回归一化坐标（0~1000）。
+   自己画一个手柄，拖拽换算直接复用 markGeom.pagePoint，与笔迹同一套口径。
+   ⚠️ 这一条漏了会怎么样（2026-11-02 真实发生过）：组件照样把 <i class="gmark-resize">
+   渲染出来，但它是个没有宽高的空行内元素 —— **看不见、点不到**，功能等于没做，
+   而 DOM 检查、接口模拟全都绿。 */
+.gmark-label .gmark-resize {
+  position: absolute; right: 1px; bottom: 1px; width: 11px; height: 11px;
+  border-right: 2px solid currentColor; border-bottom: 2px solid currentColor;
+  border-radius: 1px; cursor: nwse-resize; pointer-events: auto; opacity: .75;
+  /* transform 别加：label 自身已经有 translate(0,-100%)，这里再加会错位 */
+}
+.gmark-label .gmark-resize:hover { opacity: 1; }
+/* 画笔/橡皮/框题模式下文字标签不收指针（见下面 .mode-* 那组），手柄跟着一起关，
+   否则「想落笔」会变成「在调框大小」。 */
+.gmark-layer.mode-ink .gmark-label .gmark-resize,
+.gmark-layer.mode-erase .gmark-label .gmark-resize,
+.gmark-layer.mode-region .gmark-label .gmark-resize,
+.gmark-layer.mode-line .gmark-label .gmark-resize { display: none; }
 .gmark-label.sel { font-weight: 600; box-shadow: 0 0 0 2px var(--primary-weak); }
 .gmark-label.drag { cursor: grabbing; box-shadow: 0 3px 12px rgba(0, 0, 0, .2); z-index: 3; }
 

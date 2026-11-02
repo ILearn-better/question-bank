@@ -467,6 +467,67 @@ async function main() {
      否则「加了入口」这件事永远是口头验收（加错了一样绿）。 */
   const APP_SRC = fs.readFileSync(path.join(ROOT, 'src', 'App.js'), 'utf8');
 
+  /* ================= ① ★★ 本页的 .gmark-* 样式是 app.css 的**拷贝**，不许掉队 =================
+   *
+   * 2026-11-02 的真实事故：`4e8a096` 给文本框加了「右下角拖拽调大小」，组件里
+   * `<i class="gmark-resize">` 照样渲染，app.css 也加了它的样式 —— **唯独这一页没同步**。
+   * 于是手柄是个 `position: static`、宽高 auto 的空行内元素：看不见、点不到，
+   * 「能调大小」等于没做，而整页 382 项检查全绿（DOM 在、接口也对）。
+   * 同一批漏掉的还有 `.gmark-label.sized`（有宽高的框仍按老口径上浮一格）、
+   * `.gmark-label-body`（批注内容层退化成 inline）、`.gmark-label` 的新口径
+   * （`nowrap` + `ellipsis`，长批注又被省略号吃掉）。
+   *
+   * 判据用「**拷贝必须是 app.css 的超集**」而不是「两份一模一样」：
+   * 这一页有自己的 z-index / 辅助层，允许比 app.css **多**东西（比如 .gmark-layer
+   * 的 z-index: 20），但不许少 —— 少的每一条都是「这页上少了一个功能」。
+   * 只盯**文本框那一片**，不铺开到全部 .gmark-*（笔迹样式两边本来就各有一套注释与差异）。 */
+  const GMARK_TEXT_SELS = [
+    '.gmark-label',
+    '.gmark-label.sized',
+    '.gmark-label-body',
+    '.gmark-label-body .gm-math',
+    '.gmark-label-body .gm-math-raw',
+    '.gmark-label .gmark-resize',
+    '.gmark-label .gmark-resize:hover',
+    '.gmark-layer.mode-text .gmark-label',
+    '.gmark-layer.mode-ink .gmark-label .gmark-resize',
+    '.gmark-layer.mode-erase .gmark-label .gmark-resize',
+    '.gmark-layer.mode-region .gmark-label .gmark-resize',
+    '.gmark-layer.mode-line .gmark-label .gmark-resize',
+  ];
+  /** 把 CSS 拆成 选择器 → 声明集合。先删注释（不删的话注释里的分号会切出假声明），
+   *  再按 选择器组 拆开 —— `.a, .b { }` 这种组选择器必须每个都单独登记，
+   *  否则 `.gmark-layer.mode-*` 那组隐藏规则永远对不上。 */
+  function cssDeclMap(css) {
+    const out = new Map();
+    const noComment = css.replace(/\/\*[\s\S]*?\*\//g, '');
+    const re = /([^{}]+)\{([^{}]*)\}/g;
+    let m;
+    while ((m = re.exec(noComment))) {
+      const sels = m[1].split(',').map((s) => s.replace(/\s+/g, ' ').trim()).filter(Boolean);
+      const decls = new Set(m[2].split(';').map((d) => d.replace(/\s+/g, ' ').trim()).filter(Boolean));
+      for (const s of sels) if (!out.has(s)) out.set(s, decls);
+    }
+    return out;
+  }
+  const APP_CSS_MAP = cssDeclMap(fs.readFileSync(path.join(ROOT, 'app.css'), 'utf8'));
+  const WB_CSS_MAP = cssDeclMap(html);
+  const cssDropped = [];
+  GMARK_TEXT_SELS.forEach((sel) => {
+    const a = APP_CSS_MAP.get(sel) || new Set();
+    const w = WB_CSS_MAP.get(sel) || new Set();
+    /* app.css 里没有 → 这条断言在空转，得单独报出来，不然它永远是绿的 */
+    if (!a.size) cssDropped.push(sel + '（app.css 里没这条）');
+    const miss = [...a].filter((d) => !w.has(d));
+    /* ⚠️ 期望值写 0 而不是空数组：`[]` 会和「app.css 也没这条」一样绿，
+       区别只在于 detail 里到底列了什么。都列进 detail，人工一眼能看出是哪边空。 */
+    check('★ 样式同步 · ' + sel + '（workbench.html 少几条）',
+      miss.length, 0);
+    if (miss.length) console.log('        少的是：' + JSON.stringify(miss));
+  });
+  checkTrue('★ 上面这些选择器在 app.css 里都真有（否则同步检查是空跑）',
+    cssDropped.length === 0, cssDropped.length ? cssDropped : '12 条都在');
+
   /* 内联脚本用正则抽出来自己 eval —— 不依赖 jsdom 执行 <script>：
    * runScripts:'outside-only' 下它不会跑，而 'dangerously' 又会让所有 src 脚本
    * 真的去磁盘取（路径是 /vendor/...，取不到）。 */
@@ -1154,6 +1215,41 @@ async function main() {
   check('★ 文字框内容存上去了（kind=text）',
     (vm.g.marks || []).filter((m) => m.kind === 'text' && m.text === '这一步漏了讨论 x=0').length, 1);
   checkTrue('★ 存完弹框关掉', vm.textOpen === false, String(vm.textOpen));
+
+  /* ---- ★★ 文本框在**这一页**上到底长什么样（2026-11-02）----
+   *
+   * 光验「DOM 里有 .gmark-label」是不够的 —— 手柄漏同步样式时它照样在 DOM 里，
+   * 只是尺寸为 0、定位是 static。所以这里量**计算样式**，量的都是「老师看得见摸得着」
+   * 的那几样：手柄的定位与宽高、批注能不能换行、内容层是不是块级。
+   * 期望值取自 app.css 那份的语义（11px 手柄 / pre-wrap / auto / block），
+   * 不是「跑出来什么就写什么」。 */
+  const savedTool = vm.tool;
+  vm.tool = 'view';                 // 手柄只在 view/text 模式下给（画笔模式下按下去是落笔）
+  await sleep(90);
+  const allLabels = Array.from(D.querySelectorAll('.gmark-label'));
+  const lb3 = allLabels.filter((el) => (el.textContent || '').indexOf('这一步漏了讨论') >= 0)[0];
+  checkTrue('★★ 页面上真出现了那条批注的文本框（下面几条不是在空跑）',
+    !!lb3, allLabels.length + ' 个 .gmark-label');
+  const lbBody = lb3 && lb3.querySelector('.gmark-label-body');
+  const resizeEl = lb3 && lb3.querySelector('.gmark-resize');
+  const cs = (el) => (el ? W.getComputedStyle(el) : null);
+  const csGet = (el, k) => { const s = cs(el); return s ? s[k] : '(元素不存在)'; };
+  checkTrue('★★ 批注文字包在**内层** .gmark-label-body 里（v-html 只准挂这层，手柄得留在外层）',
+    !!lbBody && lbBody.textContent.trim() === '这一步漏了讨论 x=0',
+    lbBody ? JSON.stringify(lbBody.textContent.trim()) : '(没有这一层)');
+  check('★★ 内容层 display（inline = .gmark-label-body 规则没同步）',
+    csGet(lbBody, 'display'), 'block');
+  check('★★ 文本框 white-space（nowrap = 还在用旧口径，长批注会被省略号静默吃掉）',
+    csGet(lb3, 'whiteSpace'), 'pre-wrap');
+  check('★★ 文本框 overflow（hidden = 旧口径，超出部分直接没了）',
+    csGet(lb3, 'overflow'), 'auto');
+  checkTrue('★★★ 调大小手柄真的渲染出来了', !!resizeEl, resizeEl ? '有 <i.gmark-resize>' : '(没有)');
+  check('★★★ 手柄 position（static = .gmark-resize 规则没同步 → 手柄看不见也点不到）',
+    csGet(resizeEl, 'position'), 'absolute');
+  check('★★★ 手柄 width', csGet(resizeEl, 'width'), '11px');
+  check('★★★ 手柄 height', csGet(resizeEl, 'height'), '11px');
+  vm.tool = savedTool;
+  await sleep(60);
   /* 空内容不放一个空框上去 */
   vm.onTextAt(3, { x: 10, y: 10 });
   vm.textDraft.text = '   ';
