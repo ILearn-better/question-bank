@@ -1361,6 +1361,19 @@ export default {
      *     网络最不稳，三十笔连发很容易断在半路。 */
     async function flushPending(manual = false) {
       const queue = localDraft.marks();
+      /* 上次没传上去、期间还被老师挪过的那些：**先**把位置写回队列再发。
+         此刻它们确实不在服务端（正要补发），改 rec 不会和服务端那份撞成两条；
+         和 addMark 那条路（POST 已在路上 → 只能记 pendingGeo 等真 id）正好相反。
+         `sent` 的跳过 —— 那是另一个请求在飞，交给它的 flushPendingGeo 管。 */
+      let folded = 0;
+      for (const lid of Object.keys(pendingGeo)) {
+        const rec = queue.find((m) => m.lid === lid);
+        if (!rec || rec.sent) continue;
+        localDraft.setGeo(lid, pendingGeo[lid]);
+        delete pendingGeo[lid];
+        folded += 1;
+      }
+      if (folded) syncPending();
       if (!queue.length) {
         if (manual) ok('没有要补发的笔迹');
         return 0;

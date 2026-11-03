@@ -2389,6 +2389,20 @@ const app = createApp({
     async flushPending({ quiet = false } = {}) {
       if (!DRAFT || !this._draft) return 0;
       const queue = this._draft.marks();
+      /* 上次没传上去、期间还被挪过的那些：**先**把位置写回队列再发 —— 此刻它们确实
+         不在服务端（正要补发），改 rec 不会和服务端那份撞成两条。`sent` 的跳过：
+         那是另一个请求在飞，交给 addMark 的 flushPendingGeo 管。 */
+      if (this._pendingGeo) {
+        let folded = 0;
+        for (const lid of Object.keys(this._pendingGeo)) {
+          const rec = queue.find((m) => m.lid === lid);
+          if (!rec || rec.sent) continue;
+          DRAFT.setGeo(lid, this._pendingGeo[lid]);
+          delete this._pendingGeo[lid];
+          folded += 1;
+        }
+        if (folded) this.localMarks = this._draft.marks().slice();
+      }
       if (!queue.length) return 0;
       const server = (this.g && this.g.marks) || [];
       const missing = queue.filter((m) => !server.some((x) => DRAFT.sameMark(x, m)));
