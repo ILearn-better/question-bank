@@ -141,6 +141,11 @@
 .gmark-layer.mode-line .gmark-label .gmark-resize { display: none; }
 .gmark-label.sel { font-weight: 600; box-shadow: 0 0 0 2px var(--primary-weak); }
 .gmark-label.drag { cursor: grabbing; box-shadow: 0 3px 12px rgba(0, 0, 0, .2); z-index: 3; }
+/* 选中态（点中某一处批注 → 底部出操作条）。与 app.css 那份逐字一致 ——
+   这一页不引 app.css，两份必须一起改，否则这里点中了却看不出来。
+   .act 写在 .sel 后面：两者可能同时命中（同题的框 + 正在改的那条），要后者压住。 */
+.gmark-label.act { box-shadow: 0 0 0 2px #fff, 0 0 0 4px currentColor; z-index: 2; }
+.gmark-label.act.drag { box-shadow: 0 3px 12px rgba(0, 0, 0, .2), 0 0 0 2px #fff, 0 0 0 4px currentColor; }
 
 .grade-right { min-width: 0; }
 .grade-side-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
@@ -483,6 +488,22 @@
   }
   .pick-bar b { color: #409eff; }
   .muted-hint { color: #909399; font-size: 12px; }
+
+  /* ★ 选中一处批注后浮在底部的操作条。
+     `position: fixed` 而不是放在左栏流里：左栏是可滚动的（max-height 70vh），
+     放进流里就变成「滚到别处就看不见按钮」，而那正是老师最需要它的时候。
+     z-index 取 2100：要盖住 Element Plus 的遮罩（2000）之下的内容，但**低于**它的
+     对话框（ElDialog 默认 2001+），否则它会把「修改批注」的弹框压在下面。 */
+  .text-actbar {
+    position: fixed; left: 50%; bottom: 26px; transform: translateX(-50%);
+    z-index: 2100; display: flex; align-items: center; gap: 8px;
+    max-width: min(720px, 92vw);
+    padding: 8px 12px; border-radius: 10px;
+    background: rgba(255, 255, 255, .98); border: 1px solid #dcdfe6;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, .18); font-size: 13px; color: #303133;
+  }
+  .text-actbar-tip { color: #606266; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .text-actbar-tip b { color: #303133; font-weight: 600; }
 
   /* ===== 页面分割（与录题页同一套视觉） ===== */
   .page-wrap { margin-bottom: 20px; }
@@ -910,8 +931,10 @@
                         再传一遍会同一样东西画两遍。 -->
                 <grade-mark-layer v-if="marksReady" :marks="marksOf(pno)" :mode="layerMode"
                                   :color="inkColor" :pen-width="inkWidth" :selected-item-id="selItem"
+                                  :active-mark-id="pickedText ? pickedText.id : null"
                                   @create="(p) => addMark(pno, p)" @stamp="(p) => addMark(pno, p)"
                                   @erase="eraseMarks" @move="moveMark"
+                                  @select-mark="onSelectMark" @edit-mark="onEditMark"
                                   @text-at="(p) => onTextAt(pno, p)" @pick="onPickMark">
                 </grade-mark-layer>
               </div>
@@ -1309,14 +1332,27 @@
     </template>
   </el-dialog>
 
-  <el-dialog v-model="textOpen" title="写一句评语" width="420px" append-to-body>
+  <el-dialog v-model="textOpen" :title="textDraft.id ? '修改这条批注' : '写一句评语'"
+             width="420px" append-to-body>
     <el-input v-model="textDraft.text" type="textarea" :rows="3"
               placeholder="例如：这一步漏了讨论 x=0" @keyup.enter.ctrl="saveText"></el-input>
     <template #footer>
       <el-button @click="textOpen = false">取消</el-button>
-      <el-button type="primary" @click="saveText">放上去</el-button>
+      <el-button type="primary" @click="saveText">{{ textDraft.id ? '改好' : '放上去' }}</el-button>
     </template>
   </el-dialog>
+
+  <!-- ★ 点中一处文本框后，底部浮出这条操作条（2026-10-28 用户定的口径：
+       「编辑操作改成选中后出现」）。在这之前，写完的批注**没有任何改法** ——
+       除了橡皮擦掉重写，而重写意味着重新摆位置。
+       ⚠️ 只在 `pickedText` 非空时出现（本机还没上传的、非文本的都不给）。 -->
+  <div v-if="pickedText" class="text-actbar">
+    <span class="text-actbar-tip">已选中批注：<b>{{ pickedShort }}</b></span>
+    <span style="flex:1"></span>
+    <el-button size="small" @click="openTextEdit(pickedText)">✏️ 编辑文字</el-button>
+    <el-button size="small" type="danger" plain @click="deletePicked">🗑 删除</el-button>
+    <el-button size="small" text @click="pickedMark = null" title="取消选中">✕</el-button>
+  </div>
   </div>
 </div>
 
@@ -1610,7 +1646,15 @@ const app = createApp({
       basisPreview: false, previewId: 0, previewName: '', previewKind: '',
       previewUrl: '', previewText: '', previewNote: '',
       textOpen: false,
-      textDraft: { page: 1, x: 0, y: 0, text: '' },
+      /** `id` 非空 = **在改已有的那条**（PATCH 文字），空 = 新写一条（POST）。
+       *  用同一个弹框，是因为老师心里这两件事是同一件：「往卷面上写句话」。 */
+      textDraft: { id: null, page: 1, x: 0, y: 0, text: '' },
+      /** ★ 当前选中的那**一处**标注（目前只有文本框）。点中它 → 底部亮出
+       *  「编辑文字 / 删除」。在这之前根本没有这个状态，所以写完的批注
+       *  除了橡皮擦掉重写，没有任何改法（2026-11-03 用户报的第 1 条）。
+       *  ⚠️ 与 `selItem` 不是一回事：`selItem` 是**那道题**（item_id），
+       *     文本框的 item_id 是 null，两者不能互相顶替。 */
+      pickedMark: null,
       /** 标注层是**动态 import** 的 ESM 组件，加载完才挂。
        *  挂早了 <grade-mark-layer> 是「未知元素」，Vue 只当普通标签渲染 ——
        *  按钮都在、笔迹画不出来，控制台一声不响。 */
@@ -1635,6 +1679,22 @@ const app = createApp({
     };
   },
   computed: {
+    /** 底部操作条要不要出来：只有「已经落到服务端的文本框」才给编辑/删除。
+     *  ⚠️ 本机队列里的（`local:` 前缀）不给 —— 改它得先改队列里的那条，
+     *     而现在只有「加一条」没有「改一条」，勉强做半套反而会发出注定 422 的请求
+     *     （`PATCH /grade-marks/{mid}` 的 mid 是 int，`local:` 解析不了）。
+     *     那 1~2 秒的窗口里按下去没反应，比「看着改了、其实没改」好。 */
+    pickedText() {
+      const m = this.pickedMark;
+      if (!m || m.kind !== 'text' || !m.id) return null;
+      if (DRAFT && DRAFT.isLocalMarkId(m.id)) return null;
+      return m;
+    },
+    /** 操作条上给老师看的短摘要（长批注一行放不下，但也不能一个字都不给）。 */
+    pickedShort() {
+      const t = String((this.pickedText && this.pickedText.text) || '').trim();
+      return t.length > 20 ? (t.slice(0, 20) + '…') : (t || '（空）');
+    },
     /** 「返回」的目标 —— **由入口来源决定**（用户 2026-10-21 定的口径）。
      *
      *  学生信息 →「改作业」          → 该学生的学生信息界面（带学生上下文）
@@ -1913,6 +1973,13 @@ const app = createApp({
       const t = e.target || {};
       const tag = String(t.tagName || '').toUpperCase();
       const typing = tag === 'INPUT' || tag === 'TEXTAREA' || !!t.isContentEditable;
+      /* Esc = 取消选中那处批注（收掉底部操作条）。
+       * 放在 Ctrl 判断**之前**：Esc 不带 Ctrl。输入框里不拦 —— 那是「放弃这次编辑」，
+       * 弹框自己处理。 */
+      if (String(e.key || '') === 'Escape' && !typing && this.pickedText) {
+        this.pickedMark = null;
+        return;
+      }
       if (!(e.ctrlKey || e.metaKey)) return;
       const key = String(e.key || '').toLowerCase();
 
@@ -2038,16 +2105,69 @@ const app = createApp({
       this.textDraft = {
         page: num(pno, 1), x: clampUnit(p && p.x), y: clampUnit(p && p.y), text: '',
       };
+      this.pickedMark = null;      // 要写新的了，收掉旧的操作条
+      this.textOpen = true;
+    },
+    /** ★ 点中一处文本框（标注层 emit 上来的）。**只记状态**，操作条由模板按它显示。 */
+    onSelectMark(m) {
+      this.pickedMark = m || null;
+    },
+    /** ★ 双击文本框：直接进编辑。比「先点中、再去底下找按钮」少一步。 */
+    onEditMark(m) {
+      if (!m || !m.id) return;
+      if (DRAFT && DRAFT.isLocalMarkId(m.id)) {
+        ElementPlus.ElMessage.info('这一笔还在上传，等一下再改');
+        return;
+      }
+      this.pickedMark = m;
+      this.openTextEdit(m);
+    },
+    /** 把「改文字」的弹框按已有内容填好。**位置/颜色一概不动** —— 改的是字不是框。 */
+    openTextEdit(m) {
+      if (!m || !m.id) return;
+      const g = Array.isArray(m.geo) ? m.geo : [];
+      this.textDraft = {
+        id: m.id,
+        page: num(m.page_no, 1),
+        x: clampUnit(g[0]), y: clampUnit(g[1]),
+        text: String(m.text || ''),
+      };
       this.textOpen = true;
     },
     async saveText() {
-      const d = this.textDraft;
-      const text = String((d && d.text) || '').trim();
+      const d = this.textDraft || {};
+      const text = String(d.text || '').trim();
+      /* 改成空串不走「删除」这条路：删是有代价的动作（这条批注可能是刚才
+         费劲写的那一段），不该由「清空输入框」顺手触发。
+         ⚠️ 也不能就这么静默什么都不做 —— 老师会以为存上了。 */
+      if (!text) {
+        ElementPlus.ElMessage.warning('内容不能为空；不想留这条就点下面的「删除」');
+        return;
+      }
       this.textOpen = false;
-      if (!text) return;
-      await this.addMark(d.page, {
+      if (d.id) {                             // 改已有的
+        const mid = d.id;
+        this.pickedMark = null;
+        try {
+          await this.api('/api/grade-marks/' + mid, {
+            method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ text }),
+          });
+          await this.settle();
+          this.noteSaved();
+        } catch (e) { ElementPlus.ElMessage.error(e.message); }
+        return;
+      }
+      await this.addMark(d.page, {           // 新写一条
         kind: 'text', geo: [d.x, d.y, d.x, d.y], text, color: this.inkColor,
       });
+    },
+    /** 底部操作条上的「删除」。走 eraseMarks 而不是直接 DELETE —— 那里带撤销快照。 */
+    async deletePicked() {
+      const m = this.pickedMark;
+      if (!m || !m.id) return;
+      this.pickedMark = null;
+      await this.eraseMarks([m.id]);
     },
     async clearPageMarks(pno) {
       const mine = this.teacherMarksOf(pno);
@@ -2973,6 +3093,9 @@ const app = createApp({
     /* ============================ 分割：交互 ============================ */
     /** 页面上按下：横线模式 = 加一条线；框选模式 = 开始拖一个框。 */
     onPageDown(pno, ev) {
+      /* 在卷面空白处按下 = 取消「选中某处标注」。**必须放在所有 return 之前** ——
+         「只看」模式下这函数第一行就返回了，而那正是最常取消选中的时候。 */
+      this.pickedMark = null;
       if (this.tool === 'view') return;
       /* ★★ 手写类工具必须**原样放行**，让事件落到覆盖在上面的 <grade-mark-layer>。
        *

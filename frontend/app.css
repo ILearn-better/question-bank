@@ -837,6 +837,12 @@ table.tbl td.pending { color: var(--warning); font-weight: 600; }
 .gmark-layer.mode-line .gmark-label .gmark-resize { display: none; }
 .gmark-label.sel { font-weight: 600; box-shadow: 0 0 0 2px var(--primary-weak); }
 .gmark-label.drag { cursor: grabbing; box-shadow: 0 3px 12px rgba(0, 0, 0, .2); z-index: 3; }
+/* 选中态（点中某一处批注 → 底部出操作条）。要**明显**不同于 .sel：
+   .sel 是「这条属于当前选中的那道题」，一组好几条；.act 是「我正要改的那一条」，
+   一页只有一条 —— 两者可能同时命中，所以 .act 写在后面、用双层描边压住。
+   判据：外圈白 + 再外圈本色，在深色扫描件上也看得清（单圈本色会被纸色吃掉）。 */
+.gmark-label.act { box-shadow: 0 0 0 2px #fff, 0 0 0 4px currentColor; z-index: 2; }
+.gmark-label.act.drag { box-shadow: 0 3px 12px rgba(0, 0, 0, .2), 0 0 0 2px #fff, 0 0 0 4px currentColor; }
 
 .grade-right { min-width: 0; }
 .grade-side-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
@@ -1123,6 +1129,19 @@ table.tbl td.pending { color: var(--warning); font-weight: 600; }
 }
 .g-textbox textarea:focus { outline: none; border-color: var(--primary); }
 .g-textbox-foot { display: flex; align-items: center; gap: 8px; margin-top: 10px; }
+
+/* 选中一处批注后浮在底部的操作条（与 workbench.html 那份同一套视觉）。
+   z-index 90：要压过 .g-textmask（80）里的遮罩吗？**不要** —— 它必须低于弹框，
+   否则「修改这条批注」的输入框会被操作条挡在下半屏。 */
+.g-actbar {
+  position: fixed; left: 50%; bottom: 26px; transform: translateX(-50%);
+  z-index: 75; display: flex; align-items: center; gap: 8px;
+  max-width: min(720px, 92vw); padding: 8px 12px; border-radius: 10px;
+  background: var(--panel, #fff); border: 1px solid var(--border);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, .18); font-size: 13px;
+}
+.g-actbar-tip { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.g-actbar-tip b { color: var(--text, #1f2329); font-weight: 600; }
 
 /* 题目导航（右栏）：从文档上方搬下来，可点击跳转 + 当前题高亮 */
 .grade-nav { margin-bottom: 12px; }

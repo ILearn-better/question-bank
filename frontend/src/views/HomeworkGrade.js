@@ -153,7 +153,13 @@ export default {
      * 唯一区别是 mode —— 组件只管采集，落库/删除都在这一层（失败要能提示）。 */
     const tool = ref('view');          // view | ink | erase | text | check | cross | region | line
     const inkColor = ref('#dc2626');
-    const textDraft = ref(null);       // {x, y, text}：点完位置弹出来的输入框
+    const textDraft = ref(null);       // {id?, x, y, text}：点完位置弹出来的输入框
+    /* ★ 当前选中的那**一处**标注（目前只有文本框）。点中它 → 底部浮出
+     *  「编辑文字 / 删除」（2026-10-28 定的口径：编辑操作选中后出现）。
+     *  ⚠️ 与 `selectedItemId` 不是一回事：那个是**那道题**，而文本框的
+     *     item_id 是 null —— 拿它顶替就会出现「点了没反应」。
+     *     2026-11-03 用户报「写好内容，没办法点开重新修改」就是缺这个状态。 */
+    const pickedMark = ref(null);
     const exporting = ref('');         // 正在导出的格式（按钮置灰）
     const layerEl = ref(null);         // 标注层组件：拖动提交失败时要调它回滚本地位移
 
@@ -1409,24 +1415,79 @@ export default {
       setTool(t);
     }
 
-    /** Esc：先关掉弹着的文字框，再退回「选择」。 */
+    /** Esc：先关掉弹着的文字框，再取消选中批注，最后退回「选择」。 */
     function onEscape() {
       if (textDraft.value) { textDraft.value = null; return; }
+      if (pickedMark.value) { pickedMark.value = null; return; }
       if (tool.value !== 'view') setTool('view');
     }
 
     let keysOff = null;      // 卸载函数，onBeforeUnmount 里调用
 
     function onTextAt({ x, y }) {
+      pickedMark.value = null;                       // 要写新的了，收掉旧的操作条
       textDraft.value = { x, y, text: '' };
+    }
+
+    /** 底部操作条只对「已经落到服务端的文本框」出现。
+     *  本机队列里的（id 带 `local:`）不给 —— PATCH 的 mid 是 int，改了也只会 422。 */
+    const pickedText = computed(() => {
+      const m = pickedMark.value;
+      if (!m || m.kind !== 'text' || !m.id) return null;
+      if (isLocalMarkId(m.id)) return null;
+      return m;
+    });
+    const pickedShort = computed(() => {
+      const t = String((pickedText.value && pickedText.value.text) || '').trim();
+      return t.length > 20 ? (t.slice(0, 20) + '…') : (t || '（空）');
+    });
+    function onSelectMark(m) { pickedMark.value = m || null; }
+    function onEditMark(m) {
+      if (!m || !m.id) return;
+      if (isLocalMarkId(m.id)) { fail('这一笔还在上传，等一下再改'); return; }
+      pickedMark.value = m;
+      openTextEdit(m);
+    }
+    /** 把「改文字」的弹框按已有内容填好。**位置/颜色一概不动** —— 改的是字不是框。 */
+    function openTextEdit(m) {
+      if (!m || !m.id) return;
+      const g = Array.isArray(m.geo) ? m.geo : [];
+      textDraft.value = {
+        id: m.id,
+        x: Number(g[0]) || 0, y: Number(g[1]) || 0,
+        text: String(m.text || ''),
+      };
+    }
+    async function deletePicked() {
+      const m = pickedMark.value;
+      if (!m || !m.id) return;
+      pickedMark.value = null;
+      await eraseMarks([m.id]);
     }
 
     async function saveText() {
       const d = textDraft.value;
       if (!d) return;
       const text = (d.text || '').trim();
+      /* 改成空串 ≠ 删掉：删是有代价的动作（这条可能是刚费劲写的一段），
+         不该由「清空输入框」顺手触发。但也不能静默什么都不做 —— 老师会以为存上了。 */
+      if (!text) {
+        fail('内容不能为空；不想留这条就点下面的「删除」');
+        return;
+      }
       textDraft.value = null;
-      if (!text) return;                             // 空着就当没点
+      /* `id` 非空 = 改已有的那条：只 PATCH text，**位置/颜色一概不动**。
+         以前这里只有「新写一条」，于是写完的批注除了橡皮划掉重写没有别的改法
+         （2026-11-03 用户报的第 1 条）。 */
+      if (d.id) {
+        const mid = d.id;
+        pickedMark.value = null;
+        try {
+          await gradeApi.patchMark(mid, { text });
+          await settle();
+        } catch (e) { fail(e.message); }
+        return;
+      }
       // 给一个能装下字的默认框（2026-10-27）：以前存的是零面积点 [x,y,x,y]，
       // 于是文字只能靠 CSS 的 nowrap + 省略号收场 —— 长批注被截掉且界面不提示。
       // 现在按页宽 30% 给宽、按字数估高（下限 60 单位 ≈ 页高 6%），存进 geo 的四个数里，
@@ -1755,6 +1816,8 @@ export default {
       // 手写批改
       tool, inkColor, textDraft, exporting, INK_COLORS, teacherMarks, layerEl, readOnly,
       setTool, addMark, eraseMarks, onTextAt, saveText, moveMark,
+      // 选中一处批注 → 底部操作条（改文字 / 删除）
+      pickedMark, pickedText, pickedShort, onSelectMark, onEditMark, openTextEdit, deletePicked,
       undoLast, clearPageMarks, exportFile, archiveGrade,
       // 本机草稿：待发笔迹 / 补发
       pendingMarks, pendingUnsent, flushPending,
@@ -1988,15 +2051,17 @@ export default {
                ⚠️ 这层只是观感，**不要**在这里写 height / max-height ——
                   高度统一由 .grade-left 管，在这层限高会让标注层与卷面对不上。 -->
           <div class="grade-viewer">
-          <div class="grade-page">
+          <div class="grade-page" @pointerdown="pickedMark = null">
             <img class="grade-page-img" :src="pageUrl" loading="lazy" alt="作业原图" draggable="false"
                  @load="pageBroken = false" @error="pageBroken = true">
             <!-- ⚠️ 成对写，别写成自闭合：零构建的模板里自闭合会把后面的节点吞掉 -->
             <GradeMarkLayer ref="layerEl" :marks="pageMarks" :selected-item-id="selectedItemId"
                             :mode="readOnly ? 'view' : tool" :color="inkColor"
+                            :active-mark-id="pickedText ? pickedText.id : null"
                             :regions="layerRegions" :lines="layerLines" :bands="pageBands"
                             :tail="pageTail"
                             @pick="onPick" @create="addMark" @erase="eraseMarks"
+                            @select-mark="onSelectMark" @edit-mark="onEditMark"
                             @text-at="onTextAt" @stamp="addMark" @move="moveMark"
                             @region="addRegionBox" @region-remove="dropRegion"
                             @add-line="addLine" @move-line="moveLine"
@@ -2266,9 +2331,19 @@ export default {
     </template>
 
     <!-- 文字框：点完位置弹出来。零构建不引第三方弹窗，自己写一层遮罩就够 -->
+    <!-- ★ 点中一处批注后浮在底部的操作条（与批改工作台同一套口径：
+         编辑操作**选中后出现**）。在这之前写完的批注没有任何改法。 -->
+    <div v-if="pickedText" class="g-actbar">
+      <span class="g-actbar-tip">已选中批注：<b>{{ pickedShort }}</b></span>
+      <div class="spacer"></div>
+      <button class="btn sm" @click="openTextEdit(pickedText)">✏️ 编辑文字</button>
+      <button class="btn ghost sm" style="color:#dc2626" @click="deletePicked">🗑 删除</button>
+      <button class="btn ghost sm" title="取消选中（Esc）" @click="pickedMark = null">✕</button>
+    </div>
+
     <div v-if="textDraft" class="g-textmask" @click.self="textDraft = null">
       <div class="g-textbox">
-        <div class="g-textbox-head">在卷面上写一句批注</div>
+        <div class="g-textbox-head">{{ textDraft.id ? '修改这条批注' : '在卷面上写一句批注' }}</div>
         <textarea v-model="textDraft.text" rows="3" autofocus
                   placeholder="例如：第 3 步两边同除 x 时漏了 x=0"
                   @keydown.ctrl.enter="saveText"></textarea>
@@ -2276,7 +2351,7 @@ export default {
           <span class="small muted">Ctrl+Enter 放上去</span>
           <div class="spacer"></div>
           <button class="btn ghost sm" @click="textDraft = null">取消</button>
-          <button class="btn primary sm" @click="saveText">放上去</button>
+          <button class="btn primary sm" @click="saveText">{{ textDraft.id ? '改好' : '放上去' }}</button>
         </div>
       </div>
     </div>

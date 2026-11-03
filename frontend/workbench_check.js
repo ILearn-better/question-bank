@@ -484,6 +484,10 @@ async function main() {
   const GMARK_TEXT_SELS = [
     '.gmark-label',
     '.gmark-label.sized',
+    /* 选中态：漏了它就是「点中了却看不出来」—— 类名照样在 DOM 里，
+       所以只数 DOM 的断言抓不到，必须比选择器。 */
+    '.gmark-label.act',
+    '.gmark-label.act.drag',
     '.gmark-label-body',
     '.gmark-label-body .gm-math',
     '.gmark-label-body .gm-math-raw',
@@ -1257,6 +1261,144 @@ async function main() {
   await vm.saveText();
   await sleep(120);
   check('★ 评语是空的 → 不放一个空框上去', (vm.g.marks || []).length, nText);
+
+  /* ---- ★★ 改已有的批注（2026-11-03 用户报：「写好内容，没办法点开重新修改」）----
+   *
+   * 真因不是缺一个按钮，是**根本没有「选中某一处标注」这个状态**：
+   * `pick()` 只在 view 模式、且 item_id 非空时才发，而文本框的 item_id 是 null
+   * → 点它什么都不发生；除了橡皮划掉重写（= 重新摆位置），没有任何改法。
+   *
+   * 这里守**整条链**：点中 → 底部操作条 → 编辑 → 弹框带原文 → 发出 PATCH。
+   * ⚠️ 关键断言打在**发出去的请求体**上，不能只看 `vm.pickedMark` ——
+   *    那是界面自说自话，改了状态却没发请求一样能「全绿」。
+   * ⚠️ 期望值是「用户看得见的结果」（条子出现了、原文带出来了、库里变了），
+   *    不是「函数被调用过」。 */
+  const tmark = (vm.g.marks || []).filter((m) => m.kind === 'text'
+    && m.text === '这一步漏了讨论 x=0')[0];
+  checkTrue('★★ 先确认页面上有那条可改的批注（下面几条不是在空跑）',
+    !!tmark, tmark ? ('id=' + tmark.id) : '(没找到)');
+
+  const barEl = () => D.querySelector('.text-actbar');
+  check('★★ 还没点中任何批注时，底部不该有操作条', !!barEl(), false);
+
+  /* ★ 这里必须派**真实事件**，不能直接调 `vm.onSelectMark()` ——
+     直接调就把「点标签 → 组件 emit select-mark → 父组件记下来」这段接线绕过去了，
+     而那正是最容易断的一环（`pick()` 里原来第一句就是 `mode !== 'view'` 就 return）。
+     ⚠️ 派的是 `click` 而不是 pointerdown/pointerup 那一串：**实测 jsdom 里
+        pointer 序列到不了组件**（按下去没有任何状态变化），而 click 能。
+        真浏览器里「按一下不移动」同样会补一个 click，所以这条路径与用户的操作一致；
+        完整的按压序列由 CDP 探针在真浏览器里另外覆盖。 */
+  const savedTool3 = vm.tool;
+  vm.tool = 'view';
+  await sleep(120);
+  const lbPick = Array.from(D.querySelectorAll('.gmark-label'))
+    .filter((el) => (el.textContent || '').indexOf('这一步漏了讨论') >= 0)[0];
+  checkTrue('★★ 页面上找得到那条文本框（下面几句靠真事件点它）', !!lbPick,
+    D.querySelectorAll('.gmark-label').length + ' 个 .gmark-label');
+  if (lbPick) {
+    const pev = (type) => new W.MouseEvent(type, {
+      bubbles: true, cancelable: true, clientX: 40, clientY: 40, button: 0,
+    });
+    lbPick.dispatchEvent(pev('pointerdown'));
+    lbPick.dispatchEvent(pev('pointerup'));
+    lbPick.dispatchEvent(pev('click'));
+    await sleep(140);
+  }
+  checkTrue('★★ 点一下文本框 → 底部浮出操作条（在这之前它是不存在的）',
+    !!barEl(), barEl() ? JSON.stringify(barEl().textContent.replace(/\s+/g, ' ').trim()) : '(没有)');
+  check('★★ 组件把「选中了哪一条」真的传上来了', vm.pickedMark && vm.pickedMark.id,
+    tmark && tmark.id);
+  checkTrue('★★ 操作条上写着「编辑文字」（写死中文：只放个图标，老师不知道那里能点）',
+    !!barEl() && /编辑文字/.test(barEl().textContent),
+    barEl() ? barEl().textContent.trim() : '');
+  checkTrue('★★ 被选中的那一条会被画出来（.gmark-label.act）',
+    D.querySelectorAll('.gmark-label.act').length >= 1,
+    D.querySelectorAll('.gmark-label.act').length + ' 条带 act');
+  /* ⚠️ 光有类名不算数：样式没跟上时 `act` 照样在 DOM 里，屏幕上一个像素都不变。
+     这就是「DOM 在不在查不出这类问题」的那个坑 —— 量声明出来的描边。 */
+  checkTrue('★★ 选中态真的有描边（box-shadow 空 = .gmark-label.act 那条规则没跟上）',
+    /px/.test(String(csGet(D.querySelector('.gmark-label.act'), 'boxShadow') || '')),
+    JSON.stringify(csGet(D.querySelector('.gmark-label.act'), 'boxShadow')));
+  vm.tool = savedTool3;
+  await sleep(80);
+
+  const nMkPatch = () => CALLS.filter((c) => /^\/api\/grade-marks\/\d+$/.test(c.url)
+    && c.method === 'PATCH');
+  const pBefore = nMkPatch().length;
+
+  vm.openTextEdit(tmark);
+  await sleep(90);
+  check('★★ 弹的是「改」不是「新写一条」（认字段看 id）',
+    [vm.textOpen, vm.textDraft.id], [true, tmark.id]);
+  check('★★ 弹框里带着原文（接着改，不是让人重打一遍）', vm.textDraft.text, tmark.text);
+
+  vm.textDraft.text = '改过的批注：x^2 漏了讨论';
+  await vm.saveText();
+  await sleep(220);
+  const mps = nMkPatch();
+  check('★★ 改文字 → 恰好一个 PATCH，且打在**那一条**上',
+    [mps.length - pBefore, mps.length && mps[mps.length - 1].url],
+    [1, '/api/grade-marks/' + tmark.id]);
+  check('★★ PATCH 只带 text（把整条对象发过去会把位置/颜色一起覆盖回旧值）',
+    Object.keys((mps[mps.length - 1] || {}).body || {}).sort(), ['text']);
+  const after = (vm.g.marks || []).filter((m) => String(m.id) === String(tmark.id))[0] || {};
+  check('★★ 服务端那条的 text 真的变了（不是只改了屏幕上那个）',
+    after.text, '改过的批注：x^2 漏了讨论');
+  check('★★ 位置一个字没动（改文字不该顺手把框挪走）', after.geo, tmark.geo);
+  check('★★ 改完底部操作条收起（不该一直挂在屏幕上挡卷面）', !!barEl(), false);
+
+  /* 双击直接进编辑：少一步「先点中、再去底下找按钮」，也最像「在文件里双击一段文字」。 */
+  const lbEdit = Array.from(D.querySelectorAll('.gmark-label'))
+    .filter((el) => (el.textContent || '').indexOf('改过的批注') >= 0)[0];
+  checkTrue('★★ 找到改过的那条文本框（下面几句依托它）', !!lbEdit,
+    D.querySelectorAll('.gmark-label').length + ' 个 .gmark-label');
+  if (lbEdit) {
+    vm.textOpen = false;
+    vm.textDraft = { id: null, page: 1, x: 0, y: 0, text: '' };
+    vm.pickedMark = null;
+    lbEdit.dispatchEvent(new W.MouseEvent('dblclick', { bubbles: true, cancelable: true }));
+    await sleep(90);
+    check('★★ 双击文本框 → 直接进编辑',
+      [vm.textOpen, String(vm.textDraft.id)], [true, String(tmark.id)]);
+    vm.textOpen = false;
+  }
+
+  /* 取消选中的两条路。⚠️ 「只看」模式必须在场：`onPageDown` 第一行就 return，
+     取消选中若是写在 return 之后，最常见的场景（只看模式）反而失效。 */
+  const savedTool2 = vm.tool;
+  vm.tool = 'view';
+  vm.onSelectMark(tmark);
+  await sleep(70);
+  vm.onPageDown(3, { currentTarget: D.createElement('div') });
+  await sleep(70);
+  check('★★ 在卷面空白处按一下 → 取消选中（「只看」模式下也要管用）', !!barEl(), false);
+  vm.onSelectMark(tmark);
+  await sleep(70);
+  vm.onKeyDown({ key: 'Escape', target: { tagName: 'DIV' } });
+  await sleep(70);
+  check('★★ Esc 也能取消选中', !!barEl(), false);
+  vm.tool = savedTool2;
+
+  /* 本机还没传上去的（`local:`）**不给编辑**：PATCH 的 mid 是 int，改了也只能 422。
+     给个点不动的按钮，比给一个点了报错的按钮诚实。 */
+  vm.onSelectMark({ id: 'local:abc123', kind: 'text', text: '还没上传' });
+  await sleep(70);
+  check('★★ 还没上传的批注：不给编辑入口、操作条也不出现',
+    [vm.pickedText, !!barEl()], [null, false]);
+  vm.pickedMark = null;
+
+  /* 把内容改空 ≠ 删掉。删是有代价的动作，不该由「清空输入框」顺手触发；
+     但也不能静默什么都不做（老师会以为存上了）。 */
+  const pBeforeEmpty = nMkPatch().length;
+  vm.textDraft = { id: tmark.id, page: 1, x: 0, y: 0, text: '   ' };
+  vm.textOpen = true;                    // 模拟「弹框开着、把内容清空了再点改好」
+  await vm.saveText();
+  await sleep(160);
+  check('★★ 内容改成空的 → 不发请求，也不静默关掉弹框',
+    [nMkPatch().length - pBeforeEmpty, vm.textOpen], [0, true]);
+  vm.textOpen = false;
+  vm.textDraft = { id: null, page: 1, x: 0, y: 0, text: '' };
+
 
   /* ---- 清空本页：只清老师自己画的 ---- */
   /* AI 画的框 created_by 不是 teacher —— 一起删了老师就得重新批一遍。 */

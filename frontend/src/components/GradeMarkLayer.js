@@ -226,9 +226,18 @@ export default {
     /** 末段以下那一截（`[0,endY,1000,1000]`）：页脚带。**不进任何块、不送 AI**。
      *  没设结束线时是 null（末段一直切到页底，与历史行为一致）。 */
     tail: { type: Array, default: null },
+    /** 父组件记的「当前选中的那一处标注」的 id。**这里只用来画选中框**，
+     *  状态归父组件 —— 底部那条「编辑文字 / 删除」操作条也在父组件里，
+     *  两处各记一份就会出现「框是亮的、条子没出来」。 */
+    activeMarkId: { type: [String, Number], default: null },
   },
   emits: ['pick', 'create', 'erase', 'text-at', 'stamp', 'move', 'region', 'region-remove',
-    'add-line', 'move-line', 'remove-line'],
+    'add-line', 'move-line', 'remove-line',
+    /* 选中的是一**处标注**（目前只有文本框），父组件据此弹出底部操作条。
+       与 `pick` 分开：`pick` 是「跳到右栏那道题」，选中标注没有题可跳。 */
+    'select-mark',
+    /* 双击文本框 = 直接改字。 */
+    'edit-mark'],
   setup(props, { emit, expose }) {
     const svgEl = ref(null);
     const drawing = ref(false);
@@ -311,10 +320,27 @@ export default {
     const isDragging = (s) => !!dragState.value && dragState.value.id === String(s.mark.id);
 
     function pick(s) {
-      if (props.mode !== 'view') return;      // 画笔模式下点标注不该跳题
       if (!s) return;
+      /* ★ 文本框：点一下 = **选中它**，父组件在底部亮出「编辑文字 / 删除」。
+       *   要在 `mode` 判断**之前** —— text 标注的 item_id 是 null，「跳到那道题」无处可跳；
+       *   而 `.gmark-label` 在「只看」和「文字」两个模式下都收得到指针（见 CSS），
+       *   两个模式都该能选中，否则老师切了工具就发现「刚才还能点，现在点不动了」。
+       *   （2026-11-03 用户报「写好内容，没办法点开重新修改」——
+       *     真因不是缺一个编辑按钮，是**根本没有「选中某一处标注」这个状态**。） */
+      if (s.kind === 'text') { emit('select-mark', s.mark); return; }
+      if (props.mode !== 'view') return;      // 画笔模式下点标注不该跳题
       emit('pick', s.mark);
     }
+
+    /** 双击文本框 = 直接改字。比「先点中它、再去底下找按钮」少一步，
+     *  也是最像「在文件里双击一段文字」的直觉。 */
+    function onLabelDblClick(s) {
+      if (!s || s.kind !== 'text') return;
+      emit('select-mark', s.mark);
+      emit('edit-mark', s.mark);
+    }
+    const isActive = (s) => props.activeMarkId !== null && props.activeMarkId !== undefined
+      && same(s.mark.id, props.activeMarkId);
 
     /** 单击跳题。刚拖完的那一下 click 要吞掉，否则「拖一下框」顺手把右栏跳到那一题。 */
     function onPickClick(s) {
@@ -808,6 +834,7 @@ export default {
     return {
       svgEl, drawing, draft, erasing, regionDraft, lineDrag, pending,
       shapesFor, isPicked, isLinked, isGone, canMove, isDragging, pick, onPickClick,
+      isActive, onLabelDblClick,
       labelHtml, mathReady,
       onDown, onMove, onUp, onCancel, startDrag, dragTo, endDrag, cancelDrag,
       canResize, startResize, resizeTo, endResize, cancelResize,
@@ -922,15 +949,18 @@ export default {
     </svg>
 
     <!-- 文字标注用 HTML 定位：SVG 的 <text> 在非等比 viewBox 里会被压扁。
-         「选择」模式下可以直接按住拖走（父组件松手时 PATCH geo）。 -->
+         「选择」模式下可以直接按住拖走（父组件松手时 PATCH geo）。
+         ★ 点一下 = 选中（父组件在底部亮出「编辑文字 / 删除」），双击 = 直接改字。 -->
     <span v-for="s in shapesFor(marks).filter(x => x.text)" :key="'tx-' + s.key"
           class="gmark-label"
-          :class="{ sel: isPicked(s), linked: isLinked(s), drag: isDragging(s), sized: s.label.sized }"
+          :class="{ sel: isPicked(s), linked: isLinked(s), drag: isDragging(s),
+                    sized: s.label.sized, act: isActive(s) }"
           :style="{ left: s.label.left, top: s.label.top, borderColor: s.color, color: s.color,
                     width: s.label.w, height: s.label.h }"
           @pointerdown="startDrag($event, s)" @pointermove="dragTo"
           @pointerup="endDrag" @pointercancel="cancelDrag"
-          @click.stop="onPickClick(s)"><span class="gmark-label-body" v-html="labelHtml(s)"></span><i v-if="canResize(s)" class="gmark-resize" title="拖动调整文本框大小"
+          @click.stop="onPickClick(s)"
+          @dblclick.stop="onLabelDblClick(s)"><span class="gmark-label-body" v-html="labelHtml(s)"></span><i v-if="canResize(s)" class="gmark-resize" title="拖动调整文本框大小"
              @pointerdown.stop="startResize($event, s)"
              @pointermove.stop="resizeTo"
              @pointerup.stop="endResize"
