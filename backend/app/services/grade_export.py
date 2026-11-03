@@ -195,14 +195,21 @@ def _rich_lines(d: ImageDraw.ImageDraw, text: str, font, fs: int,
     会压到下一行文字上。竖直方向按**行盒居中**对齐：文字和公式图的视觉中线对齐，
     而不是各自顶着行顶（那样公式会整体高出半行，看着像上标漂了）。
 
-    ⚠️ 公式渲不出来时**退回纯文本、并去掉定界符**：这是发给家长看的 PDF，
-    印一串 `$x^2$` 比印出 `x^2` 更糟。log 里已经留了一行（见 `latex_img.math_image`），
-    所以不是静默 —— 只是这个退路选在「别把 $ 印到卷子上」这一侧。
+    ⚠️ `$$…$$` / `\\[…\\]`（display）**独占一行**：与屏幕 KaTeX 的 `displayMode` 同一口径，
+    否则多行推导的公式图会被挤在句子中间、左右各跟着半句话。
+
+    ⚠️ 公式里的中文先被 `split_cjk` 挑出来当普通文字排 —— mathtext 没有 CJK 字形，
+    硬喂进去是豆腐块（2026-11-03 修）。
+
+    ⚠️ 公式渲不出来时**退回可读文本**（`latex_img.plain_text`：`\\times` → `×`），
+    定界符不再印出来。这是发给家长看的 PDF，印一串 `\\begin{aligned}` 比印 `x ≤ 4` 糟得多。
+    log 里已经留了一行（见 `latex_img._math_png`），所以不是静默。
     """
     base_lh = int(fs * 1.34)
     lines: list[dict] = []
     cur: list[dict] = []
     curw = 0.0
+    swallow_nl = False          # 刚收过 display 公式：紧跟的那个换行不许再空一行
 
     def flush() -> None:
         nonlocal cur, curw
@@ -210,34 +217,73 @@ def _rich_lines(d: ImageDraw.ImageDraw, text: str, font, fs: int,
         cur, curw = [], 0.0
 
     def put(item: dict) -> None:
-        nonlocal curw
+        nonlocal curw, swallow_nl
+        swallow_nl = False
         cur.append(item)
         curw += item['w']
 
-    for part in latex_img.split_math(text):
-        chunk = None
-        if part['t'] == 'math':
-            img = latex_img.math_image(part['tex'], fs, color)
-            if img is not None:
-                iw = float(img.width)
-                if cur and curw + iw > maxw:
-                    flush()
-                put({'k': 'math', 'v': part['tex'], 'w': iw,
-                     'h': float(img.height), 'img': img})
-                continue
-            chunk = part['tex']           # 渲不出来 → 当普通文字排，去掉定界符
-        else:
-            chunk = part['v']
+    def put_chars(chunk: str) -> None:
+        nonlocal swallow_nl
         for ch in chunk:
             if ch == '\n':
+                # display 公式自己已经收过行了，源文里紧跟的 `\n` 再收一次就是**空一整行**
+                if swallow_nl:
+                    swallow_nl = False
+                    continue
                 flush()
                 continue
             cw = _text_w(d, ch, font, fs)
             if cur and curw + cw > maxw:
                 flush()
             put({'k': 'chars', 'v': ch, 'w': cw, 'h': float(base_lh), 'img': None})
-    if cur or not lines:
+
+    def put_math(tex: str) -> None:
+        """一条公式：中文走文字、剩下的走 mathtext（一条公式内部可能两样都有）。
+
+        ⚠️ **整条一起退回**，不逐段退：`\\frac{面积}{2}` 被中文切开后，数学段是
+        `\\frac{`（半个括号），单独退回会印出 `frac(` 这种断口。只要有一段渲不出来，
+        就把**原公式**交给 `plain_text` → `(面积)/(2)`，至少是人能读的东西。
+        """
+        plans: list[tuple[str, object]] = []
+        for seg in latex_img.split_cjk(tex):
+            if seg['t'] == 'text':
+                plans.append(('text', seg['v']))
+                continue
+            img = latex_img.math_image(seg['tex'], fs, color)
+            if img is None:
+                put_chars(latex_img.plain_text(tex))
+                return
+            plans.append(('math', img))
+        for kind, val in plans:
+            if kind == 'text':
+                put_chars(val)                       # type: ignore[arg-type]
+                continue
+            img = val                                    # type: ignore[assignment]
+            iw = float(img.width)
+            if cur and curw + iw > maxw:
+                flush()
+            put({'k': 'math', 'v': tex, 'w': iw,
+                 'h': float(img.height), 'img': img})
+
+    for part in latex_img.split_math(text):
+        if part['t'] != 'math':
+            put_chars(part['v'])
+            continue
+        block = bool(part.get('display'))
+        if block and cur:                         # display 公式独占一行
+            flush()
+        put_math(part['tex'])
+        if block:
+            if cur:
+                flush()
+            swallow_nl = True
+    if cur:
         flush()
+    # 末尾的空行没有意义（只表现为框被白撑高一行），但**中间**的空行要留着
+    while len(lines) > 1 and not lines[-1]['items']:
+        lines.pop()
+    if not lines:
+        lines.append({'items': [], 'h': base_lh})
 
     # 逐行抬高：有高个子公式的行要给它让出高度，否则会和下一行叠在一起
     for ln in lines:

@@ -19,6 +19,17 @@
   ④ **有宽高的文本框按新口径落位**（左上角在锚点）；老数据（零面积点）仍按旧口径
      （底边在锚点）。这是同一件事的两个分支，画错了框会整体上浮一个框高 ——
      屏幕上 `4e8a096` 已经把 `.sized` 的口径改过来了，导出不能还留在旧的。
+  ⑤ **多行环境（aligned / cases / matrix / array）自己拼版**（2026-11-03 补）。
+     matplotlib mathtext 一个环境都不认（`Unknown symbol: \\begin`），改之前多行推导
+     整段退成反斜杠原文印在卷子上 —— 用户原话「文本框中的 latex 导出的不是渲染好的」。
+     这里守：三行真是三行、cases 有左大括号、`f(x)=…` 夹在中间也认、
+     上游吃成 `\\ ` 的行分隔也认、排完版文字里一个 `begin`/反斜杠都没有。
+  ⑥ **display 公式独占一行**（与屏幕 KaTeX 的 displayMode 同口径），且紧跟的那个 `\\n`
+     不再空出一整行 —— 但批注里**真**的空行要留着。
+  ⑦ **公式里的中文走文字层**：mathtext 没有汉字字形，硬渲是豆腐块；劈开后某段渲不出时
+     **整条**退回可读文本，不许印出 `frac(` 这种断口。
+  ⑧ **退路是「人能读的文本」**：`\\leq` → `≤`、`\\frac{a}{b}` → `(a)/(b)`，
+     环境名 / `&` / 反斜杠一个都不许印出来；未知命令保留名字（诚实，但不像程序坏了）。
 
 ⚠️ 不起服务、不碰真库：纯图像计算 + 几张假的 mark 对象。
 ⚠️ 临时目录在 import app 之前设好（engine 在 import 时绑定路径）。
@@ -215,6 +226,118 @@ def t_fallback():
         L.math_image.cache_clear()
 
 
+# ---------------------------------------------------------------- ⑤ 多行环境
+def t_env():
+    print("\n⑤ 多行环境（aligned / cases）：mathtext 不认 \\begin，导出自己拼版")
+    single = L.math_image("3x+2 = 10", 26, (0, 0, 0))
+    three = L.math_image(
+        "\\begin{aligned} 3x+2 &= 10 \\\\ 3x &= 8 \\\\ x &= 4 \\end{aligned}", 26, (0, 0, 0))
+    check("★ aligned 能渲出图（改之前抛 `Unknown symbol: \\begin`、整段退成反斜杠原文）",
+          three is not None, three)
+    check("★★★ 三行真的是三行，不是被挤成一行",
+          three is not None and single is not None and three.height >= single.height * 2.4,
+          None if three is None else (three.size, single.size if single else None))
+
+    # 库里真实存的那条：上游（AI → Markdown）把行分隔 `\\` 吃成了单个 `\ `
+    mangled = L.math_image(
+        "\\begin{aligned} 120 \\times 5+50x \\leq 800 \\ 600+50x \\leq 800 \\end{aligned}",
+        26, (0, 0, 0))
+    check("★★ 被吃成 `\\ ` 的行分隔也认（这是库里批注的真实形态）",
+          mangled is not None and single is not None and mangled.height >= single.height * 1.7,
+          None if mangled is None else mangled.size)
+
+    cases = L.math_image("\\begin{cases} x & x>0 \\\\ -x & x<0 \\end{cases}", 26, (0, 0, 0))
+    matrix = L.math_image("\\begin{matrix} x & x>0 \\\\ -x & x<0 \\end{matrix}", 26, (0, 0, 0))
+    check("★ cases 也要渲得出（分段函数）", cases is not None, cases)
+    check("★★ cases 比 matrix 宽出一个左手大括号（少了它看着就是两行散式子）",
+          cases is not None and matrix is not None and cases.width > matrix.width + 4,
+          None if (cases is None or matrix is None) else (cases.width, matrix.width))
+
+    mid = L.math_image(
+        "f(x)=\\begin{cases} x^2 & x \\ge 0 \\\\ -x & x<0 \\end{cases}", 26, (0, 0, 0))
+    check("★★★ 环境夹在表达式中间（`f(x)=…` 这种最常见的写法）也要渲，不许整条退纯文本",
+          mid is not None, mid)
+    check("★ 带前缀的图比裸环境宽（前缀真的画进去了，不是被吞了）",
+          mid is not None and cases is not None and mid.width > cases.width,
+          None if (mid is None or cases is None) else (mid.width, cases.width))
+
+    arr = L.math_image("\\begin{array}{|c|c|} a & b \\\\ c & d \\end{array}", 26, (0, 0, 0))
+    check("★★ array 的列格式（`{|c|c|}`）被丢掉，不会当成第一行的一格去解析",
+          arr is not None, arr)
+
+    # 版面上：不能印出 `begin` / 反斜杠
+    import PIL.ImageDraw as _ID
+    lines, _, _, _ = E._rich_lines(
+        _ID.Draw(Image.new("RGB", (10, 10))),
+        "$$\\begin{aligned} a &= 1 \\\\ b &= 2 \\end{aligned}$$", E._font(24), 24,
+        (37, 99, 235), 400)
+    chars = "".join(it["v"] for ln in lines for it in ln["items"] if it["k"] == "chars")
+    maths = [it for ln in lines for it in ln["items"] if it["k"] == "math"]
+    check("★★★ 排完版之后文字里没有 `begin`、也没有反斜杠",
+          "begin" not in chars and "\\" not in chars, repr(chars))
+    check("★ 整块环境是**一块**公式，不是被拆成好几块", len(maths) == 1, len(maths))
+
+
+# ---------------------------------------------------------------- ⑥ display 公式的版面
+def t_display():
+    print("\n⑥ display 公式（`$$…$$`）：独占一行，且不空一整行")
+    import PIL.ImageDraw as _ID
+    d = _ID.Draw(Image.new("RGB", (10, 10)))
+    lines, _, _, _ = E._rich_lines(d, "结论：$$x=4$$\n所以最多买 4 个", E._font(24), 24,
+                                  (37, 99, 235), 400)
+    kinds = [[it["k"] for it in ln["items"]] for ln in lines]
+    check("★★ display 公式独占一行（与屏幕 KaTeX 的 displayMode 同口径）",
+          len(lines) == 3 and kinds[1] == ["math"], kinds)
+    check("★★ display 之后紧跟的换行不再空出一整行（源文就是 `$$…$$\\n文字`）",
+          all(ln["items"] for ln in lines), kinds)
+
+    # 单个换行（批注中间真有空行）还得照旧空一行 —— 别把「压掉紧跟的那个 \n」做成「压掉所有空行」
+    lines2, _, _, _ = E._rich_lines(d, "第一行\n\n第二行", E._font(24), 24, (37, 99, 235), 400)
+    check("★★ 批注里真正的空行要留着（压 `\\n` 只压 display 后面那一个）",
+          len(lines2) == 3, [[it["v"] for it in ln["items"]] for ln in lines2])
+
+
+# ---------------------------------------------------------------- ⑦ 公式里的中文
+def t_cjk():
+    print("\n⑦ 公式里的中文：mathtext 没有汉字字形，硬渲是豆腐块")
+    segs = L.split_cjk("\\text{面积}=12")
+    check("★★ 中文被挑出来交给批注字体，剩下的才是公式",
+          [s["t"] for s in segs] == ["text", "math"], segs)
+    check("★ 中文一个字没丢", bool(segs) and segs[0].get("v") == "面积", segs)
+    check("★ 没有中文时原样一条返回（调用方不必分支）",
+          L.split_cjk("x^2") == [{"t": "math", "tex": "x^2"}], L.split_cjk("x^2"))
+
+    import PIL.ImageDraw as _ID
+    d = _ID.Draw(Image.new("RGB", (10, 10)))
+    lines, _, _, _ = E._rich_lines(d, "$\\text{面积}=12$", E._font(24), 24, (37, 99, 235), 400)
+    chars = "".join(it["v"] for ln in lines for it in ln["items"] if it["k"] == "chars")
+    check("★★ 中文进的是文字层（不是被 mathtext 渲成方块）", "面积" in chars, repr(chars))
+
+    # 中文把公式劈开后，数学段是半个括号（`\frac{`）—— 单独退回会印出 `frac(` 这种断口
+    lines2, _, _, _ = E._rich_lines(d, "$\\frac{面积}{2}$", E._font(24), 24, (37, 99, 235), 400)
+    chars2 = "".join(it["v"] for ln in lines2 for it in ln["items"] if it["k"] == "chars")
+    check("★★★ 劈开后某段渲不出时**整条**退回可读文本，不许出现 `frac(` 这种断口",
+          "frac" not in chars2 and "(面积)/(2)" in chars2, repr(chars2))
+
+
+# ---------------------------------------------------------------- ⑧ 退路是「人能读的文本」
+def t_plain():
+    print("\n⑧ 退路：翻成可读文本，不是把反斜杠原文印给家长")
+    check("★ `\\leq` → ≤", L.plain_text("x \\leq 4").replace(" ", "") == "x≤4",
+          L.plain_text("x \\leq 4"))
+    check("★ `\\times` → ×", "×" in L.plain_text("2 \\times 3"), L.plain_text("2 \\times 3"))
+    check("★ 分数 → `(a)/(b)`", L.plain_text("\\frac{1}{2}") == "(1)/(2)", L.plain_text("\\frac{1}{2}"))
+    check("★ 根号 → `√(16)`", L.plain_text("\\sqrt{16}") == "√(16)", L.plain_text("\\sqrt{16}"))
+    env_txt = L.plain_text("\\begin{aligned} a &= 1 \\\\ b &= 2 \\end{aligned}")
+    check("★★ 环境名 / `&` / 反斜杠都不许印出来",
+          "begin" not in env_txt and "&" not in env_txt and "\\" not in env_txt, repr(env_txt))
+    check("★ 行还是分行（`\\\\` → 换行）", "\n" in env_txt, repr(env_txt))
+    check("★ 未知命令保留名字（老师能看出这里没渲出来，但不像程序坏了）",
+          "unknowncmd" in L.plain_text("\\unknowncmd{x}"), L.plain_text("\\unknowncmd{x}"))
+    check("★★ 退路自己不许炸", L.plain_text(None) == "" and isinstance(L.plain_text("{" * 40), str),
+          repr(L.plain_text("{" * 40)))
+
+
 # ---------------------------------------------------------------- ④ 有宽高的框怎么落位
 def t_sized_anchor():
     print("\n④ 有宽高的文本框：左上角落在锚点；老数据仍是底边落在锚点")
@@ -268,6 +391,10 @@ def main() -> int:
     t_split()
     t_paste()
     t_fallback()
+    t_env()
+    t_display()
+    t_cjk()
+    t_plain()
     t_sized_anchor()
     t_guards()
 
