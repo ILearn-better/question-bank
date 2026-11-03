@@ -467,6 +467,71 @@ async function main() {
      否则「加了入口」这件事永远是口头验收（加错了一样绿）。 */
   const APP_SRC = fs.readFileSync(path.join(ROOT, 'src', 'App.js'), 'utf8');
 
+  /* ================= ① ★★ 本页的 .gmark-* 样式是 app.css 的**拷贝**，不许掉队 =================
+   *
+   * 2026-11-02 的真实事故：`4e8a096` 给文本框加了「右下角拖拽调大小」，组件里
+   * `<i class="gmark-resize">` 照样渲染，app.css 也加了它的样式 —— **唯独这一页没同步**。
+   * 于是手柄是个 `position: static`、宽高 auto 的空行内元素：看不见、点不到，
+   * 「能调大小」等于没做，而整页 382 项检查全绿（DOM 在、接口也对）。
+   * 同一批漏掉的还有 `.gmark-label.sized`（有宽高的框仍按老口径上浮一格）、
+   * `.gmark-label-body`（批注内容层退化成 inline）、`.gmark-label` 的新口径
+   * （`nowrap` + `ellipsis`，长批注又被省略号吃掉）。
+   *
+   * 判据用「**拷贝必须是 app.css 的超集**」而不是「两份一模一样」：
+   * 这一页有自己的 z-index / 辅助层，允许比 app.css **多**东西（比如 .gmark-layer
+   * 的 z-index: 20），但不许少 —— 少的每一条都是「这页上少了一个功能」。
+   * 只盯**文本框那一片**，不铺开到全部 .gmark-*（笔迹样式两边本来就各有一套注释与差异）。 */
+  const GMARK_TEXT_SELS = [
+    '.gmark-label',
+    '.gmark-label.sized',
+    /* 选中态：漏了它就是「点中了却看不出来」—— 类名照样在 DOM 里，
+       所以只数 DOM 的断言抓不到，必须比选择器。 */
+    '.gmark-label.act',
+    '.gmark-label.act.drag',
+    '.gmark-label-body',
+    '.gmark-label-body .gm-math',
+    '.gmark-label-body .gm-math-raw',
+    '.gmark-label .gmark-resize',
+    '.gmark-label .gmark-resize:hover',
+    '.gmark-layer.mode-text .gmark-label',
+    '.gmark-layer.mode-ink .gmark-label .gmark-resize',
+    '.gmark-layer.mode-erase .gmark-label .gmark-resize',
+    '.gmark-layer.mode-region .gmark-label .gmark-resize',
+    '.gmark-layer.mode-line .gmark-label .gmark-resize',
+  ];
+  /** 把 CSS 拆成 选择器 → 声明集合。先删注释（不删的话注释里的分号会切出假声明），
+   *  再按 选择器组 拆开 —— `.a, .b { }` 这种组选择器必须每个都单独登记，
+   *  否则 `.gmark-layer.mode-*` 那组隐藏规则永远对不上。 */
+  function cssDeclMap(css) {
+    const out = new Map();
+    const noComment = css.replace(/\/\*[\s\S]*?\*\//g, '');
+    const re = /([^{}]+)\{([^{}]*)\}/g;
+    let m;
+    while ((m = re.exec(noComment))) {
+      const sels = m[1].split(',').map((s) => s.replace(/\s+/g, ' ').trim()).filter(Boolean);
+      const decls = new Set(m[2].split(';').map((d) => d.replace(/\s+/g, ' ').trim()).filter(Boolean));
+      for (const s of sels) if (!out.has(s)) out.set(s, decls);
+    }
+    return out;
+  }
+  const APP_CSS_MAP = cssDeclMap(fs.readFileSync(path.join(ROOT, 'app.css'), 'utf8'));
+  const WB_CSS_MAP = cssDeclMap(html);
+  const cssDropped = [];
+  GMARK_TEXT_SELS.forEach((sel) => {
+    const a = APP_CSS_MAP.get(sel) || new Set();
+    const w = WB_CSS_MAP.get(sel) || new Set();
+    /* app.css 里没有 → 这条断言在空转，得单独报出来，不然它永远是绿的 */
+    if (!a.size) cssDropped.push(sel + '（app.css 里没这条）');
+    const miss = [...a].filter((d) => !w.has(d));
+    /* ⚠️ 期望值写 0 而不是空数组：`[]` 会和「app.css 也没这条」一样绿，
+       区别只在于 detail 里到底列了什么。都列进 detail，人工一眼能看出是哪边空。 */
+    check('★ 样式同步 · ' + sel + '（workbench.html 少几条）',
+      miss.length, 0);
+    if (miss.length) console.log('        少的是：' + JSON.stringify(miss));
+  });
+  checkTrue('★ 上面这些选择器在 app.css 里都真有（否则同步检查是空跑）',
+    cssDropped.length === 0, cssDropped.length ? cssDropped : '12 条都在');
+
   /* 内联脚本用正则抽出来自己 eval —— 不依赖 jsdom 执行 <script>：
    * runScripts:'outside-only' 下它不会跑，而 'dangerously' 又会让所有 src 脚本
    * 真的去磁盘取（路径是 /vendor/...，取不到）。 */
@@ -1154,6 +1219,55 @@ async function main() {
   check('★ 文字框内容存上去了（kind=text）',
     (vm.g.marks || []).filter((m) => m.kind === 'text' && m.text === '这一步漏了讨论 x=0').length, 1);
   checkTrue('★ 存完弹框关掉', vm.textOpen === false, String(vm.textOpen));
+
+  /* ---- ★★ 文本框在**这一页**上到底长什么样（2026-11-02）----
+   *
+   * 光验「DOM 里有 .gmark-label」是不够的 —— 手柄漏同步样式时它照样在 DOM 里，
+   * 只是尺寸为 0、定位是 static。所以这里量**计算样式**，量的都是「老师看得见摸得着」
+   * 的那几样：手柄的定位与宽高、批注能不能换行、内容层是不是块级。
+   * 期望值取自 app.css 那份的语义（11px 手柄 / pre-wrap / auto / block），
+   * 不是「跑出来什么就写什么」。 */
+  const savedTool = vm.tool;
+  vm.tool = 'view';                 // 手柄只在 view/text 模式下给（画笔模式下按下去是落笔）
+  await sleep(90);
+  const allLabels = Array.from(D.querySelectorAll('.gmark-label'));
+  const lb3 = allLabels.filter((el) => (el.textContent || '').indexOf('这一步漏了讨论') >= 0)[0];
+  checkTrue('★★ 页面上真出现了那条批注的文本框（下面几条不是在空跑）',
+    !!lb3, allLabels.length + ' 个 .gmark-label');
+  const lbBody = lb3 && lb3.querySelector('.gmark-label-body');
+  const resizeEl = lb3 && lb3.querySelector('.gmark-resize');
+  const cs = (el) => (el ? W.getComputedStyle(el) : null);
+  const csGet = (el, k) => { const s = cs(el); return s ? s[k] : '(元素不存在)'; };
+  checkTrue('★★ 批注文字包在**内层** .gmark-label-body 里（v-html 只准挂这层，手柄得留在外层）',
+    !!lbBody && lbBody.textContent.trim() === '这一步漏了讨论 x=0',
+    lbBody ? JSON.stringify(lbBody.textContent.trim()) : '(没有这一层)');
+  check('★★ 内容层 display（inline = .gmark-label-body 规则没同步）',
+    csGet(lbBody, 'display'), 'block');
+  check('★★ 文本框 white-space（nowrap = 还在用旧口径，长批注会被省略号静默吃掉）',
+    csGet(lb3, 'whiteSpace'), 'pre-wrap');
+  /* ⚠️ 2026-11-03 起判据变了：label 自己 **overflow: visible**，滚动交给内容层。
+     原来的 auto 把滚动条长在框的最右一列，正好压住右下角手柄 ——
+     长批注一出现滚动条，手柄就点不到（老师报「没办法缩放」的一半原因）。 */
+  check('★★ 文本框 overflow（auto = 滚动条又长回框上，会压住右下角手柄）',
+    csGet(lb3, 'overflow'), 'visible');
+  check('★★ 内容层自己滚动（auto = 长批注靠它滚，不靠 label）',
+    csGet(lbBody, 'overflow'), 'auto');
+  checkTrue('★★★ 调大小手柄真的渲染出来了', !!resizeEl, resizeEl ? '有 <i.gmark-resize>' : '(没有)');
+  check('★★★ 手柄 position（static = .gmark-resize 规则没同步 → 手柄看不见也点不到）',
+    csGet(resizeEl, 'position'), 'absolute');
+  /* 12×12 + 白色底 + 同色描边：原来 11×11 只有两条 2px 边框、75% 透明，在扫描件上
+     几乎看不见。**小一点点、淡一点点，老师就以为「没有缩放这个功能」**。 */
+  check('★★★ 手柄 width', csGet(resizeEl, 'width'), '12px');
+  check('★★★ 手柄 height', csGet(resizeEl, 'height'), '12px');
+  check('★★★ 手柄在框外（right/bottom 为正 = 又被内容区和滚动条压住了）',
+    csGet(resizeEl, 'right') + ',' + csGet(resizeEl, 'bottom'), '-7px,-7px');
+  check('★★★ 手柄 touch-action（none = 触屏/手写笔上拖手柄不会变成滚页面）',
+    csGet(resizeEl, 'touchAction'), 'none');
+  checkTrue('★★★ 手柄有放大的命中区（12px 用笔点很容易点空）',
+    /\.gmark-label \.gmark-resize::after \{[^}]*inset: -7px/
+      .test(fs.readFileSync(path.join(ROOT, 'workbench.html'), 'utf8')), null);
+  vm.tool = savedTool;
+  await sleep(60);
   /* 空内容不放一个空框上去 */
   vm.onTextAt(3, { x: 10, y: 10 });
   vm.textDraft.text = '   ';
@@ -1161,6 +1275,205 @@ async function main() {
   await vm.saveText();
   await sleep(120);
   check('★ 评语是空的 → 不放一个空框上去', (vm.g.marks || []).length, nText);
+
+  /* ---- ★★ 改已有的批注（2026-11-03 用户报：「写好内容，没办法点开重新修改」）----
+   *
+   * 真因不是缺一个按钮，是**根本没有「选中某一处标注」这个状态**：
+   * `pick()` 只在 view 模式、且 item_id 非空时才发，而文本框的 item_id 是 null
+   * → 点它什么都不发生；除了橡皮划掉重写（= 重新摆位置），没有任何改法。
+   *
+   * 这里守**整条链**：点中 → 底部操作条 → 编辑 → 弹框带原文 → 发出 PATCH。
+   * ⚠️ 关键断言打在**发出去的请求体**上，不能只看 `vm.pickedMark` ——
+   *    那是界面自说自话，改了状态却没发请求一样能「全绿」。
+   * ⚠️ 期望值是「用户看得见的结果」（条子出现了、原文带出来了、库里变了），
+   *    不是「函数被调用过」。 */
+  const tmark = (vm.g.marks || []).filter((m) => m.kind === 'text'
+    && m.text === '这一步漏了讨论 x=0')[0];
+  checkTrue('★★ 先确认页面上有那条可改的批注（下面几条不是在空跑）',
+    !!tmark, tmark ? ('id=' + tmark.id) : '(没找到)');
+
+  const barEl = () => D.querySelector('.text-actbar');
+  check('★★ 还没点中任何批注时，底部不该有操作条', !!barEl(), false);
+
+  /* ★ 这里必须派**真实事件**，不能直接调 `vm.onSelectMark()` ——
+     直接调就把「点标签 → 组件 emit select-mark → 父组件记下来」这段接线绕过去了，
+     而那正是最容易断的一环（`pick()` 里原来第一句就是 `mode !== 'view'` 就 return）。
+     ⚠️ 派的是 `click` 而不是 pointerdown/pointerup 那一串：**实测 jsdom 里
+        pointer 序列到不了组件**（按下去没有任何状态变化），而 click 能。
+        真浏览器里「按一下不移动」同样会补一个 click，所以这条路径与用户的操作一致；
+        完整的按压序列由 CDP 探针在真浏览器里另外覆盖。 */
+  const savedTool3 = vm.tool;
+  vm.tool = 'view';
+  await sleep(120);
+  const lbPick = Array.from(D.querySelectorAll('.gmark-label'))
+    .filter((el) => (el.textContent || '').indexOf('这一步漏了讨论') >= 0)[0];
+  checkTrue('★★ 页面上找得到那条文本框（下面几句靠真事件点它）', !!lbPick,
+    D.querySelectorAll('.gmark-label').length + ' 个 .gmark-label');
+  if (lbPick) {
+    const pev = (type) => new W.MouseEvent(type, {
+      bubbles: true, cancelable: true, clientX: 40, clientY: 40, button: 0,
+    });
+    lbPick.dispatchEvent(pev('pointerdown'));
+    lbPick.dispatchEvent(pev('pointerup'));
+    lbPick.dispatchEvent(pev('click'));
+    await sleep(140);
+  }
+  checkTrue('★★ 点一下文本框 → 底部浮出操作条（在这之前它是不存在的）',
+    !!barEl(), barEl() ? JSON.stringify(barEl().textContent.replace(/\s+/g, ' ').trim()) : '(没有)');
+  check('★★ 组件把「选中了哪一条」真的传上来了', vm.pickedMark && vm.pickedMark.id,
+    tmark && tmark.id);
+  checkTrue('★★ 操作条上写着「编辑文字」（写死中文：只放个图标，老师不知道那里能点）',
+    !!barEl() && /编辑文字/.test(barEl().textContent),
+    barEl() ? barEl().textContent.trim() : '');
+  /* 老师报「没办法缩放」的另一半原因是**不知道哪里能拖** —— 手柄再明显，也得告诉他在哪。 */
+  checkTrue('★★ 操作条上写明了「拖右下角的小方块可改大小」（别让人猜）',
+    !!barEl() && /改大小/.test(barEl().textContent),
+    barEl() ? barEl().textContent.trim() : '');
+  checkTrue('★★ 被选中的那一条会被画出来（.gmark-label.act）',
+    D.querySelectorAll('.gmark-label.act').length >= 1,
+    D.querySelectorAll('.gmark-label.act').length + ' 条带 act');
+  /* ⚠️ 光有类名不算数：样式没跟上时 `act` 照样在 DOM 里，屏幕上一个像素都不变。
+     这就是「DOM 在不在查不出这类问题」的那个坑 —— 量声明出来的描边。 */
+  checkTrue('★★ 选中态真的有描边（box-shadow 空 = .gmark-label.act 那条规则没跟上）',
+    /px/.test(String(csGet(D.querySelector('.gmark-label.act'), 'boxShadow') || '')),
+    JSON.stringify(csGet(D.querySelector('.gmark-label.act'), 'boxShadow')));
+  vm.tool = savedTool3;
+  await sleep(80);
+
+  const nMkPatch = () => CALLS.filter((c) => /^\/api\/grade-marks\/\d+$/.test(c.url)
+    && c.method === 'PATCH');
+  const pBefore = nMkPatch().length;
+
+  vm.openTextEdit(tmark);
+  await sleep(90);
+  check('★★ 弹的是「改」不是「新写一条」（认字段看 id）',
+    [vm.textOpen, vm.textDraft.id], [true, tmark.id]);
+  check('★★ 弹框里带着原文（接着改，不是让人重打一遍）', vm.textDraft.text, tmark.text);
+
+  vm.textDraft.text = '改过的批注：x^2 漏了讨论';
+  await vm.saveText();
+  await sleep(220);
+  const mps = nMkPatch();
+  check('★★ 改文字 → 恰好一个 PATCH，且打在**那一条**上',
+    [mps.length - pBefore, mps.length && mps[mps.length - 1].url],
+    [1, '/api/grade-marks/' + tmark.id]);
+  check('★★ PATCH 只带 text（把整条对象发过去会把位置/颜色一起覆盖回旧值）',
+    Object.keys((mps[mps.length - 1] || {}).body || {}).sort(), ['text']);
+  const after = (vm.g.marks || []).filter((m) => String(m.id) === String(tmark.id))[0] || {};
+  check('★★ 服务端那条的 text 真的变了（不是只改了屏幕上那个）',
+    after.text, '改过的批注：x^2 漏了讨论');
+  check('★★ 位置一个字没动（改文字不该顺手把框挪走）', after.geo, tmark.geo);
+  check('★★ 改完底部操作条收起（不该一直挂在屏幕上挡卷面）', !!barEl(), false);
+
+  /* 双击直接进编辑：少一步「先点中、再去底下找按钮」，也最像「在文件里双击一段文字」。 */
+  const lbEdit = Array.from(D.querySelectorAll('.gmark-label'))
+    .filter((el) => (el.textContent || '').indexOf('改过的批注') >= 0)[0];
+  checkTrue('★★ 找到改过的那条文本框（下面几句依托它）', !!lbEdit,
+    D.querySelectorAll('.gmark-label').length + ' 个 .gmark-label');
+  if (lbEdit) {
+    vm.textOpen = false;
+    vm.textDraft = { id: null, page: 1, x: 0, y: 0, text: '' };
+    vm.pickedMark = null;
+    lbEdit.dispatchEvent(new W.MouseEvent('dblclick', { bubbles: true, cancelable: true }));
+    await sleep(90);
+    check('★★ 双击文本框 → 直接进编辑',
+      [vm.textOpen, String(vm.textDraft.id)], [true, String(tmark.id)]);
+    vm.textOpen = false;
+  }
+
+  /* 取消选中的两条路。⚠️ 「只看」模式必须在场：`onPageDown` 第一行就 return，
+     取消选中若是写在 return 之后，最常见的场景（只看模式）反而失效。 */
+  const savedTool2 = vm.tool;
+  vm.tool = 'view';
+  vm.onSelectMark(tmark);
+  await sleep(70);
+  vm.onPageDown(3, { currentTarget: D.createElement('div') });
+  await sleep(70);
+  check('★★ 在卷面空白处按一下 → 取消选中（「只看」模式下也要管用）', !!barEl(), false);
+  vm.onSelectMark(tmark);
+  await sleep(70);
+  vm.onKeyDown({ key: 'Escape', target: { tagName: 'DIV' } });
+  await sleep(70);
+  check('★★ Esc 也能取消选中', !!barEl(), false);
+  vm.tool = savedTool2;
+
+  /* 本机还没传上去的（`local:`）**不给编辑**：PATCH 的 mid 是 int，改了也只能 422。
+     给个点不动的按钮，比给一个点了报错的按钮诚实。 */
+  vm.onSelectMark({ id: 'local:abc123', kind: 'text', text: '还没上传' });
+  await sleep(70);
+  check('★★ 还没上传的批注：不给编辑入口、操作条也不出现',
+    [vm.pickedText, !!barEl()], [null, false]);
+  vm.pickedMark = null;
+
+  /* 把内容改空 ≠ 删掉。删是有代价的动作，不该由「清空输入框」顺手触发；
+     但也不能静默什么都不做（老师会以为存上了）。 */
+  const pBeforeEmpty = nMkPatch().length;
+  vm.textDraft = { id: tmark.id, page: 1, x: 0, y: 0, text: '   ' };
+  vm.textOpen = true;                    // 模拟「弹框开着、把内容清空了再点改好」
+  await vm.saveText();
+  await sleep(160);
+  check('★★ 内容改成空的 → 不发请求，也不静默关掉弹框',
+    [nMkPatch().length - pBeforeEmpty, vm.textOpen], [0, true]);
+  vm.textOpen = false;
+  vm.textDraft = { id: null, page: 1, x: 0, y: 0, text: '' };
+
+
+  /* ---- ★★ 键盘删掉选中的那处批注（Delete / Backspace），2026-11-03 用户点名要的 ----
+   *
+   * 这里**派真实 KeyboardEvent**（挂 window 的那个监听器），不直接调 deletePicked()：
+   * 直接调就把「键盘 → 页面记账 → 删的是哪一条」这段接线绕过去了，
+   * 而那正是这类需求最容易断的地方（比如键名写错、或者被输入框判断提前 return）。
+   */
+  const fireKey = (key, target) => {
+    const ev = new W.KeyboardEvent('keydown', { key, bubbles: true, cancelable: true });
+    (target || W.document).dispatchEvent(ev);
+    return ev.defaultPrevented;
+  };
+  const nDelCalls = () => CALLS.filter((c) => /^\/api\/grade-marks\/\d+$/.test(c.url)
+    && c.method === 'DELETE');
+
+  // 单独造一条，别用上面那条 —— 后面「清空本页」还要数条数
+  LAST_DETAIL.marks.push({
+    id: 960 + (LAST_MARK_ID += 1), page_no: 3, kind: 'text', geo: [100, 100, 300, 200],
+    text: '待删批注', color: '#dc2626', item_id: null, created_by: 'teacher', points: [],
+  });
+  await vm.settle();
+  await sleep(120);
+  const doomed = LAST_DETAIL.marks[LAST_DETAIL.marks.length - 1];
+  const undoN = (vm.undoStack || []).length;
+  const delN = nDelCalls().length;
+
+  vm.onSelectMark({ id: doomed.id, kind: 'text', text: '待删批注' });
+  await sleep(60);
+  const prevented = fireKey('Delete');
+  await sleep(260);
+  check('★★ Delete 删掉选中的那处批注（只发一个 DELETE、打在那一条上）',
+    [nDelCalls().length - delN, (nDelCalls()[nDelCalls().length - 1] || {}).url],
+    [1, '/api/grade-marks/' + doomed.id]);
+  check('★★ 删完底部操作条跟着收起（不该留一个「编辑/删除」挂在一条已经不存在的批注上）',
+    [!!barEl(), vm.pickedMark], [false, null]);
+  check('★★ 删是能撤销的（走 eraseMarks，撤销栈里留下一份快照）',
+    [(vm.undoStack || []).length - undoN,
+      ((vm.undoStack || [])[(vm.undoStack || []).length - 1] || {}).type],
+    [1, 'erase']);
+  checkTrue('★★ 真删掉了（不是只从屏幕上抹掉）', prevented,
+    'preventDefault=' + prevented);
+
+  // Backspace 同样能用（两种键盘习惯都有），而且这条走的是「没选中」的分支
+  check('★★ 什么都没选中时按 Backspace → 不拦**也不删**（吞掉键会让人以为键盘坏了）',
+    [fireKey('Backspace'), nDelCalls().length - delN - 1], [false, 0]);
+
+  // 在输入框里打字时，Backspace 必须留给浏览器（否则删不掉自己打的字）
+  const taProbe = D.createElement('textarea');
+  D.body.appendChild(taProbe);
+  taProbe.focus();
+  vm.onSelectMark({ id: doomed.id, kind: 'text', text: '待删批注' });
+  const nTyping = nDelCalls().length;
+  check('★★ 焦点在输入框里按 Backspace → 不删批注（那是删正在打的字）',
+    [fireKey('Backspace', taProbe), nDelCalls().length - nTyping], [false, 0]);
+  taProbe.remove();
+  vm.pickedMark = null;
+
 
   /* ---- 清空本页：只清老师自己画的 ---- */
   /* AI 画的框 created_by 不是 teacher —— 一起删了老师就得重新批一遍。 */

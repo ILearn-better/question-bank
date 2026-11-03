@@ -28,6 +28,7 @@ from sqlalchemy.orm import Session
 from .. import config
 from ..models import HomeworkGradeMark, Student
 from . import grade_store as store
+from . import latex_img
 
 # 与前端 GradeMarkLayer.COLORS 同值：导出的颜色必须和屏幕上看到的一致，
 # 否则老师按屏幕签字、发出的 PDF 是另一个颜色。
@@ -118,26 +119,6 @@ def _quad(raw) -> tuple[float, float, float, float] | None:
             max(0.0, min(1000.0, x1)), max(0.0, min(1000.0, y1)))
 
 
-def _wrap(draw: ImageDraw.ImageDraw, text: str, font, maxw: float) -> list[str]:
-    """按像素宽度断行。中文没有空格可断，只能逐字量 —— 一行文字量一次，不贵。"""
-    lines: list[str] = []
-    for para in str(text or "").split("\n"):
-        cur = ""
-        for ch in para:
-            trial = cur + ch
-            try:
-                wpx = draw.textlength(trial, font=font)
-            except (AttributeError, OSError):
-                wpx = len(trial) * 12
-            if cur and wpx > maxw:
-                lines.append(cur)
-                cur = ch
-            else:
-                cur = trial
-        lines.append(cur)
-    return lines or [""]
-
-
 def _draw_one(d: ImageDraw.ImageDraw, m: HomeworkGradeMark,
               w: int, h: int, kx: float, ky: float) -> None:
     kind = (m.kind or "box").strip()
@@ -196,9 +177,133 @@ def _draw_one(d: ImageDraw.ImageDraw, m: HomeworkGradeMark,
         d.polygon([p1, tip, p2], fill=color)
 
 
-def _draw_text(d: ImageDraw.ImageDraw, m: HomeworkGradeMark,
+def _text_w(d: ImageDraw.ImageDraw, s: str, font, fs: int) -> float:
+    try:
+        return float(d.textlength(s, font=font))
+    except (AttributeError, OSError):
+        return len(s) * fs * 0.6
+
+
+def _rich_lines(d: ImageDraw.ImageDraw, text: str, font, fs: int,
+                color: tuple[int, int, int], maxw: float):
+    """把批注排成**行**：文字按字符断（中文没空格可断），公式当不可拆的整块。
+
+    返回 `(lines, block_w, block_h, base_lh)`；每行是 `{'items': [...], 'h': int}`，
+    item 是 `{'k': 'chars'|'math', 'v': str, 'w': float, 'h': float, 'img': Image|None}`。
+
+    ⚠️ 行高取 `max(基准行高, 这一行里最高的公式图)` —— 不这么干，`\\frac` 那种高个子
+    会压到下一行文字上。竖直方向按**行盒居中**对齐：文字和公式图的视觉中线对齐，
+    而不是各自顶着行顶（那样公式会整体高出半行，看着像上标漂了）。
+
+    ⚠️ `$$…$$` / `\\[…\\]`（display）**独占一行**：与屏幕 KaTeX 的 `displayMode` 同一口径，
+    否则多行推导的公式图会被挤在句子中间、左右各跟着半句话。
+
+    ⚠️ 公式里的中文先被 `split_cjk` 挑出来当普通文字排 —— mathtext 没有 CJK 字形，
+    硬喂进去是豆腐块（2026-11-03 修）。
+
+    ⚠️ 公式渲不出来时**退回可读文本**（`latex_img.plain_text`：`\\times` → `×`），
+    定界符不再印出来。这是发给家长看的 PDF，印一串 `\\begin{aligned}` 比印 `x ≤ 4` 糟得多。
+    log 里已经留了一行（见 `latex_img._math_png`），所以不是静默。
+    """
+    base_lh = int(fs * 1.34)
+    lines: list[dict] = []
+    cur: list[dict] = []
+    curw = 0.0
+    swallow_nl = False          # 刚收过 display 公式：紧跟的那个换行不许再空一行
+
+    def flush() -> None:
+        nonlocal cur, curw
+        lines.append({'items': cur, 'h': base_lh})
+        cur, curw = [], 0.0
+
+    def put(item: dict) -> None:
+        nonlocal curw, swallow_nl
+        swallow_nl = False
+        cur.append(item)
+        curw += item['w']
+
+    def put_chars(chunk: str) -> None:
+        nonlocal swallow_nl
+        for ch in chunk:
+            if ch == '\n':
+                # display 公式自己已经收过行了，源文里紧跟的 `\n` 再收一次就是**空一整行**
+                if swallow_nl:
+                    swallow_nl = False
+                    continue
+                flush()
+                continue
+            cw = _text_w(d, ch, font, fs)
+            if cur and curw + cw > maxw:
+                flush()
+            put({'k': 'chars', 'v': ch, 'w': cw, 'h': float(base_lh), 'img': None})
+
+    def put_math(tex: str) -> None:
+        """一条公式：中文走文字、剩下的走 mathtext（一条公式内部可能两样都有）。
+
+        ⚠️ **整条一起退回**，不逐段退：`\\frac{面积}{2}` 被中文切开后，数学段是
+        `\\frac{`（半个括号），单独退回会印出 `frac(` 这种断口。只要有一段渲不出来，
+        就把**原公式**交给 `plain_text` → `(面积)/(2)`，至少是人能读的东西。
+        """
+        plans: list[tuple[str, object]] = []
+        for seg in latex_img.split_cjk(tex):
+            if seg['t'] == 'text':
+                plans.append(('text', seg['v']))
+                continue
+            img = latex_img.math_image(seg['tex'], fs, color)
+            if img is None:
+                put_chars(latex_img.plain_text(tex))
+                return
+            plans.append(('math', img))
+        for kind, val in plans:
+            if kind == 'text':
+                put_chars(val)                       # type: ignore[arg-type]
+                continue
+            img = val                                    # type: ignore[assignment]
+            iw = float(img.width)
+            if cur and curw + iw > maxw:
+                flush()
+            put({'k': 'math', 'v': tex, 'w': iw,
+                 'h': float(img.height), 'img': img})
+
+    for part in latex_img.split_math(text):
+        if part['t'] != 'math':
+            put_chars(part['v'])
+            continue
+        block = bool(part.get('display'))
+        if block and cur:                         # display 公式独占一行
+            flush()
+        put_math(part['tex'])
+        if block:
+            if cur:
+                flush()
+            swallow_nl = True
+    if cur:
+        flush()
+    # 末尾的空行没有意义（只表现为框被白撑高一行），但**中间**的空行要留着
+    while len(lines) > 1 and not lines[-1]['items']:
+        lines.pop()
+    if not lines:
+        lines.append({'items': [], 'h': base_lh})
+
+    # 逐行抬高：有高个子公式的行要给它让出高度，否则会和下一行叠在一起
+    for ln in lines:
+        tall = max([it['h'] for it in ln['items'] if it['k'] == 'math'] or [0.0])
+        if tall > ln['h']:
+            ln['h'] = int(math.ceil(tall)) + max(2, int(fs * 0.08))
+    block_w = max([sum(it['w'] for it in ln['items']) for ln in lines] or [0.0])
+    block_h = sum(ln['h'] for ln in lines)
+    return lines, block_w, block_h, base_lh
+
+
+def _draw_text(layer: Image.Image, d: ImageDraw.ImageDraw, m: HomeworkGradeMark,
                w: int, h: int, kx: float, ky: float) -> None:
-    """文本框。字号按页宽算，**不按 0~1000 的 y 缩放** —— 否则竖版页面上字会被压扁。"""
+    """文本框。字号按页宽算，**不按 0~1000 的 y 缩放** —— 否则竖版页面上字会被压扁。
+
+    2026-11-02 起支持 LaTeX：`$x^2$` 不再连定界符一起印出来，而是用
+    `latex_img`（matplotlib mathtext）渲成小图贴进行里 —— 与屏幕上 KaTeX 的
+    定界符口径一致。⚠️ `layer` 要传进来：公式是 `Image.paste` 贴上去的，
+    `ImageDraw` 贴不了图。
+    """
     text = (m.text or "").strip()
     if not text:
         return
@@ -207,27 +312,59 @@ def _draw_text(d: ImageDraw.ImageDraw, m: HomeworkGradeMark,
     fs = max(13, int(round(w * 0.019)))
     font = _font(fs)
 
-    maxw = w * 0.46                 # 与 CSS .gmark-label 的 max-width 对齐
-    lines = _wrap(d, text, font, maxw)
-    lh = int(fs * 1.34)
-    block_h = lh * len(lines)
-    x = q[0] * kx
-    y = q[1] * ky - block_h         # 前端 label 是 translate(0,-100%)：底边落在锚点
-    if y < 0:
-        y = q[1] * ky
+    # 宽度上限：有宽高的文本框按**框宽**排（屏幕上就是框内换行、超出滚动）；
+    # 老数据（零面积点、w/h 都是 0）没有宽度，退回 46%（与屏幕上 .gmark-label 的观感一致）。
+    geo_w = abs(q[2] - q[0]) * kx
+    geo_h = abs(q[3] - q[1]) * ky
+    sized = geo_w >= fs * 2
+    maxw = geo_w if sized else w * 0.46
 
+    lines, block_w, block_h, base_lh = _rich_lines(d, text, font, fs, color, maxw)
+    x = q[0] * kx
     pad = int(fs * 0.28)
-    widest = 0
-    for ln in lines:
-        try:
-            widest = max(widest, d.textlength(ln, font=font))
-        except (AttributeError, OSError):
-            widest = max(widest, len(ln) * fs * 0.6)
-    box = [x, y, x + widest + pad * 2, y + block_h + pad]
+    if sized:
+        # 新口径（有宽高的框）：**左上角就在锚点**，与屏幕上 `.gmark-label.sized`
+        # （transform: none）同一个意思。按老的「底边落在锚点」画，框会整体上浮
+        # 一个框高 —— 屏幕上已经改过来的口径，导出这边不能还留在旧的。
+        y = max(0.0, q[1] * ky)
+        box_w = max(geo_w, block_w + pad * 2)
+        box_h = max(geo_h, block_h + pad)
+    else:
+        # 老数据是零面积点：屏幕上仍靠 translate(0,-100%) 让**底边**落在锚点上
+        y = q[1] * ky - block_h
+        if y < 0:
+            y = q[1] * ky
+        box_w = block_w + pad * 2
+        box_h = block_h + pad
+
+    box = [x, y, x + box_w, y + box_h]
     # 半透明白底：扫描件底色深、或学生铅笔字压在下面时，纯色字看不清
     d.rounded_rectangle(box, radius=pad, fill=(255, 255, 255, 232), outline=color, width=max(1, lw_hint(w)))
-    for i, ln in enumerate(lines):
-        d.text((x + pad, y + pad + i * lh), ln, font=font, fill=color)
+
+    ytop = float(y + pad)
+    for ln in lines:
+        ln_h = ln['h']
+        # 文字与公式图都**在行盒里居中**，别各自顶格 —— 否则公式整体偏高半行
+        ty = ytop + max(0.0, (ln_h - base_lh) / 2.0)
+        cx = float(x + pad)
+        buf = ''
+        bufx = cx
+        for it in ln['items']:
+            if it['k'] == 'chars':
+                if not buf:
+                    bufx = cx
+                buf += it['v']
+                cx += it['w']
+            else:
+                if buf:
+                    d.text((bufx, ty), buf, font=font, fill=color)
+                    buf = ''
+                img = it['img']
+                layer.paste(img, (int(round(cx)), int(round(ytop + (ln_h - it['h']) / 2.0))), img)
+                cx += it['w']
+        if buf:
+            d.text((bufx, ty), buf, font=font, fill=color)
+        ytop += ln_h
 
 
 def lw_hint(w: int) -> int:
@@ -243,7 +380,7 @@ def _render_page(png: Path, marks: list[HomeworkGradeMark]) -> Image.Image:
     for m in marks:
         try:
             if (m.kind or "") == "text":
-                _draw_text(d, m, w, h, kx, ky)
+                _draw_text(layer, d, m, w, h, kx, ky)
             else:
                 _draw_one(d, m, w, h, kx, ky)
         except Exception:          # noqa: BLE001 —— 一条画坏了不该让整页导不出来
