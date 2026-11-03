@@ -1458,11 +1458,16 @@ export default {
         text: String(m.text || ''),
       };
     }
-    async function deletePicked() {
+    /* 返回 false = 什么都没删（没选中）。快捷键那层靠这个判断该不该吞掉 Backspace。
+       ⚠️ 这里**不能写成 async**：async 返回的是 Promise，`=== false` 永远不成立，
+       结果就是「什么都没选中时按退格也被吞掉」—— 而那正是最难查的「键盘坏了」。
+       eraseMarks 自己 try/catch 并提示，所以不 await 也不会漏报错。 */
+    function deletePicked() {
       const m = pickedMark.value;
-      if (!m || !m.id) return;
+      if (!m || !m.id) return false;
       pickedMark.value = null;
-      await eraseMarks([m.id]);
+      eraseMarks([m.id]);
+      return true;
     }
 
     async function saveText() {
@@ -1777,6 +1782,7 @@ export default {
         tool: useTool,
         undo: undoLast,
         escape: onEscape,
+        remove: deletePicked,
       });
       // 导航高亮：宽屏滚 .grade-left，窄屏滚 window，两条都要听。
       if (leftCol.value) leftCol.value.addEventListener('scroll', scheduleNavSpy);
@@ -2335,6 +2341,9 @@ export default {
          编辑操作**选中后出现**）。在这之前写完的批注没有任何改法。 -->
     <div v-if="pickedText" class="g-actbar">
       <span class="g-actbar-tip">已选中批注：<b>{{ pickedShort }}</b></span>
+      <!-- 老师报「没办法缩放」，一半原因是那个手柄在扫描件上根本不起眼 ——
+           选中后直接把「怎么改大小」写出来，别让人猜。 -->
+      <span class="g-actbar-hint">拖右下角的小方块可改大小</span>
       <div class="spacer"></div>
       <button class="btn sm" @click="openTextEdit(pickedText)">✏️ 编辑文字</button>
       <button class="btn ghost sm" style="color:#dc2626" @click="deletePicked">🗑 删除</button>

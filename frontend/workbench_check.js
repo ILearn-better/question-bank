@@ -1245,13 +1245,27 @@ async function main() {
     csGet(lbBody, 'display'), 'block');
   check('★★ 文本框 white-space（nowrap = 还在用旧口径，长批注会被省略号静默吃掉）',
     csGet(lb3, 'whiteSpace'), 'pre-wrap');
-  check('★★ 文本框 overflow（hidden = 旧口径，超出部分直接没了）',
-    csGet(lb3, 'overflow'), 'auto');
+  /* ⚠️ 2026-11-03 起判据变了：label 自己 **overflow: visible**，滚动交给内容层。
+     原来的 auto 把滚动条长在框的最右一列，正好压住右下角手柄 ——
+     长批注一出现滚动条，手柄就点不到（老师报「没办法缩放」的一半原因）。 */
+  check('★★ 文本框 overflow（auto = 滚动条又长回框上，会压住右下角手柄）',
+    csGet(lb3, 'overflow'), 'visible');
+  check('★★ 内容层自己滚动（auto = 长批注靠它滚，不靠 label）',
+    csGet(lbBody, 'overflow'), 'auto');
   checkTrue('★★★ 调大小手柄真的渲染出来了', !!resizeEl, resizeEl ? '有 <i.gmark-resize>' : '(没有)');
   check('★★★ 手柄 position（static = .gmark-resize 规则没同步 → 手柄看不见也点不到）',
     csGet(resizeEl, 'position'), 'absolute');
-  check('★★★ 手柄 width', csGet(resizeEl, 'width'), '11px');
-  check('★★★ 手柄 height', csGet(resizeEl, 'height'), '11px');
+  /* 12×12 + 白色底 + 同色描边：原来 11×11 只有两条 2px 边框、75% 透明，在扫描件上
+     几乎看不见。**小一点点、淡一点点，老师就以为「没有缩放这个功能」**。 */
+  check('★★★ 手柄 width', csGet(resizeEl, 'width'), '12px');
+  check('★★★ 手柄 height', csGet(resizeEl, 'height'), '12px');
+  check('★★★ 手柄在框外（right/bottom 为正 = 又被内容区和滚动条压住了）',
+    csGet(resizeEl, 'right') + ',' + csGet(resizeEl, 'bottom'), '-7px,-7px');
+  check('★★★ 手柄 touch-action（none = 触屏/手写笔上拖手柄不会变成滚页面）',
+    csGet(resizeEl, 'touchAction'), 'none');
+  checkTrue('★★★ 手柄有放大的命中区（12px 用笔点很容易点空）',
+    /\.gmark-label \.gmark-resize::after \{[^}]*inset: -7px/
+      .test(fs.readFileSync(path.join(ROOT, 'workbench.html'), 'utf8')), null);
   vm.tool = savedTool;
   await sleep(60);
   /* 空内容不放一个空框上去 */
@@ -1310,6 +1324,10 @@ async function main() {
     tmark && tmark.id);
   checkTrue('★★ 操作条上写着「编辑文字」（写死中文：只放个图标，老师不知道那里能点）',
     !!barEl() && /编辑文字/.test(barEl().textContent),
+    barEl() ? barEl().textContent.trim() : '');
+  /* 老师报「没办法缩放」的另一半原因是**不知道哪里能拖** —— 手柄再明显，也得告诉他在哪。 */
+  checkTrue('★★ 操作条上写明了「拖右下角的小方块可改大小」（别让人猜）',
+    !!barEl() && /改大小/.test(barEl().textContent),
     barEl() ? barEl().textContent.trim() : '');
   checkTrue('★★ 被选中的那一条会被画出来（.gmark-label.act）',
     D.querySelectorAll('.gmark-label.act').length >= 1,
@@ -1398,6 +1416,63 @@ async function main() {
     [nMkPatch().length - pBeforeEmpty, vm.textOpen], [0, true]);
   vm.textOpen = false;
   vm.textDraft = { id: null, page: 1, x: 0, y: 0, text: '' };
+
+
+  /* ---- ★★ 键盘删掉选中的那处批注（Delete / Backspace），2026-11-03 用户点名要的 ----
+   *
+   * 这里**派真实 KeyboardEvent**（挂 window 的那个监听器），不直接调 deletePicked()：
+   * 直接调就把「键盘 → 页面记账 → 删的是哪一条」这段接线绕过去了，
+   * 而那正是这类需求最容易断的地方（比如键名写错、或者被输入框判断提前 return）。
+   */
+  const fireKey = (key, target) => {
+    const ev = new W.KeyboardEvent('keydown', { key, bubbles: true, cancelable: true });
+    (target || W.document).dispatchEvent(ev);
+    return ev.defaultPrevented;
+  };
+  const nDelCalls = () => CALLS.filter((c) => /^\/api\/grade-marks\/\d+$/.test(c.url)
+    && c.method === 'DELETE');
+
+  // 单独造一条，别用上面那条 —— 后面「清空本页」还要数条数
+  LAST_DETAIL.marks.push({
+    id: 960 + (LAST_MARK_ID += 1), page_no: 3, kind: 'text', geo: [100, 100, 300, 200],
+    text: '待删批注', color: '#dc2626', item_id: null, created_by: 'teacher', points: [],
+  });
+  await vm.settle();
+  await sleep(120);
+  const doomed = LAST_DETAIL.marks[LAST_DETAIL.marks.length - 1];
+  const undoN = (vm.undoStack || []).length;
+  const delN = nDelCalls().length;
+
+  vm.onSelectMark({ id: doomed.id, kind: 'text', text: '待删批注' });
+  await sleep(60);
+  const prevented = fireKey('Delete');
+  await sleep(260);
+  check('★★ Delete 删掉选中的那处批注（只发一个 DELETE、打在那一条上）',
+    [nDelCalls().length - delN, (nDelCalls()[nDelCalls().length - 1] || {}).url],
+    [1, '/api/grade-marks/' + doomed.id]);
+  check('★★ 删完底部操作条跟着收起（不该留一个「编辑/删除」挂在一条已经不存在的批注上）',
+    [!!barEl(), vm.pickedMark], [false, null]);
+  check('★★ 删是能撤销的（走 eraseMarks，撤销栈里留下一份快照）',
+    [(vm.undoStack || []).length - undoN,
+      ((vm.undoStack || [])[(vm.undoStack || []).length - 1] || {}).type],
+    [1, 'erase']);
+  checkTrue('★★ 真删掉了（不是只从屏幕上抹掉）', prevented,
+    'preventDefault=' + prevented);
+
+  // Backspace 同样能用（两种键盘习惯都有），而且这条走的是「没选中」的分支
+  check('★★ 什么都没选中时按 Backspace → 不拦**也不删**（吞掉键会让人以为键盘坏了）',
+    [fireKey('Backspace'), nDelCalls().length - delN - 1], [false, 0]);
+
+  // 在输入框里打字时，Backspace 必须留给浏览器（否则删不掉自己打的字）
+  const taProbe = D.createElement('textarea');
+  D.body.appendChild(taProbe);
+  taProbe.focus();
+  vm.onSelectMark({ id: doomed.id, kind: 'text', text: '待删批注' });
+  const nTyping = nDelCalls().length;
+  check('★★ 焦点在输入框里按 Backspace → 不删批注（那是删正在打的字）',
+    [fireKey('Backspace', taProbe), nDelCalls().length - nTyping], [false, 0]);
+  taProbe.remove();
+  vm.pickedMark = null;
 
 
   /* ---- 清空本页：只清老师自己画的 ---- */

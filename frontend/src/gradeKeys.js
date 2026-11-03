@@ -33,7 +33,7 @@ export const KEY_TOOL = {
 export const KEY_HINTS = [
   ['B', '画笔'], ['E', '橡皮'], ['V', '选择'], ['T', '文字框'],
   ['C', '打勾'], ['X', '打叉'], ['L', '逐题分割'], ['R', '框题'],
-  ['Esc', '回到选择'], ['Ctrl+Z', '撤销'], ['Ctrl+S', '保存'],
+  ['Esc', '回到选择'], ['Delete', '删掉选中的批注'], ['Ctrl+Z', '撤销'], ['Ctrl+S', '保存'],
 ];
 
 /** 焦点是否在能打字的地方。命中就一律不抢键。 */
@@ -52,6 +52,8 @@ export function isTypingTarget(t) {
  * @param {() => void} [opts.undo]         撤销
  * @param {() => void} [opts.save]         保存（Ctrl+S）
  * @param {() => void} [opts.escape]       Esc：回选择 / 关弹窗
+ * @param {() => (void|boolean)} [opts.remove]  Delete / Backspace：删掉选中的那处批注。
+ *        返回 `false` 表示「没删」（没选中），此时不吞键。
  * @param {() => void} [opts.wider]        ] 笔粗一档
  * @param {() => void} [opts.thinner]      [ 笔细一档
  * @param {EventTarget} [opts.target]      挂哪儿，默认 window
@@ -89,7 +91,17 @@ export function installGradeKeys(opts) {
       if (o.escape) o.escape();
       return;
     }
-    // ④ 笔粗 / 笔细：方括号。只有新版工作台有粗细档；
+    /* ④ 删掉选中的那处批注：Delete / Backspace。
+       **只有真的删了才 preventDefault** —— 没选中东西时按退格不该被吞掉
+       （那会让人以为键盘坏了，而这个页面本身没有别的退格用途，正是最难查的那种）。
+       所以约定：`remove()` 返回 false = 什么都没删。 */
+    if (e.key === 'Delete' || e.key === 'Backspace') {
+      if (!canEdit() || !o.remove) return;
+      if (o.remove() === false) return;
+      e.preventDefault();
+      return;
+    }
+    // ⑤ 笔粗 / 笔细：方括号。只有新版工作台有粗细档；
     //    SPA 那边不传这两个回调，自然就不响应，不用各写一份判断。
     if (e.key === '[' || e.key === ']') {
       if (!canEdit()) return;

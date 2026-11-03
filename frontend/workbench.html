@@ -103,7 +103,12 @@
                   文字超出就在框内换行，再超出就滚动，**绝不静默截断**。
                   老数据（geo 是零面积点、w/h 都是 0）→ style 里不给宽高，退回按内容自适应，
                   与改动前观感一致，不会突然变成 0 宽的一条。 */
-               white-space: pre-wrap; word-break: break-word; overflow: auto;
+               /* ⚠️ 2026-11-03 从 `overflow: auto` 改成 visible：
+                  滚动条原来长在**框的最右那一列**，正好压住右下角的调大小手柄 ——
+                  长批注一出现滚动条，手柄就点不到了（老师报「没办法缩放」的一半原因）。
+                  现在滚动交给里层 `.gmark-label-body`，手柄才能落到框外不被裁。
+                  `visible` 不会让长文字溢出来：溢出的那一层是 body，它自己有 overflow:auto。 */
+               white-space: pre-wrap; word-break: break-word; overflow: visible;
                box-sizing: border-box;
                /* 拖动时别让浏览器顺手选中文字 / 触发滚动，否则一按就变成框选 */
                user-select: none; touch-action: none; }
@@ -113,7 +118,7 @@
 /* 文本框内容层：**必须**套一层再 v-html（2026-11-01）。
    同一个 label 里还有右下角的调大小手柄，直接在外层 v-html 会把它整块 innerHTML 覆盖掉，
    手柄就永远看不见；文字归这层，手柄留在外层。 */
-.gmark-label-body { display: block; }
+.gmark-label-body { display: block; height: 100%; overflow: auto; }
 /* KaTeX 的排版不能被外层的 white-space:pre-wrap 影响 —— 那个 pre-wrap 是为「批注里的换行」留的，
    而公式这一层要 normal：否则数学命令里的空格会按 pre 保留、行高也跟着乱。
    ⚠️ 别把 pre-wrap 从 .gmark-label 上删掉来"解决"—— 那会让老批注的换行全塌成一行。 */
@@ -126,13 +131,25 @@
    ⚠️ 这一条漏了会怎么样（2026-11-02 真实发生过）：组件照样把 <i class="gmark-resize">
    渲染出来，但它是个没有宽高的空行内元素 —— **看不见、点不到**，功能等于没做，
    而 DOM 检查、接口模拟全都绿。 */
+/* ⚠️ 2026-11-03 重做：原来 11×11、只有右下两条 2px 边框、opacity .75、还藏在框内 ——
+   在扫描件上基本看不见，老师根本不知道那里能拖（「没办法缩放」的另一半原因）。
+   现在是**框外**一个 12×12 的白色小方块（描边跟批注同色），一眼能看见；
+   落点故意放 `-7px`：贴在框外的右上角视觉上就等于「右下角」，但不会被内容/滚动条压住。 */
 .gmark-label .gmark-resize {
-  position: absolute; right: 1px; bottom: 1px; width: 11px; height: 11px;
-  border-right: 2px solid currentColor; border-bottom: 2px solid currentColor;
-  border-radius: 1px; cursor: nwse-resize; pointer-events: auto; opacity: .75;
+  position: absolute; right: -7px; bottom: -7px; width: 12px; height: 12px;
+  box-sizing: border-box;
+  border: 2px solid currentColor; border-radius: 3px; background: #fff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, .3);
+  cursor: nwse-resize; pointer-events: auto;
+  /* 触屏 / 手写笔上，拖手柄不该变成滚页面。label 上那条 touch-action 管不到子元素，
+     手柄得自己再写一份。 */
+  touch-action: none;
   /* transform 别加：label 自身已经有 translate(0,-100%)，这里再加会错位 */
 }
-.gmark-label .gmark-resize:hover { opacity: 1; }
+/* 命中区比看到的再大一圈：12px 的方块用笔点很容易点空。
+   伪元素属于这个 <i>，指针事件仍然算在它头上，startResize 照样收得到。 */
+.gmark-label .gmark-resize::after { content: ''; position: absolute; inset: -7px; }
+.gmark-label .gmark-resize:hover { background: currentColor; }
 /* 画笔/橡皮/框题模式下文字标签不收指针（见下面 .mode-* 那组），手柄跟着一起关，
    否则「想落笔」会变成「在调框大小」。 */
 .gmark-layer.mode-ink .gmark-label .gmark-resize,
@@ -504,6 +521,7 @@
   }
   .text-actbar-tip { color: #606266; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .text-actbar-tip b { color: #303133; font-weight: 600; }
+  .text-actbar-hint { color: #909399; font-size: 12px; margin-left: 10px; white-space: nowrap; }
 
   /* ===== 页面分割（与录题页同一套视觉） ===== */
   .page-wrap { margin-bottom: 20px; }
@@ -1348,6 +1366,9 @@
        ⚠️ 只在 `pickedText` 非空时出现（本机还没上传的、非文本的都不给）。 -->
   <div v-if="pickedText" class="text-actbar">
     <span class="text-actbar-tip">已选中批注：<b>{{ pickedShort }}</b></span>
+    <!-- 老师报「没办法缩放」，一半原因是那个手柄在扫描件上根本不起眼 ——
+         选中后直接把「怎么改大小」写出来，别让人猜。 -->
+    <span class="text-actbar-hint">拖右下角的小方块可改大小</span>
     <span style="flex:1"></span>
     <el-button size="small" @click="openTextEdit(pickedText)">✏️ 编辑文字</el-button>
     <el-button size="small" type="danger" plain @click="deletePicked">🗑 删除</el-button>
@@ -1980,6 +2001,19 @@ const app = createApp({
         this.pickedMark = null;
         return;
       }
+      /* Delete / Backspace = 删掉选中的那处批注（2026-11-03 用户点名要的）。
+         与 src/gradeKeys.js 里同一套口径：input/textarea 里不拦、没选中就不吞键。
+         ⚠️ 这一页没有复用 installGradeKeys（它自己那份 onKeyDown 还管着别的），
+            改键位时**两处都要看**。 */
+      const kRaw = String(e.key || '');
+      if ((kRaw === 'Delete' || kRaw === 'Backspace') && !typing) {
+        /* ⚠️ 判据用 `pickedText`（同步的 computed），不要用 `this.deletePicked() === false`
+           —— 那个是 async，返回 Promise，`=== false` 永远不成立，等于没选中也吞键。 */
+        if (!this.pickedText) return;
+        e.preventDefault();
+        this.deletePicked();
+        return;
+      }
       if (!(e.ctrlKey || e.metaKey)) return;
       const key = String(e.key || '').toLowerCase();
 
@@ -2162,12 +2196,14 @@ const app = createApp({
         kind: 'text', geo: [d.x, d.y, d.x, d.y], text, color: this.inkColor,
       });
     },
-    /** 底部操作条上的「删除」。走 eraseMarks 而不是直接 DELETE —— 那里带撤销快照。 */
+    /** 底部操作条上的「删除」。走 eraseMarks 而不是直接 DELETE —— 那里带撤销快照。
+     *  （快捷键那条走的是 `pickedText` 判断，不依赖这里的返回值 —— 这是 async。） */
     async deletePicked() {
       const m = this.pickedMark;
-      if (!m || !m.id) return;
+      if (!m || !m.id) return false;
       this.pickedMark = null;
       await this.eraseMarks([m.id]);
+      return true;
     },
     async clearPageMarks(pno) {
       const mine = this.teacherMarksOf(pno);

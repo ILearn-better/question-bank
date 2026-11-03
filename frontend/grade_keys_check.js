@@ -127,6 +127,41 @@ async function main() {
   }
 
   // ============================================================
+  console.log('\n==== ③b Delete / Backspace：删掉选中的那处批注 ====');
+  // ============================================================
+  {
+    const b = bus(); let n = 0;
+    installGradeKeys({ target: b, remove: () => { n += 1; return true; } });
+    b.fire(key('Delete'));
+    check('Delete 触发 remove', n === 1, n);
+    b.fire(key('Backspace'));
+    check('★ Backspace 也认（两种键盘习惯都有，不能让一半人按了没反应）', n === 2, n);
+
+    /* ★★ 这条是本组最要紧的：没选中东西时按退格**不能被吞掉**。
+       吞掉的后果是「键盘坏了」—— 而这页面本身没有别的退格用途，老师根本无从判断。 */
+    const b2 = bus();
+    installGradeKeys({ target: b2, remove: () => false });
+    const e1 = b2.fire(key('Backspace'));
+    check('★★ 没选中（remove 返回 false）→ 不 preventDefault', e1.defaultPrevented === false, e1.defaultPrevented);
+
+    const b3 = bus(); let n3 = 0;
+    installGradeKeys({ target: b3, remove: () => { n3 += 1; return true; } });
+    const e2 = b3.fire(key('Backspace', { target: AREA_T }));
+    check('★★ 焦点在 TEXTAREA 里按 Backspace → 不删批注、也不拦（那是删正在打的字）',
+      [n3, e2.defaultPrevented], [0, false]);
+
+    const b4 = bus(); let n4 = 0;
+    installGradeKeys({ target: b4, canEdit: () => false, remove: () => { n4 += 1; return true; } });
+    b4.fire(key('Delete'));
+    check('★ 查看模式下 Delete 不删（规则 2）', n4 === 0, n4);
+
+    const b5 = bus();
+    installGradeKeys({ target: b5 });          // 页面没接这个回调
+    b5.fire(key('Backspace'));
+    check('没接这个回调的页面：按 Backspace 什么也不发生、也不报错', true, null);
+  }
+
+  // ============================================================
   console.log('\n==== ④ 查看模式：只禁写，不禁看（规则 2） ====');
   // ============================================================
   {
@@ -181,6 +216,18 @@ async function main() {
       Array.isArray(gk.KEY_HINTS) && gk.KEY_HINTS.length >= 8, gk.KEY_HINTS && gk.KEY_HINTS.length);
     check('workbench.html 里还留着它自己的 onKeyDown（这一轮未合并，下轮统一）',
       /onKeyDown\(e\) \{/.test(wb), null);
+    /* Delete 两条路都要接：两页各有一份键盘处理，只接一边就变成「一个页面能删、一个不能」。 */
+    check('★ SPA 把 Delete 接到了 deletePicked', /remove: deletePicked/.test(hw), null);
+    /* ⚠️ `async function deletePicked` 返回的是 Promise，`=== false` 永远不成立 →
+       什么都没选中时按退格也被吞掉。所以这里钉死「不许是 async」。 */
+    check('★★ SPA 的 deletePicked 是同步返回 boolean（写成 async 就会永远吞掉退格）',
+      /function deletePicked\(\) \{/.test(hw) && !/async function deletePicked/.test(hw), null);
+    check('★ workbench 也接了 Delete / Backspace',
+      /kRaw === 'Delete' \|\| kRaw === 'Backspace'/.test(wb), null);
+    check('★ KEY_HINTS 里列了 Delete（提示文案不能比实际能力多也不能少）',
+      (gk.KEY_HINTS || []).some((x) => x && x[0] === 'Delete'), null);
+    check('★ 选中批注的操作条上写明「怎么改大小」（手柄不起眼，得告诉人在哪）',
+      /class="g-actbar-hint">拖右下角的小方块可改大小/.test(hw) && /\.g-actbar-hint \{/.test(csv), null);
   }
 
   // ============================================================
@@ -378,7 +425,9 @@ async function main() {
       /window\.katex/.test(layer) && /renderLabelHtml\(s && s\.text, kx\)/.test(layer), null);
 
     check('★ 内容层是 block（与 resize 手柄分属两层，各占各的位置）',
-      /\.gmark-label-body \{ display: block; \}/.test(csv), null);
+      /\.gmark-label-body \{ display: block;/.test(csv), null);
+    check('★ 内容层自己滚动（长批注靠它滚，不靠 label —— 否则滚动条会压住手柄）',
+      /\.gmark-label-body \{[^}]*overflow: auto/.test(csv), null);
     check('★ 公式层改回 white-space: normal（pre-wrap 会把 \\text 里的空格按 pre 保留）',
       /\.gmark-label-body \.gm-math \{ white-space: normal; \}/.test(csv), null);
     check('★ 公式库没加载时原文照显示（不隐藏，让人看得出没渲染）',

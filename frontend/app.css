@@ -802,7 +802,12 @@ table.tbl td.pending { color: var(--warning); font-weight: 600; }
                   文字超出就在框内换行，再超出就滚动，**绝不静默截断**。
                   老数据（geo 是零面积点、w/h 都是 0）→ style 里不给宽高，退回按内容自适应，
                   与改动前观感一致，不会突然变成 0 宽的一条。 */
-               white-space: pre-wrap; word-break: break-word; overflow: auto;
+               /* ⚠️ 2026-11-03 从 `overflow: auto` 改成 visible：
+                  滚动条原来长在**框的最右那一列**，正好压住右下角的调大小手柄 ——
+                  长批注一出现滚动条，手柄就点不到了（老师报「没办法缩放」的一半原因）。
+                  现在滚动交给里层 `.gmark-label-body`，手柄才能落到框外不被裁。
+                  `visible` 不会让长文字溢出来：溢出的那一层是 body，它自己有 overflow:auto。 */
+               white-space: pre-wrap; word-break: break-word; overflow: visible;
                box-sizing: border-box;
                /* 拖动时别让浏览器顺手选中文字 / 触发滚动，否则一按就变成框选 */
                user-select: none; touch-action: none; }
@@ -812,7 +817,7 @@ table.tbl td.pending { color: var(--warning); font-weight: 600; }
 /* 文本框内容层：**必须**套一层再 v-html（2026-11-01）。
    同一个 label 里还有右下角的调大小手柄，直接在外层 v-html 会把它整块 innerHTML 覆盖掉，
    手柄就永远看不见；文字归这层，手柄留在外层。 */
-.gmark-label-body { display: block; }
+.gmark-label-body { display: block; height: 100%; overflow: auto; }
 /* KaTeX 的排版不能被外层的 white-space:pre-wrap 影响 —— 那个 pre-wrap 是为「批注里的换行」留的，
    而公式这一层要 normal：否则 \text{a b} 的空格会按 pre 保留、行高也跟着乱。
    ⚠️ 别把 pre-wrap 从 .gmark-label 上删掉来"解决"—— 那会让老批注的换行全塌成一行。 */
@@ -822,13 +827,25 @@ table.tbl td.pending { color: var(--warning); font-weight: 600; }
 /* 右下角调大小的手柄。**不用 CSS 原生 resize**：那个在 absolute + transform:translate(0,-100%)
    的元素上行为不稳，而且它给的是 CSS px，还得再折回归一化坐标（0~1000）。
    自己画一个手柄，拖拽换算直接复用 markGeom.pagePoint，与笔迹同一套口径。 */
+/* ⚠️ 2026-11-03 重做：原来 11×11、只有右下两条 2px 边框、opacity .75、还藏在框内 ——
+   在扫描件上基本看不见，老师根本不知道那里能拖（「没办法缩放」的另一半原因）。
+   现在是**框外**一个 12×12 的白色小方块（描边跟批注同色），一眼能看见；
+   落点故意放 `-7px`：贴在框外的右上角视觉上就等于「右下角」，但不会被内容/滚动条压住。 */
 .gmark-label .gmark-resize {
-  position: absolute; right: 1px; bottom: 1px; width: 11px; height: 11px;
-  border-right: 2px solid currentColor; border-bottom: 2px solid currentColor;
-  border-radius: 1px; cursor: nwse-resize; pointer-events: auto; opacity: .75;
+  position: absolute; right: -7px; bottom: -7px; width: 12px; height: 12px;
+  box-sizing: border-box;
+  border: 2px solid currentColor; border-radius: 3px; background: #fff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, .3);
+  cursor: nwse-resize; pointer-events: auto;
+  /* 触屏 / 手写笔上，拖手柄不该变成滚页面。label 上那条 touch-action 管不到子元素，
+     手柄得自己再写一份。 */
+  touch-action: none;
   /* transform 别加：label 自身已经有 translate(0,-100%)，这里再加会错位 */
 }
-.gmark-label .gmark-resize:hover { opacity: 1; }
+/* 命中区比看到的再大一圈：12px 的方块用笔点很容易点空。
+   伪元素属于这个 <i>，指针事件仍然算在它头上，startResize 照样收得到。 */
+.gmark-label .gmark-resize::after { content: ''; position: absolute; inset: -7px; }
+.gmark-label .gmark-resize:hover { background: currentColor; }
 /* 画笔/橡皮/框题模式下文字标签不收指针（见下面 .mode-* 那组），手柄跟着一起关，
    否则「想落笔」会变成「在调框大小」。 */
 .gmark-layer.mode-ink .gmark-label .gmark-resize,
@@ -1141,6 +1158,8 @@ table.tbl td.pending { color: var(--warning); font-weight: 600; }
   box-shadow: 0 8px 24px rgba(0, 0, 0, .18); font-size: 13px;
 }
 .g-actbar-tip { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* 「拖右下角的小方块可改大小」—— 手柄在扫描件上不起眼，选中后直接写出来让人有处可找 */
+.g-actbar-hint { color: var(--muted); font-size: 12px; margin-left: 10px; white-space: nowrap; }
 .g-actbar-tip b { color: var(--text, #1f2329); font-weight: 600; }
 
 /* 题目导航（右栏）：从文档上方搬下来，可点击跳转 + 当前题高亮 */
