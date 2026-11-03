@@ -43,7 +43,6 @@
 import { computed, onMounted, ref, watch } from 'vue';
 
 import { UNIT, bboxOf, clampUnit as clamp, flatPoints, pagePoint, segDist, shiftGeo } from '../markGeom.js';
-import { isLocalMarkId } from '../gradeDraft.js';
 import { renderLabelHtml } from '../gradeLabelMath.js';
 import { ensureLibs } from '../mathRender.js';
 
@@ -263,7 +262,20 @@ export default {
     const dragState = ref(null);
     let suppressPickUntil = 0;    // 拖完松手会紧跟一个 click，别把它当成「点标注跳题」
 
+    /* 调大小的两套状态（与拖动分开存，但**退场规则必须一样**）：
+     *   resizing   = { [id]: [x1,y1,x2,y2] } 正在生效的临时 geo（松手后要一直顶到服务端跟上）
+     *   resizeBase = { [id]: 改之前的 geoKey } 用来判断「服务端跟上了没有」
+     * ⚠️⚠️ 少了 resizeBase，临时尺寸会**永远盖着**：之后每次拖动都是「屏幕上弹回原处、
+     *    库里却真的变了」—— 用户报的「调整大小后就不能移动，除非刷新」就是它（2026-11-04）。 */
+    const resizing = ref({});
+    const resizeBase = ref({});
+
     const geoKey = (g) => JSON.stringify(numList(g).map((n) => Math.round(n)));
+
+    /** 这一条**屏幕上**的 geo：有正在生效的「调大小」临时尺寸就用它。
+     *  拖动/再调大小的起点必须按它算 —— 拿服务端那份（可能还慢半拍）去算，
+     *  框会先跳一下再走。 */
+    const effGeo = (s) => resizing.value[String(s.mark.id)] || s.mark.geo;
 
     // 数据一换（settle / 切页 / 橡皮删掉），过期偏移必须退场。
     // ⚠️ 别只按 id 清：同一条标注可能只是被后端改了 geo（拖成功），此时也该清；
@@ -306,17 +318,16 @@ export default {
      * ⚠️ 画笔/橡皮必须保持纯画/纯擦：那两个模式下按住标注是「落笔」，不是「抓东西」，
      *    混在一起会变成「想写一笔，结果把上一笔拖跑了」。 */
     const MOVE_MODES = ['view', 'text'];
-    /* ⚠️ 还没传上去的（本机队列里，id 带 `local:` 前缀）**不给拖** —— 2026-11-01 查出来的。
-       拖动松手走 `PATCH /api/grade-marks/{id}`，而那个路由的 mid 是 int，
-       `local:xxx` 必然 422 → 父组件 catch → `clearOffsets()` → **界面弹回原位**。
-       这就是「莫名跳回原位」的第三条路径：刚落笔/刚写完批注的那一两秒里拖它，
-       一定失败、一定弹回，网络越慢窗口越长。
-       拦在这里比让它发一次注定 422 的请求好：那 1~2 秒里按下去没反应（很快就正常），
-       而不是「拖走了又被拽回去」。判据函数与父组件用同一个（gradeDraft.isLocalMarkId）。 */
+    /* ⚠️ 本机队列里（id 带 `local:` 前缀）的那一两秒**也给拖**（2026-11-04 用户点名：
+       「新插入文本框…只要我又点选该文本框，就能随时移动、缩放」）。
+       以前这里拦着，理由是 PATCH 的 mid 是 int、`local:xxx` 必然 422 → 父组件 catch →
+       `clearOffsets()` → 界面弹回原位，所以干脆不让拖。
+       现在改成**父组件自己认这段窗口**：把 geo 记在 `pendingGeo[lid]` 里，等 POST 回来
+       拿到真 id 再补一次 PATCH（两页都这么接，见 moveMark / flushPendingGeo）。
+       所以这一层只管「拖得动」，不再需要知道 id 是不是真的。 */
     const canMove = (s) => MOVE_MODES.indexOf(props.mode) >= 0
       && MOVE_KINDS.includes(s.kind)
-      && s.mark.id !== null && s.mark.id !== undefined
-      && !isLocalMarkId(s.mark.id);
+      && s.mark.id !== null && s.mark.id !== undefined;
     const isDragging = (s) => !!dragState.value && dragState.value.id === String(s.mark.id);
 
     function pick(s) {
@@ -355,7 +366,9 @@ export default {
       e.preventDefault();                            // 别让浏览器顺手选中文字
       e.stopPropagation();                           // 也别掉进 svg 的画/擦逻辑
       dragState.value = {
-        id: String(s.mark.id), mark: s.mark,
+        // geo 快照按**屏幕上**那份存（可能还顶着一层临时尺寸）：松手时按它算新 geo，
+        // 才不会「缩放完再拖一下」就跳回缩放前的坐标。
+        id: String(s.mark.id), mark: s.mark, geo: numList(effGeo(s)),
         sx: e.clientX, sy: e.clientY, moved: false,
       };
       const el = e.currentTarget;
@@ -379,7 +392,7 @@ export default {
       const prev = offsets.value[st.id];
       const next = Object.assign({}, offsets.value);
       next[st.id] = {
-        base: prev ? prev.base : geoKey(st.mark.geo),
+        base: prev ? prev.base : geoKey(st.geo),
         dx: px / rect.width * UNIT,      // x 用宽、y 用高**分别**换算（同 pagePoint 口径）
         dy: py / rect.height * UNIT,
       };
@@ -406,7 +419,7 @@ export default {
 
       const off = offsets.value[st.id];
       if (!off) return;
-      const geo = shiftGeo(numList(st.mark.geo), off.dx, off.dy);
+      const geo = shiftGeo(st.geo, off.dx, off.dy);
       if (geo.length < 4) return;      // 没有可用 geo 的标注（理论上进不来）
       emit('move', { mark: st.mark, geo });   // 一次松手只发一个 PATCH
     }
@@ -424,6 +437,7 @@ export default {
     function clearOffsets() {
       offsets.value = {};
       resizing.value = {};      // 调大小的临时尺寸一起退，否则会停在「看着变大了、库里没变」
+      resizeBase.value = {};
     }
 
     /* ---------------- 文本框里的 LaTeX（2026-11-01） ----------------
@@ -456,14 +470,13 @@ export default {
        两者松手都 emit('move')，父组件复用同一条 PATCH（geo 是同一个字段）——
        所以后端、接口、表结构零改动，`homework_grade_marks.geo` 本来就是 4 个 0~1000 整数。
        ⚠️ 宽高存在 geo 里，**不能借 width 字段**：那个字段是笔迹粗细（grade_store 里
-          clamp 0~200），混用会让笔迹粗细跟着一起坏。 */
-    const resizing = ref({});     // { [id]: [x1,y1,x2,y2] } 拖动中的实时 geo
+          clamp 0~200），混用会让笔迹粗细跟着一起坏。
+       ⚠️ `resizing` / `resizeBase` 声明在上面拖动那一段 —— 两者的退场规则要放在一起看。 */
     let resizeState = null;       // { id, mark, x1, y1 }
 
-    /** 只有「已入库的文本框」能调大小；画笔/橡皮模式下不给（那两个模式按下去是落笔）。 */
+    /** 文本框都能调大小（含「刚写完还没传上去」那一秒，理由见上面 canMove）。 */
     const canResize = (s) => s.kind === 'text'
       && s.mark.id !== null && s.mark.id !== undefined
-      && !isLocalMarkId(s.mark.id)      // 同上：还没传上去的改不了，改了也 422
       && !isGone(s)
       && MOVE_MODES.indexOf(props.mode) >= 0;
 
@@ -472,10 +485,13 @@ export default {
       if (e.pointerType === 'mouse' && e.button !== 0) return;
       e.preventDefault();
       e.stopPropagation();
-      const g = numList(s.mark.geo);
+      const g = numList(effGeo(s));        // 起点按**屏幕上**那份算，不然框会先跳一下
       const x1 = g.length >= 4 ? Math.min(g[0], g[2]) : 0;
       const y1 = g.length >= 4 ? Math.min(g[1], g[3]) : 0;
-      resizeState = { id: String(s.mark.id), mark: s.mark, x1, y1 };
+      const id = String(s.mark.id);
+      // 记下「改之前服务端是什么样」—— 服务端跟上来了才知道该撤掉临时尺寸（见下面的 watch）
+      resizeBase.value = Object.assign({}, resizeBase.value, { [id]: geoKey(s.mark.geo) });
+      resizeState = { id, mark: s.mark, x1, y1 };
       const el = e.currentTarget;
       if (el && el.setPointerCapture) {
         try { el.setPointerCapture(e.pointerId); } catch (err) { /* 老浏览器 */ }
@@ -516,7 +532,40 @@ export default {
       const next = Object.assign({}, resizing.value);
       delete next[id];                 // 被打断就退回原尺寸
       resizing.value = next;
+      const nb = Object.assign({}, resizeBase.value);
+      delete nb[id];
+      resizeBase.value = nb;
     }
+
+    /* ★ 「临时尺寸」的退场（2026-11-04 修）。
+     *
+     * 松手发 PATCH 之后，临时尺寸要**一直顶到服务端跟上**（否则会闪回原尺寸再变大）；
+     * 但服务端跟上之后必须撤掉 —— 以前没人撤，于是这一层覆盖永远盖在最后那次尺寸上：
+     *   · 拖动时 `offsets` 照算，屏幕上看着动了（覆盖的 geo + 平移）
+     *   · 松手 PATCH 成功、`settle()` 回来 → 覆盖还在 → **框弹回缩放后那个位置**
+     * 老师看到的就是「同一个地方反复拖，一松手就跳回去」＝ 拖不动；刷新（内存状态清空）
+     * 才恢复。判据：`settle()`（或任何刷新）之后这条 geo 还等于 `resizeBase` 吗 ——
+     * 不等于就是服务端已采纳，覆盖该撤。手上正在拖的那一条除外。 */
+    watch(() => props.marks, () => {
+      const cur = resizing.value;
+      const keys = Object.keys(cur);
+      if (!keys.length) return;
+      const base = resizeBase.value || {};
+      const next = {};
+      const nextBase = {};
+      let kept = 0;
+      for (const k of keys) {
+        if (resizeState && resizeState.id === k) {      // 手上还在改，别撤
+          next[k] = cur[k]; nextBase[k] = base[k]; kept += 1; continue;
+        }
+        const m = (props.marks || []).find((x) => String(x.id) === k);
+        // 服务端还是「改之前」那个 geo = 请求还没落地，继续用临时尺寸顶着
+        if (m && base[k] !== undefined && geoKey(m.geo) === base[k]) {
+          next[k] = cur[k]; nextBase[k] = base[k]; kept += 1;
+        }
+      }
+      if (kept !== keys.length) { resizing.value = next; resizeBase.value = nextBase; }
+    });
 
     /** 屏幕坐标 → 0~1000 的页坐标。换算本身在 ../markGeom.js（那边有 node 单测）。 */
     function toPt(e) {

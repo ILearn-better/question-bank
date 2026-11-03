@@ -2089,7 +2089,17 @@ const app = createApp({
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(body),
         });
+        // 「刚写完就被挪/缩过」：先把位置补上再 settle，出队那一刻服务端已经在正确位置
+        await this.flushPendingGeo(lid, r && r.id);
         await this.settle();          // 取回服务端数据之后才出队，中间不留空白
+        /* ⚠️ settle 也是要等的（网络慢时两秒起步），这期间老师还能再挪一次 ——
+           上面那次补丁只盖住「POST 途中」的挪动。所以 settle 完再看一眼，
+           有新的位置就再补一次、再拉一次；没有就出队。
+           （不这么兜，那一次挪动会被出队吃掉：屏幕上先挪走、随后弹回原处。） */
+        for (let i = 0; i < 3 && this._pendingGeo && this._pendingGeo[lid]; i += 1) {
+          await this.flushPendingGeo(lid, r && r.id);
+          await this.settle();
+        }
         this.dropLocal([lid]);
         this.noteSaved();             // 这一笔真的进库了 —— 状态条的「已保存」跟着走
         this.pushUndo({ type: 'add', id: (r && r.id) || null, lid });
@@ -2097,10 +2107,36 @@ const app = createApp({
         /* 没传上去不代表「没画」—— 它还在本机队列里、界面上也看得见，
          * 所以**照样要能撤**（撤 = 从本机队列删掉）。 */
         this.pushUndo({ type: 'add', id: null, lid });
+        /* 这一笔只在队列里（服务端没有副本）→ 把老师最后放的位置写回队列，
+           下次自动补发才带得上；服务端有副本时走的是 flushPendingGeo，别在这儿改。 */
+        const pg = this._pendingGeo && this._pendingGeo[lid];
+        if (pg && DRAFT && DRAFT.setGeo) {
+          DRAFT.setGeo(lid, pg);
+          delete this._pendingGeo[lid];
+          this.localMarks = DRAFT.marks().slice();
+        }
         ElementPlus.ElMessage.error({
           message: e.message + ' —— 这一笔已经存在本机，下次打开会自动补发',
           duration: 6000,
         });
+      }
+    },
+    /** 把「新批注还没上传完就被挪过」的位置补一次 PATCH（理由见 moveMark / 队列注释）。 */
+    async flushPendingGeo(lid, id) {
+      if (!id || !this._pendingGeo) return;
+      for (let i = 0; i < 3; i += 1) {
+        const geo = this._pendingGeo[lid];
+        if (!geo) return;
+        delete this._pendingGeo[lid];
+        try {
+          await this.api('/api/grade-marks/' + id, {
+            method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ geo }),
+          });
+        } catch (e) {
+          ElementPlus.ElMessage.error('位置没存上：' + e.message);
+          return;
+        }
       }
     },
     /** 松手时一次交上来一批 id。**串行删**：SQLite 单写者，并发删会撞锁。
@@ -2137,7 +2173,13 @@ const app = createApp({
       const mark = payload && payload.mark;
       const geo = payload && payload.geo;
       if (!mark || !mark.id || !geo || geo.length < 4) return;
-      if (DRAFT && DRAFT.isLocalMarkId(mark.id)) return;   // 还没传上去的没处 PATCH
+      /* 本机队列里那一两秒（`local:xxx`）：没有 id 可 PATCH，先把位置记下来，
+         等 POST 回来拿到真 id 再补（flushPendingGeo）。
+         ⚠️ 别直接改队列里那条的 geo：POST 已经在路上，改了它服务端那份坐标就对不上，
+            reconcile 会认成两笔 → 补发时变出两条一样的批注。 */
+      const lid = mark.local_id
+        || (DRAFT && DRAFT.isLocalMarkId(mark.id) ? String(mark.id).slice(6) : '');
+      if (lid) { this._pendingGeo[lid] = geo; return; }
       try {
         await this.api('/api/grade-marks/' + mark.id, {
           method: 'PATCH', headers: { 'Content-Type': 'application/json' },
@@ -2318,10 +2360,14 @@ const app = createApp({
       if (!DRAFT || !this.gid) return;
       this.teardownDraft();
       this._draft = DRAFT.createDraft(this.gid);
+      /* 本机队列里那几条被挪/缩过的最新位置（lid → geo）。
+         **不进 data**：它是控制流不是界面状态，进了 data 每次改都白触发一轮 patch。 */
+      this._pendingGeo = {};
       this.localMarks = this._draft.marks().slice();
     },
     teardownDraft() {
       if (this._draft) { this._draft.flush(); this._draft = null; }
+      this._pendingGeo = {};
       this.localMarks = [];
     },
     pushLocal(body) {

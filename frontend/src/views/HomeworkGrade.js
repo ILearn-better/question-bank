@@ -170,6 +170,12 @@ export default {
     const boot = localDraft.data;
     const pendingMarks = ref(localDraft.marks());   // 本机队列（含已发送未对账的）
     const syncPending = () => { pendingMarks.value = localDraft.marks(); };
+    /* 老师在「刚写完、还没传上去」那一秒里挪/缩过它的位置：lid → geo。
+     * POST 是用**发起那一刻**的 geo 发的，之后的挪动服务端不知道 —— 拿到真 id 后
+     * 由 `flushPendingGeo` 补一次 PATCH 补上（见 moveMark / addMark）。
+     * ⚠️ 不直接改队列里那条 rec 的 geo：POST 已经在路上，改了它服务端那份就对不上，
+     *    reconcile 会因为「坐标不同」认成两笔 → 补发时变出**两条**一样的批注。 */
+    const pendingGeo = {};
     /** 还没送上去的笔数 —— 只数 `sent === false` 的（sent 的其实已经在库里）。 */
     const pendingUnsent = computed(
       () => pendingMarks.value.filter((m) => !m.sent).length,
@@ -1297,15 +1303,53 @@ export default {
       const lid = localDraft.pushMark(body);
       syncPending();
       try {
-        await gradeApi.addMark(gid, body);
+        const created = await gradeApi.addMark(gid, body);
         localDraft.setSent(lid, true);
         syncPending();
+        // 「刚写完就被挪/缩过」→ 先把位置补上去，再 settle：这样出队那一刻服务端
+        // 已经在正确位置，界面不会先弹回原位再跳过去
+        await flushPendingGeo(lid, created && created.id);
         await settle();
+        /* ⚠️ settle 也要等（网络慢时两三秒），这期间老师还能再挪一次 —— 上面那次
+           只盖住「POST 途中」的挪动。settle 完再看一眼，有就再补、再拉；没有就出队
+           （不兜这一段，那次挪动会被出队吃掉：屏幕上先挪走、随后弹回原处）。 */
+        for (let i = 0; i < 3 && pendingGeo[lid]; i += 1) {
+          await flushPendingGeo(lid, created && created.id);
+          await settle();
+        }
         // settle 成功才出队 —— 否则「POST 成功但详情没拉回来」会有一瞬间的空白
         localDraft.dropMarks([lid]);
         syncPending();
       } catch (e) {
+        /* 没传上去：这一笔只在队列里，那就在队列里把它挪到老师最后放的位置
+           （服务端没有副本，不会撞成两条）。 */
+        if (pendingGeo[lid]) {
+          try { localDraft.setGeo(lid, pendingGeo[lid]); } catch (err) { /* 队列不在就算了 */ }
+          delete pendingGeo[lid];
+          syncPending();
+        }
         fail(`${e.message} —— 这一笔已经存在本机，下次打开会自动补发`);
+      }
+    }
+
+    /** 把「新批注还没上传完就被挪过」的位置补一次 PATCH。
+     *
+     *  为什么不能直接改队列里那条的 geo 让 POST 带上：POST 已经发出去了（用的是
+     *  按下「放上去」那一刻的坐标），改了 rec 只会让服务端那份和队列那份**坐标不同**，
+     *  `reconcile` 认成两笔 → 补发时多出一条重复批注。
+     *  ⚠️ 循环到最新的那次为止：补 PATCH 的这几十毫秒里老师可能还在挪。 */
+    async function flushPendingGeo(lid, id) {
+      if (!id) return;
+      for (let i = 0; i < 3; i += 1) {
+        const geo = pendingGeo[lid];
+        if (!geo) return;
+        delete pendingGeo[lid];
+        try {
+          await gradeApi.patchMark(id, { geo });
+        } catch (e) {
+          fail(`位置没存上：${e.message}`);
+          return;
+        }
       }
     }
 
@@ -1392,6 +1436,10 @@ export default {
       const mark = payload && payload.mark;
       const geo = payload && payload.geo;
       if (!mark || !mark.id || !geo || geo.length < 4) return;
+      /* 本机队列里那一两秒（id 是 `local:xxx`）：没有 id 可 PATCH，先把位置记下来，
+         等 addMark 拿到服务端 id 再补一次（见 flushPendingGeo）。 */
+      const lid = mark.local_id || (isLocalMarkId(mark.id) ? String(mark.id).slice(6) : '');
+      if (lid) { pendingGeo[lid] = geo; return; }
       busy.value = 'mv-' + mark.id;
       try {
         await gradeApi.patchMark(mark.id, { geo });
