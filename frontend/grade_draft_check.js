@@ -74,6 +74,32 @@ function fakeStorage({ quota = 0 } = {}) {
   d1.dropMark(lid2);
   check('dropMark 删单条', d1.marks().length === 0);
 
+  /* ---------------- setGeo：还没传上去的那条被挪/缩过 ----------------
+     ⚠️ 只在**服务端还没有副本**时用（POST 失败、或打开时补发之前）。
+        正常路径是父组件记 pendingGeo、拿到真 id 再补 PATCH —— 所以这条
+        必须真的改到 rec 上、并且立刻落盘，否则下次补发还是老位置。 */
+  const lid3 = d1.pushMark({ page_no: 1, kind: 'text', geo: [100, 100, 100, 100], text: 'x' });
+  d1.setGeo(lid3, [100, 100, 420, 260]);
+  check('★ setGeo 改得动队列里那条的坐标',
+        J(d1.marks()[0].geo) === J([100, 100, 420, 260]), d1.marks()[0].geo);
+  d1.flush();
+  check('★ setGeo 的结果落盘了（下次补发才带得上）',
+        J(D.readDraft(11).marks[0].geo) === J([100, 100, 420, 260]),
+        D.readDraft(11).marks[0].geo);
+  check('setGeo 存的是拷贝，不是把外面那个数组挂进去',
+        (() => {
+          const g = [0, 0, 50, 50];
+          d1.setGeo(lid3, g);
+          g[0] = 999;
+          return d1.marks()[0].geo[0] === 0;
+        })(), d1.marks()[0].geo);
+  d1.setGeo(lid3, [1, 2]);                       // 不足四个数 → 忽略（宁可不动，不要写半个框）
+  check('setGeo 拒绝不完整的 geo（不会写半个框）',
+        J(d1.marks()[0].geo) === J([0, 0, 50, 50]), d1.marks()[0].geo);
+  d1.setGeo('不存在的 lid', [1, 2, 3, 4]);
+  check('setGeo 找不到那条就安静返回（不抛）', d1.marks().length === 1);
+  d1.dropMark(lid3);
+
   /* ---------------- 框题草稿 / 判定依据 ---------------- */
   d1.touch({
     page_no: 3,

@@ -433,16 +433,31 @@ async function main() {
     check('★ 公式库没加载时原文照显示（不隐藏，让人看得出没渲染）',
       /\.gmark-label-body \.gm-math-raw \{ opacity: /.test(csv), null);
 
-    /* 「莫名跳回原位」的第三条路径（2026-11-01）：还没传上去的标注 id 是 `local:xxx`，
-       拖动松手会 PATCH 这个 id，而后端 mid 是 int → 必然 422 → 父组件 catch →
-       clearOffsets() → 界面弹回原位。窗口 = 从落笔到 settle 完成那 1~2 秒。
-       所以 canMove / canResize 都必须把它挡掉。 */
-    check('★ 还没传上去的标注（local: 前缀）不给拖 —— 否则 PATCH 必 422、界面弹回原位',
-      /const canMove = \(s\) =>[\s\S]{0,320}!isLocalMarkId\(s\.mark\.id\)/.test(layer), null);
-    check('★ 同理不给调大小（走同一条 PATCH，一样会 422）',
-      /const canResize = \(s\) =>[\s\S]{0,320}!isLocalMarkId\(s\.mark\.id\)/.test(layer), null);
-    check('isLocalMarkId 用的是 gradeDraft 的导出（前缀口径只有一处）',
-      /import \{ isLocalMarkId \} from '\.\.\/gradeDraft\.js'/.test(layer), null);
+    /* 2026-11-04 口径变了：还没传上去的（`local:xxx`）**也要能拖、能调大小**。
+       用户原话「新插入文本框…只要我又点选该文本框，就能随时移动、缩放」。
+       以前是靠 canMove/canResize 把它挡掉（挡的理由是 PATCH 必 422、界面弹回原位），
+       现在改成父组件认这段窗口：记住位置 → 拿到真 id 后补一次 PATCH。
+       所以这里守两件事：① 标注层不再排除 local；② 那条「补一次 PATCH」的链路在。
+       ⚠️ 光守 ① 会变成「能拖但位置丢了」，所以 ② 是必须成对出现的。 */
+    const spa = read('src/views/HomeworkGrade.js');
+    const draft = read('src/gradeDraft.js');
+    check('★ 本机队列里的标注不再被 canMove 排除（刚写完就能拖）',
+      !/const canMove = \(s\) =>[\s\S]{0,400}isLocalMarkId/.test(layer), null);
+    check('★ 同理 canResize 不再排除（刚写完就能调大小）',
+      !/const canResize = \(s\) =>[\s\S]{0,400}isLocalMarkId/.test(layer), null);
+    check('★ 批改台 moveMark 认 local: → 位置先记进 pendingGeo（此刻没有 id 可 PATCH）',
+      /function moveMark\(payload\)[\s\S]{0,900}pendingGeo\[lid\] = geo/.test(spa), null);
+    check('★★ 批改台 addMark 在 settle **之前**补这一次位置（否则出队瞬间会弹回原位再跳过去）',
+      /const created = await gradeApi\.addMark\(gid, body\)[\s\S]{0,500}await flushPendingGeo\(lid, created && created\.id\)[\s\S]{0,200}await settle\(\)/.test(spa),
+      null);
+    check('★ 工作台 moveMark 同样认 local: → this._pendingGeo[lid] = geo',
+      /async moveMark\(payload\)[\s\S]{0,900}this\._pendingGeo\[lid\] = geo/.test(wb), null);
+    check('★★ 工作台 addMark 也是先补位置再 settle',
+      /await this\.flushPendingGeo\(lid, r && r\.id\)[\s\S]{0,200}await this\.settle\(\)/.test(wb), null);
+    check('★ 队列提供 setGeo（POST 失败时把位置写回本机那一条，下次补发才带得上）',
+      /function setGeo\(lid, geo\)/.test(draft) && /^\s*setGeo,$/m.test(draft), null);
+    check('★ 两页都**不**直接改队列里那条的 geo 去顶 POST（坐标和已发出的请求不同 → 补发会多一条）',
+      !/localDraft\.setGeo\([^)]*\)[\s\S]{0,80}await settle\(\)/.test(spa), null);
   }
 
   // ============================================================

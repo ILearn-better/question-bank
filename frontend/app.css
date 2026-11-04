@@ -817,7 +817,15 @@ table.tbl td.pending { color: var(--warning); font-weight: 600; }
 /* 文本框内容层：**必须**套一层再 v-html（2026-11-01）。
    同一个 label 里还有右下角的调大小手柄，直接在外层 v-html 会把它整块 innerHTML 覆盖掉，
    手柄就永远看不见；文字归这层，手柄留在外层。 */
-.gmark-label-body { display: block; height: 100%; overflow: auto; }
+/* ⚠️⚠️ `touch-action: none` **必须在这一层再写一遍**（2026-11-04 查明）。
+   `touch-action` **不继承**：它只写在 `.gmark-label` 上，管不到这个子元素。
+   而这层自己 `overflow: auto` 是个滚动容器 —— 笔/手指一按下去，浏览器认定
+   「他是在滚这个框」，第一次移动就发 `pointercancel` → `cancelDrag()`
+   → 框弹回原位。表现就是**「放入内容后的文本框怎么拖都不动」**
+   （空框根本没有 label，所以只在「有字」时才被发现）；鼠标不走触摸手势，看不出来。
+   代价：长批注不能用手指在框里滚，得靠滚轮 / 打开编辑框看 —— 拖框优先。
+   判据在 `workbench_check.js`（两份 CSS 都要有这一条），真浏览器验证见 memory 11-04。 */
+.gmark-label-body { display: block; height: 100%; overflow: auto; touch-action: none; }
 /* KaTeX 的排版不能被外层的 white-space:pre-wrap 影响 —— 那个 pre-wrap 是为「批注里的换行」留的，
    而公式这一层要 normal：否则 \text{a b} 的空格会按 pre 保留、行高也跟着乱。
    ⚠️ 别把 pre-wrap 从 .gmark-label 上删掉来"解决"—— 那会让老批注的换行全塌成一行。 */

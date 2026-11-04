@@ -532,6 +532,24 @@ async function main() {
   checkTrue('★ 上面这些选择器在 app.css 里都真有（否则同步检查是空跑）',
     cssDropped.length === 0, cssDropped.length ? cssDropped : '12 条都在');
 
+  /* ★★ 2026-11-04：`.gmark-label-body` 必须**自己**写 `touch-action: none`。
+   *
+   * 只写在外层 `.gmark-label` 上是不够的 —— `touch-action` **不继承**，而这层
+   * `overflow: auto` 本身是个滚动容器：笔 / 手指一按下去，浏览器认定「他在滚这个框」，
+   * 第一次 pointermove 就发 `pointercancel` → `cancelDrag()` → 框弹回原位。
+   * 老师看到的就是「放入内容后的文本框怎么拖都不动」（空框根本没有 label，所以只在
+   * 「有字」时才被发现）；鼠标不走触摸手势，用鼠标验永远验不出来。
+   *
+   * 为什么不能只靠上面那条「超集」：它比的是两份**一致**，两边一起把这条删掉照样绿。
+   * 这里盯的是 app.css 本身有没有这一句。 */
+  const bodyDecls = [...(APP_CSS_MAP.get('.gmark-label-body') || [])];
+  const wbBodyDecls = [...(WB_CSS_MAP.get('.gmark-label-body') || [])];
+  const hasNone = (list) => list.some((d) => /^touch-action: *none$/.test(d));
+  checkTrue('★★ .gmark-label-body 自己写了 touch-action: none（不写 = 笔/触屏拖不动框）',
+    hasNone(bodyDecls), bodyDecls);
+  checkTrue('★★ 工作台那份拷贝也有这一句（两份一起漏才算真漏）',
+    hasNone(wbBodyDecls), wbBodyDecls);
+
   /* 内联脚本用正则抽出来自己 eval —— 不依赖 jsdom 执行 <script>：
    * runScripts:'outside-only' 下它不会跑，而 'dangerously' 又会让所有 src 脚本
    * 真的去磁盘取（路径是 /vendor/...，取不到）。 */

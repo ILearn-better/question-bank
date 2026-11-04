@@ -228,6 +228,18 @@ export function createDraft(gid, { delay = 250 } = {}) {
     touch({ marks: next });
   }
 
+  /** 改队列里那一条的坐标（「还没上传完就被老师挪/缩过」用）。
+   *
+   *  ⚠️ **只在服务端没有副本时用**：POST 已经发出去的情况下改这个，
+   *     服务端那份的坐标就和队列不同 → `reconcile` 认成两笔 → 补发多出一条重复批注。
+   *     正常路径是记住位置、等拿到真 id 后补 PATCH（见页面里的 pendingGeo）。 */
+  function setGeo(lid, geo) {
+    const rec = current.marks.find((m) => m.lid === lid);
+    if (!rec || !Array.isArray(geo) || geo.length < 4) return;
+    rec.geo = geo.slice();
+    touch({ marks: current.marks });
+  }
+
   /** 只有「服务端确实已经有这条了」才出队 —— 见 HomeworkGrade.reconcile 的说明。 */
   function dropMarks(lids) {
     const gone = new Set((lids || []).map(String));
@@ -245,6 +257,7 @@ export function createDraft(gid, { delay = 250 } = {}) {
     pushMark,
     setSent,
     dropMark,
+    setGeo,
     dropMarks,
     clear() {
       if (timer) { clearTimeout(timer); timer = 0; }
