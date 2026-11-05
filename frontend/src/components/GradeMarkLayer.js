@@ -141,6 +141,9 @@ function buildShape(mark, off) {
     // 0 = 这一笔没记粗细（0033 之前的老记录）→ 模板里不绑 style，走 CSS 默认
     width: Number(mark.width) || 0,
     text: mark.text || '',
+    // 插入的图片（0039）：URL 由后端给（`/api/mark-images/xxx.png`），这里只负责摆位置。
+    // 空串 = 图丢了（文件被删 / 老记录）→ 模板画一块可见的占位，别让老师面对一片空白。
+    image: String(mark.image || ''),
     x, y, w, h, cx, cy,
     rect: { x: r1(x), y: r1(y), w: r1(w), h: r1(h) },
     line: { x1: clamp(ax), y1: clamp(ay), x2: clamp(bx), y2: clamp(by) },
@@ -171,6 +174,11 @@ function buildShape(mark, off) {
              // 有宽高 = 新口径（矩形，top 就是左上角）→ 模板里去掉 translate(0,-100%)；
              // 零面积点 = 老口径（一个点、文字往上浮）→ 保留 translate，老标注观感不变。
              sized: w > 0 && h > 0 },
+    /* 图片批注摆在哪、多大（0039）。与 label 同一套百分比口径 —— 都是「相对页面的
+       定位 + 尺寸」，不是 SVG 单位，所以不受 preserveAspectRatio 影响。
+       宽高给一个最小可见尺寸（40 ≈ 页宽 4%）：一条坐标坏掉的记录若缩成 0 宽，
+       眼睛看不见、手指也点不着，等于「删不掉」。 */
+    img: { left: pct(x), top: pct(y), w: pct(Math.max(w, 40)), h: pct(Math.max(h, 40)) },
   };
 }
 
@@ -187,8 +195,9 @@ const ERASE_LINE = 22;     // 手绘线本身多粗算擦到（要大于笔画�
       4000 点约 30KB，正常一笔到不了。 */
 const MAX_POINTS = 4000;
 
-/** 能拖的只有「四个数就说完」的框类标注。笔迹 ink 不在里面 —— 见文件头 ⑥。 */
-const MOVE_KINDS = ['box', 'ellipse', 'check', 'cross', 'arrow', 'text'];
+/** 能拖的只有「四个数就说完」的框类标注。笔迹 ink 不在里面 —— 见文件头 ⑥。
+ *  `image`（插入的图片）就是一张有 geo 的矩形，平移 = 四个数同加，与文本框同一套。 */
+const MOVE_KINDS = ['box', 'ellipse', 'check', 'cross', 'arrow', 'text', 'image'];
 const DRAG_MIN = 4;        // 屏幕像素：手一抖几个像素不该被当成拖动（与月历那边同一个经验）
 
 /** 「框题」的最小边长（0~1000 制，20 ≈ 纸面 2%）。
@@ -298,16 +307,24 @@ export default {
 
     /* 每帧只算一次。以前模板里调两遍（SVG 列表 + 文字标签），hitTest 里还要再调一遍，
        页上标注一多就是每帧 O(3 × 全页点数) 的字符串重建 —— 这是书写时「抖」的主因之一。
-       computed 的依赖：props.marks（父组件整体换数组）+ offsets + resizing，任一变了才重算。 */
-    const allShapes = computed(() => (props.marks || []).map((m) => {
+       computed 的依赖：props.marks（父组件整体换数组）+ offsets + resizing，任一变了才重算。
+       `ord` = 这一条在数组里的下标。**数组顺序就是创建顺序**（后端按 id 升序给，
+       本机队列的排在后面），模板拿它算 z-index —— 见文件头 ⑧。 */
+    const allShapes = computed(() => (props.marks || []).map((m, i) => {
       const ov = resizing.value[String(m.id)];
       // 调大小只换 geo（四个数），不叠加平移 —— 与拖动同一套渲染，但状态分开存
-      return buildShape(ov ? Object.assign({}, m, { geo: ov }) : m, offsets.value[String(m.id)]);
+      const s = buildShape(ov ? Object.assign({}, m, { geo: ov }) : m, offsets.value[String(m.id)]);
+      s.ord = i;
+      return s;
     }));
     /** 兼容原来的调用姿势：传进来就是 props.marks 时直接用缓存，别的列表才现算。 */
     const shapesFor = (list) => (list === undefined || list === props.marks
       ? allShapes.value
-      : (list || []).map((m) => buildShape(m, offsets.value[String(m.id)])));
+      : (list || []).map((m, i) => {
+        const s = buildShape(m, offsets.value[String(m.id)]);
+        s.ord = i;
+        return s;
+      }));
     const isPicked = (s) => same(s.itemId, props.selectedItemId);
     const isLinked = (s) => s.itemId !== null && s.itemId !== undefined;
     const isGone = (s) => erasing.value.includes(String(s.mark.id));
@@ -338,7 +355,7 @@ export default {
        *   两个模式都该能选中，否则老师切了工具就发现「刚才还能点，现在点不动了」。
        *   （2026-11-03 用户报「写好内容，没办法点开重新修改」——
        *     真因不是缺一个编辑按钮，是**根本没有「选中某一处标注」这个状态**。） */
-      if (s.kind === 'text') { emit('select-mark', s.mark); return; }
+      if (s.kind === 'text' || s.kind === 'image') { emit('select-mark', s.mark); return; }
       if (props.mode !== 'view') return;      // 画笔模式下点标注不该跳题
       emit('pick', s.mark);
     }
@@ -352,6 +369,24 @@ export default {
     }
     const isActive = (s) => props.activeMarkId !== null && props.activeMarkId !== undefined
       && same(s.mark.id, props.activeMarkId);
+
+    /* ★ 层级 = **创建先后**（2026-11-06 用户要求：「笔画、文本框、图片谁先出现就谁放下面」）。
+     *
+     * 以前这件事做不到，因为三种东西分散在两块画布上：图形在一个大 `<svg>` 里
+     * （绘制顺序即层级），文本框是浮在它上面的 HTML —— 于是「先插的图片永远盖住
+     * 后写的文字」这类现象没有任何修正余地。
+     * 现在每一条标注都是一个**绝对定位节点**（`.gmark-node` / `.gmark-imgbox` / `.gmark-label`），
+     * 层级统一由这里给，三者共用同一条线。
+     *
+     * 正在拖 / 正在缩放 / 刚选中的那一条**临时抬到最上面**：正在操作的东西被别的压住时，
+     * 指针一离开它的区域就收不到 pointerup → 框会卡在半路，老师的感受是「按下去没反应」。
+     */
+    const Z_BASE = 10;
+    const Z_TOP = 900;       // 临时抬高量。必须 < 999（画笔画到一半的那一笔永远在最上）
+    function zOf(s) {
+      const busy = isDragging(s) || isActive(s) || !!resizing.value[String(s.mark.id)];
+      return Z_BASE + Number(s.ord || 0) + (busy ? Z_TOP : 0);
+    }
 
     /** 单击跳题。刚拖完的那一下 click 要吞掉，否则「拖一下框」顺手把右栏跳到那一题。 */
     function onPickClick(s) {
@@ -474,8 +509,9 @@ export default {
        ⚠️ `resizing` / `resizeBase` 声明在上面拖动那一段 —— 两者的退场规则要放在一起看。 */
     let resizeState = null;       // { id, mark, x1, y1 }
 
-    /** 文本框都能调大小（含「刚写完还没传上去」那一秒，理由见上面 canMove）。 */
-    const canResize = (s) => s.kind === 'text'
+    /** 文本框都能调大小（含「刚写完还没传上去」那一秒，理由见上面 canMove）。
+     *  插入的图片同理 —— 老师拖进来的多半是一张照片，不调大小根本放不进去。 */
+    const canResize = (s) => (s.kind === 'text' || s.kind === 'image')
       && s.mark.id !== null && s.mark.id !== undefined
       && !isGone(s)
       && MOVE_MODES.indexOf(props.mode) >= 0;
@@ -883,7 +919,7 @@ export default {
     return {
       svgEl, drawing, draft, erasing, regionDraft, lineDrag, pending,
       shapesFor, isPicked, isLinked, isGone, canMove, isDragging, pick, onPickClick,
-      isActive, onLabelDblClick,
+      isActive, onLabelDblClick, zOf,
       labelHtml, mathReady,
       onDown, onMove, onUp, onCancel, startDrag, dragTo, endDrag, cancelDrag,
       canResize, startResize, resizeTo, endResize, cancelResize,
@@ -943,12 +979,63 @@ export default {
         <line v-for="(l, i) in lineList()" :key="'gll-' + i" class="gl-line"
               x1="0" :y1="l.y" x2="1000" :y2="l.y" />
       </g>
-      <g v-for="s in shapesFor(marks).filter(x => !isGone(x))" :key="s.key" class="gmark"
-         :class="{ sel: isPicked(s), linked: isLinked(s), rough: s.mark.created_by !== 'teacher',
-                   mv: canMove(s), drag: isDragging(s) }"
-         @pointerdown="startDrag($event, s)" @pointermove="dragTo"
-         @pointerup="endDrag" @pointercancel="cancelDrag"
-         @click.stop="onPickClick(s)">
+      <!-- ★ 一条标注（图片 / 文本框）也画在根 SVG 里吗？不 —— 见下面 .gmark-node 那段。 -->
+    </svg>
+
+    <!-- ★★ 一条标注 = 一个**绝对定位节点**（0039 起，用户要求「笔画、文本框、图片谁先出现
+         就谁放下面」）。层级全部由 zOf 算（创建先后 + 正在操作的那条临时置顶），
+         所以三种东西必须都在同一批 HTML 节点上 —— 以前图形困在一个大 SVG 里，
+         绘制顺序就是层级，跨不到浮在上面的文本框去。
+         三种分支：
+           · 图片   → .gmark-imgbox（里面一张 img + 右下角手柄）
+           · 文本框 → .gmark-label（HTML 定位：SVG 的 text 在非等比 viewBox 里会被压扁）
+           · 图形   → 自己一个小 svg，class 仍是 .gmark（样式与拆开之前逐字一致）
+         ⚠️ 节点本身 pointer-events: none（它铺满整页，否则页面哪儿都点不动），
+            命中由内部元素各自打开（见 app.css 的 .gmark-node 区块）。 -->
+    <div v-for="s in shapesFor(marks).filter(x => !isGone(x))" :key="s.key"
+         class="gmark-node" :style="{ zIndex: zOf(s) }">
+
+      <!-- ---------- 图片（kind = image） ---------- -->
+      <div v-if="s.kind === 'image'" class="gmark-imgbox"
+           :class="{ sel: isPicked(s), linked: isLinked(s), drag: isDragging(s),
+                     mv: canMove(s), act: isActive(s) }"
+           :style="{ left: s.img.left, top: s.img.top, width: s.img.w, height: s.img.h }"
+           @pointerdown="startDrag($event, s)" @pointermove="dragTo"
+           @pointerup="endDrag" @pointercancel="cancelDrag"
+           @click.stop="onPickClick(s)">
+        <img v-if="s.image" class="gmark-img" :src="s.image" alt="" draggable="false">
+        <!-- 文件被删 / 老记录：**必须画出来**。什么都不画的话这一条既看不见也点不着，
+             老师只会觉得「我插的图凭空没了」，连删都没法删。 -->
+        <span v-else class="gmark-img-miss">这张图丢了</span>
+        <i v-if="canResize(s)" class="gmark-resize" title="拖动调整图片大小"
+           @pointerdown.stop="startResize($event, s)"
+           @pointermove.stop="resizeTo"
+           @pointerup.stop="endResize"
+           @pointercancel.stop="cancelResize"></i>
+      </div>
+
+      <!-- ---------- 文本框（geo 有宽高 = 矩形；老数据是零面积点，靠 .sized 区分） ---------- -->
+      <span v-else-if="s.text" class="gmark-label"
+            :class="{ sel: isPicked(s), linked: isLinked(s), drag: isDragging(s),
+                      sized: s.label.sized, act: isActive(s) }"
+            :style="{ left: s.label.left, top: s.label.top, borderColor: s.color, color: s.color,
+                      width: s.label.w, height: s.label.h }"
+            @pointerdown="startDrag($event, s)" @pointermove="dragTo"
+            @pointerup="endDrag" @pointercancel="cancelDrag"
+            @click.stop="onPickClick(s)"
+            @dblclick.stop="onLabelDblClick(s)"><span class="gmark-label-body" v-html="labelHtml(s)"></span><i v-if="canResize(s)" class="gmark-resize" title="拖动调整文本框大小"
+               @pointerdown.stop="startResize($event, s)"
+               @pointermove.stop="resizeTo"
+               @pointerup.stop="endResize"
+               @pointercancel.stop="cancelResize"></i></span>
+
+      <!-- ---------- 图形（框 / 圈 / √ × / 箭头 / 手绘笔迹） ---------- -->
+      <svg v-else class="gmark" viewBox="0 0 1000 1000" preserveAspectRatio="none"
+           :class="{ sel: isPicked(s), linked: isLinked(s), rough: s.mark.created_by !== 'teacher',
+                     mv: canMove(s), drag: isDragging(s) }"
+           @pointerdown="startDrag($event, s)" @pointermove="dragTo"
+           @pointerup="endDrag" @pointercancel="cancelDrag"
+           @click.stop="onPickClick(s)">
         <!-- 透明命中区：细线/小勾也得点得着 -->
         <rect class="gmark-hit" :x="s.hit.x" :y="s.hit.y" :width="s.hit.w" :height="s.hit.h" />
 
@@ -987,33 +1074,19 @@ export default {
                   fill="none" stroke-linecap="round" stroke-linejoin="round" />
         <circle v-if="s.dot" class="shape" :cx="s.dot.cx" :cy="s.dot.cy" r="7"
                 :stroke="s.color" fill="none" />
-      </g>
+      </svg>
+    </div>
 
-      <!-- 正在画的这一笔：不进库、不落后端，松手才提交（拖到一半网断了不至于留半条） -->
-      <!-- ⚠️ 判据是 >= 1 而不是 > 1：落笔的第一个点就要画出来（一个点靠 linecap:round 显示成圆点）。
-           写成 > 1 的话，按下到第一次移动之间屏幕上是空的 —— 这就是「笔尖消失」最直接的一条。 -->
+    <!-- 正在画的这一笔：不进库、不落后端，松手才提交（拖到一半网断了不至于留半条）。
+         单独一层、压在所有标注之上（见 CSS 的 .gmark-live）—— 笔在写的时候被自己的
+         一条批注盖住，看着就像「笔断了一下」。
+         ⚠️ 判据是 >= 1 而不是 > 1：落笔的第一个点就要画出来（一个点靠 linecap:round 显示成圆点）。
+             写成 > 1 的话，按下到第一次移动之间屏幕上是空的 —— 这就是「笔尖消失」最直接的一条。 -->
+    <svg class="gmark-live" viewBox="0 0 1000 1000" preserveAspectRatio="none">
       <polyline v-if="draft.length >= 1" class="gmark-draft" :points="draftPoly(draft)"
                 :stroke="color" :style="penWidth > 0 ? { strokeWidth: penWidth + 'px' } : null"
                 fill="none" stroke-linecap="round" stroke-linejoin="round" />
     </svg>
-
-    <!-- 文字标注用 HTML 定位：SVG 的 <text> 在非等比 viewBox 里会被压扁。
-         「选择」模式下可以直接按住拖走（父组件松手时 PATCH geo）。
-         ★ 点一下 = 选中（父组件在底部亮出「编辑文字 / 删除」），双击 = 直接改字。 -->
-    <span v-for="s in shapesFor(marks).filter(x => x.text)" :key="'tx-' + s.key"
-          class="gmark-label"
-          :class="{ sel: isPicked(s), linked: isLinked(s), drag: isDragging(s),
-                    sized: s.label.sized, act: isActive(s) }"
-          :style="{ left: s.label.left, top: s.label.top, borderColor: s.color, color: s.color,
-                    width: s.label.w, height: s.label.h }"
-          @pointerdown="startDrag($event, s)" @pointermove="dragTo"
-          @pointerup="endDrag" @pointercancel="cancelDrag"
-          @click.stop="onPickClick(s)"
-          @dblclick.stop="onLabelDblClick(s)"><span class="gmark-label-body" v-html="labelHtml(s)"></span><i v-if="canResize(s)" class="gmark-resize" title="拖动调整文本框大小"
-             @pointerdown.stop="startResize($event, s)"
-             @pointermove.stop="resizeTo"
-             @pointerup.stop="endResize"
-             @pointercancel.stop="cancelResize"></i></span>
 
     <!-- 分割线：段序号 + 线上的 ×。
          ⚠️ 点线本身**不删**（只拖），删除只走这个 × —— 见文件头 ⑦。 -->

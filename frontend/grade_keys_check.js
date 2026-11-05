@@ -227,7 +227,8 @@ async function main() {
     check('★ KEY_HINTS 里列了 Delete（提示文案不能比实际能力多也不能少）',
       (gk.KEY_HINTS || []).some((x) => x && x[0] === 'Delete'), null);
     check('★ 选中批注的操作条上写明「怎么改大小」（手柄不起眼，得告诉人在哪）',
-      /class="g-actbar-hint">拖右下角的小方块可改大小/.test(hw) && /\.g-actbar-hint \{/.test(csv), null);
+      /class="g-actbar-hint"[\s\S]{0,200}拖右下角的小方块可改大小/.test(hw)
+      && /\.g-actbar-hint \{/.test(csv), null);
   }
 
   // ============================================================
@@ -326,9 +327,14 @@ async function main() {
       && !/\.gmark-label \{[^}]*text-overflow: ellipsis/.test(csv), null);
     check('★ 新数据按矩形渲染：去掉上浮（.gmark-label.sized）',
       /\.gmark-label\.sized \{ transform: none; \}/.test(csv), null);
-    check('★ 右下角有 resize 手柄', /class="gmark-resize"/.test(layer) && /\.gmark-label \.gmark-resize \{/.test(csv), null);
+    /* 两个手柄：文本框一个、插入的图片一个（0039）。两份 CSS 都要有那条合并选择器 ——
+       只写 .gmark-label 那半边的话，图片的右下角就没有调大小的方块（而且不报错）。 */
+    check('★ 右下角有 resize 手柄（文本框 + 图片各一个）',
+      (layer.match(/class="gmark-resize"/g) || []).length >= 2
+      && /\.gmark-label \.gmark-resize, \.gmark-imgbox \.gmark-resize \{/.test(csv), null);
     check('★ 手柄在画笔/橡皮/框题/分割模式下关掉（想落笔不该变成调大小）',
-      /\.gmark-layer\.mode-ink \.gmark-label \.gmark-resize[\s\S]{0,200}display: none/.test(csv), null);
+      // 组规则从 4 条扩到 8 条（图片手柄同理要关），字符窗口跟着放宽
+      /\.gmark-layer\.mode-ink \.gmark-label \.gmark-resize[\s\S]{0,420}display: none/.test(csv), null);
     check('★ 尺寸写进 geo 四元组，不借 width（width 是笔迹粗细）',
       /geo: \[Math\.round\(x1\), Math\.round\(y1\), Math\.round\(x1 \+ w\), Math\.round\(y1 \+ h\)\]/.test(hw), null);
     check('resize 松手走同一条 PATCH（emit move + geo）',
@@ -397,8 +403,13 @@ async function main() {
           谁把它挪到前面也照样绿，而实际已经失效。
        ② 模板里 `v-html` 必须在**内层** body 上，不能挂到 `.gmark-label` 自己身上：
           挂外层会把右下角的 resize 手柄一起 innerHTML 覆盖掉（手柄永远消失）。 */
-    const groupRule = csv.indexOf('.gmark-layer.mode-cross .gmark-label { pointer-events: none; }');
-    const textOverride = csv.indexOf('.gmark-layer.mode-text .gmark-label { pointer-events: auto;');
+    /* ⚠️ 别再用 indexOf 找整行字面量：那两组规则在 0039 里各多了一个选择器
+       （`.gmark-imgbox`），逐字匹配会**假红** —— 而假红比漏测更坏，它逼人去改断言而不是改代码。
+       这里只关心「两条规则的先后」，正则放松到「组首 → pointer-events」。 */
+    const groupRule = csv.search(
+      /\.gmark-layer\.mode-cross \.gmark-label,[\s\S]{0,340}\{ pointer-events: none; \}/);
+    const textOverride = csv.search(
+      /\.gmark-layer\.mode-text \.gmark-label,\s*\.gmark-layer\.mode-text \.gmark-imgbox \{ pointer-events: auto;/);
     check('★ 文字模式下文本框重新接收指针（不然「刚写完想挪一下」按下去毫无反应）',
       textOverride > 0, textOverride);
     check('★★ 这条覆盖规则必须排在那组 pointer-events:none **之后**（同特异性靠顺序取胜）',

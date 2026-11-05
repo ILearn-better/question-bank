@@ -1366,10 +1366,13 @@ class HomeworkGradeMark(Base):
     )
     page_no: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
     kind: Mapped[str] = mapped_column(String, default="box", server_default="box")
-    # box / ellipse / check / cross / arrow / text
+    # box / ellipse / check / cross / arrow / text / ink / image
     geo: Mapped[str] = mapped_column(Text, default="[]", server_default="[]")       # [x0,y0,x1,y1]，0~1000
     points: Mapped[str] = mapped_column(Text, default="[]", server_default="[]")    # 手绘折线，0~1000
     text: Mapped[str] = mapped_column(Text, default="", server_default="")
+    # kind="image" 时老师插到卷面上的那张图，存 URL（`/api/mark-images/xxx.png`，与题干
+    # `image` 同一种形态）。其他 kind 一律空串 —— 一列只服务一种用途，不借 text 复用。
+    image: Mapped[str] = mapped_column(Text, default="", server_default="")
     color: Mapped[str] = mapped_column(String, default="", server_default="")
     # 笔迹粗细，**屏幕像素**（前端配 `vector-effect: non-scaling-stroke`，缩放时不变）；
     # 0 = 没指定，交给样式表（`.gmark .shape { stroke-width: 2.2 }`）。

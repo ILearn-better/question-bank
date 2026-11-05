@@ -38,6 +38,7 @@ from ..schemas import (
 from ..services import grade_basis
 from ..services import grade_export
 from ..services import grade_store as store
+from ..services import images
 
 router = APIRouter(prefix="/api", tags=["homework-grades"])
 
@@ -355,6 +356,39 @@ def delete_mark(mid: int, db: Session = Depends(get_db)):
     except store.GradeError as e:
         raise _fail(e) from e
     return {"ok": True}
+
+
+# ---------------------------------------------------------------- 批注图片（0039）
+@router.post("/homework-grades/{gid}/mark-image")
+def upload_mark_image(gid: int, file: UploadFile = File(...), db: Session = Depends(get_db)):
+    """老师往卷面上插一张图：先传图拿到 URL，再拿这个 URL 去 `POST .../marks`。
+
+    **为什么先传图、再建标注**（不是在同一个请求里把图塞进标注）：
+    图片校验失败（太大 / 不是图）要能单独告诉老师「这张图不行」，而标注的
+    其它字段（坐标、页码）此时还没用过 —— 合成一个请求就得为两种完全不同的
+    失败共用一个状态码，前端只能说一句含糊的话。
+
+    同步 def：几百 KB 的读写不该占事件循环（与 `/api/uploads/image` 同一个理由）。
+    """
+    try:
+        store.get_grade(db, gid)          # gid 不存在就别白落一张图
+    except store.GradeError as e:
+        raise _fail(e) from e
+    data = file.file.read(images.MAX_IMAGE_BYTES + 1)
+    try:
+        return store.save_mark_image(data)
+    except images.ImageRejected as e:
+        raise HTTPException(422, str(e)) from e
+
+
+@router.get("/mark-images/{name}")
+def get_mark_image(name: str):
+    """服务一张批注图片。按 basename 取，杜绝 `../` 穿越。"""
+    p = store.mark_image_path(name)
+    if not p.is_file():
+        raise HTTPException(404, "图片不存在")
+    media = mimetypes.guess_type(p.name)[0] or "image/png"
+    return FileResponse(str(p), media_type=media)
 
 
 # ---------------------------------------------------------------- 一题一区域

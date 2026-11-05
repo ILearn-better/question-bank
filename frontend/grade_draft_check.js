@@ -220,6 +220,35 @@ function fakeStorage({ quota = 0 } = {}) {
           && D.readDraft(12).marks.length === 0);
   }
 
+  /* ---------------- 插入的图片（0039） ----------------
+     三条都要量，各自对应一种「静默丢图」：
+       ① 队列里存得住（pushMark / readDraft 是**手写字段清单**，漏一行就丢）
+       ② localMark 给界面的那条也带图（不然「还没传上去」那几秒只是一块「图丢了」占位）
+       ③ sameMark 把 image 算进签名（两张**不同**的图放在同一位置时，坐标/文字完全一样） */
+  globalThis.localStorage = fakeStorage();
+  {
+    const db = D.createDraft(14, { delay: 5 });
+    const lid = db.pushMark({
+      page_no: 1, kind: 'image', image: '/api/mark-images/gm_abc.png', geo: [10, 20, 210, 260],
+    });
+    const rec = db.marks().find((m) => m.lid === lid);
+    check('① 队列记下了图片 URL', !!rec && rec.image === '/api/mark-images/gm_abc.png',
+      rec && rec.image);
+    db.flush();
+    const back = D.readDraft(14).marks.find((m) => m.lid === lid);
+    check('① 落盘再读回来仍然有图（漏字段 = 补发时变成「图丢了」占位）',
+      !!back && back.image === '/api/mark-images/gm_abc.png', back && back.image);
+    const lm = D.localMark(back);
+    check('② 给界面画的那条也带图', lm.image === '/api/mark-images/gm_abc.png', lm.image);
+    const other = {
+      kind: 'image', image: '/api/mark-images/gm_zzz.png', geo: [10, 20, 210, 260], text: '',
+    };
+    check('③ 同位置的两张**不同**图不是同一笔（否则 reconcile 会把后插的那张出队丢掉）',
+      D.sameMark(lm, other) === false, D.sameMark(lm, other));
+    check('③ 同一条自己跟自己仍然是同一笔（去重还得能去）',
+      D.sameMark(lm, Object.assign({}, lm)) === true, null);
+  }
+
   /* ---------------- 防抖 ---------------- */
   globalThis.localStorage = fakeStorage();
   {
