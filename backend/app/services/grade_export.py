@@ -21,7 +21,7 @@ import math
 from functools import lru_cache
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -53,6 +53,7 @@ _FONT_CANDIDATES = (
 )
 
 MIN_BOX = 30          # 与前端 buildShape 的「最小可视尺寸」一致（勾/叉常只有一个小点）
+MIN_IMG = 40          # 前端 `Math.max(w, 40)` —— 图片框的最小边长（页宽 4%）
 
 
 def _rgb(css: str, fallback: str) -> tuple[int, int, int]:
@@ -371,6 +372,80 @@ def lw_hint(w: int) -> int:
     return max(1, int(round(w * 0.0015)))
 
 
+def _dashed_rect(d: ImageDraw.ImageDraw, box, color, width: int = 3, dash: int = 9) -> None:
+    """虚线框。Pillow 没有虚线，只能一条边一条边地摊点。"""
+    x0, y0, x1, y1 = box
+    step = max(2, dash * 2)
+    for y in (y0, y1):
+        x = x0
+        while x < x1:
+            d.line([(x, y), (min(x + dash, x1), y)], fill=color, width=width)
+            x += step
+    for x in (x0, x1):
+        y = y0
+        while y < y1:
+            d.line([(x, y), (x, min(y + dash, y1))], fill=color, width=width)
+            y += step
+
+
+def _draw_missing(d: ImageDraw.ImageDraw, box, w: int) -> None:
+    """图丢了。**不静默跳过** —— 静默 = 「导出的 PDF 里少一张图」没人知道，
+    老师会把缺图的副本直接发给家长。画个虚线红框写明情况，至少看得见。
+    """
+    color = (220, 38, 38)
+    _dashed_rect(d, box, color, width=max(2, lw_hint(w)))
+    fs = max(12, int(round(w * 0.014)))
+    text = "图片丢失"
+    try:
+        tw = d.textlength(text, font=_font(fs))
+    except (AttributeError, OSError):
+        tw = fs * len(text)
+    cx = (box[0] + box[2]) / 2
+    cy = (box[1] + box[3]) / 2
+    d.text((cx - tw / 2, cy - fs / 2), text, font=_font(fs), fill=color)
+
+
+def _draw_image(layer: Image.Image, d: ImageDraw.ImageDraw, m: HomeworkGradeMark,
+                w: int, h: int, kx: float, ky: float) -> None:
+    """老师插到卷面上的那张图（`kind="image"`，2026-11-06）。
+
+    ⚠️ **拉伸铺满 geo 框（fill），不做等比留白**。屏幕上 `.gmark-img` 就是
+    `object-fit: fill`，老师是照着屏幕调的大小和比例；这边擅自等比缩放，
+    导出的图会比看到的窄一圈，图里的箭头就指偏了。要「看起来一样」，
+    只能跟屏幕用同一条规则。
+
+    ⚠️ `m.image` 存的是 `/api/mark-images/xxx.png`，取文件名交给
+    `store.mark_image_path()`（它自己 `basename`）—— 别在这里手拼路径，
+    库里万一有 `../` 就变成读本机任意文件了。
+    """
+    q = _quad(m.geo)
+    if q is None:
+        return
+    x0, y0, x1, y1 = q
+    box = (min(x0, x1) * kx, min(y0, y1) * ky, max(x0, x1) * kx, max(y0, y1) * ky)
+    # 最小边长跟前端 `Math.max(w, 40)` 对齐：屏幕上能看见的一条（老数据的零面积点、
+    # 或者老师把框缩到极窄），导出别缩成 1px 的像素点。
+    bw = max(1, int(round(max(box[2] - box[0], MIN_IMG * kx))))
+    bh = max(1, int(round(max(box[3] - box[1], MIN_IMG * ky))))
+
+    url = (m.image or "").strip()
+    name = url.rsplit("/", 1)[-1] if "/" in url else ""
+    path = store.mark_image_path(name) if name else None
+    if path is None or not path.is_file():
+        _draw_missing(d, box, w)
+        return
+    try:
+        with Image.open(path) as src:
+            # 手机截图常带 EXIF 方向；不转会横躺着贴上卷面
+            im = ImageOps.exif_transpose(src)
+            im = im.convert("RGBA").resize((bw, bh), Image.LANCZOS)
+    except Exception:          # noqa: BLE001 —— 坏图 / 格式不支持，别让整页导不出来
+        _draw_missing(d, box, w)
+        return
+    # 用自身当 mask：PNG 的透明区不该变成白块。跨出画布的部分 Pillow 自己裁。
+    layer.paste(im, (int(round(box[0])), int(round(box[1]))), im)
+
+
 def _render_page(png: Path, marks: list[HomeworkGradeMark]) -> Image.Image:
     base = Image.open(png).convert("RGBA")
     w, h = base.size
@@ -379,8 +454,13 @@ def _render_page(png: Path, marks: list[HomeworkGradeMark]) -> Image.Image:
     kx, ky = w / 1000.0, h / 1000.0
     for m in marks:
         try:
-            if (m.kind or "") == "text":
+            kind = (m.kind or "").strip()
+            if kind == "text":
                 _draw_text(layer, d, m, w, h, kx, ky)
+            elif kind == "image":
+                # ⚠️ 顺序即层序：`marks` 按 id（= 创建先后）取出来，图片插在哪一层
+                #    就画在哪一层，跟屏幕上 `zOf()` 的 ord 是同一个意思。
+                _draw_image(layer, d, m, w, h, kx, ky)
             else:
                 _draw_one(d, m, w, h, kx, ky)
         except Exception:          # noqa: BLE001 —— 一条画坏了不该让整页导不出来
