@@ -81,6 +81,13 @@
  *   只影响看得见看不见，不影响谁接事件 —— 抬高不会有副作用。 */
 .gmark-layer { position: absolute; inset: 0; pointer-events: none; z-index: 20; }
 .gmark-svg { display: block; width: 100%; height: 100%; }
+/* ★ 一条标注一个节点（0039）：层级按创建先后，由组件算好写在 inline z-index 上。
+   ⚠️ 节点自己必须 pointer-events:none —— 它铺满整页，打开就等于「整页都点不动」。
+      命中由里面的 .gmark / .gmark-label / .gmark-imgbox 各自打开。
+   ⚠️ 这两页不引 app.css，改样式必须两份一起改（见本文件开头那段）。 */
+.gmark-node { position: absolute; inset: 0; pointer-events: none; }
+/* 图形类标注各自一个 svg：尺寸要在这里补，`.gmark-svg` 那条只认根节点那一张。 */
+.gmark-node > svg.gmark { display: block; width: 100%; height: 100%; }
 .gmark { pointer-events: auto; cursor: pointer; }
 .gmark-hit { fill: transparent; }
 .gmark .shape { stroke-width: 2.2; vector-effect: non-scaling-stroke; }
@@ -92,6 +99,22 @@
 /* 可拖的标注（框类）给「抓手」光标 —— 用户得先知道这东西能拖，否则永远发现不了 */
 .gmark.mv { cursor: grab; }
 .gmark.mv.drag { cursor: grabbing; }
+/* 正在画的那一笔：单独一层压在所有标注之上（z-index 必须大于组件的 Z_TOP + 条数）。 */
+.gmark-live { position: absolute; inset: 0; width: 100%; height: 100%;
+              pointer-events: none; z-index: 999; }
+/* 插入的图片（0039）：与文本框同一套「绝对定位 + 百分比尺寸」，所以拖/缩/删全复用。 */
+.gmark-imgbox { position: absolute; pointer-events: auto; cursor: grab;
+                outline: 1px dashed rgba(37, 99, 235, .45); outline-offset: 0; }
+.gmark-img { display: block; width: 100%; height: 100%; object-fit: fill;
+             user-select: none; -webkit-user-drag: none; }
+.gmark-imgbox.mv { cursor: grab; }
+.gmark-imgbox.drag { cursor: grabbing; box-shadow: 0 3px 12px rgba(0, 0, 0, .25); }
+.gmark-imgbox.sel { outline: 2px solid var(--primary); }
+.gmark-imgbox.act { outline: 2px solid var(--primary); box-shadow: 0 0 0 3px var(--primary-weak); }
+/* 图丢了（文件被删 / 老记录）：画一块能看见、能点、能删的占位。 */
+.gmark-img-miss { display: flex; align-items: center; justify-content: center;
+                  width: 100%; height: 100%; min-height: 28px; font-size: 11px;
+                  color: #b91c1c; background: rgba(254, 226, 238, .9); }
 /* 文字标注走 HTML：SVG 的 <text> 在非等比 viewBox 里会被横向压扁 */
 .gmark-label { position: absolute; transform: translate(0, -100%);
                pointer-events: auto; cursor: grab; font-size: 11px; line-height: 1.4;
@@ -143,7 +166,7 @@
    在扫描件上基本看不见，老师根本不知道那里能拖（「没办法缩放」的另一半原因）。
    现在是**框外**一个 12×12 的白色小方块（描边跟批注同色），一眼能看见；
    落点故意放 `-7px`：贴在框外的右上角视觉上就等于「右下角」，但不会被内容/滚动条压住。 */
-.gmark-label .gmark-resize {
+.gmark-label .gmark-resize, .gmark-imgbox .gmark-resize {
   position: absolute; right: -7px; bottom: -7px; width: 12px; height: 12px;
   box-sizing: border-box;
   border: 2px solid currentColor; border-radius: 3px; background: #fff;
@@ -156,14 +179,18 @@
 }
 /* 命中区比看到的再大一圈：12px 的方块用笔点很容易点空。
    伪元素属于这个 <i>，指针事件仍然算在它头上，startResize 照样收得到。 */
-.gmark-label .gmark-resize::after { content: ''; position: absolute; inset: -7px; }
-.gmark-label .gmark-resize:hover { background: currentColor; }
+.gmark-label .gmark-resize::after, .gmark-imgbox .gmark-resize::after { content: ''; position: absolute; inset: -7px; }
+.gmark-label .gmark-resize:hover, .gmark-imgbox .gmark-resize:hover { background: currentColor; }
 /* 画笔/橡皮/框题模式下文字标签不收指针（见下面 .mode-* 那组），手柄跟着一起关，
    否则「想落笔」会变成「在调框大小」。 */
 .gmark-layer.mode-ink .gmark-label .gmark-resize,
 .gmark-layer.mode-erase .gmark-label .gmark-resize,
 .gmark-layer.mode-region .gmark-label .gmark-resize,
-.gmark-layer.mode-line .gmark-label .gmark-resize { display: none; }
+.gmark-layer.mode-line .gmark-label .gmark-resize,
+.gmark-layer.mode-ink .gmark-imgbox .gmark-resize,
+.gmark-layer.mode-erase .gmark-imgbox .gmark-resize,
+.gmark-layer.mode-region .gmark-imgbox .gmark-resize,
+.gmark-layer.mode-line .gmark-imgbox .gmark-resize { display: none; }
 .gmark-label.sel { font-weight: 600; box-shadow: 0 0 0 2px var(--primary-weak); }
 .gmark-label.drag { cursor: grabbing; box-shadow: 0 3px 12px rgba(0, 0, 0, .2); z-index: 3; }
 /* 选中态（点中某一处批注 → 底部出操作条）。与 app.css 那份逐字一致 ——
@@ -367,12 +394,16 @@
 .gmark-layer.mode-cross .gmark,
 .gmark-layer.mode-ink .gmark-label, .gmark-layer.mode-erase .gmark-label,
 .gmark-layer.mode-text .gmark-label, .gmark-layer.mode-check .gmark-label,
-.gmark-layer.mode-cross .gmark-label { pointer-events: none; }
+.gmark-layer.mode-cross .gmark-label,
+.gmark-layer.mode-ink .gmark-imgbox, .gmark-layer.mode-erase .gmark-imgbox,
+.gmark-layer.mode-check .gmark-imgbox, .gmark-layer.mode-cross .gmark-imgbox
+{ pointer-events: none; }
 /* ★ 但**文字模式下，已有的文本框要能拖**（用户 2026-10-20：「我还需要文本框可以移动」）。
  *   只放开 label，SVG 那堆图形仍是 pointer-events:none —— 否则在文字模式下
  *   想把框挪一下，点下去反而又插了一个新框。
  *   位置必须在这组「手写模式让标注失指针」的规则**之后**：同权重，后写的胜。 */
-.gmark-layer.mode-text .gmark-label { pointer-events: auto; cursor: grab; }
+.gmark-layer.mode-text .gmark-label,
+.gmark-layer.mode-text .gmark-imgbox { pointer-events: auto; cursor: grab; }
 
 /* ---------------- 一题一区域（框题）----------------
    与标注同一条 svg、同一套 0~1000 坐标，但语义不同：
@@ -381,7 +412,8 @@
 .gmark-layer.mode-region { pointer-events: auto; touch-action: none; cursor: crosshair; }
 /* 画框时已有标注必须失去指针，否则起手那一下就被某条标注吃掉（同画笔那条坑） */
 .gmark-layer.mode-region .gmark,
-.gmark-layer.mode-region .gmark-label { pointer-events: none; }
+.gmark-layer.mode-region .gmark-label,
+.gmark-layer.mode-region .gmark-imgbox { pointer-events: none; }
 .gmark-region { pointer-events: auto; cursor: pointer; }
 .rg-rect { fill: rgba(37, 99, 235, .05); stroke: #2563eb; stroke-width: 1.8;
            stroke-dasharray: 8 6; vector-effect: non-scaling-stroke; }
@@ -402,6 +434,7 @@
    老师点哪里都在点段，一条新线也画不出来。段的删除走右栏面板。 */
 .gmark-layer.mode-line .gmark,
 .gmark-layer.mode-line .gmark-label,
+.gmark-layer.mode-line .gmark-imgbox,
 .gmark-layer.mode-line .rg-rect,
 .gmark-layer.mode-line .gl-band { pointer-events: none; }
 .gl-band { fill: rgba(217, 119, 6, .045); }
@@ -825,6 +858,14 @@
                       @click="inkColor = c"></span>
               </span>
               <span class="tool-sep"></span>
+              <!-- 插图（0039）：另一张纸上的草稿、题目截图，贴到卷面某一处。
+                   落点页 = 老师最后碰过的那一页（见 onPageDown 里的 imgPage）。
+                   层序与笔迹、文本框同一条线 —— 谁先放谁在下（GradeMarkLayer 的 zOf）。 -->
+              <el-button size="small" plain :disabled="!gid || markImgBusy"
+                         :loading="markImgBusy" @click="pickMarkImage"
+                         title="把一张图片贴到卷面上（可拖动、可缩放、Ctrl+Z 可撤销）">🖼 图片</el-button>
+              <input ref="markImgInput" type="file" accept="image/*" style="display:none"
+                     @change="onMarkImage">
               <!-- ★ 撤销（Ctrl+Z）。按钮是给「想不起来快捷键」的时候用的；
                    真正的入口是键盘 —— 画错一笔的手是停在纸上的，不该先去点按钮。 -->
               <el-button size="small" plain :disabled="!undoStack.length || undoBusy"
@@ -961,7 +1002,7 @@
                         再传一遍会同一样东西画两遍。 -->
                 <grade-mark-layer v-if="marksReady" :marks="marksOf(pno)" :mode="layerMode"
                                   :color="inkColor" :pen-width="inkWidth" :selected-item-id="selItem"
-                                  :active-mark-id="pickedText ? pickedText.id : null"
+                                  :active-mark-id="pickedAct ? pickedAct.id : null"
                                   @create="(p) => addMark(pno, p)" @stamp="(p) => addMark(pno, p)"
                                   @erase="eraseMarks" @move="moveMark"
                                   @select-mark="onSelectMark" @edit-mark="onEditMark"
@@ -1372,17 +1413,19 @@
     </template>
   </el-dialog>
 
-  <!-- ★ 点中一处文本框后，底部浮出这条操作条（2026-10-28 用户定的口径：
+  <!-- ★ 点中一处批注后，底部浮出这条操作条（2026-10-28 用户定的口径：
        「编辑操作改成选中后出现」）。在这之前，写完的批注**没有任何改法** ——
        除了橡皮擦掉重写，而重写意味着重新摆位置。
-       ⚠️ 只在 `pickedText` 非空时出现（本机还没上传的、非文本的都不给）。 -->
-  <div v-if="pickedText" class="text-actbar">
-    <span class="text-actbar-tip">已选中批注：<b>{{ pickedShort }}</b></span>
+       ⚠️ 只在 `pickedAct` 非空时出现：文本框（改字 / 删除）与插入的图片（删除 / 调大小）。
+          本机还没上传的那些不给 —— 见 pickedAct 的说明。 -->
+  <div v-if="pickedAct" class="text-actbar">
+    <span class="text-actbar-tip">已选中{{ pickedAct.kind === 'image' ? '图片' : '批注' }}：<b>{{ pickedShort }}</b></span>
     <!-- 老师报「没办法缩放」，一半原因是那个手柄在扫描件上根本不起眼 ——
          选中后直接把「怎么改大小」写出来，别让人猜。 -->
-    <span class="text-actbar-hint">拖右下角的小方块可改大小</span>
+    <span class="text-actbar-hint">{{ pickedAct.kind === 'image'
+      ? '按住图片可移动；拖右下角的小方块可改大小' : '拖右下角的小方块可改大小' }}</span>
     <span style="flex:1"></span>
-    <el-button size="small" @click="openTextEdit(pickedText)">✏️ 编辑文字</el-button>
+    <el-button v-if="pickedText" size="small" @click="openTextEdit(pickedText)">✏️ 编辑文字</el-button>
     <el-button size="small" type="danger" plain @click="deletePicked">🗑 删除</el-button>
     <el-button size="small" text @click="pickedMark = null" title="取消选中">✕</el-button>
   </div>
@@ -1688,6 +1731,10 @@ const app = createApp({
        *  ⚠️ 与 `selItem` 不是一回事：`selItem` 是**那道题**（item_id），
        *     文本框的 item_id 是 null，两者不能互相顶替。 */
       pickedMark: null,
+      /** 插图（0039）落在哪一页：`onPageDown` 里随手记「最后碰过的页」。
+       *  这一页是多页竖排、没有"当前页"状态，而插图按钮在工具栏 —— 只能这么定。 */
+      imgPage: 1,
+      markImgBusy: false,
       /** 标注层是**动态 import** 的 ESM 组件，加载完才挂。
        *  挂早了 <grade-mark-layer> 是「未知元素」，Vue 只当普通标签渲染 ——
        *  按钮都在、笔迹画不出来，控制台一声不响。 */
@@ -1717,15 +1764,29 @@ const app = createApp({
      *     而现在只有「加一条」没有「改一条」，勉强做半套反而会发出注定 422 的请求
      *     （`PATCH /grade-marks/{mid}` 的 mid 是 int，`local:` 解析不了）。
      *     那 1~2 秒的窗口里按下去没反应，比「看着改了、其实没改」好。 */
-    pickedText() {
+    /** 底部操作条服务两类批注：**文本框**（改字）与**插入的图片**（删除 / 调大小）。
+     *  ⚠️ 本机队列里的（`local:` 前缀）不给 —— 改它得先改队列里的那条，
+     *     而现在只有「加一条」没有「改一条」，勉强做半套反而会发出注定 422 的请求
+     *     （`PATCH /grade-marks/{mid}` 的 mid 是 int，`local:` 解析不了）。
+     *     那 1~2 秒的窗口里按下去没反应，比「看着改了、其实没改」好。 */
+    pickedAct() {
       const m = this.pickedMark;
-      if (!m || m.kind !== 'text' || !m.id) return null;
+      if (!m || !m.id) return null;
       if (DRAFT && DRAFT.isLocalMarkId(m.id)) return null;
+      if (m.kind !== 'text' && m.kind !== 'image') return null;
       return m;
+    },
+    /** 选中的是一条**文字**批注（只有它才有「编辑文字」这个按钮）。 */
+    pickedText() {
+      const m = this.pickedAct;
+      return m && m.kind === 'text' ? m : null;
     },
     /** 操作条上给老师看的短摘要（长批注一行放不下，但也不能一个字都不给）。 */
     pickedShort() {
-      const t = String((this.pickedText && this.pickedText.text) || '').trim();
+      const m = this.pickedAct;
+      if (!m) return '';
+      if (m.kind === 'image') return '插入的图片';
+      const t = String(m.text || '').trim();
       return t.length > 20 ? (t.slice(0, 20) + '…') : (t || '（空）');
     },
     /** 「返回」的目标 —— **由入口来源决定**（用户 2026-10-21 定的口径）。
@@ -2008,8 +2069,11 @@ const app = createApp({
       const typing = tag === 'INPUT' || tag === 'TEXTAREA' || !!t.isContentEditable;
       /* Esc = 取消选中那处批注（收掉底部操作条）。
        * 放在 Ctrl 判断**之前**：Esc 不带 Ctrl。输入框里不拦 —— 那是「放弃这次编辑」，
-       * 弹框自己处理。 */
-      if (String(e.key || '') === 'Escape' && !typing && this.pickedText) {
+       * 弹框自己处理。
+       * ⚠️ 判据用 `pickedAct || pickedMark`：插入的图片也是「选中了一处批注」，
+       *    只认 pickedText 的话选着图片按 Esc 毫无反应。 */
+      if (String(e.key || '') === 'Escape' && !typing
+          && (this.pickedAct || this.pickedMark)) {
         this.pickedMark = null;
         return;
       }
@@ -2019,9 +2083,13 @@ const app = createApp({
             改键位时**两处都要看**。 */
       const kRaw = String(e.key || '');
       if ((kRaw === 'Delete' || kRaw === 'Backspace') && !typing) {
-        /* ⚠️ 判据用 `pickedText`（同步的 computed），不要用 `this.deletePicked() === false`
-           —— 那个是 async，返回 Promise，`=== false` 永远不成立，等于没选中也吞键。 */
-        if (!this.pickedText) return;
+        /* ⚠️ 判据用 `pickedAct`（同步的 computed），不要用 `this.deletePicked() === false`
+           —— 那个是 async，返回 Promise，`=== false` 永远不成立，等于没选中也吞键。
+           ⚠️ 也**不能**用 `pickedText`：那个只认文本框，而 0039 之后插入的图片
+           同样要能用 Delete 删掉（用户 2026-11-06 点名要求的）。用 pickedText 的
+           后果是「选着图片按 Delete 什么都不发生，而且键还被静默放过」——
+           不报错、不提示，只有真按一下才知道。 */
+        if (!this.pickedAct) return;
         e.preventDefault();
         this.deletePicked();
         return;
@@ -2155,6 +2223,9 @@ const app = createApp({
           page_no: m.page_no, kind: m.kind,
           geo: m.geo || [], points: m.points || [],
           text: m.text || '', color: m.color || '',
+          /* ⚠️ 图片必须一起进快照：撤销擦除是**重新 POST 一条**，
+             少了这个字段，恢复出来的只是一块「图丢了」的占位。 */
+          image: m.image || '',
           item_id: m.item_id || null,
         }));
       if (locals.length) this.dropLocal(locals);
@@ -2250,8 +2321,71 @@ const app = createApp({
         kind: 'text', geo: [d.x, d.y, d.x, d.y], text, color: this.inkColor,
       });
     },
+    /* ==================== 往卷面上插图片（0039） ====================
+     * 用户 2026-11-06：「加入文件插图图片功能……能够删除图片、撤销插入（Ctrl+Z）、
+     * 鼠标拖拽调整图片大小」。
+     * 与 A 路线（`src/views/HomeworkGrade.js`）同一套两步走：**先传图拿 URL，
+     * 再建一条 kind=image 的标注**。合成一个请求的话，「图片太大」和「坐标不合法」
+     * 会共用一句话；而且 geo 要按原图宽高比算 —— 只有浏览器这边知道。
+     *
+     * ★ 撤销不用另做：`addMark` 里已经 `pushUndo({type:'add'})`，
+     *   插图也是一条标注，Ctrl+Z 天然能撤（撤 = 删掉这一条）。
+     */
+    pickMarkImage() {
+      if (!this.gid) return;
+      const el = this.$refs.markImgInput;
+      if (el) el.click();
+    },
+    /** 读一张图的原始像素尺寸。读不到返回 null → 调用方退回方形框。 */
+    imageSize(file) {
+      return new Promise((resolve) => {
+        let url = '';
+        try { url = URL.createObjectURL(file); } catch (e) { resolve(null); return; }
+        const im = new Image();
+        im.onload = () => {
+          const w = im.naturalWidth || 0;
+          const h = im.naturalHeight || 0;
+          URL.revokeObjectURL(url);
+          resolve(w && h ? { w, h } : null);
+        };
+        im.onerror = () => { URL.revokeObjectURL(url); resolve(null); };
+        im.src = url;
+      });
+    },
+    async onMarkImage(e) {
+      const input = e && e.target;
+      const file = (input && input.files && input.files[0]) || null;
+      if (input) input.value = '';        /* 同一个文件再选一次也要能触发 */
+      if (!file || !this.gid) return;
+      const pno = num(this.imgPage, 1);
+      this.markImgBusy = true;
+      try {
+        const sz = await this.imageSize(file);
+        const fd = new FormData();
+        /* 截图工具 / 拖出来的 Blob 常常没名字，补一个 —— 后端按魔数判格式，
+           但 UploadFile 那条路上没有名字会很难排查。 */
+        fd.append('file', file, file.name || ('mark-' + Date.now() + '.png'));
+        const up = await this.api('/api/homework-grades/' + this.gid + '/mark-image',
+          { method: 'POST', body: fd });
+        /* 等比放进页中央：宽定死，高按原图比例算，再夹进 [80, 700]（页高的 8%~70%）。
+           一张竖版长截图按比例能到 1500+，直接铺出去会把整页盖住。 */
+        const w = 360;
+        const h = Math.min(700, Math.max(80, Math.round(sz ? (w * sz.h) / sz.w : w)));
+        const x = Math.round((1000 - w) / 2);
+        const y = Math.round((1000 - h) / 2);
+        await this.addMark(pno, {
+          kind: 'image', image: up.url, geo: [x, y, x + w, y + h], color: this.inkColor,
+        });
+        ElementPlus.ElMessage.success(
+          '第 ' + pno + ' 页放上一张图片 —— 按住可移动，拖右下角可改大小，Ctrl+Z 可撤销');
+      } catch (err) {
+        ElementPlus.ElMessage.error(err.message);
+      } finally {
+        this.markImgBusy = false;
+      }
+    },
     /** 底部操作条上的「删除」。走 eraseMarks 而不是直接 DELETE —— 那里带撤销快照。
-     *  （快捷键那条走的是 `pickedText` 判断，不依赖这里的返回值 —— 这是 async。） */
+     *  （快捷键那条走的是 `pickedAct` 判断，不依赖这里的返回值 —— 这是 async。） */
     async deletePicked() {
       const m = this.pickedMark;
       if (!m || !m.id) return false;
@@ -2417,7 +2551,7 @@ const app = createApp({
           body: JSON.stringify({
             marks: missing.map((m) => ({
               page_no: m.page_no, kind: m.kind, geo: m.geo, points: m.points,
-              text: m.text, color: m.color,
+              text: m.text, color: m.color, image: m.image || '',
               // ⚠️ 别忘了这一行：单笔 `addMark` 是 payload 直传（天然带 width），
               //    补发这条路是**手写的字段清单**，漏一个就静默丢失一个。
               width: m.width || 0,
@@ -3204,6 +3338,10 @@ const app = createApp({
       /* 在卷面空白处按下 = 取消「选中某处标注」。**必须放在所有 return 之前** ——
          「只看」模式下这函数第一行就返回了，而那正是最常取消选中的时候。 */
       this.pickedMark = null;
+      /* 记下「老师最后碰的是哪一页」—— 插图（0039）要有个落点页。
+         这一页是多页竖排、没有"当前页"这个状态，而插图按钮在工具栏（不在卷面上），
+         只能靠这个记号：老师想在哪页放图，先在那一页上点一下再看工具栏。 */
+      this.imgPage = num(pno, 1);
       if (this.tool === 'view') return;
       /* ★★ 手写类工具必须**原样放行**，让事件落到覆盖在上面的 <grade-mark-layer>。
        *

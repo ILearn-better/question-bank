@@ -1282,7 +1282,9 @@ async function main() {
   check('★★★ 手柄 touch-action（none = 触屏/手写笔上拖手柄不会变成滚页面）',
     csGet(resizeEl, 'touchAction'), 'none');
   checkTrue('★★★ 手柄有放大的命中区（12px 用笔点很容易点空）',
-    /\.gmark-label \.gmark-resize::after \{[^}]*inset: -7px/
+    /* 选择器自 0039 起是「label + imgbox」并列，::after 后面跟着一个逗号 ——
+       原来那条「::after {」的写法会假红。这里只要求 ::after 那条规则里有 inset:-7px。 */
+    /\.gmark-label \.gmark-resize::after[^{]*\{[^}]*inset: -7px/
       .test(fs.readFileSync(path.join(ROOT, 'workbench.html'), 'utf8')), null);
   vm.tool = savedTool;
   await sleep(60);
@@ -1725,7 +1727,8 @@ async function main() {
      pointer-events:none —— 于是「加了文本框想挪一下」只能先切「只看」，
      或者在文字模式下再点一下（结果又插了一个新框，越点越多）。 */
   checkTrue('★★ 文字模式下已有的文本框能拖（CSS 放开了 label 的指针）',
-    /\.gmark-layer\.mode-text \.gmark-label\s*\{[^}]*pointer-events:\s*auto/.test(html), true);
+    // 同样：0039 起这一组多了 .gmark-imgbox，原来的「\s*\{」不再成立
+    /\.gmark-layer\.mode-text \.gmark-label,[\s\S]{0,140}pointer-events:\s*auto/.test(html), true);
   const uGML = fs.readFileSync('src/components/GradeMarkLayer.js', 'utf8');
   checkTrue('★★ 组件的可拖模式里包含 text',
     /MOVE_MODES\s*=\s*\[\s*'view'\s*,\s*'text'\s*\]/.test(uGML),

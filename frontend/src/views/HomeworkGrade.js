@@ -1320,6 +1320,9 @@ export default {
         // settle 成功才出队 —— 否则「POST 成功但详情没拉回来」会有一瞬间的空白
         localDraft.dropMarks([lid]);
         syncPending();
+        /* 返回服务端那条（插入图片要靠它「插完就选中」—— 老师刚贴上去就想删/调大小）。
+           失败时返回 null，不抛：调用方各自已经有提示了。 */
+        return created;
       } catch (e) {
         /* 没传上去：这一笔只在队列里，那就在队列里把它挪到老师最后放的位置
            （服务端没有副本，不会撞成两条）。 */
@@ -1329,6 +1332,7 @@ export default {
           syncPending();
         }
         fail(`${e.message} —— 这一笔已经存在本机，下次打开会自动补发`);
+        return null;
       }
     }
 
@@ -1393,6 +1397,9 @@ export default {
           geo: m.geo,
           points: m.points,
           text: m.text,
+          // ⚠️ 手写字段清单，漏一个就静默丢一个。插入的图片（0039）漏了 →
+          //    补发时建出一条 kind=image 但 image 为空的标注（界面上只剩「图丢了」）。
+          image: m.image || '',
           color: m.color,
         })));
         localDraft.dropMarks(missing.map((m) => m.lid));
@@ -1490,16 +1497,25 @@ export default {
       textDraft.value = { x, y, text: '' };
     }
 
-    /** 底部操作条只对「已经落到服务端的文本框」出现。
-     *  本机队列里的（id 带 `local:`）不给 —— PATCH 的 mid 是 int，改了也只会 422。 */
-    const pickedText = computed(() => {
+    /** 底部操作条服务两类批注：**文本框**（改字）与**插入的图片**（删除 / 调大小）。
+     *  只对「已经落到服务端」的那些出现 —— 本机队列里的 id 带 `local:`，
+     *  PATCH / DELETE 的 id 是 int，改了也只会 422。
+     *  （2026-11-06 从「只认文本框」扩开：图片插上去之后要能选中删除，见图片那段。） */
+    const pickedAct = computed(() => {
       const m = pickedMark.value;
-      if (!m || m.kind !== 'text' || !m.id) return null;
+      if (!m || !m.id) return null;
       if (isLocalMarkId(m.id)) return null;
+      if (m.kind !== 'text' && m.kind !== 'image') return null;
       return m;
     });
+    /** 选中的是一条**文字**批注（只有它才有「编辑文字」这个按钮）。 */
+    const pickedText = computed(() => (pickedAct.value && pickedAct.value.kind === 'text'
+      ? pickedAct.value : null));
     const pickedShort = computed(() => {
-      const t = String((pickedText.value && pickedText.value.text) || '').trim();
+      const m = pickedAct.value;
+      if (!m) return '';
+      if (m.kind === 'image') return '插入的图片';
+      const t = String(m.text || '').trim();
       return t.length > 20 ? (t.slice(0, 20) + '…') : (t || '（空）');
     });
     function onSelectMark(m) { pickedMark.value = m || null; }
@@ -1569,6 +1585,75 @@ export default {
         geo: [Math.round(x1), Math.round(y1), Math.round(x1 + w), Math.round(y1 + h)],
         text, color: inkColor.value,
       });
+    }
+
+    /* ---------------- 往卷面上插图片（0039） ----------------
+     * 用户 2026-11-06：「在作业批改处加入文件插图图片功能……并且要求能够删除图片、
+     * 撤销插入（快捷键 ctrl z）、鼠标拖拽调整图片大小」。
+     *
+     * 两条路分开走，不是图省事：
+     *   ① `POST /homework-grades/{gid}/mark-image` 先传图拿 URL
+     *   ② 再带着 URL 建一条 `kind=image` 的标注
+     * 合成一个请求的话，「图片太大」和「坐标不合法」会共用一句错误提示；而且 geo
+     * 要按**图片原始宽高比**算 —— 那是只有浏览器这边才知道的事。
+     *
+     * 落点放**页中央**，插完立刻选中：老师贴上去的第一件事通常是「这个位置不对」，
+     * 底部操作条直接给出「删除」，手不用先去找。
+     */
+    const imgInput = ref(null);
+    const imgBusy = ref(false);
+    const IMG_BOX_W = 360;      // 默认占页宽 36%（与文本框默认 300 同一量级）
+
+    /** 读一张图的原始像素尺寸。读不到返回 null —— 调用方退回一个方形框。 */
+    function imageSize(file) {
+      return new Promise((resolve) => {
+        let url = '';
+        try { url = URL.createObjectURL(file); } catch (e) { resolve(null); return; }
+        const im = new Image();
+        im.onload = () => {
+          const w = im.naturalWidth || 0;
+          const h = im.naturalHeight || 0;
+          URL.revokeObjectURL(url);
+          resolve(w && h ? { w, h } : null);
+        };
+        im.onerror = () => { URL.revokeObjectURL(url); resolve(null); };
+        im.src = url;
+      });
+    }
+
+    function pickMarkImage() {
+      if (readOnly.value) return;
+      const el = imgInput.value;
+      if (el) el.click();
+    }
+
+    async function onMarkImage(e) {
+      const input = e && e.target;
+      const file = (input && input.files && input.files[0]) || null;
+      if (input) input.value = '';      // 清掉 value：同一个文件再选一次也要能触发
+      if (!file) return;
+      imgBusy.value = true;
+      try {
+        const sz = await imageSize(file);
+        const fd = new FormData();
+        fd.append('file', file);
+        const up = await gradeApi.uploadMarkImage(gid, fd);
+        /* 等比放进页中央：宽先定死，高按原图比例算，再夹进 [80, 700]（页高的 8%~70%）。
+           一张竖版长截图按比例能到 1500+，直接铺出去会把整页盖住。 */
+        const w = IMG_BOX_W;
+        const h = Math.min(700, Math.max(80, Math.round(sz ? (w * sz.h) / sz.w : w)));
+        const x = Math.round((1000 - w) / 2);
+        const y = Math.round((1000 - h) / 2);
+        const created = await addMark({
+          kind: 'image', image: up.url, geo: [x, y, x + w, y + h], color: inkColor.value,
+        });
+        if (created && created.id) pickedMark.value = created;   // 插完就选中，立刻能删
+        ok('图片放上去了 —— 按住图片能移动，拖右下角的小方块能改大小');
+      } catch (err) {
+        fail(err.message);
+      } finally {
+        imgBusy.value = false;
+      }
     }
 
     /** 撤销：先退**本机还没传上去的**最后一笔，再退服务端的。
@@ -1884,7 +1969,10 @@ export default {
       tool, inkColor, textDraft, exporting, INK_COLORS, teacherMarks, layerEl, readOnly,
       setTool, addMark, eraseMarks, onTextAt, saveText, moveMark,
       // 选中一处批注 → 底部操作条（改文字 / 删除）
-      pickedMark, pickedText, pickedShort, onSelectMark, onEditMark, openTextEdit, deletePicked,
+      pickedMark, pickedAct, pickedText, pickedShort, onSelectMark, onEditMark, openTextEdit,
+      deletePicked,
+      // 往卷面上插图片（0039）：选文件 → 传图 → 建一条 kind=image 的标注
+      imgInput, imgBusy, pickMarkImage, onMarkImage,
       undoLast, clearPageMarks, exportFile, archiveGrade,
       // 本机草稿：待发笔迹 / 补发
       pendingMarks, pendingUnsent, flushPending,
@@ -2097,6 +2185,12 @@ export default {
                     @click="setTool('line')">逐题分割</button>
             <button class="g-tool" :class="{ on: tool === 'region' }" title="框出每道题的作答范围：有框就一题一裁一判，比整页判准得多"
                     @click="setTool('region')">框题</button>
+            <!-- 插图（0039）：另一张纸上的草稿、题目截图，贴到卷面某一处。
+                 层序与笔迹、文本框同一条线 —— 谁先放谁在下（见 GradeMarkLayer 的 zOf）。 -->
+            <button class="g-tool" :disabled="imgBusy" title="把一张图片贴到卷面上（可拖动、可缩放、可撤销）"
+                    @click="pickMarkImage">{{ imgBusy ? '插入中…' : '图片' }}</button>
+            <input ref="imgInput" type="file" accept="image/*" class="g-file-hidden"
+                   @change="onMarkImage">
             <button v-for="c in INK_COLORS" :key="c.v" class="g-color" :class="{ on: inkColor === c.v }"
                     :style="{ background: c.v }" :title="c.n" @click="inkColor = c.v"></button>
             <div class="spacer"></div>
@@ -2124,7 +2218,7 @@ export default {
             <!-- ⚠️ 成对写，别写成自闭合：零构建的模板里自闭合会把后面的节点吞掉 -->
             <GradeMarkLayer ref="layerEl" :marks="pageMarks" :selected-item-id="selectedItemId"
                             :mode="readOnly ? 'view' : tool" :color="inkColor"
-                            :active-mark-id="pickedText ? pickedText.id : null"
+                            :active-mark-id="pickedAct ? pickedAct.id : null"
                             :regions="layerRegions" :lines="layerLines" :bands="pageBands"
                             :tail="pageTail"
                             @pick="onPick" @create="addMark" @erase="eraseMarks"
@@ -2400,13 +2494,14 @@ export default {
     <!-- 文字框：点完位置弹出来。零构建不引第三方弹窗，自己写一层遮罩就够 -->
     <!-- ★ 点中一处批注后浮在底部的操作条（与批改工作台同一套口径：
          编辑操作**选中后出现**）。在这之前写完的批注没有任何改法。 -->
-    <div v-if="pickedText" class="g-actbar">
-      <span class="g-actbar-tip">已选中批注：<b>{{ pickedShort }}</b></span>
+    <div v-if="pickedAct" class="g-actbar">
+      <span class="g-actbar-tip">已选中{{ pickedAct.kind === 'image' ? '图片' : '批注' }}：<b>{{ pickedShort }}</b></span>
       <!-- 老师报「没办法缩放」，一半原因是那个手柄在扫描件上根本不起眼 ——
            选中后直接把「怎么改大小」写出来，别让人猜。 -->
-      <span class="g-actbar-hint">拖右下角的小方块可改大小</span>
+      <span class="g-actbar-hint">{{ pickedAct.kind === 'image'
+        ? '按住图片可移动；拖右下角的小方块可改大小' : '拖右下角的小方块可改大小' }}</span>
       <div class="spacer"></div>
-      <button class="btn sm" @click="openTextEdit(pickedText)">✏️ 编辑文字</button>
+      <button v-if="pickedText" class="btn sm" @click="openTextEdit(pickedText)">✏️ 编辑文字</button>
       <button class="btn ghost sm" style="color:#dc2626" @click="deletePicked">🗑 删除</button>
       <button class="btn ghost sm" title="取消选中（Esc）" @click="pickedMark = null">✕</button>
     </div>

@@ -889,8 +889,16 @@ def t_frontend() -> None:
     check("界面写明「不给分」", "不给分" in view)
     check("判不了必须能显示原因（不能只显示一个灰点）", "naReason" in view)
 
-    # 文件选择不能设 accept（会挡掉 .lnk 之类）
-    check("文件 input 没设 accept", "accept=" not in view and "accept=" not in layer)
+    # 文件选择不能设 accept（会挡掉 .lnk 之类）。
+    # ⚠️ 口径是**按 input 标签**，不是「整个文件里不出现 accept=」（2026-11-06 改）：
+    #    图片插图那个 input（`ref="imgInput"`）设 `accept="image/*"` 是**项目惯例**
+    #    （FeedbackDialog / HomeworkDialog / Notes / entry.html 全都这么写），它只收图片；
+    #    而「老师什么都可能选」的入口 —— 作业文件、判定依据 —— **一律不设 accept**。
+    _fins = re.findall(r"<input\b[^>]*type=\"file\"[^>]*>", view + layer)
+    _keep = [t for t in _fins if 'ref="imgInput"' not in t]
+    check("文件 input 没设 accept",
+          bool(_fins) and all("accept=" not in t for t in _keep),
+          [t[:60] for t in _keep] or "一个 file input 都没抓到")
 
     # ★ 手写批改（2026-10-17 用户要求：能画 / 能擦 / 能放文本框 / 手动批改 / 导出）
     check("工具条有画笔 / 橡皮 / 文字框",
@@ -2214,8 +2222,13 @@ def t_answer_images() -> None:
         check("设置区有「直接传照片」入口", "直接传照片" in view)
         check("★ 上传后立刻把文件 id 挂进判定依据（不是等老师再点一次保存）",
               "answer_file_ids: setupAnswerFiles.value" in view)
+        # ⚠️ 按 input 标签判（见上面第一条同名断言的理由）：插图那个 input 是
+        #    `accept="image/*"`，这里只盯「什么都可能选」的那几个。
+        _fins = re.findall(r"<input\b[^>]*type=\"file\"[^>]*>", view)
+        _keep = [t for t in _fins if 'ref="imgInput"' not in t]
         check("★ file input 不设 accept（本机经验：accept 会把老师要选的文件藏起来）",
-              "accept=" not in view)
+              bool(_fins) and all("accept=" not in t for t in _keep),
+              [t[:60] for t in _keep])
         check("上传走这一课的文件接口（role=homework，与提交件同一份清单）",
               "lessonFilesApi.upload(detail.value.lesson_id, fd, 'homework')" in view)
     finally:

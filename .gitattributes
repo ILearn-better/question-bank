@@ -1,0 +1,10 @@
+# 行尾由 .bat 自己说了算。
+#
+# 为什么要这条：全局 `core.autocrlf=true`，GBK/UTF-8 + CRLF 的 .bat 第一次 `git add`
+# 会被静默转成 LF。本地看不出来（工作区还是 CRLF），别人 clone 之后双击报错，
+# 而报错位置指向「goto :eof」那种和文件内容无关的行 —— 极难查。
+#
+# ⚠️ 加了这条之后**必须重算索引**：单跑 `git add -A` 不会把已入库的 .bat 重新转换，
+#    要 `git rm --cached -- "*.bat"` 再 `git add -- "*.bat"`，
+#    然后用 `git ls-files --eol` 确认是 `i/crlf w/crlf attr/-text`。
+*.bat -text

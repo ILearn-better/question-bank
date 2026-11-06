@@ -101,6 +101,9 @@ export function readDraft(gid, now = Date.now()) {
       geo: Array.isArray(m.geo) ? m.geo : [],
       points: Array.isArray(m.points) ? m.points : [],
       text: String(m.text || ''),
+      // 插入的图片（0039）。⚠️ 漏这一行 = 队列里的图**静默丢掉**：
+      // 下次补发会建出一条 kind=image、image 为空的标注（界面上只剩「图丢了」占位）。
+      image: String(m.image || ''),
       color: String(m.color || ''),
       // 笔迹粗细（0033）。老草稿没有这个字段 → 0 = 走样式表默认，行为不变
       width: Math.max(0, Number(m.width) || 0),
@@ -205,6 +208,7 @@ export function createDraft(gid, { delay = 250 } = {}) {
       geo: Array.isArray(payload && payload.geo) ? payload.geo : [],
       points: Array.isArray(payload && payload.points) ? payload.points : [],
       text: String((payload && payload.text) || ''),
+      image: String((payload && payload.image) || ''),
       color: String((payload && payload.color) || ''),
       // ⚠️ 必须跟着存：补发走的是**批量接口**（手写字段清单），漏了就不报错地丢
       width: Math.max(0, Number((payload || {}).width) || 0),
@@ -281,6 +285,7 @@ export function localMark(rec) {
     geo: rec.geo,
     points: rec.points,
     text: rec.text,
+    image: rec.image || '',
     color: rec.color,
     width: rec.width || 0,
     created_by: 'teacher',
@@ -302,6 +307,9 @@ export function sameMark(a, b) {
     (m.geo || []).map((n) => Math.round(Number(n) || 0)),
     (m.points || []).map((n) => Math.round(Number(n) || 0)),
     String(m.text || ''),
+    // ⚠️ 必须带上：两张**不同**的图插在同一个位置时，坐标/文字完全一样 ——
+    //    漏了这一项，reconcile 会把后插的那张认成「服务端已经有了」直接出队丢掉。
+    String(m.image || ''),
   ]);
   return sig(a) === sig(b);
 }

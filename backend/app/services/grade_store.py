@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -54,7 +55,7 @@ from ..schemas import (
     GradeSetupPatch,
     GradeToBankIn,
 )
-from . import grade_basis, knowledge, storage
+from . import grade_basis, images, knowledge, storage
 
 # 页 = 一次模型调用。并发数与 batch_page 同一个量级：再高只是把模型的限流打满。
 WORKERS = 3
@@ -326,6 +327,9 @@ def mark_dict(m: HomeworkGradeMark) -> dict:
         "geo": _json_list(m.geo),
         "points": _json_list(m.points),
         "text": m.text,
+        # 0039：老师在卷面上插入的图片（只有 kind="image" 才有）。URL 形态与题干 image 一致，
+        # 前端 `<img :src>` 直接用，不需要再拼前缀。
+        "image": m.image or "",
         "color": m.color,
         "width": float(m.width or 0),
         "created_by": m.created_by,
@@ -2380,6 +2384,45 @@ def to_bank(db: Session, iid: str, payload: GradeToBankIn) -> HomeworkGradeItem:
 
 
 # ---------------------------------------------------------------- 标注
+# 批注图片的 URL 前缀。**上传端点、清洗函数、前端拼 URL 三处共用这一个字符串**
+# （前端在 GradeMarkLayer 里另有同名常量注释）—— 各写一份的话，改了一处另两处
+# 就静默拒绝 / 静默 404，表现都是「插进卷面的图不显示」，而且不报错。
+MARK_IMAGE_PREFIX = "/api/mark-images/"
+
+
+def _clean_mark_image(url: str | None) -> str:
+    """只认本系统自己发出的批注图 URL，别的一律收成空串。
+
+    为什么必须收口：这个字段会直接进前端 `img.src`。放任存 `http://别的站/x.png`
+    就等于「打开一份批改」会自动去拉外部资源（跟踪像素 / 内网探测），
+    而库里那条记录看起来还是一条正常批注。只认「自家前缀 + 纯文件名」就够了。
+    """
+    s = (url or "").strip()
+    if not s.startswith(MARK_IMAGE_PREFIX):
+        return ""
+    name = s[len(MARK_IMAGE_PREFIX):]
+    # 不许带子路径、不许 `..` —— 服务端点本身只按 basename 取文件，这里提前挡一层，
+    # 免得库里存进一条「长得像 URL、其实指向别处」的记录。
+    if not name or "/" in name or "\\" in name or name.startswith("."):
+        return ""
+    return MARK_IMAGE_PREFIX + name
+
+
+def save_mark_image(data: bytes) -> dict:
+    """老师插到卷面上的图片落盘，返回 `{url, name, size_bytes}`。
+
+    校验（魔数 / 大小上限）全部复用 `images.save_image` —— 与补答案传图同一套，
+    别在这里自己 sniff：多一套判定就多一条「某种格式能传、另一种不能」的缝。
+    """
+    saved = images.save_image(data, config.GRADE_MARKS_DIR, prefix="gm")
+    return {"url": MARK_IMAGE_PREFIX + saved["name"], **saved}
+
+
+def mark_image_path(name: str) -> Path:
+    """批注图片的真实路径（服务端点用）。只取 basename，杜绝路径穿越。"""
+    return config.GRADE_MARKS_DIR / os.path.basename(name or "")
+
+
 def _norm_geo(values) -> list[int]:
     """坐标一律 0~1000 的整数（按页归一化，前端 viewBox 直接吃）。
 
@@ -2407,6 +2450,9 @@ def _mark_row(grade: HomeworkGrade, payload: GradeMarkIn, created_by: str) -> Ho
         geo=json.dumps(_norm_geo(payload.geo)),
         points=json.dumps(_norm_geo(payload.points)),
         text=payload.text or "",
+        # ★ 图片只在 kind="image" 时才收：否则一条 `kind=ink` 的记录会带着一张
+        #   「永远不显示、却一直占着盘」的图，排查时只看 kind 根本找不到它。
+        image=_clean_mark_image(payload.image) if payload.kind == "image" else "",
         color=payload.color or "",
         # 铂笔粗细：0 = 走样式表默认；负数/天文数字都夹回来，否则SVG里这一笔会消失或扑屏。
         width=max(0.0, min(200.0, _num(payload.width) or 0.0)),
@@ -2489,10 +2535,16 @@ def patch_mark(db: Session, mid: int, payload: GradeMarkPatch) -> HomeworkGradeM
         m.points = json.dumps(_norm_geo(fields["points"]))
     if "text" in fields:
         m.text = fields["text"] or ""
+    if "image" in fields:
+        m.image = _clean_mark_image(fields["image"])
     if "color" in fields:
         m.color = fields["color"] or ""
     if "kind" in fields:
         m.kind = fields["kind"]
+        # 从「图片」改成别的形状 = 那张图再没有任何入口，字段跟着清掉。
+        # ⚠️ 文件**不删** —— 老师用 Ctrl+Z 撤销后要能重新指回来（见 delete_mark 的说明）。
+        if fields["kind"] != "image":
+            m.image = ""
     # 老师动过的标注就归老师：模型给的框只可信到"哪一带"，拖动之后不能再算 AI 猜的。
     m.created_by = "teacher"
     db.commit()
@@ -2500,6 +2552,16 @@ def patch_mark(db: Session, mid: int, payload: GradeMarkPatch) -> HomeworkGradeM
 
 
 def delete_mark(db: Session, mid: int) -> None:
+    """删一条标注。**只删库里的行，不删它指向的图片文件**。
+
+    为什么图片不跟着删（2026-11-06 的决定）：
+      · 老师是要「撤销」的（Ctrl+Z 就是删掉刚插的那一张），文件没了就再也恢复不出来 ——
+        撤销反悔的代价是「图彻底丢了」，而留着的代价只是几百 KB 磁盘。
+      · 项目里所有删除都是「库先改、文件后删」的引用计数口径（services/crops.py）。
+        批注图的主人是批注行，可一条图只被一行引用，没有第二处能证明「还有人要它」，
+        所以这里干脆不做回收 —— 谁要做清理，请写一条「扫 GRADE_MARKS_DIR 减全库
+        homework_grade_marks.image」的独立任务，别塞进删除路径。
+    """
     m = _mark_or_404(db, mid)
     db.delete(m)
     db.commit()

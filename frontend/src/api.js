@@ -432,6 +432,11 @@ export const gradeApi = {
   addMarks: (gid, marks) => api.post(`/api/homework-grades/${gid}/marks/batch`, { marks }),
   patchMark: (mid, body) => api.patch(`/api/grade-marks/${mid}`, body),
   removeMark: (mid) => api.del(`/api/grade-marks/${mid}`),
+  /** 往卷面上插一张图（0039）：**先传图拿 URL，再带着这个 URL 建标注**。
+   *  两步走是为了让「这张图不行」能单独报出来 —— 合成一个请求的话，图片格式错和
+   *  坐标错会共用同一句话，老师看不出该怎么改。 */
+  uploadMarkImage: (gid, formData) =>
+    api.upload(`/api/homework-grades/${gid}/mark-image`, formData),
 };
 
 export const systemApi = {

@@ -763,10 +763,13 @@ class GradeMarkIn(BaseModel):
     """
 
     page_no: int = 1
-    kind: Literal["box", "ellipse", "check", "cross", "arrow", "text", "ink"] = "box"
+    kind: Literal["box", "ellipse", "check", "cross", "arrow", "text", "ink", "image"] = "box"
     geo: List[float] = Field(default_factory=list)      # [x0, y0, x1, y1]
     points: List[float] = Field(default_factory=list)   # 手绘折线 [x,y,x,y,…]
     text: str = ""
+    # kind="image"：卷面上插入的图片（`POST /api/homework-grades/{gid}/mark-image` 拿到的 URL）。
+    # 后端只认自己那条上传端点发出的相对路径，别的一律丢掉 —— 见 grade_store._clean_mark_image。
+    image: str = ""
     color: str = ""
     # 笔迹粗细（0~1000 坐标系里的单位，与 geo/points 同一套）。
     # 0 = 没指定 → 前端不输出 stroke-width，走样式表默认（旧记录全是 0，行为不变）。
@@ -796,8 +799,9 @@ class GradeMarkPatch(BaseModel):
     geo: Optional[List[float]] = None
     points: Optional[List[float]] = None
     text: Optional[str] = None
+    image: Optional[str] = None
     color: Optional[str] = None
-    kind: Optional[Literal["box", "ellipse", "check", "cross", "arrow", "text", "ink"]] = None
+    kind: Optional[Literal["box", "ellipse", "check", "cross", "arrow", "text", "ink", "image"]] = None
 
 
 class GradeRegionIn(BaseModel):

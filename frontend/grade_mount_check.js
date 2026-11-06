@@ -120,6 +120,11 @@ const DETAIL = {
        是为了同时守住「渲染改造没有把老数据弄坏」——两条都要在。 */
     { id: 203, item_id: 102, page_no: 1, kind: 'text', geo: [420, 700, 760, 780],
       points: [], text: '这一步错在 $a^2$ 写成 $a^3$', color: '#2563eb', created_by: 'teacher' },
+    /* 0039：老师插到卷面上的图片。**放在最后**（id 最大 = 最后创建），
+       层级断言就靠它的 z-index 比上面几条都大。 */
+    { id: 204, item_id: null, page_no: 1, kind: 'image', geo: [100, 100, 400, 300],
+      points: [], text: '', image: '/api/mark-images/gm_test.png',
+      color: '#dc2626', created_by: 'teacher' },
   ],
   skipped_pages: [],
   regions: [
@@ -474,6 +479,38 @@ async function main() {
       const plain = labs.find((e) => /缺全等/.test(e.textContent || ''));
       checkTrue('纯文字批注照旧显示（渲染改造没把老数据弄坏）',
         !!plain && !!plain.querySelector('.gmark-label-body'), plain && plain.textContent);
+    }
+
+    /* ---- 7c. 插入的图片 + 层级按创建先后（2026-11-06 / 0039）----
+       ★ 这里量的是**用户的原话**：「笔画、文本框、图片谁先出现就谁放下面」。
+       做法是拿同一页每条批注节点的 computed z-index，断言它跟 marks 数组顺序同向 ——
+       只查「有没有 img 节点」是不够的：层级错了界面照样能显示，只是盖住了别人，
+       而那正是这条需求要解决的现象。 */
+    {
+      const imgs = Array.from(D.querySelectorAll('.gmark-imgbox'));
+      check('图片批注渲染成 .gmark-imgbox（1 块）', imgs.length, 1);
+      const im = imgs[0] && imgs[0].querySelector('.gmark-img');
+      checkTrue('★ 图片真的挂上了 src（不是只剩一个空框）',
+        !!im && /gm_test\.png$/.test(im.getAttribute('src') || ''),
+        im && im.getAttribute('src'));
+      checkTrue('★ 图片有右下角的调大小手柄（不能缩放的图片等于贴了一张揭不下来的纸）',
+        !!imgs[0] && !!imgs[0].querySelector('.gmark-resize'),
+        imgs[0] && imgs[0].innerHTML.slice(0, 120));
+      checkTrue('★ 「选择」模式下图片带 mv 类（可拖光标 = canMove 认它）',
+        !!imgs[0] && /(^|\s)mv(\s|$)/.test(imgs[0].className), imgs[0] && imgs[0].className);
+
+      const nodes = Array.from(D.querySelectorAll('.gmark-node'));
+      check('一条批注一个节点（这一页 4 条 = 4 个，不多不少）', nodes.length, 4);
+      const cs = D.defaultView.getComputedStyle.bind(D.defaultView);
+      const zs = nodes.map((n) => Number(cs(n).zIndex));
+      const sorted = zs.slice().sort((a, b) => a - b);
+      checkTrue('★★ 层级严格按创建先后（z-index 随数组递增，后出现的盖在上面）',
+        zs.length === 4 && zs.every((v) => Number.isFinite(v))
+          && JSON.stringify(zs) === JSON.stringify(sorted), zs);
+      checkTrue('★★ 最后插入的图片压在最上面（它 id 最大 = 最后创建）',
+        zs.length === 4 && zs[3] === Math.max.apply(null, zs), zs);
+      checkTrue('★ 文本框不是「永远压在图形之上」：第 2 条（文本框）确实比第 1 条（AI 的√）高',
+        zs[1] > zs[0], zs);
     }
     check('默认「选择」模式下不画框（平时不该满页虚线框）',
       D.querySelectorAll('.gmark-regions').length, 0);

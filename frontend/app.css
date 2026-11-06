@@ -780,6 +780,12 @@ table.tbl td.pending { color: var(--warning); font-weight: 600; }
  *   本页（A 路线）没有那些辅助层，不需要。 */
 .gmark-layer { position: absolute; inset: 0; pointer-events: none; }
 .gmark-svg { display: block; width: 100%; height: 100%; }
+/* ★ 一条标注一个节点（0039）：层级按创建先后，由组件算好写在 inline z-index 上。
+   ⚠️ 节点自己必须 pointer-events:none —— 它铺满整页，打开就等于「整页都点不动」。
+      命中由里面的 .gmark / .gmark-label / .gmark-imgbox 各自打开。 */
+.gmark-node { position: absolute; inset: 0; pointer-events: none; }
+/* 图形类标注各自一个 svg：尺寸要在这里补，`.gmark-svg` 那条只认根节点那一张。 */
+.gmark-node > svg.gmark { display: block; width: 100%; height: 100%; }
 .gmark { pointer-events: auto; cursor: pointer; }
 .gmark-hit { fill: transparent; }
 .gmark .shape { stroke-width: 2.2; vector-effect: non-scaling-stroke; }
@@ -791,6 +797,22 @@ table.tbl td.pending { color: var(--warning); font-weight: 600; }
 /* 可拖的标注（框类）给「抓手」光标 —— 用户得先知道这东西能拖，否则永远发现不了 */
 .gmark.mv { cursor: grab; }
 .gmark.mv.drag { cursor: grabbing; }
+/* 正在画的那一笔：单独一层压在所有标注之上（它的 z-index 必须大于组件的 Z_TOP+条数）。 */
+.gmark-live { position: absolute; inset: 0; width: 100%; height: 100%;
+              pointer-events: none; z-index: 999; }
+/* 插入的图片（0039）：与文本框同一套「绝对定位 + 百分比尺寸」，所以拖/缩/删全复用。 */
+.gmark-imgbox { position: absolute; pointer-events: auto; cursor: grab;
+                outline: 1px dashed rgba(37, 99, 235, .45); outline-offset: 0; }
+.gmark-img { display: block; width: 100%; height: 100%; object-fit: fill;
+             user-select: none; -webkit-user-drag: none; }
+.gmark-imgbox.mv { cursor: grab; }
+.gmark-imgbox.drag { cursor: grabbing; box-shadow: 0 3px 12px rgba(0, 0, 0, .25); }
+.gmark-imgbox.sel { outline: 2px solid var(--primary); }
+.gmark-imgbox.act { outline: 2px solid var(--primary); box-shadow: 0 0 0 3px var(--primary-weak); }
+/* 图丢了（文件被删 / 老记录）：画一块能看见、能点、能删的占位。 */
+.gmark-img-miss { display: flex; align-items: center; justify-content: center;
+                  width: 100%; height: 100%; min-height: 28px; font-size: 11px;
+                  color: #b91c1c; background: rgba(254, 226, 226, .9); }
 /* 文字标注走 HTML：SVG 的 <text> 在非等比 viewBox 里会被横向压扁 */
 .gmark-label { position: absolute; transform: translate(0, -100%);
                pointer-events: auto; cursor: grab; font-size: 11px; line-height: 1.4;
@@ -839,7 +861,7 @@ table.tbl td.pending { color: var(--warning); font-weight: 600; }
    在扫描件上基本看不见，老师根本不知道那里能拖（「没办法缩放」的另一半原因）。
    现在是**框外**一个 12×12 的白色小方块（描边跟批注同色），一眼能看见；
    落点故意放 `-7px`：贴在框外的右上角视觉上就等于「右下角」，但不会被内容/滚动条压住。 */
-.gmark-label .gmark-resize {
+.gmark-label .gmark-resize, .gmark-imgbox .gmark-resize {
   position: absolute; right: -7px; bottom: -7px; width: 12px; height: 12px;
   box-sizing: border-box;
   border: 2px solid currentColor; border-radius: 3px; background: #fff;
@@ -852,14 +874,18 @@ table.tbl td.pending { color: var(--warning); font-weight: 600; }
 }
 /* 命中区比看到的再大一圈：12px 的方块用笔点很容易点空。
    伪元素属于这个 <i>，指针事件仍然算在它头上，startResize 照样收得到。 */
-.gmark-label .gmark-resize::after { content: ''; position: absolute; inset: -7px; }
-.gmark-label .gmark-resize:hover { background: currentColor; }
+.gmark-label .gmark-resize::after, .gmark-imgbox .gmark-resize::after { content: ''; position: absolute; inset: -7px; }
+.gmark-label .gmark-resize:hover, .gmark-imgbox .gmark-resize:hover { background: currentColor; }
 /* 画笔/橡皮/框题模式下文字标签不收指针（见下面 .mode-* 那组），手柄跟着一起关，
    否则「想落笔」会变成「在调框大小」。 */
 .gmark-layer.mode-ink .gmark-label .gmark-resize,
 .gmark-layer.mode-erase .gmark-label .gmark-resize,
 .gmark-layer.mode-region .gmark-label .gmark-resize,
-.gmark-layer.mode-line .gmark-label .gmark-resize { display: none; }
+.gmark-layer.mode-line .gmark-label .gmark-resize,
+.gmark-layer.mode-ink .gmark-imgbox .gmark-resize,
+.gmark-layer.mode-erase .gmark-imgbox .gmark-resize,
+.gmark-layer.mode-region .gmark-imgbox .gmark-resize,
+.gmark-layer.mode-line .gmark-imgbox .gmark-resize { display: none; }
 .gmark-label.sel { font-weight: 600; box-shadow: 0 0 0 2px var(--primary-weak); }
 .gmark-label.drag { cursor: grabbing; box-shadow: 0 3px 12px rgba(0, 0, 0, .2); z-index: 3; }
 /* 选中态（点中某一处批注 → 底部出操作条）。要**明显**不同于 .sel：
@@ -970,6 +996,9 @@ table.tbl td.pending { color: var(--warning); font-weight: 600; }
 .g-tool:hover { border-color: var(--primary); color: var(--primary); }
 .g-tool.on { background: var(--primary); border-color: var(--primary); color: #fff; }
 .g-tool.g-mark { min-width: 30px; padding: 2px 8px; font-size: 15px; font-weight: 700; }
+/* 插图用的文件选择器：**必须留在 DOM 里**（点按钮时 programmatic click 才能开窗），
+   只是不占位置。不能用 `hidden` 属性 —— 有的浏览器对 hidden 的 input 不响应 click()。 */
+.g-file-hidden { display: none; }
 .g-sep { width: 1px; height: 18px; background: var(--border); margin: 0 2px; }
 .g-color {
   width: 18px; height: 18px; padding: 0; border: 2px solid var(--panel, #fff);
@@ -1064,7 +1093,10 @@ table.tbl td.pending { color: var(--warning); font-weight: 600; }
 .gmark-layer.mode-cross .gmark,
 .gmark-layer.mode-ink .gmark-label, .gmark-layer.mode-erase .gmark-label,
 .gmark-layer.mode-text .gmark-label, .gmark-layer.mode-check .gmark-label,
-.gmark-layer.mode-cross .gmark-label { pointer-events: none; }
+.gmark-layer.mode-cross .gmark-label,
+.gmark-layer.mode-ink .gmark-imgbox, .gmark-layer.mode-erase .gmark-imgbox,
+.gmark-layer.mode-check .gmark-imgbox, .gmark-layer.mode-cross .gmark-imgbox
+{ pointer-events: none; }
 
 /* ⚠️ 文字模式是**例外**：上面那组把 .gmark-label 的指针关掉了，但文本框要能拖。
    判据在 JS 侧（GradeMarkLayer.js 的 MOVE_MODES 含 'text'）：文字模式下
@@ -1073,7 +1105,8 @@ table.tbl td.pending { color: var(--warning); font-weight: 600; }
    2026-11-01 用户报的就是这个（真浏览器实测：命中元素是 svg、不是 span）。
    为什么只放开 label 不放开 .gmark：v/x/框这些形状收事件会把「在这里写批注」的落点抢走。
    注意这条**必须排在上面那组之后**（同特异性，靠顺序取胜）。 */
-.gmark-layer.mode-text .gmark-label { pointer-events: auto; cursor: grab; }
+.gmark-layer.mode-text .gmark-label,
+.gmark-layer.mode-text .gmark-imgbox { pointer-events: auto; cursor: grab; }
 
 /* ---------------- 一题一区域（框题）----------------
    与标注同一条 svg、同一套 0~1000 坐标，但语义不同：
@@ -1082,7 +1115,8 @@ table.tbl td.pending { color: var(--warning); font-weight: 600; }
 .gmark-layer.mode-region { pointer-events: auto; touch-action: none; cursor: crosshair; }
 /* 画框时已有标注必须失去指针，否则起手那一下就被某条标注吃掉（同画笔那条坑） */
 .gmark-layer.mode-region .gmark,
-.gmark-layer.mode-region .gmark-label { pointer-events: none; }
+.gmark-layer.mode-region .gmark-label,
+.gmark-layer.mode-region .gmark-imgbox { pointer-events: none; }
 .gmark-region { pointer-events: auto; cursor: pointer; }
 .rg-rect { fill: rgba(37, 99, 235, .05); stroke: #2563eb; stroke-width: 1.8;
            stroke-dasharray: 8 6; vector-effect: non-scaling-stroke; }
@@ -1103,6 +1137,7 @@ table.tbl td.pending { color: var(--warning); font-weight: 600; }
    老师点哪里都在点段，一条新线也画不出来。段的删除走右栏面板。 */
 .gmark-layer.mode-line .gmark,
 .gmark-layer.mode-line .gmark-label,
+.gmark-layer.mode-line .gmark-imgbox,
 .gmark-layer.mode-line .rg-rect,
 .gmark-layer.mode-line .gl-band { pointer-events: none; }
 .gl-band { fill: rgba(217, 119, 6, .045); }
