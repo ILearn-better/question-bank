@@ -5,10 +5,12 @@
   · HTML —— 保真度最高。图片以 base64 内嵌，导出的单个文件发给谁都还能看；
             $…$ 交给浏览器里的 KaTeX 渲染，Ctrl+P 直接就能存成 PDF。
   · DOCX —— 可编辑。老师要改题干、加批注、套学校抬头时用。
-  · PDF  —— 直接打印。服务端用 PyMuPDF 排 A4，中文用内置 china-s 字体。
+  · PDF  —— 直接打印。**优先走真 LaTeX（tectonic/XeLaTeX，见 paper_latex.py）**：
+           题库里存的本来就是 LaTeX，`$…$` 原样交给引擎就是真排版。
+           引擎缺失或编译失败时回退到 PyMuPDF 那条老路（贴图公式），绝不直接报错。
 
-⚠️ 关于公式的实话：服务端没有 LaTeX 排版引擎，**DOCX / PDF 里的 $…$ 会原样输出**。
-   想要公式排版就出 HTML。这点不藏着 —— 假装支持比不支持更糟。
+⚠️ DOCX 的公式是「LaTeX → OMML」的原生 Word 公式；PDF 是真 LaTeX 排版。
+   三者（HTML/DOCX/PDF）共用同一份分段规则（latex_img.split_math），别各写一套。
 
 三处差异（卷面样式）由 `paper_style.py` 提供的模板参数控制：抬头区、分区标题、
 字号行距页边距、题号形态、每题分值、解答题留白。**不传模板 = 与加样式功能之前完全一致**，
@@ -21,6 +23,7 @@ from __future__ import annotations
 
 import base64
 import html as html_mod
+import logging
 import mimetypes
 import re
 import string
@@ -29,7 +32,9 @@ from pathlib import Path
 import pymupdf
 
 from .. import config
-from . import paper_math, paper_style
+from . import paper_latex, paper_math, paper_style
+
+_log = logging.getLogger("shike")
 
 # A4（pt）
 A4_W, A4_H = 595.28, 841.89
@@ -504,6 +509,21 @@ def _chunks(text: str, size: int = 400) -> list[str]:
 
 
 def build_pdf(title: str, items: list[dict], opts: dict, tpl=None) -> bytes:
+    """出一份 PDF。**先真 LaTeX 排版，失败回退 PyMuPDF 贴图那条老路。**
+
+    为什么不是「只报错」：老师正在出卷，引擎没装 / 宏包没缓存 / 某道题的公式写坏了，
+    都不该让「导出」直接崩。回退之后版面差一档，但卷子还是出得来，而且日志里有原因。
+    """
+    if paper_latex.available():
+        try:
+            data = paper_latex.build(title, items, opts, tpl)
+        except Exception as exc:          # 引擎内部崩了也不许把导出拖死
+            data = None
+            _log.warning("LaTeX 排版异常，回退旧路径：%s", exc)
+        if data:
+            return data
+        _log.warning("LaTeX 排版失败，回退旧路径：%s", paper_latex.last_error())
+
     t = paper_style.resolve(tpl)
     paper, style = t["paper"], t["style"]
     base = style["font_size"]

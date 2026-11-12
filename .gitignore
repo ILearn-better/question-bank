@@ -36,6 +36,11 @@ Thumbs.db
 # 中国香港考评局 DSE 卷）有版权、且单文件几十 MB，只留在本机做识别验证。
 samples/2025真题/
 
+# LaTeX 引擎
+# tectonic.exe 单文件 50MB，进仓库会把 clone 拖垮，而且它本来就该按平台下载。
+# 用 tools/安装-LaTeX引擎.bat 装到 backend/vendor/；找不到引擎时导出会自动回退旧路径。
+backend/vendor/
+
 # 临时 / 调试文件
 # 提交时用 git add -A 很容易把它们误带进仓库（真发生过：_debug.html 被提交了一次）。
 _debug.html

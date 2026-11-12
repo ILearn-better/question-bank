@@ -121,7 +121,7 @@ def docx_text(data: bytes) -> str:
 
 
 def part_b():
-    print("\n==== B DOCX：公式进 Word 是图片，不是美元符号 ====")
+    print("\n==== B DOCX：公式进 Word 是原生公式（OMML），不是美元符号 ====")
 
     items = [
         q(1, r"已知函数 $f(x)=x^2+2x$ 在 $x=1$ 处的值为多少？",
@@ -138,14 +138,18 @@ def part_b():
     truthy("中文题干还在", "已知函数" in txt, txt[:120])
     truthy("答案区的中文还在", "代入" in txt or "3" in txt)
 
-    n_draw = xml.count("<w:drawing>")
-    # 题 1 题干 2 个 + 答案 1 个 + 解析 1 个 = 4 张；题 2 一个都没有
-    check("公式图的数量 = 题干 2 + 答案 1 + 解析 1", n_draw, 4)
+    # 2026-11-12 起 DOCX 的公式是**原生 Word 公式**（OMML），不再是图片。
+    # 这里数的是 m:oMath：题 1 题干 2 个 + 答案 1 个 + 解析 1 个 = 4 个；题 2 一个都没有。
+    n_math = xml.count("<m:oMath")
+    check("原生公式的数量 = 题干 2 + 答案 1 + 解析 1", n_math, 4)
+    check("公式不再是一张张贴图", xml.count("<w:drawing>"), 0)
 
-    # 纯文本题不该凭空多出图
+    # 纯文本题不该凭空多出公式或图
     items2 = [q(1, "纯文字题目，没有公式。", answer="11")]
     d2 = paper_export.build_docx("纯文本卷", items2, OPTS)
-    check("没有公式的卷子一张公式图都不加", docx_xml(d2).count("<w:drawing>"), 0)
+    x2 = docx_xml(d2)
+    check("没有公式的卷子一个公式对象都不加", x2.count("<m:oMath"), 0)
+    check("也没有图", x2.count("<w:drawing>"), 0)
 
     # 多段题干：\n 必须变成 Word 的换行，不能被吞成一行
     items3 = [q(1, "第一段话\n第二段话\n第三段话")]
@@ -191,15 +195,12 @@ def part_c():
     d2 = paper_export.build_pdf("只有公式", only_math, {"show_answer": False})
     doc2 = pdf_open(d2)
     page = doc2[0]
-    pix = page.get_pixmap(dpi=100)
-    dark = 0
-    # 只看正文区（避开标题那一行）：标题也有字，会干扰判断
-    clip = pymupdf.Rect(0, 120, page.rect.width, page.rect.height - 100)
-    pix2 = page.get_pixmap(dpi=100, clip=clip)
-    for y in range(0, pix2.height, 2):
-        for x in range(0, pix2.width, 2):
-            if pix2.pixel(x, y)[0] < 120:
-                dark += 1
+    # ⚠️ 不要写死 y 区间（以前是 120..页高-100）。换成 LaTeX 排版后正文更靠上，
+    #    写死的区间就把它整个漏掉 —— 断言变红但功能是好的，这种假红最费时间。
+    #    改成：先找到「那道题」的文字块，只在它的矩形里数墨。
+    body_rect = find_block_rect(page, "1.")
+    truthy("能找到那道题的文字块", body_rect is not None)
+    dark = count_dark(page, body_rect, dpi=200)
     truthy("只有公式的那道题，正文区真的有墨点（= 公式画出来了）", dark > 20,
            f"暗像素 {dark} 个")
     t2 = page.get_text()
@@ -212,6 +213,8 @@ def part_c():
                                    {"show_answer": False})
     b1 = pdf_text_height(one)
     b3 = pdf_text_height(three)
+    truthy("一段 / 三段都找到了正文块（否则下面的比较没意义）", b1 > 0 and b3 > 0,
+           f"一段 {b1:.1f}pt / 三段 {b3:.1f}pt")
     truthy("多段题干占的高度更大（\\n 真的换行了）", b3 > b1,
            f"一段 {b1:.1f}pt / 三段 {b3:.1f}pt")
 
@@ -224,12 +227,37 @@ def part_c():
     dca.close()
 
 
-def pdf_text_height(data: bytes) -> float:
-    """页面上所有文字块的纵向总高度 —— 用来判断「有没有真的换行」。"""
+def find_block_rect(page, prefix: str):
+    """找以 prefix 开头的那个文字块，返回它的矩形（含一点余量）。找不到返回 None。"""
+    for b in page.get_text("blocks"):
+        if (b[4] or "").strip().startswith(prefix):
+            return pymupdf.Rect(b[0] - 4, b[1] - 4, b[2] + 4, b[3] + 4)
+    return None
+
+
+def count_dark(page, rect, dpi: int = 200) -> int:
+    """在给定矩形里数暗像素。用来判断「这里是真的画了东西」。"""
+    if rect is None:
+        return 0
+    pix = page.get_pixmap(dpi=dpi, clip=rect)
+    n = 0
+    for y in range(0, pix.height, 2):
+        for x in range(0, pix.width, 2):
+            if pix.pixel(x, y)[0] < 120:
+                n += 1
+    return n
+
+
+def pdf_text_height(data: bytes, needle: str = "甲") -> float:
+    """只量**含 needle 的那些文字块**的纵向跨度 —— 判断「有没有真的换行」。
+
+    ⚠️ 不能量全页：页脚页码、标题都会进统计，量出来永远等于「页高」，
+       「三段比一段高」这种比较就恒定成立/恒定失败。换 LaTeX 排版时正是这么翻的车。
+    """
     d = pymupdf.open("pdf", data)
     p = d[0]
     # get_text("blocks") 每项是 (x0, y0, x1, y1, text, block_no, block_type)
-    rects = p.get_text("blocks")
+    rects = [b for b in p.get_text("blocks") if needle in (b[4] or "")]
     h = (max(r[3] for r in rects) - min(r[1] for r in rects)) if rects else 0.0
     d.close()
     return h
