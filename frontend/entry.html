@@ -1155,6 +1155,9 @@ const app = createApp({
     // 绑在某个输入框上的话，老师在页面空白处按 Ctrl+V 就没反应。
     // onPaste 里只在「剪贴板确实是纯截图」时才接手，粘文字一概放行。
     document.addEventListener('paste', this.onPaste);
+    // 从出卷页点「去修这题」过来时带着 ?answer=1&qid=xxx：
+    // 直接进补答案模式并选中那道题。放最后调，等上面那几个 load 先发出请求。
+    this.enterAnswerFromUrl();
   },
   beforeUnmount() {
     document.removeEventListener('paste', this.onPaste);
@@ -2002,6 +2005,41 @@ const app = createApp({
       this.answerShots = [];        // 换成单张了，之前那批截图不能再参与拼接
       ElementPlus.ElMessage.success('已把题目图设为答案图');
     },
+    /** 从 URL 参数直接进入「给这道题补答案」（2026-11-12）。
+     *
+     *  出卷时发现某道题没答案、或者录入有问题，卷面上点「去修这题」就跳到这里。
+     *  URL 形如 `entry.html?answer=1&qid=<题目id>`。
+     *
+     *  ⚠️ 复用 `onModeChange()` 而不是自己把状态摆一遍：它管着 abTimer / abItems /
+     *     abJob / resetSel / editingId 的清空，漏一项就会出现「上一道题的补录建议
+     *     还挂在面板上」这种串台。它内部调 `searchQuestions()` 但**不 await**，
+     *     所以这里再 await 一次，否则下面按 id 找不到那道题。
+     *  ⚠️ 那道题不一定在前 50 条里（按最近录入排），找不到就单取一条 ——
+     *     老题正是最需要补答案的那批，光靠列表会漏。
+     */
+    async enterAnswerFromUrl() {
+      let p;
+      try { p = new URLSearchParams(location.search); } catch (e) { return; }
+      if (p.get('answer') !== '1') return;
+      this.answerMode = true;
+      this.onModeChange();
+      await this.searchQuestions();
+      const qid = (p.get('qid') || '').trim();
+      if (!qid) return;
+      let q = this.pickList.find(x => String(x.id) === String(qid));
+      if (!q) {
+        try {
+          q = await this.api('/api/questions/' + encodeURIComponent(qid));
+        } catch (e) {
+          ElementPlus.ElMessage.error('没找到这道题（可能已被删除）：' + e.message);
+          return;
+        }
+      }
+      if (!q) return;
+      this.pickQuestion(q);
+      ElementPlus.ElMessage.success('已定位到这道题，改完点右下角「保存答案」');
+    },
+
     /** 点「已录入题目」里某一题的「补答案」——直接切到补答案模式并选中它。 */
     startAnswerFor(q) {
       this.answerMode = true;

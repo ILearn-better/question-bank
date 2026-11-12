@@ -483,3 +483,17 @@ def recheck_question_answer(qid: str, payload: AnswerRecheckIn,
         return {"items": answer_backfill.recheck_pages(db, q, payload.pages, payload.hint)}
     except answer_backfill.BackfillError as e:
         raise HTTPException(422, str(e))
+
+@router.get("/questions/{qid}")
+def get_question(qid: str, db: Session = Depends(get_db)):
+    """取一道题的全部字段。**出卷页要「跳到这道题去修」时用**（2026-11-12）。
+
+    ⚠️ 必须注册在 `GET /questions/search` **之后**（本文件末尾就是这个位置）。
+       `/questions/{qid}` 里的 qid 是字符串，`search` 也是合法字符串 ——
+       FastAPI 按注册顺序匹配，放到前面的话 `/questions/search` 会被它抢先吃掉，
+       整个筛选接口直接变成「题目不存在」。
+    """
+    q = db.get(Question, qid)
+    if q is None:
+        raise HTTPException(404, "题目不存在")
+    return _serialize(q)

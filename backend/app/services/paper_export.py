@@ -29,7 +29,7 @@ from pathlib import Path
 import pymupdf
 
 from .. import config
-from . import paper_style
+from . import paper_math, paper_style
 
 # A4（pt）
 A4_W, A4_H = 595.28, 841.89
@@ -413,14 +413,15 @@ def build_docx(title: str, items: list[dict], opts: dict, tpl=None) -> bytes:
     normal.paragraph_format.line_spacing = style["line_height"]
 
     def para(text: str = "", size: float | None = None, center: bool = False, bold: bool = False):
+        """一个段落。**所有文字都从这里进** —— 公式在 `paper_math.docx_runs` 里被换成了
+        行内图片，所以题干、答案、解析里的 `$…$` 到 Word 里就是排好版的公式，
+        不再是美元符号原文（2026-11-12 之前三处都是照原文印出去的）。
+        """
         p = doc.add_paragraph()
         if center:
             p.alignment = WD_ALIGN_PARAGRAPH.CENTER
         if text:
-            r = p.add_run(text)
-            r.bold = bold
-            if size:
-                r.font.size = Pt(size)
+            paper_math.docx_runs(p, text, size or style["font_size"], bold=bold)
         return p
 
     tp = para(title, size=style["title_size"], center=True, bold=True)
@@ -477,14 +478,15 @@ def build_docx(title: str, items: list[dict], opts: dict, tpl=None) -> bytes:
         # 同 HTML：答案区的顺序与题号必须跟卷面同源
         for it in paper_style.flat(items, t["sections"]):
             if answer_form(it, opts.get("render_mode")) == "image":
-                doc.add_paragraph(f'{it["n"]}.')
+                para(f'{it["n"]}.')
                 p = image_path(it.get("answer_image"))
                 if p:
                     doc.add_picture(str(p), width=Cm(content_cm * 0.6))
             else:
-                doc.add_paragraph(f'{it["n"]}. {it.get("answer") or "（未填）"}')
+                # 走 para（不是 doc.add_paragraph）：答案里的公式同样要渲成图
+                para(f'{it["n"]}. {it.get("answer") or "（未填）"}')
             if opts.get("show_analysis") and it.get("analysis"):
-                doc.add_paragraph(f'解析：{it["analysis"]}')
+                para(f'解析：{it["analysis"]}')
 
     buf = io.BytesIO()
     doc.save(buf)
@@ -521,28 +523,31 @@ def build_pdf(title: str, items: list[dict], opts: dict, tpl=None) -> bytes:
         state["y"] = margin_top
 
     def write(text: str, size: float | None = None, gap: float | None = None,
-              center: bool = False) -> None:
+              center: bool = False, bold: bool = False) -> None:
+        """一个段落。**所有文字都从这里进**。
+
+        2026-11-12 起走 `insert_htmlbox`（HTML 片段里公式已经是 data-uri 的图），
+        不再用 `insert_textbox` 直接写字符串 —— 后者不认公式，`$…$` 会原样印在卷面上。
+        代价是排版前要先用 Story 量一次高度（`paper_math.measure_width`）：
+        `insert_htmlbox` 放不下时只会缩字或者截断，不会告诉你差多少。
+        """
         size = base if size is None else size
         gap = 5.0 if gap is None else gap
-        for chunk in _chunks(text):
-            rect = pymupdf.Rect(margin, state["y"], A4_W - margin, A4_H - margin_top)
-            if rect.height < size * 1.8:            # 只剩不到两行 → 换页
-                new_page()
-                rect = pymupdf.Rect(margin, state["y"], A4_W - margin, A4_H - margin_top)
-            left = state["page"].insert_textbox(
-                rect, chunk, fontsize=size, fontname="china-s",
-                align=1 if center else 0,
-            )
-            if left < 0:                            # 还是放不下 → 换页重排一次
-                new_page()
-                rect = pymupdf.Rect(margin, state["y"], A4_W - margin, A4_H - margin_top)
-                left = state["page"].insert_textbox(
-                    rect, chunk, fontsize=size, fontname="china-s",
-                    align=1 if center else 0,
-                )
-                if left < 0:
-                    continue
-            state["y"] += (rect.height - left) + gap
+        if not (text or "").strip():
+            state["y"] += gap
+            return
+        frag = paper_math.pdf_block("", text, "", font_pt=size, bold=bold, center=center)
+        ih = paper_math.measure_width(frag, content_w)
+        bottom = A4_H - margin_top
+        if state["y"] + ih > bottom:            # 本页放不下 → 换页
+            new_page()
+        rect = pymupdf.Rect(margin, state["y"], A4_W - margin,
+                            min(bottom, state["y"] + ih + 2.0))
+        try:
+            state["page"].insert_htmlbox(rect, frag, scale_low=1)
+        except Exception:                       # noqa: BLE001 —— 排不出来也不该让整卷失败
+            pass
+        state["y"] += ih + gap
 
     def draw_image(path: Path | None, max_ratio: float = 1.0) -> None:
         # path 为 None = 这题没有那幅图（配图未框、或文件已被删）。
@@ -589,13 +594,13 @@ def build_pdf(title: str, items: list[dict], opts: dict, tpl=None) -> bytes:
             state["y"] += step
         state["y"] += 4
 
-    write(title, size=style["title_size"], gap=10, center=True)
+    write(title, size=style["title_size"], gap=10, center=True, bold=True)
 
     for b in head_blocks(paper, opts):
         if b["kind"] in ("subtitle", "note", "fill"):
             write(b["text"], size=base - 1.5, gap=8, center=True)
         elif b["kind"] == "instructions":
-            write(b["title"], size=base - 0.5, gap=4)
+            write(b["title"], size=base - 0.5, gap=4, bold=True)
             for i, x in enumerate(b["items"], start=1):
                 write(f"{i}. {x}", size=base - 1.5, gap=4)
             state["y"] += 6
@@ -623,7 +628,7 @@ def build_pdf(title: str, items: list[dict], opts: dict, tpl=None) -> bytes:
         if g["title"]:
             if g["page_break"]:
                 new_page()
-            write(g["title"], size=style["section_size"], gap=4)
+            write(g["title"], size=style["section_size"], gap=4, bold=True)
         if g["title"] or g["note"]:
             note = paper_style.section_note(g["note"], g["items"], style)
             if note:
@@ -649,7 +654,7 @@ def build_pdf(title: str, items: list[dict], opts: dict, tpl=None) -> bytes:
 
     if opts.get("show_answer"):
         new_page()
-        write("参考答案与解析", size=14, gap=12, center=True)
+        write("参考答案与解析", size=14, gap=12, center=True, bold=True)
         # 同 HTML / docx：答案区的顺序与题号必须跟卷面同源
         for it in paper_style.flat(items, t["sections"]):
             if answer_form(it, opts.get("render_mode")) == "image":
@@ -662,6 +667,16 @@ def build_pdf(title: str, items: list[dict], opts: dict, tpl=None) -> bytes:
             if opts.get("show_analysis") and it.get("analysis"):
                 write(f'解析：{it["analysis"]}', size=10.5)
 
-    data = doc.tobytes()
+    # ⚠️ 体积：insert_htmlbox 每调一次就往文件里嵌一份**完整的中文字体**
+    # （Droid Sans Fallback，Type0/ttf，单份 3.4MB）。实测 3 题 20.9MB、10 题 80MB、
+    # 20 题 153MB —— 老师下载这种东西就是功能坏了，所以收尾必须两道都做：
+    #   subset_fonts() 只留真正用到的字形（不做这步，deflate 只能到 13.6MB）；
+    #   garbage=4 丢掉子集化后废弃的对象 + deflate 压缩流。
+    # 实测 28MB → 0.04MB。
+    try:
+        doc.subset_fonts()
+    except Exception:      # 子集化失败不许把整份卷子搞没：宁可文件大，不能导不出
+        pass
+    data = doc.tobytes(deflate=True, garbage=4)
     doc.close()
     return data
