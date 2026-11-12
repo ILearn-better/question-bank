@@ -214,6 +214,65 @@ def part_d() -> None:
         print("  [SKIP] 引擎没装，跳过「编译失败回退」两条")
 
 
+# ================================================================ E. 表格
+# 题库里「填表题」存的就是 Markdown 表格。不转的话 `| 棱柱 | 面的个数 |` 和
+# `|---|---|` 会**原样印在卷子上** —— 老师是要拿去印给学生的，这等于卷子废了。
+TABLE_Q = (
+    "【思考 2】请同学们完成下列表格：\n\n"
+    "| 棱柱 | 面的个数 | 顶点个数 |\n"
+    "|---|:---|---:|\n"
+    "| 三棱柱 |  |  |\n"
+    "| 四棱柱 | $4$ | $8$ |\n"
+    "\n然后回答：$n$ 棱柱有多少条棱？"
+)
+
+
+def part_e(has_engine: bool) -> None:
+    print("\n==== E Markdown 表格 → 真表格 ====")
+
+    src = paper_latex.tex_body(TABLE_Q)
+    truthy("表格被转成 tabular", "\\begin{tabular}" in src, src[:200])
+    falsy("没留下 Markdown 的分隔行", "|---" in src, src[:200])
+    truthy("表头进了表格", "棱柱 & 面的个数 & 顶点个数" in src, src[:300])
+    truthy("单元格里的公式还是数学（没被当文字转义）", "$4$" in src and "$8$" in src, src[:300])
+    truthy("对齐按 Markdown 分隔行来（左/右）", "|c|l|r|" in src, src[:300])
+    truthy("表格前后的文字都还在", "请同学们完成下列表格" in src and "然后回答" in src, src[:200])
+    falsy("只生成一张表格（没按行重复生成）", src.count("\\end{tabular}") > 1, src[:200])
+
+    # 不该误伤：普通文字里的竖线、以及没有分隔行的「假表格」
+    plain = paper_latex.tex_body("条件 a | b 成立，求 $x_1$ 的值。")
+    truthy("普通文字里的竖线原样保留", "a | b" in plain, plain)
+    noisy = paper_latex.tex_body("| a | b |")
+    falsy("没有分隔行就不当表格（原样输出）", "tabular" in noisy, noisy)
+
+    if not has_engine:
+        print("  [SKIP] 引擎没装，跳过下面的真排版断言")
+        return
+
+    pdf = paper_export.build_pdf("表格卷", [q(1, TABLE_Q, score=5)], OPTS, TPL)
+    truthy("带表格的卷子出得来", pdf and pdf[:4] == b"%PDF", paper_latex.last_error())
+    txt = flat(text_of(pdf))
+    # ⚠️ 不能找 "|---"：TeX 会把 `---` 排成破折号「—」，改坏之后也照样「找不到」→ 假绿。
+    #    真正的直接后果是**竖线本身印在卷面上**（表格的框线是矢量线，不进文字层）。
+    falsy("卷面上没有印出 Markdown 竖线", "|" in txt, txt[:200])
+    falsy("卷面上没有印出 LaTeX 源码", "tabular" in txt, txt[:200])
+    truthy("表格里的字真的在卷面上", "三棱柱" in txt and "四棱柱" in txt, txt[:300])
+    truthy("表格外的题干也在", "然后回答" in txt or "n棱柱" in txt, txt[:300])
+
+    # 正面证据：表格是**真画出来的框线**（矢量线），不是凑巧没印出竖线。
+    def rules(data: bytes) -> int:
+        d = pymupdf.open("pdf", data)
+        n = len(d[0].get_drawings())
+        d.close()
+        return n
+
+    plain = paper_export.build_pdf(
+        "无表格卷", [q(1, "请同学们完成下列任务，并回答：$n$ 棱柱有多少条棱？", score=5)], OPTS, TPL)
+    n_tbl, n_plain = rules(pdf), rules(plain)
+    truthy("表格框线真的画出来了（比同样排版的纯文字卷多出横竖线）",
+           n_tbl >= n_plain + 3, f"表格卷 {n_tbl} 条 / 纯文字卷 {n_plain} 条")
+
+
 def main() -> int:
     has_engine = part_a()
     if has_engine:
@@ -221,6 +280,7 @@ def main() -> int:
         part_c()
     else:
         print("\n==== B/C 跳过：没装 tectonic ====")
+    part_e(has_engine)
     part_d()
 
     print("\n" + "=" * 60)

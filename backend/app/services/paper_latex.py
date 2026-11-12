@@ -93,11 +93,12 @@ def _tight(s: str) -> str:
     return "{\\xeCJKsetup{CJKecglue={}}%s}" % s
 
 
-def tex_body(text: str | None) -> str:
-    """题干 / 答案：文字转义，`$…$` 与 `$$…$$` 原样交给 LaTeX。
+def _inline(text: str | None, breaks: bool = False) -> str:
+    """文字段：数学原样、文字转义。
 
-    分段靠 `latex_img.split_math`（和 DOCX / 旧 PDF 同一条分段规则）——
-    自己再写一份正则，迟早跟另外两条路段的边界不一样。
+    `breaks=True` 时把 `\\n` 显式换成 `\\\\` —— LaTeX 源码里的**单个换行只是空格**，
+    不换成断行的话，题库里分段存的题干（每行一句）会全挤成一段。
+    表格单元用 `breaks=False`（格子里本来就没有换行）。
     """
     from . import latex_img
 
@@ -109,9 +110,88 @@ def tex_body(text: str | None) -> str:
                 continue
             out.append(f"\\[{tex}\\]" if part.get("display") else f"${tex}$")
         else:
-            # `\n` 必须显式换成 `\\`：LaTeX 源码里的**单个换行只是空格**，
-            # 不换成断行的话，题库里分段存的题干（每行一句）会全挤成一段。
-            out.append(escape_text(part.get("v")).replace("\n", "\\\\\n"))
+            s = escape_text(part.get("v"))
+            out.append(s.replace("\n", "\\\\\n") if breaks else s)
+    return "".join(out)
+
+
+# Markdown 表格：**表头行 + 分隔行（必须有，`|---|`）**，后面跟任意多行。
+# 只认「有分隔行」的，避免把题干里偶然出现的竖线当表格。
+_TABLE_BLOCK = re.compile(
+    r"(?m)^[ \t]*\|[^\n]*\|[ \t]*$\n"
+    r"^[ \t]*\|[\s:|\-]+\|[ \t]*$"
+    r"(?:\n^[ \t]*\|[^\n]*\|[ \t]*$)*"
+)
+
+
+def _cells(line: str) -> list[str]:
+    s = line.strip()
+    if s.startswith("|"):
+        s = s[1:]
+    if s.endswith("|"):
+        s = s[:-1]
+    return [c.strip() for c in s.split("|")]
+
+
+def _table_tex(block: str) -> str:
+    """Markdown 表格 → LaTeX `tabular`。
+
+    为什么必须转：题库里填空表格题存的就是 Markdown（`| 棱柱 | 面的个数 |`），
+    不转的话这些竖线和 `|---|` 会**原样印在卷子上**（老师要拿去印给学生的）。
+    """
+    lines = [ln for ln in block.splitlines() if ln.strip()]
+    if len(lines) < 2:
+        return _inline(block)
+    head, sep = _cells(lines[0]), _cells(lines[1])
+    body = [_cells(ln) for ln in lines[2:]]
+    n = max([len(head), len(sep)] + [len(r) for r in body])
+    if n <= 0:
+        return _inline(block)
+
+    # 对齐按 Markdown 的分隔行来：`:---` 左、`---:` 右、其余居中
+    align = []
+    for i in range(n):
+        s = sep[i] if i < len(sep) else ""
+        left, right = s.startswith(":"), s.endswith(":")
+        align.append("l" if left and not right else ("r" if right and not left else "c"))
+    spec = "|" + "|".join(align) + "|"
+
+    def row(cs: list[str]) -> str:
+        cs = cs + [""] * (n - len(cs))
+        return " & ".join(_inline(c) for c in cs) + " \\\\"
+
+    out = ["\\begin{center}\\small\n",
+           # 表格里行高比正文紧一点才像卷子上的表（默认 1.0 会顶到框线）
+           "\\renewcommand{\\arraystretch}{1.35}\n",
+           "\\begin{tabular}{%s}\n" % spec, "\\hline\n", row(head) + "\n", "\\hline\n"]
+    for r in body:
+        out.append(row(r) + "\n")
+    out.append("\\hline\n\\end{tabular}\n\\end{center}\n")
+    return "".join(out)
+
+
+def tex_body(text: str | None) -> str:
+    """题干 / 答案：文字转义，`$…$` 与 `$$…$$` 原样交给 LaTeX。
+
+    分段靠 `latex_img.split_math`（和 DOCX / 旧 PDF 同一条分段规则）——
+    自己再写一份正则，迟早跟另外两条路段的边界不一样。
+
+    表格单独走 `_table_tex`：整段文字不能先按行切开再转义，否则跨行的 `$$…$$`
+    会被切坏 —— 所以先按「表格块」把原文分成若干段，非表格段整段处理。
+    """
+    text = text or ""
+    out: list[str] = []
+    pos = 0
+    for m in _TABLE_BLOCK.finditer(text):
+        # 表格前后的空行要吃掉：原样转成 `\\` 会在表格上下各多顶出一行空白
+        chunk = text[pos:m.start()].rstrip()
+        if chunk.strip():
+            out.append(_inline(chunk, breaks=True) + "\n")
+        out.append(_table_tex(m.group(0)))
+        pos = m.end()
+    rest = text[pos:].lstrip()
+    if rest.strip():
+        out.append(_inline(rest, breaks=True))
     return "".join(out)
 
 
