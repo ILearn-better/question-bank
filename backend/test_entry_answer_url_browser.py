@@ -62,13 +62,18 @@ def http_json(path):
 
 
 def pick_question():
-    """从库里挑一道**有答案**的题 —— 第 E 条要看「表单里读进了原答案」。"""
-    d = http_json("/api/questions/search?limit=20&with_answer=true&sort=created")
+    """从库里挑一道**有文字答案**的题 —— 第 E 条要看「表单里读进了原答案」。
+
+    ⚠️ 别退回「随便挑一道」：`answer` 为空时第 E 条必然红。老师的题里有相当一部分
+       是「答案只有一张图」（`answer_image`），最近 20 条恰好全是这种 → 要往后翻。
+       一条文字答案都没有就 SKIP，而不是拿答案空的题硬测（2026-11-13 踩过）。
+    """
+    d = http_json("/api/questions/search?limit=200&with_answer=true&sort=created")
     items = d.get("items") or []
     for q in items:
         if (q.get("answer") or "").strip():
             return q
-    return items[0] if items else None
+    return None
 
 
 async def send(ws, mid, method, **params):
@@ -114,7 +119,7 @@ async def main():
         print("SKIP: 服务没在跑（%s）—— 先双击「启动拾课.bat」" % e)
         return 0
     if not q:
-        print("SKIP: 题库里一道题都没有，没法验")
+        print("SKIP: 题库里没有带文字答案的题（只有答案图的题验不了第 E 条）")
         return 0
 
     qid = str(q["id"])
