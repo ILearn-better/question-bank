@@ -64,14 +64,14 @@ check("fill_fields 显式空数组要保住",
 check("fill_fields 不给时用默认三种",
       paper_style.normalize_paper({})["fill_fields"], ["姓名", "班级", "日期"])
 
-# ---------------------------------------------------------------- ② 四套内置卷种
-print("\n==== ② 四套内置卷种的关键取值 ====")
+# ---------------------------------------------------------------- ② 内置卷种
+print("\n==== ② 五套内置卷种的关键取值 ====")
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from app.seed import BUILTIN_PAPER_TEMPLATES  # noqa: E402
 
-check("内置卷种共 4 套", len(BUILTIN_PAPER_TEMPLATES), 4)
-check("四套的 code", [t["code"] for t in BUILTIN_PAPER_TEMPLATES],
-      ["gaokao", "zhongkao", "dse", "alevel"])
+check("内置卷种共 5 套", len(BUILTIN_PAPER_TEMPLATES), 5)
+check("五套的 code", [t["code"] for t in BUILTIN_PAPER_TEMPLATES],
+      ["gaokao", "zhongkao", "dse", "dse-zh", "alevel"])
 
 by_code = {t["code"]: paper_style.resolve(t) for t in BUILTIN_PAPER_TEMPLATES}
 
@@ -98,6 +98,26 @@ check("DSE 分区含 Section 字样",
       all("Section" in s["title"] for s in dse["sections"]), True)
 check("DSE 分区是按难度阶梯（A(1)/A(2)/B 那一套）",
       all(s["difficulties"] for s in dse["sections"]), True)
+
+# DSE 中文卷（2026-11-12 用户要的）：与英文卷**同结构、只换语言**
+zh = by_code["dse-zh"]
+truthy("DSE 中文卷抬头是繁体中文",
+       "香港中學文憑考試" in (zh["paper"]["subtitle"] or ""))
+check("DSE 中文卷的考生须知是繁体", zh["paper"]["instructions_title"], "考生須知")
+check("DSE 中文卷题号形态与英文卷一致", zh["style"]["number_style"],
+      dse["style"]["number_style"])
+check("DSE 中文卷每题标分值", zh["style"]["show_score"], True)
+check("DSE 中文卷分值单位是中文「分」", zh["style"].get("score_unit"), "分")
+check("DSE 中文卷分区数与英文卷相同", len(zh["sections"]), len(dse["sections"]))
+check("DSE 中文卷分区按难度阶梯（与英文卷同一套维度）",
+      all(s["difficulties"] for s in zh["sections"]), True)
+check("DSE 中文卷分区标题是繁体甲部/乙部",
+      all(("甲部" in s["title"] or "乙部" in s["title"]) for s in zh["sections"]), True)
+check("DSE 中文卷解答题也留作答横线",
+      zh["style"]["answer_space"] > 0 and bool(zh["style"].get("answer_space_types")), True)
+# ⚠️ 题型名是库里存的简体枚举，繁体抬头不该把它也改了 —— 改了这些题就分不进区
+check("DSE 中文卷的分区匹配仍用库里的简体题型名",
+      zh["style"]["answer_space_types"], ["解答题", "证明题", "应用题"])
 
 # A-Level：英文，题号 Question N
 al = by_code["alevel"]

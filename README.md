@@ -381,7 +381,17 @@ cd backend
 ./.venv/Scripts/python.exe test_exams.py           # 考试情况：自由文本日期 / 附件暂存转归档 / 改名搬目录 / 考情分析模板（临时库，不连服务）
 ./.venv/Scripts/python.exe test_plans.py           # 整体规划：打字与上传文件都成正文 / 列表只给摘要 / 原件归档与改名搬目录 / 规划引用的图不被回收（临时库 + node + jsdom，不连服务）
 ./.venv/Scripts/python.exe test_homework_grades.py  # AI 批改作业：批改线程与页图 / 判定依据 / 手写批改（画·擦·文字框）/ 导出副本（逐像素比对 + 原件 md5 不变）/ 前端模板编译 + 标注几何 node 单测（临时库，AI 层全桩、不联网不花钱）
+./.venv/Scripts/python.exe test_paper_latex.py      # PDF 真 LaTeX：特殊字符转义 / 抬头与分区 / 公式有墨 / \n 换行 / 答案区 / 体积 / **引擎缺失或公式写坏时回退旧路径**（不需要服务）
+./.venv/Scripts/python.exe test_paper_omml.py       # Word 原生公式：15 种中学写法 → OMML / XML 合法性 / 结构对得上 / 导出的 docx 里 0 张公式图 / `SHIKE_DOCX_MATH=image` 开关（不需要服务）
 ```
+
+> **PDF 导出需要 LaTeX 引擎**（`tectonic`，单文件 50MB，不进仓库）：
+> 双击 `tools/安装-LaTeX引擎.bat` 装到 `backend/vendor/`。首次导出要联网拉排版宏包
+> （约 5 分钟，缓存到 `%LOCALAPPDATA%\TectonicProject`），之后每次几秒。
+> **没装也能用** —— 导出会自动回退到旧的贴图路径，只是版面差一档，日志里会写明原因。
+>
+> Word 导出的公式是**原生 Word 公式（OMML）**：双击能改、字号跟着段落。
+> 若用老版 WPS 打开出现空白公式框，设环境变量 `SHIKE_DOCX_MATH=image` 重启即可退回图片。
 
 > `test_paper_ui.py` 覆盖这几块：
 > - **渲染管线唯一出处**（`frontend/src/mathRender.js`）：笔记页与出卷页共用一套

@@ -71,11 +71,17 @@ export const papersApi = {
   exportUrl: () => 'about:blank',
 };
 export const paperTemplatesApi = { list: async () => ({ items: [] }) };
-export const curriculumApi = { nodes: async () => [] };
+// 每套体系给一棵不一样的树 —— 断言「只剩该体系的节点」时拿名字就能分辨
+export const curriculumApi = {
+  nodes: async (cid) => (String(cid) === '1'
+    ? [{ name: '集合', children: [{ name: '交集', children: [] }] }, { name: '函数', children: [] }]
+    : [{ name: '代数', children: [] }, { name: '几何', children: [] }]),
+};
 `;
 
 const STORE_STUB = `
-export const state = { curricula: [] };
+// 两套体系：知识点「选了体系就只列该体系」这条要验得出来，mock 里必须有不止一套。
+export const state = { curricula: [{ id: 1, name: '体系甲' }, { id: 2, name: '体系乙' }] };
 export const fail = () => {};
 export const ok = () => {};
 export const loadCurricula = async () => {};
@@ -249,7 +255,11 @@ async function main() {
       .find((r) => r.querySelector('.q-thumb'));
     checkTrue('能在左栏找到图片题那一行', !!picRow);
     if (picRow) {
-      const btn = picRow.querySelector('button');
+      // ⚠️ 按**文案**找，别用 querySelector('button')：2026-11-12 这一行前面加了
+      //    「看」和「修」，第一个 button 就不再是「加入」了 —— 点错按钮后断言
+      //    「已选里也有图」会红，看起来像功能坏了，其实是定位太脆。
+      const btn = Array.from(picRow.querySelectorAll('button'))
+        .find((x) => /加入/.test(x.textContent || ''));
       checkTrue('图片题那一行有「加入」按钮', !!btn);
       if (btn) {
         btn.click();
@@ -260,6 +270,133 @@ async function main() {
           pickedCard.querySelectorAll('.q-rich').length, 0);
       }
     }
+
+    /* ================= 7. 2026-11-12 新增的四件事 =================
+     * 批量勾选 / 已选预览 / 跳去修题 / 知识点按体系过滤。
+     * 这四条都是「界面变了但库里没变」的高危区：勾了没进卷子、预览弹层开了但
+     * 公式没渲染、修链接的 qid 拼错、选了体系下拉里还挂着一堆别的体系节点 ——
+     * 只看源码全都「写对了」，只有真挂载点一遍才知道。 */
+    console.log('\n---- 7 批量勾选 / 预览 / 修题 / 知识点按体系 ----');
+    const tick = (ms) => new Promise((r) => setTimeout(r, ms || 200));
+
+    // ---- 7a 知识点：选了体系就只列该体系 ----
+    const kpSelect = Array.from(D.querySelectorAll('select'))
+      .find((s) => s.querySelector('optgroup'));
+    checkTrue('找到知识点下拉（带 optgroup 的那个）', !!kpSelect);
+    if (kpSelect) {
+      check('未选体系时两套体系的知识点都在', kpSelect.querySelectorAll('optgroup').length, 2);
+      vm.filter.curriculum_id = 1;
+      await tick();
+      check('★ 选了体系甲后只剩甲的知识点', kpSelect.querySelectorAll('optgroup').length, 1);
+      check('剩下的那组就是体系甲',
+        kpSelect.querySelector('optgroup').getAttribute('label'), '体系甲');
+      checkTrue('甲体系下的节点还在（集合 / 函数）',
+        /集合/.test(kpSelect.textContent) && /函数/.test(kpSelect.textContent));
+      checkTrue('★ 乙体系的节点不再出现（代数 / 几何）',
+        !/代数/.test(kpSelect.textContent) && !/几何/.test(kpSelect.textContent),
+        kpSelect.textContent.replace(/\s+/g, ' ').slice(0, 80));
+
+      vm.filter.curriculum_id = 2;
+      await tick();
+      check('切到体系乙后只剩乙的知识点', kpSelect.querySelectorAll('optgroup').length, 1);
+      checkTrue('★ 换成乙的节点（代数 / 几何）',
+        /代数/.test(kpSelect.textContent) && /几何/.test(kpSelect.textContent));
+    }
+
+    // ---- 7b 换体系后，原来选的知识点要清掉（不留「看不见的过滤器」） ----
+    vm.filter.curriculum_id = 2;
+    await tick();
+    vm.filter.kp = '代数';
+    await tick();
+    check('体系乙下选中「代数」', vm.filter.kp, '代数');
+    vm.filter.curriculum_id = 1;
+    await tick();
+    check('★ 换到体系甲后「代数」被清空（否则筛选条件还在生效但下拉里看不见）',
+      vm.filter.kp, '');
+
+    // 复位，后面几条不依赖体系
+    vm.filter.curriculum_id = '';
+    await tick();
+
+    // ---- 7c 批量选题：勾几个 → 完成 → 一起进卷子 ----
+    vm.clearPicked();
+    await tick();
+    check('先清空卷子', vm.picked.length, 0);
+    const rowEls = resultCard.querySelectorAll('.lesson-row');
+    check('题库结果还是 4 行', rowEls.length, 4);
+    const boxes = Array.from(resultCard.querySelectorAll('input[type=checkbox]'));
+    checkTrue('每行都有勾选框', boxes.length === 4, '实际 ' + boxes.length + ' 个');
+    if (boxes.length === 4) {
+      boxes[0].click();
+      boxes[1].click();
+      await tick();
+      check('★ 勾了两行（勾选状态真的记下了）', vm.checkedCount, 2);
+      checkTrue('批量工具条出现了「已勾 2 题」', /已勾\s*2\s*题/.test(resultCard.textContent),
+        (resultCard.textContent || '').replace(/\s+/g, ' ').slice(0, 120));
+      const doneBtn = Array.from(resultCard.querySelectorAll('button'))
+        .find((x) => /完成/.test(x.textContent || ''));
+      checkTrue('有「完成（加入卷子）」按钮', !!doneBtn);
+      if (doneBtn) {
+        doneBtn.click();
+        await tick();
+        check('★ 点完成后 2 道题进了卷子', vm.picked.length, 2);
+        check('完成后勾选自动清空', vm.checkedCount, 0);
+        check('进卷子的就是勾的那两道',
+          vm.picked.map((q) => q.id).join(','), 'q1,q2');
+      }
+    }
+
+    // ---- 7d 已选预览：题干 / 答案 / 解析一眼看全 ----
+    const lookBtn = Array.from(resultCard.querySelectorAll('button'))
+      .find((x) => (x.textContent || '').trim() === '看');
+    checkTrue('题库结果行上有「看」按钮', !!lookBtn);
+    if (lookBtn) {
+      lookBtn.click();
+      await tick(300);
+      const mask = D.querySelector('.modal-mask');
+      checkTrue('★ 点「看」弹出了预览层', !!mask);
+      check('预览的是点的那道题', vm.preview && vm.preview.id, 'q1');
+      if (mask) {
+        checkTrue('预览里有答案内容', /x=1/.test(mask.textContent || ''),
+          (mask.textContent || '').replace(/\s+/g, ' ').slice(0, 120));
+        checkTrue('★ 预览里的题干公式也渲染了（.katex ≥ 1）',
+          mask.querySelectorAll('.katex').length >= 1,
+          '找到 ' + mask.querySelectorAll('.katex').length + ' 个');
+        checkTrue('★ 预览里没有残留 $…$ 原文',
+          !/\$[^$]+\$/.test(mask.querySelector('.q-rich') ? mask.querySelector('.q-rich').textContent : ''),
+          '');
+        // 预览里能直接把这题移出卷子
+        const rmBtn = Array.from(mask.querySelectorAll('button'))
+          .find((x) => /移除/.test(x.textContent || ''));
+        checkTrue('预览底部有「从卷子里移除」', !!rmBtn);
+        if (rmBtn) {
+          rmBtn.click();
+          await tick(300);
+          check('★ 在预览里移除后卷子少一道', vm.picked.length, 1);
+          check('移除后弹层关闭', vm.preview, null);
+          check('弹层真的从 DOM 上摘掉了', D.querySelectorAll('.modal-mask').length, 0);
+        }
+      }
+    }
+
+    // ---- 7e 「修」跳到录题页的补答案模式，且带对 qid ----
+    const fixLink = Array.from(resultCard.querySelectorAll('a'))
+      .find((a) => (a.textContent || '').trim() === '修');
+    checkTrue('题库结果行上有「修」链接', !!fixLink);
+    if (fixLink) {
+      check('★ 修链接指向 entry.html 的补答案模式并带 qid',
+        fixLink.getAttribute('href'), '/entry.html?answer=1&qid=q1');
+      check('修链接新开标签页（不顶掉出卷页，攒的选题不会丢）',
+        fixLink.getAttribute('target'), '_blank');
+    }
+
+    // ---- 7f 「缺答案 / 缺题干」要在列表上就点出来 ----
+    // ⚠️ 断言口径要**具体到那个红标签**：只拿整个 body 去正则匹配的话，
+    //    「没有识别出文字」这类无关文案也能命中，看着绿其实没验到东西。
+    const gapTags = Array.from(resultCard.querySelectorAll('.tag.red'))
+      .map((el) => (el.textContent || '').trim());
+    checkTrue('★ 缺题干/缺答案的题在列表上用红标签点出来（不用点开才知道）',
+      gapTags.some((t) => /没有(答案|题干)/.test(t)), '找到的红标签：' + JSON.stringify(gapTags));
   } finally {
     try { fs.rmSync(tmp, { recursive: true, force: true }); } catch (e) { /* 删不掉留着也无妨 */ }
   }

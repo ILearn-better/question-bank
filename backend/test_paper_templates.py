@@ -74,12 +74,16 @@ def export(ids, fmt="html", tid=None, title="测试卷"):
 
 try:
     # ------------------------------------------------------------ 列表
-    print("==== ① 四套内置样式 ====")
+    print("==== ① 内置样式 ====")
     st, d = req("GET", "/api/paper-templates")
     check("HTTP 200", st, 200)
     tpls = d["items"]
-    check("四套内置", len(tpls), 4)
-    check("顺序", [t["code"] for t in tpls], ["gaokao", "zhongkao", "dse", "alevel"])
+    # 内置套数会随版本增加（2026-11-12 加了「DSE 数学（中文卷）」= dse-zh），
+    # 所以不写死总数：只断言这几套还在、且顺序没被打乱；删除那一步按基线比。
+    base_count = len(tpls)
+    WANT = ["gaokao", "zhongkao", "dse", "alevel"]
+    check("内置样式齐全", [c in [t["code"] for t in tpls] for c in WANT], [True] * 4)
+    check("前四套顺序", [t["code"] for t in tpls][:4], WANT)
     print("     名字:", [t["name"] for t in tpls])
     gk = tpls[0]
     check("返回里带**解析后**的三大块",
@@ -132,7 +136,7 @@ try:
     print("\n==== ⑦ 删除自己复制的 ====")
     for t in (cp, cp2, cp3):
         check(f"删「{t['name']}」→ 200", req("DELETE", f"/api/paper-templates/{t['id']}")[0], 200)
-    check("删完只剩四套内置", len(req("GET", "/api/paper-templates")[1]["items"]), 4)
+    check("删完只剩开工时那几套", len(req("GET", "/api/paper-templates")[1]["items"]), base_count)
 
     # ------------------------------------------------------------ 导出
     print("\n==== ⑧ 造 3 道临时题（选择题/填空题/解答题）====")

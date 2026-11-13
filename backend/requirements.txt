@@ -11,6 +11,11 @@ pywin32>=306; sys_platform == "win32"
 # 把 LaTeX 公式渲染成图片 —— 导出 PDF 用（PyMuPDF 自己不会渲染 LaTeX）。
 # 2026-10-05 为验证「公式识别」能力已装入本机 venv；方案见 docs/批量导入与卷种样式方案.md §3.1.4 / P7。
 matplotlib>=3.8
+# 导出 Word 时把 LaTeX 公式变成**原生 Word 公式（OMML）**，不是图片。
+# 链路：latex2mathml 把 LaTeX 转 MathML，mathml2omml 再把 MathML 转 OMML（纯 Python，
+# 不需要 pandoc，也不需要本机装 Office 的 MML2OMML.XSL）。见 app/services/paper_math.py。
+latex2mathml>=3.77
+mathml2omml>=0.0.2
 # 公式识别前把截图压小再送模型（见 app/services/vision.py）。
 # 少装它会让识别请求体大好几倍 —— 整页渲染图是 3 倍分辨率，base64 后还要再涨 33%。
 Pillow>=10

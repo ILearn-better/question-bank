@@ -241,7 +241,7 @@ def ensure_feedback_doc_templates(db: Session) -> int:
 
 
 # ---------------------------------------------------------------- 卷种样式模板
-# 四套内置卷种：高考 / 中考 / DSE / A-Level。
+# 五套内置卷种：高考 / 中考 / DSE（英文卷 + 中文卷）/ A-Level。
 #
 # ⚠️ 这是**起点**，不是标准答案。同一场考试不同年份、不同省份、不同学校
 #    的抬头和注意事项都不一样，所以这些字段全部可改（内置模板也能改，只是不能删）。
@@ -374,6 +374,53 @@ BUILTIN_PAPER_TEMPLATES: list[dict] = [
              "note": "Answer ALL questions in this section."},
             {"title": "Section B", "difficulties": ["拔高"],
              "note": "Answer ALL questions in this section."},
+        ],
+    },
+    {
+        # DSE 数学的**中文卷**。英文卷（上面那个）抬头和指引全是英文，中文卷是同一个考试
+        # 的中文版本 —— 香港很多学校用中文应考，卷面必须全繁体（2026-11-12 用户要的）。
+        # 两者除了语言，结构一模一样：同样按**难度阶梯**分甲部(1)/甲部(2)/乙部，
+        # 同样每题标分数、解答题下留 6 行作答线。改一处别忘了另一处。
+        "code": "dse-zh",
+        "name": "DSE 数学（中文卷）",
+        "sample": "繁體抬頭 + 考生須知；甲部(1) / 甲部(2) / 乙部 按**難度階梯**分"
+                  "（對應庫裡的 基础/中档/拔高），與 DSE Paper 1 的中文版一致。"
+                  "解答題下方留 6 行作答橫線。",
+        "paper": {
+            "subtitle": "香港中學文憑考試　數學　必修部分　試卷一",
+            "exam_note": "時限：二小時十五分鐘　　本卷全部試題均須作答",
+            "instructions_title": "考生須知",
+            "instructions": [
+                "細閱答題簿上的指示。",
+                "本卷共分甲部(1)、甲部(2)及乙部三部分，全部試題均須作答。",
+                "除特別指明外，所有運算過程須清楚顯示。",
+                "除特別指明外，數值答案須用真確值，或準確至三位有效數字的近似值表示。",
+                "本卷的圖形不一定按比例繪畫。",
+            ],
+            "fill_fields": ["考生編號", "姓名"],
+            "score_table": False,
+        },
+        "style": {
+            "font_size": 11.5,
+            "title_size": 15.0,
+            "section_size": 13.0,
+            "line_height": 1.8,
+            "margin_mm": [16.0, 14.0],
+            "question_gap": 14.0,
+            "number_style": "1.",
+            "show_score": True,
+            "score_unit": "分",
+            "answer_space": 6,
+            # 题型名是库里的简体枚举（题库按简体存），别跟着抬头改成繁体
+            "answer_space_types": ["解答题", "证明题", "应用题"],
+        },
+        "sections": [
+            {"title": "甲部(1)", "difficulties": ["基础"],
+             "note": "本部分全部試題均須作答。"},
+            {"title": "甲部(2)", "difficulties": ["中档"],
+             "note": "本部分全部試題均須作答。"},
+            {"title": "乙部", "difficulties": ["拔高"],
+             "note": "本部分全部試題均須作答。"},
         ],
     },
     {
