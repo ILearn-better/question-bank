@@ -1,17 +1,26 @@
 # -*- coding: utf-8 -*-
-"""题库 vault 接口：扫描磁盘上的题目 md、把题库里的题导出成 md。
+"""题库 vault 接口：扫描磁盘上的题目 md、把题库里的题导出成 md、
+**把 PDF / Word / 图片转成题目 md**。
 
 为什么把这些单独开一个路由，而不是塞进 questions 或 notes：
   它操作的对象既不是「库里的一道题」也不是「一篇笔记」，而是**磁盘上一个文件夹**。
   前缀 `/api/vault/*`，和题库（/api/questions）、笔记（/api/notes）平级，
   将来要加「讲义目录」「学生资料目录」也不会在这两个路由里越堆越乱。
+
+关于「PDF → markdown 由谁做」（老师 2026-11-18 点明的一条）：
+  不靠 Obsidian 插件。社区插件都在抠 PDF 的**文字层**，而数学卷里的公式在文字层里
+  基本是废的（本项目已经确认过：含公式的卷一律走视觉模型）。让插件转出来的 md
+  公式是乱的、配图是没有的 —— 那正是「效果无法严格保证」的来源。
+  所以转换这一步留在拾课：它已有跑通的整页识别（配图定位、跨页判断、兜底整题图），
+  转出来的 md 才带得上公式与图。Obsidian 那边只负责**编辑**。
 """
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -62,8 +71,20 @@ def vault_status(db: Session = Depends(get_db)):
         "md_questions": md_questions,
         "linked": linked,
         "inbox_pending": inbox,
-        "dirs": {"shelf": vault.SHELF, "attach": vault.ATTACH, "inbox": vault.INBOX},
+        # 识别出来但没把握的稿子（`题库/_待审/`）。它们**还没入库** —— 老师改好拖进
+        # `题库/` 再同步才算。这个数要摆在页面上，否则老师永远不知道有东西在等他。
+        "pending_review": len(_pending_review()),
+        "dirs": {"shelf": vault.SHELF, "attach": vault.ATTACH, "inbox": vault.INBOX,
+                 "pending": vault.PENDING},
     }
+
+
+def _pending_review() -> list[Path]:
+    """`题库/_待审/` 下的题目 md。"""
+    d = vault.pending_dir()
+    if not d.is_dir():
+        return []
+    return sorted(p for p in d.glob("*.md") if p.is_file())
 
 
 def _writable(p: Path) -> bool:
@@ -216,6 +237,80 @@ def question_source(qid: str, db: Session = Depends(get_db)):
     return {"qid": qid, "md_path": q.md_path, "abs": str(full), "exists": exists, "uri": uri}
 
 
+# ---------------------------------------------------------------- 转换（文档 → 题目 md）
+_BAD_FILE = re.compile(r'[\\/:*?"<>|\r\n\t]+')
+
+
+def _clean_filename(filename: str, ext: str) -> str:
+    """上传来的文件名 → 能落盘的名字（去路径分隔符、去 Windows 保留字符、截长度）。
+
+    不保留原扩展名以外的东西：老师传的可能是 `2024 P1（真题）(1).pdf`，
+    括号和空格都留着没问题，但反斜杠、斜杠、冒号、星号这些会让 `write_bytes` 抛错。
+    """
+    stem = _BAD_FILE.sub(" ", Path(filename or "上传").stem).strip(" .") or "上传"
+    return f"{stem[:60].strip(' .') or '上传'}{ext}"
+
+
+def _unique(directory: Path, name: str) -> Path:
+    """同名文件不覆盖：老师可能第二次传同一份卷子的修订版。"""
+    path = directory / name
+    n = 1
+    while path.exists():
+        n += 1
+        path = directory / f"{Path(name).stem}-{n}{Path(name).suffix}"
+    return path
+
+
+@router.post("/convert")
+def convert_to_md(
+    file: UploadFile = File(...),
+    curriculum: str | None = Form(None, description="体系：id / code / name 任一"),
+    db: Session = Depends(get_db),
+):
+    """上传一份 PDF / Word / 图片 → 识别 → 写成 `题库/` 下的题目 md。
+
+    **转换由拾课做，不靠 Obsidian 插件。** 插件抠的是 PDF 的文字层，数学卷的公式在
+    文字层里基本是废的；拾课这边走视觉模型，公式原样落成 `$…$`、配图单独裁出来。
+    这样转出来的 md 才能「符合模板、直接录入题库」。
+
+    落点：文件先进 `收件箱/<体系 code>/`（和老师从 Obsidian 拖进去是同一条路），
+    跑完由收件箱的收尾逻辑写 md —— 零疑点的进 `题库/`，没把握的进 `题库/_待审/`。
+    这样两种来源（网页上传 / 拖进文件夹）不会有两套半成品。
+
+    同步 def（不是 async）：`_kickoff` 里有 PyMuPDF / Word 的同步解析，几百毫秒到几十秒。
+    """
+    from ..services import vault_inbox
+    from .auto import _resolve_curriculum
+    from .documents import check_ext
+
+    curr = _resolve_curriculum(db, curriculum)          # 先校验体系：别为无效调用存文件
+    filename = file.filename or "upload"
+    ext = os.path.splitext(filename)[1].lower()
+    check_ext(ext)                                      # 不认识的后缀在这里就 422
+
+    vault.ensure_dirs()
+    dest_dir = vault.inbox_dir() / (curr.code or curr.name or str(curr.id))
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = _unique(dest_dir, _clean_filename(filename, ext))
+    dest.write_bytes(file.file.read())
+
+    try:
+        res = vault_inbox.enqueue(db, dest, curr)
+    except Exception as exc:                            # noqa: BLE001
+        # 开不了任务就别把文件留在收件箱：下一轮扫描会再试一次，然后又是同样的报错，
+        # 而老师从页面上看不出「其实已经失败了」。删掉 + 把原因返回去。
+        dest.unlink(missing_ok=True)
+        raise HTTPException(422, f"转换失败：{exc}") from exc
+
+    res.update({
+        "curriculum": curr.code or curr.name,
+        "dir": vault.rel(dest_dir),
+        "hint": "识别在后台跑（一页几秒）。跑完题目 md 出现在 题库/ 下；"
+                "拾课没把握的会进 题库/_待审/，等在 Obsidian 里看过再拖进 题库/。",
+    })
+    return res
+
+
 # ---------------------------------------------------------------- 收件箱
 @router.get("/inbox")
 def inbox_status(db: Session = Depends(get_db)):
@@ -242,6 +337,8 @@ def inbox_status(db: Session = Depends(get_db)):
         "hint": "把卷子放进 收件箱/<体系 code>/ 里（子文件夹名就是体系）",
         "pending": files,
         "tasks": tasks,
+        # 识别完但没把握的稿子：在 Obsidian 里看、改，然后拖进 题库/ 再点同步
+        "review": [vault.rel(p) for p in _pending_review()],
         "curricula": [c.code or c.name for c in db.scalars(select(Curriculum)).all()],
         "enabled": config.VAULT_INBOX,
     }

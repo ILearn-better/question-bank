@@ -600,16 +600,17 @@ def _finalize(job_id: str, done: int, failed: int, error: str | None) -> None:
 
 
 # ---------------------------------------------------------------- 通过 / 驳回
-def approve_item(db: Session, item: BatchItem) -> str:
-    """把一条待审条目写进正式题库，返回新题目 id。
+def build_question(db: Session, item: BatchItem, qid: str) -> tuple[Question, int | None]:
+    """`BatchItem` → 一道**还没落库**的 `Question`，并返回 `(题, node_id)`。
 
-    两种形态都带上：`content`（模型识别 + 老师可能改过的文本）与 `image`（原貌图）。
-    `render_prefer` 给 auto —— 有文本用文本。理由：**这一条已经被老师审核过了**，
-    文本是被确认过的内容；而原貌图始终留着，需要时在出卷页整卷切「图片」即可。
+    为什么抽出来：同一条待审条目有两条出口 —— 零疑点的正式入库（`approve_item`），
+    和「有疑点、写成 md 等老师在 Obsidian 里改」（`vault_inbox._export_pending_items`）。
+    两条出口必须写出**同一道题**，否则老师在 md 里补好答案、入库后却和当初网页上看到的
+    不是同一份字段。这个项目已经有五条字段写入路径（fields_from_obj / _write_page_items /
+    _item_dict / saveItem / approve_item），漏一条不报错、只是静默丢字段 —— 所以这里
+    只留**一个**映射，两边都调它。
 
-    ⚠️ 唯一的例外：整页识别里配图定位不到的题，`image` 存的是**整道题**的兜底图
-    （`figure_whole_question`）。那种题必须印图片 —— 印文本就丢图了。
-    判据只认这个标记，别的条目一个字都不改。
+    `qid` 由调用方给：入库时是新 id，待审稿时也是新 id（只是先当文件名用）。
     """
     job = db.get(BatchJob, item.job_id)
     curriculum_id = job.curriculum_id if job else None
@@ -623,8 +624,7 @@ def approve_item(db: Session, item: BatchItem) -> str:
     kps, node_id, curriculum_id = knowledge.resolve_kp(
         db, [item.knowledge_point] if item.knowledge_point else [], curriculum_id, fuzzy=True
     )
-    qid = uuid.uuid4().hex[:12]
-    db.add(Question(
+    return Question(
         id=qid,
         owner_id=config.OWNER_ID,
         document_id=item.document_id,
@@ -648,7 +648,23 @@ def approve_item(db: Session, item: BatchItem) -> str:
         # 兜底那条路裁的是**整道题**（配图定位不到时）→ 出卷必须印这张图，
         # 印文本反而丢图。其余情况照旧 auto（有文本用文本）。
         render_prefer=("image" if "figure_whole_question" in item_flags else "auto"),
-    ))
+    ), node_id
+
+
+def approve_item(db: Session, item: BatchItem) -> str:
+    """把一条待审条目写进正式题库，返回新题目 id。
+
+    两种形态都带上：`content`（模型识别 + 老师可能改过的文本）与 `image`（原貌图）。
+    `render_prefer` 给 auto —— 有文本用文本。理由：**这一条已经被老师审核过了**，
+    文本是被确认过的内容；而原貌图始终留着，需要时在出卷页整卷切「图片」即可。
+
+    ⚠️ 唯一的例外：整页识别里配图定位不到的题，`image` 存的是**整道题**的兜底图
+    （`figure_whole_question`）。那种题必须印图片 —— 印文本就丢图了。
+    判据只认这个标记，别的条目一个字都不改。
+    """
+    qid = uuid.uuid4().hex[:12]
+    q, node_id = build_question(db, item, qid)     # 字段映射的唯一出处
+    db.add(q)
     if node_id:
         db.add(QuestionNode(question_id=qid, node_id=node_id, weight=1.0))
     item.status = "approved"

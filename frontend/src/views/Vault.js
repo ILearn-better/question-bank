@@ -10,7 +10,7 @@
 // ⚠️ 这个项目**没有引入 Element Plus**（index.html 的 importmap 只有 vue / vue-router），
 //    所以这一页和别的页一样用原生 HTML + app.css 里的 `.card` / `.btn` / `.muted`。
 //    写成 `<el-card>` 不会报错，只会渲染成一堆没样式的未知标签。
-import { computed, onMounted, ref } from 'vue';
+import { computed, onMounted, onUnmounted, ref } from 'vue';
 import { vaultApi } from '../api.js';
 import { fail, ok } from '../store.js';
 
@@ -24,6 +24,16 @@ export default {
     const exportResult = ref(null);
     const exportLimit = ref(200);
 
+    // ---- 转换（PDF/Word/图片 → 题目 md）----
+    const picked = ref(null);          // 选中的 File
+    const pickedName = ref('');
+    const convertCurr = ref('');
+    const converting = ref(false);
+    const convertResult = ref(null);
+    // 识别在后台跑，页面上只能靠轮询看进度。定时器必须在卸载时清掉，
+    // 否则离开这一页之后还在每 5 秒打一次接口。
+    const pollTimer = ref(null);
+
     const nothingHappened = computed(() => {
       const r = report.value;
       return r && !r.created.length && !r.updated.length && !r.errors.length;
@@ -35,6 +45,52 @@ export default {
         inbox.value = await vaultApi.inbox();
       } catch (e) {
         fail(e.message);
+      }
+    }
+
+    function stopPolling() {
+      if (pollTimer.value) {
+        clearInterval(pollTimer.value);
+        pollTimer.value = null;
+      }
+    }
+
+    /** 有任务在跑 / 收件箱里还有文件时才轮询；空了就自己停。 */
+    function startPolling() {
+      stopPolling();
+      pollTimer.value = setInterval(async () => {
+        await load();
+        const tasks = (inbox.value && inbox.value.tasks) || [];
+        const pending = (inbox.value && inbox.value.pending) || [];
+        if (!tasks.length && !pending.length) stopPolling();
+      }, 5000);
+    }
+
+    function onPick(ev) {
+      const f = (ev.target.files && ev.target.files[0]) || null;
+      picked.value = f;
+      pickedName.value = f ? f.name : '';
+    }
+
+    async function doConvert() {
+      if (!picked.value || !convertCurr.value) return;
+      converting.value = true;
+      convertResult.value = null;
+      const fd = new FormData();
+      fd.append('file', picked.value);
+      fd.append('curriculum', convertCurr.value);
+      try {
+        const r = await vaultApi.convert(fd);
+        convertResult.value = r;
+        ok(`已收下「${pickedName.value}」，正在识别（跑完写成题目 md）`);
+        picked.value = null;
+        pickedName.value = '';
+        await load();
+        startPolling();
+      } catch (e) {
+        fail(e.message);
+      } finally {
+        converting.value = false;
       }
     }
 
@@ -127,10 +183,12 @@ export default {
     }
 
     onMounted(load);
+    onUnmounted(stopPolling);
 
     return {
       status, inbox, busy, report, nothingHappened, exportResult, exportLimit,
       load, scan, doExport, seedTemplate, openFolder, copyPath, runInbox,
+      picked, pickedName, convertCurr, converting, convertResult, onPick, doConvert,
     };
   },
   template: `
@@ -173,7 +231,55 @@ export default {
                :style="{ color: status.inbox_pending ? 'var(--warning)' : 'inherit' }">{{ status.inbox_pending }}</div>
           <div class="muted small">收件箱待处理</div>
         </div>
+        <div v-if="status.pending_review">
+          <div style="font-size:22px;font-weight:600;color:var(--warning)">{{ status.pending_review }}</div>
+          <div class="muted small">待审稿（还没入库）</div>
+        </div>
       </div>
+    </div>
+
+    <div class="card">
+      <h2>把 PDF / Word / 图片转成题目 md</h2>
+      <div class="muted small" style="line-height:1.8;margin-bottom:10px">
+        这一步<b>由拾课做</b>，不靠 Obsidian 插件 —— 插件抠的是 PDF 的文字层，而数学卷的公式
+        在文字层里基本是废的（转出来的 md 公式是乱的、图也没有）。拾课走视觉模型识别，
+        公式原样落成 <code>$…$</code>、配图单独裁出来存进「附件」。
+      </div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+        <input type="file" accept=".pdf,.docx,.png,.jpg,.jpeg,.webp,.bmp"
+               :disabled="converting" @change="onPick" />
+        <select v-model="convertCurr" :disabled="converting" style="min-width:130px">
+          <option value="">选体系…</option>
+          <option v-for="c in (inbox ? inbox.curricula : [])" :key="c" :value="c">{{ c }}</option>
+        </select>
+        <button class="btn primary" :disabled="converting || !pickedName || !convertCurr" @click="doConvert">
+          {{ converting ? '上传中…' : '开始转换' }}
+        </button>
+        <span v-if="pickedName" class="muted small">已选：{{ pickedName }}</span>
+      </div>
+      <div class="muted small" style="margin-top:10px;line-height:1.8">
+        体系必须选：知识点要挂到对应的知识树上，猜错不会报错，只会在出卷时发现「知识点全对不上」。
+        识别在后台跑（一页几秒），跑完题目 md 出现在 <code>题库/</code> 下；
+        拾课<b>没把握</b>的会先放 <code>题库/_待审/</code>。
+      </div>
+      <div v-if="convertResult" class="small" style="margin-top:10px;line-height:1.8">
+        <div>已收进收件箱：<code>{{ convertResult.file }}</code></div>
+        <div class="muted">{{ convertResult.hint }}</div>
+        <div v-if="inbox && inbox.tasks.length" class="muted">
+          正在跑的：
+          <span v-for="t in inbox.tasks" :key="t.file">{{ t.file }}（{{ t.stage || t.status }}） </span>
+        </div>
+      </div>
+    </div>
+
+    <div class="card" v-if="inbox && inbox.review.length">
+      <h2>待审稿（识别出来但拾课没把握）</h2>
+      <div class="muted small" style="line-height:1.8;margin-bottom:8px">
+        这些题<b>还没进题库</b>。在 Obsidian 里打开、改好（补图 / 改公式 / 删掉误识别的行），
+        然后把文件从 <code>题库/_待审/</code> 拖进 <code>题库/</code>，再点上面的「同步」就入库了。
+        每篇的 frontmatter 里有一条 <code>shike_todo</code> 写着当时哪里没把握，改完删掉即可。
+      </div>
+      <div v-for="f in inbox.review" :key="f" class="small" style="line-height:1.9">· {{ f }}</div>
     </div>
 
     <div class="card">

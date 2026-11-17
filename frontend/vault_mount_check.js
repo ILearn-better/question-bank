@@ -53,14 +53,15 @@ const API_STUB = `
 const STATUS = {
   root: 'D:/shike/backend/data/vault',
   exists: true, writable: true,
-  md_total: 5, md_questions: 3, linked: 2, inbox_pending: 1,
-  dirs: { shelf: '题库', attach: '附件', inbox: '收件箱' },
+  md_total: 5, md_questions: 3, linked: 2, inbox_pending: 1, pending_review: 2,
+  dirs: { shelf: '题库', attach: '附件', inbox: '收件箱', pending: '_待审' },
 };
 const INBOX = {
   dir: 'D:/shike/backend/data/vault/收件箱',
   hint: '把卷子放进 收件箱/<体系 code>/ 里（子文件夹名就是体系）',
   pending: ['收件箱/DSE/2024-P1.pdf'],
   tasks: [],
+  review: ['题库/_待审/某道配图有疑点的题.md'],
   curricula: ['DSE', 'CN-SENIOR'],
   enabled: true,
 };
@@ -83,6 +84,11 @@ export const vaultApi = {
   export: async () => ({ exported: [], failed: [], note: '没有需要导出的题' }),
   seedTemplate: async () => ({ path: '题库/题目模板（照这个写）.md', existed: false }),
   openFolder: async () => ({ ok: true }),
+  convert: async () => ({
+    file: '收件箱/DSE/2024-P1.pdf', task_id: 't1', curriculum: 'DSE',
+    dir: '收件箱/DSE',
+    hint: '识别在后台跑（一页几秒）。跑完题目 md 出现在 题库/ 下',
+  }),
   inboxRun: async () => ({ started: [], finished: [], failed: [], ignored: [], waiting: [] }),
   source: async () => ({ qid: 'q1', md_path: null, exists: false, uri: null }),
 };
@@ -108,6 +114,7 @@ export const ref = (...a) => V.ref(...a);
 export const watch = (...a) => V.watch(...a);
 export const reactive = (...a) => V.reactive(...a);
 export const onMounted = (...a) => V.onMounted(...a);
+export const onUnmounted = (...a) => V.onUnmounted(...a);
 export const createApp = (...a) => V.createApp(...a);
 export default V;
 `;
@@ -200,6 +207,46 @@ async function main() {
     checkTrue('「2 道题已关联」上屏了', html.includes('>2<'));
     checkTrue('收件箱待处理数上屏了', html.includes('>1<'));
     checkTrue('收件箱提示里写了子目录规则', html.includes('子文件夹名就是体系'));
+    // 待审稿：识别没把握的题写成 md 放在 题库/_待审/，等老师看过再拖进 题库/
+    checkTrue('待审稿数量上屏了', html.includes('>2<') && html.includes('待审稿（还没入库）'));
+    checkTrue('待审稿清单上屏了', html.includes('题库/_待审/某道配图有疑点的题.md'));
+    checkTrue('说明了「拖进 题库/ 再同步才入库」', html.includes('拖进'));
+
+    // ③ 转换：PDF/Word/图片 → 题目 md（转换由拾课做，不靠 Obsidian 插件）
+    checkTrue('有「把 PDF / Word / 图片转成题目 md」这块', html.includes('转成题目 md'));
+    checkTrue('写清了为什么不用 Obsidian 插件（公式在文字层里是废的）',
+      html.includes('文字层'));
+    const convBtn = btn(D, '开始转换');
+    checkTrue('找到转换按钮', !!convBtn);
+    checkTrue('没选文件+体系时转换按钮是禁用的', convBtn.disabled === true);
+    // 桩一个 File + 选体系：按钮该变为可点，点了要能出「已收进收件箱」
+    // ⚠️ 走**真事件**（选文件 → change，选体系 → change），别直接改 vm 上的 ref：
+    //    那样测的只是「模板能渲染 pickedName」，测不出 onPick / v-model 有没有接错。
+    const sel = D.querySelector('select');
+    sel.value = 'DSE';
+    sel.dispatchEvent(new W.Event('change'));
+    const fileInput = D.querySelector('input[type=file]');
+    checkTrue('页面上有选文件的 input', !!fileInput);
+    try {
+      const dt = new W.DataTransfer();
+      dt.items.add(new W.File(['%PDF-1.4'], '2024-P1.pdf', { type: 'application/pdf' }));
+      fileInput.files = dt.files;
+      fileInput.dispatchEvent(new W.Event('change'));
+    } catch (e) {
+      // jsdom 版本的 DataTransfer 不够用时就退化成直接给 ref —— 后面两条断言仍有效
+      vm.picked = new W.File(['%PDF-1.4'], '2024-P1.pdf', { type: 'application/pdf' });
+      vm.pickedName = '2024-P1.pdf';
+    }
+    await tick(80);
+    const convBtn2 = btn(D, '开始转换');
+    checkTrue('选好文件和体系后按钮可点', convBtn2.disabled === false);
+    convBtn2.click();
+    await tick(300);
+    const afterConv = D.querySelector('#app').innerHTML;
+    checkTrue('★ 转换后回显「已收进收件箱」', afterConv.includes('已收进收件箱'));
+    checkTrue('★ 回显了落在哪个子目录', afterConv.includes('收件箱/DSE/2024-P1.pdf'));
+    checkTrue('★ 回显了「跑完题目 md 出现在 题库/ 下」',
+      afterConv.includes('题库/ 下'));
 
     // ③ 点「同步」→ 报告出现
     checkTrue('还没点同步时没有报告', !html.includes('同步结果'));

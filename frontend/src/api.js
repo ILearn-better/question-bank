@@ -454,6 +454,12 @@ export const vaultApi = {
   /** 收件箱：把卷子丢进 `vault/收件箱/<体系>/`，后台自动识别成题目 md。 */
   inbox: () => api.get('/api/vault/inbox'),
   inboxRun: () => api.post('/api/vault/inbox/run'),
+  /**
+   * 上传一份 PDF / Word / 图片 → 拾课识别 → 写成题目 md。
+   * 转换在服务端做（视觉模型），不靠 Obsidian 插件 —— 插件抠文字层，公式是废的。
+   * FormData 里带 file / curriculum。
+   */
+  convert: (formData) => api.upload('/api/vault/convert', formData),
   /** 这道题来自哪个 md（题目详情里「在 Obsidian 里打开」用）。 */
   source: (qid) => api.get(`/api/vault/source/${qid}`),
 };

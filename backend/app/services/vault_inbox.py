@@ -33,6 +33,7 @@ import logging
 import shutil
 import threading
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -57,6 +58,10 @@ MAX_ACTIVE = 2
 # queued 也算「在跑」？**不算**：真正的在跑是 recognizing/fixing/approving。
 # 但 queued 说明已经排队了，占一个名额 —— 否则同一个文件会被开两次任务。
 ACTIVE = {"queued", "recognizing", "fixing", "approving"}
+
+# 状态文件（读 → 改 → 写）与「开任务」的互斥锁。后台轮询线程与 HTTP 请求都会进来，
+# 不加锁最坏的结果不是丢一个计数，而是**同一份卷子被识别两遍、题入两遍库**。
+_lock = threading.Lock()
 
 
 def _state_path() -> Path:
@@ -165,14 +170,104 @@ def _export_task_questions(db: Session, task: AutoTask) -> list[str]:
     return written
 
 
+def _copy_origin(it: BatchItem) -> str:
+    """把这道题的原貌截图复制进 `附件/`，返回文件名（拿不到就空串）。
+
+    待审稿为什么要把原貌图也放过去：老师在 Obsidian 里改题时最需要的就是
+    「这题原本长什么样」—— 尤其配图疑点的题，光看识别出来的文字根本判断不了。
+    文件名带条目前缀，和题目附件不会互相覆盖。
+    """
+    if not it.image:
+        return ""
+    src = config.CROPS_DIR / Path(it.image).name
+    if not src.is_file():
+        return ""
+    name = f"原貌-{it.id}{src.suffix or '.png'}"
+    try:
+        shutil.copyfile(src, vault.attach_dir() / name)
+    except OSError:
+        return ""
+    return name
+
+
+def _export_pending_items(db: Session, task: AutoTask) -> list[str]:
+    """把**有疑点、但内容没坏**的条目写进 `题库/_待审/`，返回写了哪些路径。
+
+    为什么值得落成文件：识别不可能总是完美（配图框歪了、某页模型返回坏 JSON）。
+    这些条目以前只躺在网页待审列表里，而老师日常就在 Obsidian 里 ——
+    把题摊到他面前，他能随手截图贴图、对着原貌图改公式，比在网页上逐条框图省事。
+    改完把文件从 `_待审/` 拖进 `题库/`，下一次同步就入库。
+
+    ⚠️ **判据用 `auto_import.judge`，别自己写**：什么算「内容本身坏了」（bad_json /
+       parse_failed / empty_stem）已经有唯一出处。内容坏了的条目导出成 md 毫无意义 ——
+       那里面是占位文本，老师改不出东西来。
+
+    ⚠️ 稿子**不写 `shike_id`**（见 `vault.render` 的 `with_id`）：这题还没入库，
+       写个不存在的 id 只会让「拖进题库 → 同步」时多一句白报。
+    """
+    from . import auto_import, batch_import
+
+    try:
+        job_ids = json.loads(task.job_ids or "[]")
+    except ValueError:
+        job_ids = []
+    if not job_ids:
+        return []
+    items = db.scalars(
+        select(BatchItem).where(BatchItem.job_id.in_(job_ids))
+        .order_by(BatchItem.seq)
+    ).all()
+    written: list[str] = []
+    for it in items:
+        if it.status == "approved" or not (it.content or "").strip():
+            continue
+        verdict, reason = auto_import.judge(
+            it.content, it.flags, bool(it.needs_figure), it.figure_image or "")
+        if verdict == "skip":
+            # 内容本身坏了（坏 JSON / 解析失败 / 空题干）—— 那是占位文本，导出成 md
+            # 老师也改不出东西来，只能重跑那一页。它留在网页待审列表里更合适。
+            #
+            # ⚠️ 判据是 `== "skip"` 而不是 `!= "pass"`：`repair`（配图有疑点/没配上）
+            #    和 `human`（自动修图也失败）**正是**最该落到 Obsidian 里让人改的一类。
+            continue
+        try:
+            qid = uuid.uuid4().hex[:12]
+            q, _node = batch_import.build_question(db, it, qid)   # 与正式入库同一份字段映射
+            todo = "拾课识别没把握，先放这里等你看一眼 —— " + auto_import.reason_text(reason)
+            origin = _copy_origin(it)
+            if origin:
+                todo += f"。原貌图（识别时的整题截图）在 附件/{origin}"
+            if it.note:
+                todo += f"。模型自述：{it.note[:200]}"
+            todo += "。改好这个文件后，把它拖进 题库/ 再点「同步」就入库"
+            path = vault.write_new(q, folder=vault.PENDING,
+                                   extra_fm={"shike_todo": todo}, with_id=False)
+            written.append(vault.rel(path))
+        except Exception as exc:                   # noqa: BLE001 —— 一条失败不带走整批
+            _log.warning("收件箱：条目 %s 写待审稿失败：%s", it.id, exc)
+            db.rollback()
+    return written
+
+
 def scan_once(db: Session, *, enqueue: bool = True) -> dict:
     """跑一轮：先收尾已经跑完的任务，再给新文件开任务。
 
     顺序不能反 —— 先开新的会让「同时最多 2 个」这个上限失效。
     """
     vault.ensure_dirs()
-    state = _load()
-    report: dict = {"started": [], "finished": [], "failed": [], "ignored": [], "waiting": []}
+    report: dict = {"started": [], "finished": [], "failed": [], "ignored": [],
+                    "waiting": [], "drafts": []}
+    # ⚠️ 状态文件是「读 → 改 → 写」，后台轮询线程和 HTTP 请求**会同时进来**。
+    #    不加锁的经典后果：网页上传刚登记好，轮询线程用几秒前读到的旧内容写回去，
+    #    登记就消失了 → 下一轮看到文件还在收件箱 → 再开一次任务 → **同一份卷子入两遍库**。
+    with _lock:
+        state = _load()
+        _scan_locked(db, state, report, enqueue=enqueue)
+        _save(state)
+    return report
+
+
+def _scan_locked(db: Session, state: dict, report: dict, *, enqueue: bool = True) -> None:
 
     # ---- ① 收尾：看已开跑的任务
     active = 0
@@ -189,6 +284,10 @@ def scan_once(db: Session, *, enqueue: bool = True) -> dict:
             continue
         if task.status in ("done", "partial"):
             ids = _export_task_questions(db, task)
+            # 零疑点的题已经入库并写成了 md；有疑点的题也不能就这么留在网页里 ——
+            # 写成 `题库/_待审/` 的稿子，老师在 Obsidian 里改完拖进来才算数。
+            drafts = _export_pending_items(db, task)
+            report["drafts"].extend(drafts)
             src = vault.root() / key
             moved = ""
             if src.is_file():
@@ -197,7 +296,8 @@ def scan_once(db: Session, *, enqueue: bool = True) -> dict:
                 except OSError as exc:
                     _log.warning("收件箱：挪走 %s 失败：%s", src, exc)
             report["finished"].append({"file": key, "task_id": task.id, "status": task.status,
-                                       "questions": len(ids), "moved_to": moved,
+                                       "questions": len(ids), "drafts": len(drafts),
+                                       "moved_to": moved,
                                        "approved": task.approved or 0})
             state["tasks"].pop(key, None)
             continue
@@ -262,8 +362,27 @@ def scan_once(db: Session, *, enqueue: bool = True) -> dict:
                                   "curriculum": curr.code or curr.name})
         active += 1
 
-    _save(state)
-    return report
+
+def enqueue(db: Session, path: Path, curr: Curriculum) -> dict:
+    """把**一个**已经放进收件箱的文件立刻开识别任务（网页上传走这条）。
+
+    为什么要绕回收件箱：这样「网页上传的」和「老师从 Obsidian 拖进收件箱的」
+    是同一种东西 —— 收尾、挪 `_已处理/`、导出 md、写待审稿全走同一段代码。
+    另起一套「转换任务」等于把这条链复制一遍，两套的半成品迟早不一样。
+    """
+    key = vault.rel(path)
+    with _lock:
+        state = _load()
+        if key in state["tasks"]:
+            return {"file": key, "task_id": state["tasks"][key].get("task_id"),
+                    "already": True}
+        task_id = _kickoff(db, path, curr)
+        state["tasks"][key] = {
+            "task_id": task_id, "curriculum": curr.code or curr.name,
+            "at": datetime.now().isoformat(timespec="seconds"),
+        }
+        _save(state)
+    return {"file": key, "task_id": task_id, "curriculum": curr.code or curr.name}
 
 
 def _codes(db: Session) -> str:
