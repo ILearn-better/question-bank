@@ -23,3 +23,7 @@ Pillow>=10
 # 不需要 pandas —— 为读一张几行的表拖进 numpy/pandas 不划算（numpy 已经因为 matplotlib 在了，
 # 但 pandas 是另一回事）。
 openpyxl>=3.1
+# 题库 md 的 frontmatter（app/services/vault.py）。包名是 PyYAML、模块名才是 yaml。
+# 它一直是**传递依赖**带进来的（matplotlib / uvicorn 都会拉），以前没有这一行也能跑 ——
+# 但那是巧合：哪天依赖树变了，题库同步会在读 YAML 时炸，报错还指向一个「没人装过」的包。
+PyYAML>=6.0

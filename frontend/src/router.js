@@ -45,6 +45,14 @@ const routes = [
     meta: { title: '笔记' },
   },
   {
+    // 题库文件（vault）。和「笔记」并列但不共用一棵树：
+    // 那边是老师自己整理的讲义，这边是题目正文的真源，混在一起谁都不敢动。
+    path: '/vault',
+    name: 'vault',
+    component: () => import('./views/Vault.js'),
+    meta: { title: '题库文件' },
+  },
+  {
     path: '/settings',
     name: 'settings',
     component: () => import('./views/Settings.js'),

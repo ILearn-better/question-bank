@@ -50,6 +50,21 @@ PLAN_CACHE_DIR = UPLOAD_DIR / "plans_cache"
 EXPORT_DIR = DATA_DIR / "exports"
 BACKUP_DIR = DATA_DIR / "backups"
 
+# 题库 vault：老师用 Obsidian 打开的那个文件夹（迁移 0040 / services/vault.py）。
+# 里面装的是「题目 md」—— 一份 md = 一道题，正文就是题面，frontmatter 放字段。
+# 拾课扫描它把内容同步进题库；在网页上改题时再写回对应文件。
+#
+# ⚠️ 与其他目录的一处关键差别：**这里的文件是用户的东西，不是我们的缓存**。
+#    所以：删除走「移到 _回收/」而不是 unlink；写文件保持原行尾（CRLF/LF 不擅自统一）；
+#    除了 `shike_id` 与用户自己触发的编辑回写，不去改人家的文件。
+VAULT_DIR = _env_path("SHIKE_VAULT", DATA_DIR / "vault")
+# 收件箱：把卷子丢进 `vault/收件箱/<体系>/` 就自动识别并写成题目 md。
+# 之所以留开关：识别是整页视觉模型、要花 API 额度，测试与「只想整理已有 md」的场景
+# 不需要它转；关掉不影响 vault 的扫描 / 导出。
+VAULT_INBOX = os.getenv("SHIKE_VAULT_INBOX", "1").strip() not in ("0", "false", "False", "")
+
+
+
 FRONTEND_DIR = _env_path("SHIKE_FRONTEND_DIR", ROOT_DIR / "frontend")
 LEGACY_TREE_PATH = ROOT_DIR / "data" / "math-knowledge-tree.json"
 

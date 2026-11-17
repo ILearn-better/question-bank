@@ -52,6 +52,7 @@ from app.routers import (                                   # noqa: E402
     supplements,
     system,
     uploads,
+    vault,
 )
 
 
@@ -106,7 +107,25 @@ async def lifespan(_app: FastAPI):
                   f"导入知识点 {stats['nodes_imported']} 个")
     finally:
         db.close()
+
+    # 题库 vault 的收件箱：老师把卷子丢进 `data/vault/收件箱/<体系>/` 就自动识别。
+    # 它是**后台轮询**（每 20 秒），不是定时任务框架 —— 这里只起一个 daemon 线程。
+    # 起不来（或 SHIKE_VAULT_INBOX=0）也不该拦住服务启动：vault 的「扫描/导出」
+    # 两条主路径不依赖它，收件箱只是最省事的那条入口。
+    if config.VAULT_INBOX:
+        try:
+            from app.services import vault_inbox
+            vault_inbox.start_worker()
+            print(f"[拾课] 题库收件箱已启用：{config.VAULT_DIR}\\收件箱\\<体系>\\")
+        except Exception as exc:                     # noqa: BLE001
+            logging.getLogger("shike").warning("题库收件箱没起来：%s", exc)
     yield
+
+    try:
+        from app.services import vault_inbox as _inbox
+        _inbox.stop_worker()
+    except Exception:                                # noqa: BLE001
+        pass
 
 
 app = FastAPI(
@@ -201,6 +220,9 @@ app.include_router(notes.router)
 app.include_router(note_folders.router)
 # 笔记备份 / 迁移（导出 zip、导入 zip）。前缀是 /api/notes-backup，避开路由歧义
 app.include_router(notes_transfer.router)
+# 题库 vault：磁盘上的题目 md（/api/vault/*）。与题库、笔记平级的第三个"入口"——
+# 它操作的是**一个文件夹**，不是库里的某张表，所以单独一个前缀。
+app.include_router(vault.router)
 
 # ---- 前端静态资源（必须最后挂，否则会吃掉 /api/*）----
 if config.FRONTEND_DIR.exists():

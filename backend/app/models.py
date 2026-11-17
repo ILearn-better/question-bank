@@ -188,8 +188,28 @@ class Question(Base):
     #   text  —— 强制用文本（没有文本时自动退回图，不印空白题）
     #   image —— 强制用图（没有图时自动退回文本）
     render_prefer: Mapped[str] = mapped_column(String, default="auto", server_default="auto")
+    # ---------------- 题目在磁盘上的那一份（迁移 0040）
+    # 题干/答案/解析/配图这些**内容**可以来自 vault 里的一个 .md 文件：
+    # 老师在 Obsidian 里改完保存，扫描时同步进库（见 services/vault.py）。
+    #
+    #   md_path —— 相对 vault 根的 posix 路径，例如 "题库/初一几何/三棱柱形礼盒.md"。
+    #              **NULL 表示这道题不来自 md**（网页录的、批量识别的都算），
+    #              不是空串 —— 唯一索引要靠 NULL 才能「多个不同时冲突」。
+    #   md_hash —— 上次同步时那个文件的内容指纹（sha256 前 16 位）。
+    #              只用来回答「文件变过没有」，避免每次同步都刷新 updated_at。
+    #
+    # 为什么身份是路径而不是文件名：Obsidian 里重命名笔记是常事，
+    # 但重命名会**移动文件**，路径跟着变 —— 所以认出「还是那道题」靠的是
+    # 文件里的 `shike_id`，md_path 只是「上次它在哪」，用来发现「被挪走了」。
+    md_path: Mapped[str | None] = mapped_column(Text)
+    md_hash: Mapped[str | None] = mapped_column(String(16))
 
-    __table_args__ = (Index("idx_questions_curr", "curriculum_id", "node_id"),)
+    __table_args__ = (
+        Index("idx_questions_curr", "curriculum_id", "node_id"),
+        # 一个 md 文件只能对应一道题。partial：NULL（不来自 md）不参与唯一性判定。
+        Index("uq_questions_md_path", "md_path", unique=True,
+              sqlite_where=text("md_path IS NOT NULL")),
+    )
 
 
 class QuestionNode(Base):
