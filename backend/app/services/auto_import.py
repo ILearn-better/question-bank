@@ -78,14 +78,6 @@ _REASON_TEXT = {
 _SOFT_FLAGS = ("figure_only_candidate", "figure_rough")
 
 
-def reason_text(reason: str) -> str:
-    """`reason` → 一句人话。报告、CLI 摘要、待审稿都读它 —— 别各写一份措辞。
-
-    查不到就原样返回：新增 reason 时哪怕忘了补文案，也不会抛异常或显示空字符串。
-    """
-    return _REASON_TEXT.get(reason, reason)
-
-
 def _as_list(raw) -> list:
     """flags / pages 这类列可能是 JSON 字符串，也可能已经是 list。"""
     if isinstance(raw, list):

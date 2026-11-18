@@ -94,20 +94,10 @@ SHELF = "题库"        # 题目 md 的落脚处（导出时按知识点分目�
 ATTACH = "附件"       # 题目用的图片
 TRASH = "_回收"       # 网页上删题时，md 移到这儿而不是删掉
 
-# 识别出来了、但拾课自己没把握的题，写成 md 放在 `题库/_待审/`。
-#
-# 为什么要有这一层：识别不可能总是完美（配图框歪了、某页模型返回坏 JSON）。
-# 那些条目以前只留在网页待审列表里 —— 而老师**日常就在 Obsidian 里**，
-# 让他为了改一道题去开网页、点进待审、逐条框图，不如把题写成 md 摊在眼前：
-# 他在 Obsidian 里能随手截图贴图、能对着原秒改公式、能直接引别处的笔记。
-# 改好之后把文件从 `_待审/` 拖进 `题库/`，下一次同步就入库 —— **入库这一步由人决定**。
-PENDING = "_待审"
-
 IMG_EXT = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"}
 # 扫描时整目录跳过。`.obsidian` 是 Obsidian 自己存的配置（里面有 .md 也不是题），
-# `_回收` 是删掉的题（再扫回来等于删不掉），`_待审` 是**还没入库的稿子**
-# （扫进来就失去了「人看过才入库」的意义）。
-SKIP_DIRS = {".obsidian", ".git", ".trash", TRASH, PENDING}
+# `_回收` 是删掉的题（再扫回来等于删不掉）。
+SKIP_DIRS = {".obsidian", ".git", ".trash", TRASH}
 
 
 def root() -> Path:
@@ -124,11 +114,6 @@ def shelf_dir() -> Path:
 
 def attach_dir() -> Path:
     return root() / ATTACH
-
-
-def pending_dir() -> Path:
-    """`题库/_待审/` —— 识别出来但没把握的题稿。扫描不碰它。"""
-    return shelf_dir() / PENDING
 
 
 def ensure_dirs() -> Path:
@@ -413,26 +398,13 @@ def _yaml_list(name: str, items: Iterable[str]) -> list[str]:
     return [f"{name}:"] + [f"  - {_yaml_value(i)}" for i in items]
 
 
-def render(q: Question, *, fig_name: str | None = None, ans_name: str | None = None,
-           extra_fm: dict | None = None, with_id: bool = True) -> str:
+def render(q: Question, *, fig_name: str | None = None, ans_name: str | None = None) -> str:
     """一道题 → md 正文。
 
     `fig_name` / `ans_name` 是**附件文件名**（写进 `![[…]]` 的那个），不是路径。
     传 None 表示这道题没有对应的图。
-
-    `extra_fm`：额外的 frontmatter 键（如待审稿的 `shike_todo`）。
-      ⚠️ 键名与值都**只由我们的代码给**，别接用户输入 —— 这里不做 YAML 注入防护以外的转义，
-         只保证值可解析（走 `_yaml_value`）。
-      ⚠️ `parse` 只读它认识的键，多出来的键会被忽略 —— 所以它能安全地「只给人看」。
-
-    `with_id=False`：不写 `shike_id`。
-      **待审稿必须这么写**：那道题还没入库，硬写一个库里不存在的 id，等老师把文件拖进
-      `题库/` 同步时只会得到一句「shike_id 在题库里找不到，按新题入库并写回新 id」的白报。
-      不写 id 时，扫描按「路径 → 上次对应的题」或直接新建，干净得多。
     """
-    lines = ["---", "shike: question"]
-    if with_id:
-        lines.append(f"shike_id: {q.id}")
+    lines = ["---", "shike: question", f"shike_id: {q.id}"]
     if q.qtype:
         lines.append(f"qtype: {_yaml_value(q.qtype)}")
     if q.difficulty:
@@ -448,8 +420,6 @@ def render(q: Question, *, fig_name: str | None = None, ans_name: str | None = N
     lines += _yaml_list("tags", _json_list(q.tags))
     if (q.render_prefer or "auto") != "auto":
         lines.append(f"render_prefer: {q.render_prefer}")
-    for k, v in (extra_fm or {}).items():
-        lines.append(f"{k}: {_yaml_value(v)}")
     lines += ["---", ""]
 
     parts: list[str] = []
@@ -605,15 +575,16 @@ def _title_of(q: Question) -> str:
 
 
 # ---------------------------------------------------------------- 导出
-def _attachment(q: Question) -> tuple[str | None, str | None]:
-    """把这道题的两张图复制进 `附件/`，返回 `(题干图名, 答案图名)`。
+def export_question(db: Session, q: Question, *, folder: str | None = None) -> Path:
+    """把一道题写成 md（已存在就原地重写），返回文件路径。
 
-    为什么要复制而不是让 md 直接指向 `/api/crops/x.png`：Obsidian 只认磁盘上的文件，
-    而题库的截图目录是它的私有资产（有引用计数、删题时会清理）。两边各存一份，
-    谁整理自己的目录都不会弄坏对方。
+    这个函数**会改用户的文件**：只在两种情况下被调用 —— 用户点了「导出到 vault」，
+    或在网页上改了这道题（那时 md 本来就该跟着变，它是正文的真源）。
     """
+    ensure_dirs()
     fig_name = ans_name = None
     _clean_attach(q.id)
+
     for url, kind in ((q.figure_image, "fig"), (q.answer_image, "ans")):
         if not url:
             continue
@@ -627,52 +598,22 @@ def _attachment(q: Question) -> tuple[str | None, str | None]:
             fig_name = name
         else:
             ans_name = name
-    return fig_name, ans_name
 
-
-def write_new(q: Question, *, folder: str = "", extra_fm: dict | None = None,
-              with_id: bool = True) -> Path:
-    """**新写**一道题的 md（不碰库里 `md_path`），返回路径。重名自动加 `-2`、`-3`。
-
-    与 `export_question` 的分工：那个会记录「这道题来自哪个文件」，
-    而这个只负责落一个文件 —— 待审稿用它（那时题目还没入库，无从记录）。
-    """
-    ensure_dirs()
-    fig_name, ans_name = _attachment(q)
-    text = render(q, fig_name=fig_name, ans_name=ans_name,
-                  extra_fm=extra_fm, with_id=with_id)
-    base = (shelf_dir() / folder) if folder else shelf_dir()
-    stem = _title_of(q)
-    path = base / f"{stem}.md"
-    n = 1
-    while path.exists():
-        n += 1
-        path = base / f"{stem}-{n}.md"
-    write_md(path, text)
-    return path
-
-
-def export_question(db: Session, q: Question, *, folder: str | None = None) -> Path:
-    """把一道题写成 md（已存在就原地重写），返回文件路径。
-
-    这个函数**会改用户的文件**：只在两种情况下被调用 —— 用户点了「导出到 vault」，
-    或在网页上改了这道题（那时 md 本来就该跟着变，它是正文的真源）。
-    """
-    if not q.md_path:
-        path = write_new(q, folder=folder or _folder_for(q))
-        q.md_path = rel(path)
-        q.md_hash = _digest(read_md(path).text)
-        db.flush()
-        return path
-
-    ensure_dirs()
-    fig_name, ans_name = _attachment(q)
     text = render(q, fig_name=fig_name, ans_name=ans_name)
-    path = resolve(q.md_path)
+
+    if q.md_path:
+        path = resolve(q.md_path)
+    else:
+        sub = folder or _folder_for(q)
+        base = (shelf_dir() / sub) if sub else shelf_dir()
+        path = base / f"{_title_of(q)}.md"
+        n = 1
+        while path.exists():
+            n += 1
+            path = base / f"{_title_of(q)}-{n}.md"
     write_md(path, text)
-    # 哈希按**磁盘上那份**算，而不是按刚生成的字符串 —— 两者差在一个换行/BOM 上时，
-    # 下次扫描就会判成「改过了」，白同步一次。（`write_md` 会跟着原文件的换行风格写。）
-    q.md_hash = _digest(read_md(path).text)
+    q.md_path = rel(path)
+    q.md_hash = _digest(text)
     db.flush()
     return path
 
