@@ -70,6 +70,7 @@ Obsidian 新建的是 LF，擅自统一会在 git 里制造一次整文件 diff�
 from __future__ import annotations
 
 import hashlib
+import html
 import json
 import re
 import shutil
@@ -78,6 +79,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable
+from urllib.parse import unquote
 
 import yaml
 from sqlalchemy import select
@@ -89,7 +91,7 @@ from . import crops, knowledge
 
 # ---------------------------------------------------------------- 目录布局
 # 三个名字是**目录约定**，不是配置项：Obsidian 里就是这三层，改了老师那边就找不到了。
-INBOX = "收件箱"      # 丢进来的 PDF/图片，后台识别完变成题目 md
+INBOX = "收件箱"      # 丢进来的卷子/截图/插件转出来的 md，处理后变成题目 md
 SHELF = "题库"        # 题目 md 的落脚处（导出时按知识点分目录）
 ATTACH = "附件"       # 题目用的图片
 TRASH = "_回收"       # 网页上删题时，md 移到这儿而不是删掉
@@ -211,7 +213,9 @@ SOL_HEAD = re.compile(r"^##[ \t]*(?:解析|详解|Solution|Explanation)[ \t]*$",
 # Obsidian 的嵌入 `![[图.png]]` / `![[图.png|300]]`，与标准 Markdown `![](路径)`。
 # 两种都认：Obsidian 默认写第一种，但老师从别处粘进来的是第二种。
 IMG_WIKI = re.compile(r"!\[\[([^\[\]\|]+?)(?:\|[^\[\]]*)?\]\]")
-IMG_MD = re.compile(r"!\[([^\[\]]*)\]\(([^()]+)\)")
+# 末尾那段 `{width=50%}` 是 Pandoc 给图片加的行内属性。**必须一起吃掉**：
+# 吃不吃路径都一样能解析出来，但那串花括号会留在正文里，出卷时原样印到卷子上。
+IMG_MD = re.compile(r"!\[([^\[\]]*)\]\(([^()]+)\)[ \t]*(?:\{[^{}\n]*\})?")
 # 这两行是「这是题目 md」的判据。放常量里，别在两处各写一份。
 REQUIRED_MARK = "question"
 
@@ -463,32 +467,63 @@ def _index_images() -> dict[str, list[Path]]:
             continue
         if any(part in SKIP_DIRS for part in p.relative_to(base).parts[:-1]):
             continue
-        idx.setdefault(p.name, []).append(p)
+        idx.setdefault(p.name.lower(), []).append(p)
     return idx
+
+
+def _clean_ref(ref: str) -> str:
+    """把各种转换器塞进图片引用里的壳剥掉，只留下路径本身。
+
+    真实遇到过的形态（Pandoc / Obsidian / Word 导出 / 老师手写）：
+        media/image1.png            Pandoc 把图放在旁边的 media/
+        ./attachments/a.png         显式相对
+        ../附件/a.png               上一级
+        my%20image.png              URL 编码的空格
+        <my image.png>              尖括号包住带空格的路径
+        x.png#center                带锚点
+        x.png "图 1"                Markdown 的标题部分
+        attachments\\x.png          Windows 反斜杠
+    这些都得认出来 —— 认不出来就是「图丢了」，而图丢了这道题基本就废了。
+    """
+    ref = html.unescape(ref or "").strip()
+    # Markdown 允许 `![](x.png "标题")`。剥标题要排在剥引号**之前** ——
+    # 反过来会把末尾那个引号先吃掉，于是这段标题就匹配不上了。
+    ref = re.sub(r'\s+"[^"]*"\s*$', "", ref).strip()
+    # 整段被 `<>` / `""` / `''` 包住（带空格路径的常见写法）
+    if len(ref) > 1 and ref[0] + ref[-1] in ('""', "''", "<>"):
+        ref = ref[1:-1].strip()
+    # 锚点与查询串（`#center`、`?raw=1`）不是路径的一部分。
+    # 切在 unquote 之前：`%23` 是字面的 `#`，先解码会被误切。
+    ref = ref.split("#", 1)[0].split("?", 1)[0].strip()
+    ref = unquote(ref)
+    return ref.replace("\\", "/")
 
 
 def _locate(ref: str, md_dir: Path, idx: dict[str, list[Path]]) -> tuple[Path | None, str]:
     """把 md 里的图片引用解析成实际文件。返回 (路径, 出错原因)。
 
-    顺序：标准 Markdown 的相对路径先按「md 所在目录」找，再按 vault 根找；
-    wiki 链接按文件名全局找。两个都落空就是真的找不到（文件被删/挪了）。
+    顺序：先按「md 所在目录」找，再按 vault 根找，最后按文件名全局找。
+    两个基准都试，因为插件可能写相对 md 的路径，也可能写相对 vault 根的路径。
     """
-    ref = ref.strip()
-    if ref.lower().startswith(("http://", "https://", "data:")):
-        return None, "外链图片没有下载（本机不联网）"
+    ref = _clean_ref(ref)
+    if not ref:
+        return None, "图片引用是空的"
+    low = ref.lower()
+    if low.startswith(("http://", "https://", "data:", "file:")):
+        return None, f"外链图片没有下载（{ref[:60]}）"
     if re.match(r"^[A-Za-z]:", ref) or ref.startswith("/"):
-        return None, "图片引用必须是 vault 内的相对路径"
+        return None, f"图片引用必须是 vault 内的相对路径（{ref}）"
     # 先当相对路径试
     for base in (md_dir, root()):
         try:
-            cand = (base / ref.replace("\\", "/")).resolve()
+            cand = (base / ref).resolve()
         except (OSError, ValueError):
             continue
         base_r = root().resolve()
         if (cand == base_r or base_r in cand.parents) and cand.is_file():
             return cand, ""
-    # 再按文件名找（Obsidian wiki 链接）
-    name = Path(ref.replace("\\", "/")).name
+    # 再按文件名找（Obsidian wiki 链接，以及 Pandoc 的 media/image1.png）
+    name = Path(ref).name.lower()
     hits = idx.get(name) or []
     if len(hits) == 1:
         return hits[0], ""
@@ -927,3 +962,126 @@ def sync_back(db: Session, q: Question) -> bool:
         return False
     export_question(db, q)
     return True
+
+
+# ---------------------------------------------------------------- 宽松摄取（插件转出来的 md）
+#
+# 老师选定的转换方式是「在 Obsidian 里用插件把 PDF 变成 md」。插件转出来的东西
+# **不是**题目模板：没有 frontmatter、正文是整份卷子、图片写的是 `![](media/image1.png)`。
+# 但恰恰是它手上最多。这一段只做一件事：把它变成标准题目模板，然后交给上面那套
+# parse / _settle_plan / _apply / export_question —— **不新增第二条入库路径**。
+#
+# 判据靠位置，不靠内容嗅探：进了 `收件箱/` 的 md 才走这里。原因是「正文里有 ## 答案
+# 就是题目」这种嗅探会把老师自己的笔记也吸进来，而那是不可逆的（笔记被当题入库）。
+
+_SPLIT = "\uE002"          # 私用区字符，正文里不会出现
+# 水平分割线：**前后都必须是空行**。这一条很要紧 ——
+# `上一行文字\n---` 在 Markdown 里是 setext 二级标题，不是分割线。
+_RULE = re.compile(r"\n[ \t]*\n[ \t]*(?:-{3,}|\*{3,}|_{3,})[ \t]*\n[ \t]*\n")
+# 大题号：`1.` `1、` `第 1 题`。`1.5 米` 不算 —— 所以 `.` 后面不能紧跟数字。
+_QNUM = re.compile(r"^[ \t]*(?:\d{1,2}[.、．](?!\d)|第[ \t]*\d{1,2}[ \t]*题)", re.M)
+
+
+def count_questions(text: str) -> int:
+    """数一下正文里有几处大题号。用来判断「这是一份卷子」还是「这是一道题」。"""
+    return len(_QNUM.findall(_norm(text)))
+
+
+def split_units(text: str) -> list[str]:
+    """把一份 md 切成「一题一段」。
+
+    ⚠️ 分割线本身**不足以判断**是分题：老师也常用 `---` 把题干和答案隔开。
+       所以只有「切出两段以上、且**至少两段里出现大题号**」才真的切；
+       否则整篇当一道题 —— 宁可让老师手动拆，也不要把一道题切碎成几道废题。
+    ⚠️ 题号只在**段首 200 字内**找：卷子第一段常常先有一行卷名（`2024 年卷一`），
+       标题之后的 `1.` 才是题号；而正文深处的 `1.` 多半是小问，不该算。
+    """
+    whole = _norm(text).strip()
+    if not whole:
+        return []
+    parts = [p.strip() for p in _RULE.sub(f"\n\n{_SPLIT}\n\n", whole).split(_SPLIT)]
+    parts = [p for p in parts if p]
+    if len(parts) <= 1:
+        return [whole]
+    if sum(1 for p in parts if _QNUM.search(p[:200])) >= 2:
+        return parts
+    return [whole]
+
+
+def _ensure_mark(text: str, *, source: str = "") -> str:
+    """补上 `shike: question` 标记。已经有的话**一个字都不动**（原 frontmatter 的键全保留）。"""
+    m = _FM_RE.match(text)
+    if m is None:
+        head = ["---", "shike: question"]
+        if source:
+            head.append(f"source: {_yaml_value(source)}")
+        head += ["---", ""]
+        return "\n".join(head) + "\n" + text.lstrip("\n")
+    if _MARK_RE.search(m.group(1)):
+        return text
+    # 插在 frontmatter 内容的第一行：原有键一个不动
+    return text[:m.start(1)] + "shike: question\n" + text[m.start(1):]
+
+
+def ingest_md(db: Session, path: Path, *, dry_run: bool = False) -> dict:
+    """收件箱里的一份 md → 若干道题（入库 + 在 `题库/` 下写出标准模板）。
+
+    返回的报告要能回答老师三个问题：进来了几段、成功了哪些、没成功的是为什么。
+    """
+    md = read_md(path)
+    report: dict = {
+        "path": rel(path), "units": 0, "created": [], "skipped": [],
+        "warnings": [], "needs_split": False,
+    }
+    units = split_units(md.text)
+    if not units:
+        report["skipped"].append({"unit": 0, "reason": "文件是空的"})
+        return report
+    if len(units) == 1:
+        n = count_questions(units[0])
+        if n >= 2:
+            # 整篇当一道题入库等于造一道废题，不如不进来、把话说清楚
+            report["needs_split"] = True
+            report["skipped"].append({
+                "unit": 0,
+                "reason": f"这篇里像是 {n} 道题，但没找到分隔线。请在 Obsidian 里"
+                          f"每道题之间空一行加一条 `---`，或拆成一题一个文件。",
+            })
+            return report
+
+    idx = _index_images()
+    for no, raw in enumerate(units, 1):
+        text = _ensure_mark(raw, source=path.stem)
+        parsed = parse(text)
+        if not parsed.ok or not parsed.stem.strip():
+            report["skipped"].append({
+                "unit": no, "reason": "；".join(parsed.warnings) or "题干是空的",
+            })
+            continue
+        if dry_run:
+            report["created"].append({"unit": no, "id": None,
+                                      "title": _safe_stem(parsed.stem, "dryrun", 30), "dry": True})
+            continue
+        plan = _Plan(path=path, existed=None, parsed=parsed, text=text)
+        try:
+            _settle_plan(db, plan, idx)
+            qid = _apply(db, plan)
+            q = db.get(Question, qid)
+            # `_apply` 把来源记成了这份**收件箱文件**。但它的归宿是 `题库/` 下的标准模板 ——
+            # 不清掉的话 `export_question` 会原地重写收件箱里那份，源文件就毁了。
+            q.md_path = None
+            q.md_hash = None
+            db.flush()
+            out = export_question(db, q)
+            db.commit()
+        except Exception as exc:                       # noqa: BLE001 —— 一段坏了不带走别的段
+            db.rollback()
+            report["skipped"].append({"unit": no, "reason": str(exc)})
+            continue
+        report["created"].append({"unit": no, "id": qid,
+                                  "title": _title_of(q), "md": rel(out)})
+        if parsed.warnings:
+            report["warnings"].append({"unit": no, "messages": list(parsed.warnings)})
+
+    report["units"] = len(units)
+    return report

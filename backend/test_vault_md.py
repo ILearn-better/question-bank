@@ -524,6 +524,158 @@ def part_g(db) -> None:
     check("乱写的名字认不出", vault_inbox._curriculum(db, "绝对不存在的体系xyz") is None)
 
 
+# ---------------------------------------------------------------- I 插件转出来的 md
+# 老师定的转换方式是「在 Obsidian 里用插件把 PDF 变成 md」。插件产物没有 frontmatter、
+# 图片写的是 `![](media/image1.png)` 这种相对路径，还常常把整份卷子放一个文件。
+# 这一组守的就是：这种文件丢进收件箱，能不能变成「一题一个标准模板」。
+PLUGIN_DOC = """2024 年卷一
+
+1. 如图，三棱柱的棱数是（ ）
+
+![](media/image1.png)
+
+A．6　B．9　C．12　D．15
+
+---
+
+2. 化简 $\\frac{x^2-1}{x-1}$。
+
+![](<我的 图二.png>)
+
+## 答案
+
+$x+1$
+"""
+
+
+def part_i(db) -> None:
+    print("\n==== I 插件转出来的 md（宽松摄取）====")
+
+    # ---- 纯函数：路径清洗（这些壳都是真实转换器会写出来的）
+    check("Pandoc 的 media/ 路径原样保留", vault._clean_ref("media/image1.png") == "media/image1.png")
+    check("尖括号包住的空格路径剥掉尖括号", vault._clean_ref("<我的 图二.png>") == "我的 图二.png")
+    check("URL 编码解开", vault._clean_ref("a%20b.png") == "a b.png")
+    check("锚点不算路径", vault._clean_ref("x.png#center") == "x.png")
+    check("Markdown 的标题部分剥掉", vault._clean_ref('y.png "图 1"') == "y.png")
+    check("反斜杠转正斜杠", vault._clean_ref("att\\b.png") == "att/b.png")
+    check("外链留给 _locate 去拒绝", vault._clean_ref("https://a.com/x.png").startswith("http"))
+
+    check("整卷按 --- 切成一题一段", len(vault.split_units(PLUGIN_DOC)) == 2,
+          len(vault.split_units(PLUGIN_DOC)))
+    check("一道题里的装饰线不切",
+          len(vault.split_units("求 $x$。\n\n---\n\n## 答案\n\nB")) == 1)
+    check("题号数得出来（1.5 米不算题号）",
+          vault.count_questions("1. 甲\n2. 乙\n3.2 米") == 2,
+          vault.count_questions("1. 甲\n2. 乙\n3.2 米"))
+
+    # 转换器会自作主张改图片大小写（`IMG_0012.PNG` → 引用里写 `img_0012.png`），
+    # Windows 上那本来就是同一个文件 —— 精确匹配会让图「凭空找不到」。
+    _make_png(vault.attach_dir() / "CASE.PNG", b"\x70")
+    hit, why = vault._locate("case.png", vault.inbox_dir(), vault._index_images())
+    truthy("图片名大小写不同也能找到", hit is not None, why)
+
+    # ---- 真的走一遍收件箱
+    # G 组留下的两个假 PDF 先清掉：接着跑会真去开识别任务（要 AI 配置）
+    for name in ("随便一份.pdf", "不存在的体系/卷子.pdf"):
+        (vault.inbox_dir() / name).unlink(missing_ok=True)
+
+    box = vault.inbox_dir()
+    (box / "media").mkdir(parents=True, exist_ok=True)
+    _make_png(box / "media" / "image1.png", b"\x50")
+    _make_png(box / "我的 图二.png", b"\x60")
+    src = box / "2024 年卷一.md"
+    src.write_text(PLUGIN_DOC, encoding="utf-8")
+
+    before = db.query(Question).count()
+    r = vault_inbox.scan_once(db)
+    ing = [x for x in r["ingested"] if x["file"].endswith("2024 年卷一.md")]
+    truthy("收件箱认出了这份 md", ing, r.get("ingested"))
+    if not ing:
+        return
+    one = ing[0]
+    check("切成两段就入了两道题", len(one["created"]) == 2, one["created"])
+    check("题库题数 +2", db.query(Question).count() == before + 2, db.query(Question).count())
+
+    moved = one.get("moved_to") or ""
+    truthy("源文件挪进了 _已处理/", vault_inbox.DONE_DIR in moved, moved)
+    falsy("源文件不在收件箱根下了", src.is_file(), moved)
+
+    paths = [c.get("md") or "" for c in one["created"]]
+    truthy("两道题都在 题库/ 下写了标准模板",
+           all(p.startswith(vault.SHELF + "/") and p.endswith(".md") for p in paths), paths)
+    body1 = (vault.root() / paths[0]).read_text(encoding="utf-8") if paths and paths[0] else ""
+    truthy("模板里有 shike: question 标记", vault.is_question_md(body1), body1[:120])
+    truthy("模板里写回了 shike_id", "shike_id:" in body1, body1[:200])
+    falsy("图片引用没原样留在正文里", "![](media/" in body1, body1[-200:])
+    truthy("图片变成了 Obsidian 的附件链接", "![[" in body1, body1[-200:])
+
+    qs = [db.get(Question, c["id"]) for c in one["created"] if c.get("id")]
+    truthy("两道题都进库了", all(q is not None for q in qs) and len(qs) == 2, len(qs))
+    if len(qs) == 2:
+        truthy("第一道题的配图导进来了",
+               (qs[0].figure_image or "").startswith("/api/crops/"), qs[0].figure_image)
+        check("第二道题的答案搬对了", (qs[1].answer or "").strip() == "$x+1$", qs[1].answer)
+        falsy("题干里没有残留的图片语法", "![" in (qs[0].content or ""), qs[0].content[:200])
+
+    # 再跑一轮：源文件已归档，不许重复入库
+    n_after = db.query(Question).count()
+    r2 = vault_inbox.scan_once(db)
+    check("再跑一轮不重复入库", db.query(Question).count() == n_after, db.query(Question).count())
+    falsy("也不会再报一次这份 md",
+           any((x.get("file") or "").endswith("2024 年卷一.md") for x in r2["ingested"]), r2["ingested"])
+
+    # ---- 整卷但没有分隔线：不入库，把话说明白
+    n = db.query(Question).count()
+    (box / "没分隔线.md").write_text("1. 甲题\n\n2. 乙题\n\n3. 丙题\n", encoding="utf-8")
+    r3 = vault_inbox.scan_once(db)
+    bad = [x for x in r3["ingested"] if x["file"].endswith("没分隔线.md")]
+    # ⚠️ 这里不能只断言「文件出现在报告里」—— 那在「照常入库」时同样成立（假绿）。
+    #    要断言的是**被拦下了**：标了 needs_split，而且一道都没入库。
+    truthy("整卷没分隔线时不入库、标 needs_split",
+           bool(bad) and bad[0].get("needs_split") is True and not bad[0].get("created"),
+           bad[0] if bad else r3["ingested"])
+    if bad:
+        truthy("报告里标了 needs_split", bad[0].get("needs_split"), bad[0])
+        check("一道都没入库", db.query(Question).count() == n, db.query(Question).count())
+        truthy("源文件挪进了 _失败/（改好再拖回来）",
+               vault_inbox.FAIL_DIR in (bad[0].get("moved_to") or ""), bad[0].get("moved_to"))
+        truthy("拦下时把原因写清楚了",
+               any("分隔线" in s.get("reason", "") for s in bad[0].get("skipped", [])),
+               bad[0].get("skipped"))
+
+    # ---- 只有一道题（一处题号）的 md：照常入库
+    (box / "单题.md").write_text("1. 求 $2+3$ 的值。\n", encoding="utf-8")
+    r4 = vault_inbox.scan_once(db)
+    single = [x for x in r4["ingested"] if x["file"].endswith("单题.md")]
+    truthy("单题也处理了", single, r4["ingested"])
+    if single:
+        check("单题入了一道", len(single[0]["created"]) == 1, single[0]["created"])
+
+    # ---- 已经是标准模板的 md 丢进收件箱：只挪到 题库/，**不入库**
+    #      否则「同步」和「摄取」会各入一遍 → 一道题变两道
+    n = db.query(Question).count()
+    (box / "手工模板.md").write_text(
+        "---\nshike: question\n---\n\n手工写的一道题。\n", encoding="utf-8")
+    r5 = vault_inbox.scan_once(db)
+    hand = [x for x in r5["ingested"] if x["file"].endswith("手工模板.md")]
+    truthy("标准模板被收件箱认出来了", hand, r5["ingested"])
+    if hand:
+        falsy("标准模板没被摄取入库", hand[0].get("created"), hand[0].get("created"))
+        truthy("标准模板挪进了 题库/",
+               (hand[0].get("moved_to") or "").startswith(vault.SHELF + "/"), hand[0].get("moved_to"))
+    check("摄取这一步没让题数变多", db.query(Question).count() == n, db.query(Question).count())
+    # 接着同步：入库一次，且来源是 题库/ 下的那份
+    vault.scan(db)
+    moved_q = db.query(Question).filter(Question.content.like("手工写的一道题%")).first()
+    truthy("同步后入库了这道手工模板", moved_q is not None)
+    if moved_q:
+        truthy("它挂的来源是 题库/ 下那份",
+               (moved_q.md_path or "").startswith(vault.SHELF + "/"), moved_q.md_path)
+    check("同步也只入了一道（不是两道）",
+          db.query(Question).filter(Question.content.like("手工写的一道题%")).count() == 1,
+          db.query(Question).filter(Question.content.like("手工写的一道题%")).count())
+
+
 # ---------------------------------------------------------------- main
 def main() -> int:
     print("临时目录:", TMP)
@@ -552,6 +704,7 @@ def main() -> int:
             part_e(db, tri)
             part_f(db)
         part_g(db)
+        part_i(db)
     finally:
         db.close()
 

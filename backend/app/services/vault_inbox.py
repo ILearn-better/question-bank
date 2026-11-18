@@ -1,16 +1,19 @@
 # -*- coding: utf-8 -*-
-"""收件箱：把 PDF / Word / 截图丢进 `vault/收件箱/<体系>/`，自动变成题目 md。
+"""收件箱：把卷子 / 截图 / 插件转出来的 md 丢进 `vault/收件箱/<体系>/`，变成题目 md。
 
-## 为什么要有这一层
+## 收进来的东西分两条路
 
-老师选定的用法是「在 Obsidian 里把 PDF 变成题目模板 md」。但 Obsidian 本身不会把
-含公式的数学卷子转成 Markdown —— 社区插件都在抠 PDF 的文字层，而数学卷的公式在文字层里
-基本是废的（这条在本项目的识别方案里已经确认过：一律走视觉模型）。
+  · **`.md`（Obsidian 插件转出来的）** → `vault.ingest_md()`：补 frontmatter、
+    把图搬进 `附件/`、按 `---` 切成一题一段，入库后在 `题库/` 下写出标准模板。
+    纯本地解析，**不花 AI 额度**，几毫秒就跑完。
+  · **PDF / Word / 截图** → 拾课自己的整页识别（`auto_import`）→ 识别成题目再导出 md。
 
-拾课这边**已经**有一条跑通的整页识别链路（配图定位、跨页判断、兜底整题图）。
-所以「在 Obsidian 里转换」的实际实现是：文件进了 vault 的收件箱 → 拾课后台识别 →
-识别出来的题写成 `题库/` 下的 md。老师看到的就是「拖进去，过一会儿就有了」。
-他也确实全程没离开 Obsidian 那个文件夹。
+老师选定的转换方式是「在 Obsidian 里用插件把 PDF 变成 md」。插件路线的好处是
+老师全程不离开 Obsidian、也不用等 AI；代价是插件转出来的东西不可靠（公式、图、
+双栏都会走样），所以拾课这边**完全不挑**：能吃就吃，吃不下的明说哪里不行
+（比如整卷没有分隔线，就不入库、把原因写进报告）。
+
+PDF/截图那条路留着：插件转不动的卷子，直接丢 PDF 进来一样出题。
 
 ## 体系按**子目录**认，不猜
 
@@ -19,6 +22,9 @@
 
 为什么不给个「默认体系」：一份卷子一套体系，猜错的代价是整批知识点挂到错误的树上，
 而那种错不会报错，只在出卷时发现「知识点全对不上」（同 routers/auto.py 的判断）。
+
+**md 是例外，不要求子目录**：它的知识点来自 frontmatter 里的 `knowledge:`，
+体系对解析没用。硬要求放子目录只是多一道仪式，还会让人以为「放错地方就不认」。
 
 ## 状态放在哪
 
@@ -50,6 +56,8 @@ DONE_DIR = "_已处理"
 FAIL_DIR = "_失败"
 # 收件箱能收的东西：卷子（PDF/Word）与直接拍下来的题（截图）。
 EXTS = {".pdf", ".docx", ".doc", ".png", ".jpg", ".jpeg"}
+# 插件转出来的 md 走另一条路（本地解析，不识别）。
+MD_EXT = {".md", ".markdown"}
 POLL_SECONDS = 20
 # 同时最多跑几个识别任务。识别是整页视觉模型（一页几秒到几十秒），
 # 一次丢十个 PDF 进去全开，机器和 API 额度都会炸。
@@ -57,6 +65,11 @@ MAX_ACTIVE = 2
 # queued 也算「在跑」？**不算**：真正的在跑是 recognizing/fixing/approving。
 # 但 queued 说明已经排队了，占一个名额 —— 否则同一个文件会被开两次任务。
 ACTIVE = {"queued", "recognizing", "fixing", "approving"}
+
+# ⚠️ 状态文件是「读 → 改 → 写」，后台轮询线程和 HTTP 请求**会同时进来**。
+#    不加锁的经典后果不是丢计数：网页侧刚登记好，轮询线程用几秒前读到的旧内容写回去，
+#    登记就消失了 → 下一轮看到文件还在收件箱 → 再开一次任务 → **同一份卷子入两遍库**。
+_lock = threading.Lock()
 
 
 def _state_path() -> Path:
@@ -102,14 +115,24 @@ def pending_files() -> list[Path]:
     if not box.is_dir():
         return []
     out = []
+    ok = EXTS | MD_EXT
     for p in box.rglob("*"):
-        if not p.is_file() or p.suffix.lower() not in EXTS:
+        if not p.is_file() or p.suffix.lower() not in ok:
             continue
         parts = p.relative_to(box).parts
         if parts and parts[0] in (DONE_DIR, FAIL_DIR):
             continue
         out.append(p)
     return sorted(out)
+
+
+def pending_split() -> tuple[list[Path], list[Path]]:
+    """待处理的文件分成 (卷子/截图, md)。两条路走的东西不一样，计数也得分开。"""
+    docs: list[Path] = []
+    mds: list[Path] = []
+    for p in pending_files():
+        (mds if p.suffix.lower() in MD_EXT else docs).append(p)
+    return docs, mds
 
 
 def _move(src: Path, sub: str) -> Path:
@@ -170,9 +193,15 @@ def scan_once(db: Session, *, enqueue: bool = True) -> dict:
 
     顺序不能反 —— 先开新的会让「同时最多 2 个」这个上限失效。
     """
+    with _lock:
+        return _scan_locked(db, enqueue=enqueue)
+
+
+def _scan_locked(db: Session, *, enqueue: bool = True) -> dict:
     vault.ensure_dirs()
     state = _load()
-    report: dict = {"started": [], "finished": [], "failed": [], "ignored": [], "waiting": []}
+    report: dict = {"started": [], "finished": [], "failed": [], "ignored": [],
+                    "waiting": [], "ingested": []}
 
     # ---- ① 收尾：看已开跑的任务
     active = 0
@@ -218,11 +247,15 @@ def scan_once(db: Session, *, enqueue: bool = True) -> dict:
     # `enqueue=False` 是「只看会开什么、不开」：校验一样要跑完（认体系、挡根目录文件），
     # 只是不真的去识别。否则预检时永远看到一片空白，等于没预检。
     for path in pending_files():
-        if active >= MAX_ACTIVE:
-            report["waiting"].append({"file": vault.rel(path), "task_id": None, "status": "排队"})
-            continue
         key = vault.rel(path)
         if key in state["tasks"]:
+            continue
+        # md 走本地摄取：不识别、不花 AI 额度、也不占识别名额。
+        if path.suffix.lower() in MD_EXT:
+            report["ingested"].append(_ingest_one(db, path, key, dry_run=not enqueue))
+            continue
+        if active >= MAX_ACTIVE:
+            report["waiting"].append({"file": key, "task_id": None, "status": "排队"})
             continue
         box = vault.inbox_dir()
         try:
@@ -264,6 +297,67 @@ def scan_once(db: Session, *, enqueue: bool = True) -> dict:
 
     _save(state)
     return report
+
+
+def _ingest_one(db: Session, path: Path, key: str, *, dry_run: bool = False) -> dict:
+    """收件箱里的一份 md → 题目（或者一条「得先拆开」的说明）。
+
+    源文件怎么处置：
+      · 进去了题 → `_已处理/`。留在收件箱会被下一轮再吃一遍 —— 同一批题入两遍库。
+      · 一道都没进去 → `_失败/`。老师加好分隔线再拖回收件箱，就能重新处理。
+    """
+    try:
+        if vault.is_question_md(vault.read_md(path).text):
+            # 已经是标准模板（frontmatter 里有 shike: question）。
+            # ⚠️ 这种文件**不能**走 ingest：它会被「同步」和「摄取」各入一遍库 → 一道题变两道。
+            #    交给 scan，这里只负责把它从收件箱挪到 题库/。
+            return _file_to_shelf(path, key, dry_run=dry_run)
+        res = vault.ingest_md(db, path, dry_run=dry_run)
+    except Exception as exc:                           # noqa: BLE001
+        db.rollback()
+        _log.warning("收件箱：摄取 %s 失败：%s", key, exc)
+        moved = ""
+        if not dry_run and path.is_file():
+            try:
+                moved = vault.rel(_move(path, FAIL_DIR))
+            except OSError:
+                pass
+        return {"file": key, "error": str(exc), "moved_to": moved,
+                "units": 0, "created": [], "skipped": [], "warnings": [],
+                "needs_split": False}
+    if dry_run:
+        return {"file": key, "dry": True, **res}
+    moved = ""
+    if path.is_file():
+        try:
+            moved = vault.rel(_move(path, DONE_DIR if res["created"] else FAIL_DIR))
+        except OSError as exc:
+            _log.warning("收件箱：挪走 %s 失败：%s", path, exc)
+    return {"file": key, "moved_to": moved, **res}
+
+
+def _file_to_shelf(path: Path, key: str, *, dry_run: bool = False) -> dict:
+    """把收件箱里一份**已是标准模板**的 md 挪进 `题库/`（重名加 -2），不解析不入库。
+
+    入库交给「同步」（`vault.scan`），这样「怎么入库」只有一条路。
+    """
+    empty: dict = {"file": key, "path": vault.rel(path), "units": 0, "created": [],
+                   "skipped": [], "warnings": [], "needs_split": False,
+                   "note": "已经是标准题目模板，挪进 题库/ 交给同步"}
+    if dry_run:
+        return {**empty, "dry": True, "moved_to": ""}
+    dest = vault.shelf_dir() / path.name
+    n = 1
+    while dest.exists():
+        n += 1
+        dest = vault.shelf_dir() / f"{path.stem}-{n}{path.suffix}"
+    try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(path), str(dest))
+    except OSError as exc:
+        _log.warning("收件箱：把 %s 挪进题库失败：%s", key, exc)
+        return {**empty, "moved_to": "", "error": str(exc)}
+    return {**empty, "moved_to": vault.rel(dest)}
 
 
 def _codes(db: Session) -> str:

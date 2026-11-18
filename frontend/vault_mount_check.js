@@ -53,13 +53,14 @@ const API_STUB = `
 const STATUS = {
   root: 'D:/shike/backend/data/vault',
   exists: true, writable: true,
-  md_total: 5, md_questions: 3, linked: 2, inbox_pending: 1,
+  md_total: 5, md_questions: 3, linked: 2, inbox_pending: 1, inbox_md: 2,
   dirs: { shelf: '题库', attach: '附件', inbox: '收件箱' },
 };
 const INBOX = {
   dir: 'D:/shike/backend/data/vault/收件箱',
-  hint: '把卷子放进 收件箱/<体系 code>/ 里（子文件夹名就是体系）',
+  hint: '卷子放 收件箱/<体系>/（子文件夹名就是体系）；插件转出来的 md 放收件箱里任意位置都行',
   pending: ['收件箱/DSE/2024-P1.pdf'],
+  pending_md: ['收件箱/2024 年卷一.md'],
   tasks: [],
   curricula: ['DSE', 'CN-SENIOR'],
   enabled: true,
@@ -83,7 +84,20 @@ export const vaultApi = {
   export: async () => ({ exported: [], failed: [], note: '没有需要导出的题' }),
   seedTemplate: async () => ({ path: '题库/题目模板（照这个写）.md', existed: false }),
   openFolder: async () => ({ ok: true }),
-  inboxRun: async () => ({ started: [], finished: [], failed: [], ignored: [], waiting: [] }),
+  inboxRun: async () => ({
+    started: [], finished: [], failed: [], ignored: [], waiting: [],
+    ingested: [
+      { file: '收件箱/2024 年卷一.md', moved_to: '收件箱/_已处理/2024 年卷一.md',
+        units: 2, needs_split: false,
+        created: [{ unit: 1, id: 'n1', title: '1. 如图', md: '题库/1. 如图.md' },
+                  { unit: 2, id: 'n2', title: '2. 化简', md: '题库/2. 化简.md' }],
+        skipped: [], warnings: [] },
+      { file: '收件箱/没分隔线.md', moved_to: '收件箱/_失败/没分隔线.md',
+        units: 1, needs_split: true, created: [],
+        skipped: [{ unit: 0, reason: '这篇里像是 3 道题，但没找到分隔线。' }],
+        warnings: [] },
+    ],
+  }),
   source: async () => ({ qid: 'q1', md_path: null, exists: false, uri: null }),
 };
 `;
@@ -200,6 +214,9 @@ async function main() {
     checkTrue('「2 道题已关联」上屏了', html.includes('>2<'));
     checkTrue('收件箱待处理数上屏了', html.includes('>1<'));
     checkTrue('收件箱提示里写了子目录规则', html.includes('子文件夹名就是体系'));
+    checkTrue('收件箱里的 md 计数上屏了', html.includes('收件箱里的 md'));
+    checkTrue('等着解析的 md 清单上屏了',
+      html.includes('等着解析的 md') && html.includes('2024 年卷一.md'));
 
     // ③ 点「同步」→ 报告出现
     checkTrue('还没点同步时没有报告', !html.includes('同步结果'));
@@ -239,6 +256,23 @@ async function main() {
     checkTrue('导出后给出人话提示',
       global.__TOASTS__.some(([, m]) => String(m).includes('没有需要导出的题')),
       JSON.stringify(global.__TOASTS__));
+
+    // ⑥ 收件箱「现在处理一次」：md 摄取的结果必须看得见 ——
+    //    收到了几道、哪份没进来、为什么、源文件去哪了。只报「处理完成」等于没说。
+    const inBtn = btn(D, '现在处理一次');
+    checkTrue('找到收件箱处理按钮', !!inBtn);
+    inBtn.click();
+    await tick(300);
+    const ing = D.querySelector('#app').innerHTML;
+    checkTrue('★ md 摄取结果上屏（收到 2 道题）', ing.includes('收到 2 道题'), '');
+    checkTrue('★ 没进来的那份标了「得先按题拆开」', ing.includes('得先按题拆开'));
+    checkTrue('★ 拦下的原因写出来了', ing.includes('没找到分隔线'));
+    checkTrue('★ 源文件去向也写出来了', ing.includes('_已处理/2024 年卷一.md'));
+    checkTrue('摄取成功的提示走 ok',
+      global.__TOASTS__.some(([, m]) => String(m).includes('收进 2 道题')),
+      JSON.stringify(global.__TOASTS__));
+    checkTrue('没进来的那份走了 fail（不是静默）',
+      global.__TOASTS__.some(([t]) => t === 'fail'), JSON.stringify(global.__TOASTS__));
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }

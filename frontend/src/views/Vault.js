@@ -21,6 +21,7 @@ export default {
     const inbox = ref(null);
     const busy = ref('');
     const report = ref(null);
+    const inboxReport = ref(null);      // 收件箱那一轮的处理结果（md 摄取 / 识别任务）
     const exportResult = ref(null);
     const exportLimit = ref(200);
 
@@ -101,11 +102,23 @@ export default {
       busy.value = 'inbox';
       try {
         const r = await vaultApi.inboxRun();
+        inboxReport.value = r;
+        const ing = (r.ingested || []).filter((x) => !x.dry);
+        const got = ing.reduce((s, x) => s + (x.created || []).length, 0);
+        const stuck = ing.filter((x) => x.error || x.needs_split || !(x.created || []).length);
         const n = r.started.length;
-        if (n) ok(`已开始识别 ${n} 份文件，跑完会自动写成题目 md`);
-        else if (r.ignored.length) fail(r.ignored[0].reason);
-        else if (r.waiting.length) ok('已经有任务在跑，等它跑完再处理下一份');
-        else ok('收件箱里没有可处理的新文件');
+        if (got) ok('从 ' + ing.length + ' 份 md 里收进 ' + got + ' 道题');
+        if (stuck.length) {
+          const first = stuck[0];
+          const why = first.error || (first.skipped && first.skipped[0] && first.skipped[0].reason) || '见下面的报告';
+          fail(stuck.length + ' 份 md 没进来：' + why);
+        }
+        if (!got && !stuck.length) {
+          if (n) ok('已开始识别 ' + n + ' 份文件，跑完会自动写成题目 md');
+          else if (r.ignored.length) fail(r.ignored[0].reason);
+          else if (r.waiting.length) ok('已经有任务在跑，等它跑完再处理下一份');
+          else ok('收件箱里没有可处理的新文件');
+        }
         await load();
       } catch (e) {
         fail(e.message);
@@ -129,7 +142,7 @@ export default {
     onMounted(load);
 
     return {
-      status, inbox, busy, report, nothingHappened, exportResult, exportLimit,
+      status, inbox, busy, report, inboxReport, nothingHappened, exportResult, exportLimit,
       load, scan, doExport, seedTemplate, openFolder, copyPath, runInbox,
     };
   },
@@ -173,6 +186,10 @@ export default {
                :style="{ color: status.inbox_pending ? 'var(--warning)' : 'inherit' }">{{ status.inbox_pending }}</div>
           <div class="muted small">收件箱待处理</div>
         </div>
+        <div v-if="status.inbox_md">
+          <div style="font-size:22px;font-weight:600" :style="{ color: 'var(--warning)' }">{{ status.inbox_md }}</div>
+          <div class="muted small">收件箱里的 md</div>
+        </div>
       </div>
     </div>
 
@@ -200,9 +217,13 @@ export default {
     </div>
 
     <div class="card" v-if="inbox">
-      <h2>收件箱（把卷子丢进去就自动识别）</h2>
-      <div class="muted small" style="line-height:1.8;margin-bottom:10px">
-        {{ inbox.hint }}。识别用的是拾课已有的整页识别，跑完会自动写成题目 md 放进「题库」。
+      <h2>收件箱（转换入口）</h2>
+      <div class="muted small" style="line-height:1.8;margin-bottom:8px">{{ inbox.hint }}。</div>
+      <div class="muted small" style="line-height:1.9;margin-bottom:10px">
+        · <b>插件转出来的 md</b>：在 Obsidian 里用插件把 PDF 转成 md，丢进收件箱即可。拾课本机解析、
+        不花识别额度：补 frontmatter、把图搬进「附件」、按 <code>---</code> 切成一题一段，
+        跑完在「题库」下写出标准模板。<br />
+        · <b>PDF / Word / 截图</b>：走整页识别（要开 AI）。插件转不动的卷子用这条。
         <span v-if="!inbox.enabled" style="color:var(--warning)">（收件箱已关闭：SHIKE_VAULT_INBOX=0）</span>
       </div>
       <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
@@ -213,13 +234,33 @@ export default {
       </div>
 
       <div v-if="inbox.pending.length" style="margin-top:12px">
-        <div class="muted small" style="margin-bottom:4px">等着处理的文件</div>
+        <div class="muted small" style="margin-bottom:4px">等着识别的卷子 / 截图</div>
         <div v-for="f in inbox.pending" :key="f" class="small" style="line-height:1.9">· {{ f }}</div>
       </div>
-      <div v-else class="muted small" style="margin-top:10px">收件箱是空的。</div>
+      <div v-if="inbox.pending_md && inbox.pending_md.length" style="margin-top:12px">
+        <div class="muted small" style="margin-bottom:4px">等着解析的 md（插件转出来的）</div>
+        <div v-for="f in inbox.pending_md" :key="'m'+f" class="small" style="line-height:1.9">· {{ f }}</div>
+      </div>
+      <div v-if="!inbox.pending.length && !(inbox.pending_md && inbox.pending_md.length)"
+           class="muted small" style="margin-top:10px">收件箱是空的。</div>
+
+      <div v-if="inboxReport && inboxReport.ingested.length" style="margin-top:14px">
+        <div class="muted small" style="margin-bottom:4px">这一轮处理的 md</div>
+        <div v-for="x in inboxReport.ingested" :key="'i'+x.file" class="small" style="line-height:1.9">
+          · {{ x.file }}
+          <span v-if="x.created.length" style="color:var(--success)">→ 收到 {{ x.created.length }} 道题</span>
+          <span v-else-if="x.needs_split" style="color:var(--warning)">→ 得先按题拆开</span>
+          <span v-else-if="x.error" style="color:var(--danger)">→ {{ x.error }}</span>
+          <span v-else style="color:var(--warning)">→ 没收到题</span>
+          <span v-if="x.moved_to" class="muted">（源文件挪到 {{ x.moved_to }}）</span>
+          <div v-if="x.skipped && x.skipped.length" class="muted" style="padding-left:14px">
+            <div v-for="(s, si) in x.skipped" :key="'s'+si">第 {{ s.unit }} 段：{{ s.reason }}</div>
+          </div>
+        </div>
+      </div>
 
       <div v-if="inbox.tasks.length" style="margin-top:12px">
-        <div class="muted small" style="margin-bottom:4px">正在处理的</div>
+        <div class="muted small" style="margin-bottom:4px">正在识别的</div>
         <div v-for="t in inbox.tasks" :key="t.file" class="small" style="line-height:1.9">
           · {{ t.file }}
           <span class="muted">— {{ t.stage || t.status }}</span>

@@ -48,12 +48,11 @@ def vault_status(db: Session = Depends(get_db)):
                 continue
     linked = db.scalar(select(func.count()).select_from(Question)
                        .where(Question.md_path.isnot(None))) or 0
-    inbox = 0
-    if vault.inbox_dir().is_dir():
-        # 「收件箱里还有东西没处理」是老师最容易困惑的一件事：
-        # 拖进去了却半天没变成题目 md —— 得能直接看到还剩几个。
-        inbox = sum(1 for p in vault.inbox_dir().rglob("*")
-                    if p.is_file() and p.suffix.lower() in (".pdf", ".docx", ".doc", ".png", ".jpg", ".jpeg"))
+    # 「收件箱里还有东西没处理」是老师最容易困惑的一件事：拖进去了却半天没变成题目。
+    # 两条路的计数分开报 —— md 是本地解析（几秒），卷子要识别（几分钟），
+    # 混成一个数会让人以为 md 卡住了。
+    from ..services import vault_inbox
+    docs, mds = vault_inbox.pending_split()
     return {
         "root": str(root),
         "exists": root.is_dir(),
@@ -61,7 +60,8 @@ def vault_status(db: Session = Depends(get_db)):
         "md_total": md_total,
         "md_questions": md_questions,
         "linked": linked,
-        "inbox_pending": inbox,
+        "inbox_pending": len(docs),
+        "inbox_md": len(mds),
         "dirs": {"shelf": vault.SHELF, "attach": vault.ATTACH, "inbox": vault.INBOX},
     }
 
@@ -236,11 +236,12 @@ def inbox_status(db: Session = Depends(get_db)):
             row.update(status=t.status, stage=t.stage or "", error=t.error or "",
                        approved=t.approved or 0)
         tasks.append(row)
-    files = [vault.rel(p) for p in vault_inbox.pending_files()]
+    docs, mds = vault_inbox.pending_split()
     return {
         "dir": str(vault.inbox_dir()),
-        "hint": "把卷子放进 收件箱/<体系 code>/ 里（子文件夹名就是体系）",
-        "pending": files,
+        "hint": "卷子放 收件箱/<体系>/（子文件夹名就是体系）；插件转出来的 md 放收件箱里任意位置都行",
+        "pending": [vault.rel(p) for p in docs],
+        "pending_md": [vault.rel(p) for p in mds],
         "tasks": tasks,
         "curricula": [c.code or c.name for c in db.scalars(select(Curriculum)).all()],
         "enabled": config.VAULT_INBOX,
