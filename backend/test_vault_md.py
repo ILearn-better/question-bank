@@ -16,6 +16,8 @@
   F 冲突       —— 复制 md 不改 id，后扫到的会抢走题的归属（不报错）
   G 收件箱     —— 子目录认体系；根目录文件不猜体系
   K 模板       —— 「照这个写」的模板本身被当题入库（还会把 id 写进模板，复制全撞 id）
+  L 重复文件   —— 同一道题在 vault 里变成两份（收件箱搬运 / 导出各有一条路会造），
+                  之后每次同步都有一条失败，老师不知道那份副本哪来的
 
 ⚠️ 全程用临时目录（`SHIKE_DB_PATH` / `SHIKE_DATA_DIR` / `SHIKE_VAULT` 指到 TEMP），
    **必须在 import app.* 之前设置**，否则 engine 已经钉在真库上了。
@@ -782,6 +784,73 @@ def part_k(db) -> None:
     check("库里没有任何题的来源是模板文件", n == 0, n)
 
 
+# ---------------------------------------------------------------- L 一道题两份文件
+def part_l(db) -> None:
+    """一道题在 vault 里只许有一份文件。
+
+    文件名不是身份，`shike_id` 才是。有两条路会造出「同一道题两份文件」：
+      · 收件箱搬运（`_file_to_shelf`）：重名就加 `-2`，搬进去的副本带着同一个 id；
+      · 导出（`export_question`）：`md_path` 空 + 同名文件已存在，也加 `-2`。
+    后果完全一样：之后**每次同步都有一条失败**（「这个 id 已经对应另一个文件」），
+    而老师不知道那份多出来的是几时从哪来的。所以三条都要守住。
+    """
+    print("\n==== L 同一道题不许有两份文件 ====")
+    import uuid
+    from datetime import datetime
+
+    shelf = vault.shelf_dir()
+
+    # ---- ① 导出两次，必须落在同一份文件上
+    q = Question(id="lt" + uuid.uuid4().hex[:8], owner_id=config.OWNER_ID,
+                 created_at=datetime.now().isoformat(timespec="seconds"),
+                 tags="[]", knowledge_points="[]", content="L组导出复用测试题干，别和别的题撞名。",
+                 answer="A", analysis="", qtype="选择题")
+    db.add(q)
+    db.flush()
+    first = vault.export_question(db, q)
+    q.md_path = None                       # ingest_md 就是这么干的：清掉再导出
+    db.flush()
+    second = vault.export_question(db, q)
+    check("同一道题导出两次落在同一个文件上", first == second, (first.name, second.name))
+    falsy("没有造出 -2 副本", (first.parent / f"{first.stem}-2{first.suffix}").exists(),
+          sorted(p.name for p in shelf.rglob("*-2.md")))
+
+    # ---- ② 收件箱里来了一份题库已有的题 → 不搬，别造第二份
+    src = db.query(Question).filter(Question.md_path.isnot(None),
+                                    Question.id != q.id).first()
+    truthy("有一道现成的来源题", src is not None)
+    if src is None:
+        return
+    src_path = vault.resolve(src.md_path)
+    inbox = vault.inbox_dir()
+    inbox.mkdir(parents=True, exist_ok=True)
+    dup = inbox / src_path.name
+    dup.write_bytes(src_path.read_bytes())
+    res = vault_inbox._file_to_shelf(dup, f"{vault.INBOX}/{dup.name}")
+    same_id = [p for p in vault.shelf_dir().rglob("*.md")
+               if p.is_file() and vault.qid_of(p) == src.id]
+    check("题库里带着这个 id 的文件还是只有一份", len(same_id) == 1,
+          [vault.rel(p) for p in same_id])
+    truthy("结果里说清了「是副本」", "副本" in (res.get("note") or ""), res)
+    falsy("收件箱里那份没有留在原地", dup.exists(), vault.rel(dup))
+
+    # ---- ③ 同步撞上两份同 id 文件：内容一样 vs 已经不一样，提示必须分清
+    twin = shelf / "L组副本.md"
+    twin.write_bytes(src_path.read_bytes())
+    rep = vault.scan(db)
+    errs = [e for e in rep["errors"] if e["path"].endswith("L组副本.md")]
+    truthy("两份同 id 文件被拦下（不静默挑一份）", bool(errs), rep["errors"])
+    truthy("内容相同时说「删掉这一份就行」",
+           bool(errs) and "完全相同" in errs[0]["error"], errs)
+    twin.write_text(twin.read_text(encoding="utf-8") + "\n\n（改过一行，内容已经和正本不同）\n",
+                    encoding="utf-8")
+    rep = vault.scan(db)
+    errs = [e for e in rep["errors"] if e["path"].endswith("L组副本.md")]
+    truthy("内容不同时说「先决定留哪一份」",
+           bool(errs) and "不一样" in errs[0]["error"], errs)
+    twin.unlink()
+
+
 def main() -> int:
     print("临时目录:", TMP)
     part_a()
@@ -812,6 +881,7 @@ def main() -> int:
         part_i(db)
         part_j(db)
         part_k(db)
+        part_l(db)
     finally:
         db.close()
 

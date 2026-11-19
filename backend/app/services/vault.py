@@ -258,6 +258,39 @@ def is_question_md(text: str) -> bool:
     return bool(m and _MARK_RE.search(m.group(1)))
 
 
+def qid_of(path: Path) -> str:
+    """这份 md 的 frontmatter 里写着哪个 `shike_id`（没写/读不动 → 空串）。
+
+    不解析正文、不做任何校验：只用来回答「这两份文件是不是同一道题」。
+    """
+    try:
+        m = _FM_RE.match(read_md(path).text)
+    except OSError:
+        return ""
+    if not m:
+        return ""
+    hit = re.search(r"^shike_id[ \t]*:[ \t]*(\S+)[ \t]*$", m.group(1), re.M)
+    return hit.group(1) if hit else ""
+
+
+def file_of_qid(qid: str, *, exclude: Path | None = None) -> Path | None:
+    """vault 里哪份 md 已经写着这个 `shike_id`（跳过 `exclude` 自己）。
+
+    用途只有一个：**同一道题不许在 vault 里出现两份**。两份写着同一个 id 的文件
+    会让每次同步都有一条失败（「这个 id 已经对应另一个文件」），而老师根本不知道
+    那份多出来的是哪来的 —— 所以两条会造出副本的路（收件箱搬运、导出）都先问它。
+    """
+    if not qid:
+        return None
+    ex = exclude.resolve() if exclude is not None else None
+    for p in _iter_md():
+        if ex is not None and p.resolve() == ex:
+            continue
+        if qid_of(p) == qid:
+            return p
+    return None
+
+
 def _take_images(text: str) -> tuple[str, list[str]]:
     """把正文里的图片引用摘出来，并**从文本里删掉**。
 
@@ -659,6 +692,11 @@ def export_question(db: Session, q: Question, *, folder: str | None = None) -> P
         path = base / f"{_title_of(q)}.md"
         n = 1
         while path.exists():
+            # 同名的那份已经是**这道题自己**（复制/挪动留下的）→ 直接复用它。
+            # 以前这里无脑加 `-2`，于是同一道题在 vault 里变成两份、写着同一个
+            # `shike_id`，之后每次同步都有一条失败：「这个 id 已经对应另一个文件」。
+            if qid_of(path) == q.id:
+                break
             n += 1
             path = base / f"{_title_of(q)}-{n}.md"
     write_md(path, text)
@@ -812,6 +850,27 @@ def _apply(db: Session, plan: _Plan) -> str:
     return q.id
 
 
+def _dup_hint(other_rel: str, text: str) -> str:
+    """「两份文件写着同一个 shike_id」时，告诉老师下一步该做什么。
+
+    「内容一样」和「内容已经不一样」是两回事：前者只是多了一份副本，删谁都行；
+    后者是两份各自改过，得先定下留哪一份。老师点同步只看到一条红字，
+    必须一眼知道属于哪种 —— 否则只能来问人。
+    """
+    try:
+        other = resolve(other_rel)
+    except ValueError:
+        other = None
+    same = False
+    if other is not None and other.is_file():
+        try:
+            same = _digest(read_md(other).text) == _digest(text)
+        except OSError:
+            same = False
+    return ("两份内容完全相同，删掉这一份就行（改哪一份都一样）。" if same
+            else "两份内容已经不一样了，先决定留哪一份，再把另一份删掉。")
+
+
 def scan(db: Session, *, dry_run: bool = False) -> dict:
     """扫一遍 vault，把变了的题目 md 同步进库。
 
@@ -868,7 +927,8 @@ def scan(db: Session, *, dry_run: bool = False) -> dict:
                 # 那会成为「谁最后扫到谁赢」的随机结果。
                 report["errors"].append({
                     "path": rel_path,
-                    "error": f"shike_id={qid} 已经被 {seen_qids[qid]} 用过了（是不是复制了文件？）",
+                    "error": f"shike_id={qid} 已经被 {seen_qids[qid]} 用过了。"
+                             + _dup_hint(seen_qids[qid], md.text),
                 })
                 continue
         if existed is None:
@@ -890,7 +950,7 @@ def scan(db: Session, *, dry_run: bool = False) -> dict:
                 report["errors"].append({
                     "path": rel_path,
                     "error": f"shike_id={existed.id} 已经对应 {existed.md_path}（那个文件还在）。"
-                             "是不是复制了 md 却没改 shike_id？",
+                             + _dup_hint(existed.md_path, md.text),
                 })
                 continue
 

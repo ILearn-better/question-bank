@@ -340,12 +340,29 @@ def _file_to_shelf(path: Path, key: str, *, dry_run: bool = False) -> dict:
     """把收件箱里一份**已是标准模板**的 md 挪进 `题库/`（重名加 -2），不解析不入库。
 
     入库交给「同步」（`vault.scan`），这样「怎么入库」只有一条路。
+
+    ⚠️ **同一道题不许在题库里出现两份**。重名就加 `-2` 本来是为了不覆盖别人的文件，
+    但文件名不是身份 —— `shike_id` 才是。老师把一份已经在题库里的题又拖进收件箱
+    （或者从题库复制一份过来），加个 `-2` 搬进去就成了「同一道题两个文件」，
+    之后**每次同步都有一条失败**（「这个 id 已经对应另一个文件」），而老师完全
+    不知道那份多出来的是自己几时拖进来的。所以按 id 撞上了就不搬。
     """
     empty: dict = {"file": key, "path": vault.rel(path), "units": 0, "created": [],
                    "skipped": [], "warnings": [], "needs_split": False,
                    "note": "已经是标准题目模板，挪进 题库/ 交给同步"}
     if dry_run:
         return {**empty, "dry": True, "moved_to": ""}
+
+    twin = vault.file_of_qid(vault.qid_of(path), exclude=path)
+    if twin is not None:
+        moved = ""
+        try:
+            moved = vault.rel(_move(path, DONE_DIR))
+        except OSError as exc:
+            _log.warning("收件箱：把重复的 %s 挪进 %s 失败：%s", key, DONE_DIR, exc)
+        return {**empty, "moved_to": moved,
+                "note": f"题库里已经有这道题（{vault.rel(twin)}），这份是副本，没再入一份"}
+
     dest = vault.shelf_dir() / path.name
     n = 1
     while dest.exists():
