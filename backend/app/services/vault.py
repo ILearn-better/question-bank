@@ -450,11 +450,43 @@ def _yaml_list(name: str, items: Iterable[str]) -> list[str]:
     return [f"{name}:"] + [f"  - {_yaml_value(i)}" for i in items]
 
 
-def render(q: Question, *, fig_name: str | None = None, ans_name: str | None = None) -> str:
+def _img_link(name: str, fig_dir: str | None) -> str:
+    """一张图的引用写法。
+
+    给了 `fig_dir` 就写标准 Markdown（用 `<>` 包住路径：文件名里有空格、中文、括号
+    都不会把链接截断）；没给就写 Obsidian 的 `![[…]]`。
+    """
+    if fig_dir:
+        return f"![](<{fig_dir}/{name}>)"
+    return f"![[{name}]]"
+
+
+def _rel_to_attach(md_dir: Path) -> str:
+    """这份 md 所在目录 → `附件/` 的相对前缀（posix）：`../附件` / `../../附件`。
+
+    md 是按知识点分子目录放的，所以不能写死一层 —— 写成 `../附件` 的题放在
+    `题库/立体几何/` 里就指到 `题库/附件/` 去了，图照样看不到。
+    """
+    base = root().resolve()
+    try:
+        depth = len(md_dir.resolve().relative_to(base).parts)
+    except ValueError:
+        depth = 1
+    return "/".join([".."] * depth) + f"/{ATTACH}"
+
+
+def render(q: Question, *, fig_name: str | None = None, ans_name: str | None = None,
+           fig_dir: str | None = None) -> str:
     """一道题 → md 正文。
 
-    `fig_name` / `ans_name` 是**附件文件名**（写进 `![[…]]` 的那个），不是路径。
+    `fig_name` / `ans_name` 是**附件文件名**（写进图片链接的那个），不是路径。
     传 None 表示这道题没有对应的图。
+
+    `fig_dir` 是「这份 md 所在目录 → `附件/`」的相对前缀（`../附件`、`../../附件`）。
+    给了就写**标准 Markdown 图片** `![](<../附件/图.png>)`，不给就写 Obsidian 的
+    `![[图.png]]`。为什么默认要传：`![[…]]` 只有 Obsidian 认，Typora / VSCode /
+    资源管理器预览里全是空链接 —— 老师「导出成 md 看不到图」就是这么来的。
+    标准写法两边都认（Obsidian 也支持 Markdown 图片），所以导出走标准写法。
     """
     lines = ["---", "shike: question", f"shike_id: {q.id}"]
     if q.qtype:
@@ -479,12 +511,12 @@ def render(q: Question, *, fig_name: str | None = None, ans_name: str | None = N
     if body:
         parts.append(body)
     if fig_name:
-        parts.append(f"![[{fig_name}]]")
+        parts.append(_img_link(fig_name, fig_dir))
     text = "\n\n".join(parts)
     if (q.answer or "").strip():
         text += "\n\n## 答案\n\n" + (q.answer or "").strip()
     if ans_name:
-        text += "\n\n![[%s]]" % ans_name
+        text += "\n\n" + _img_link(ans_name, fig_dir)
     if (q.analysis or "").strip():
         text += "\n\n## 解析\n\n" + (q.analysis or "").strip()
     return "\n".join(lines) + text.rstrip() + "\n"
@@ -624,9 +656,16 @@ def _clean_attach(qid: str) -> None:
         p.unlink(missing_ok=True)
 
 
+# 附件名里除了 Windows 的非法字符，还要去掉 `[](){}#%&`：
+# 这些字符会把 Markdown 的 `![](路径)` 和 Obsidian 的 `![[名字]]` 一起截断
+# （`![](<../附件/(1) xxx.png>)` 里的 `)` 会让链接提前结束，图直接不显示）。
+_BAD_ATTACH = re.compile(r"[\[\]\(\)\{\}#%&]+")
+
+
 def _attach_name(title: str, qid: str, kind: str, src: Path) -> str:
     """附件名：可读标题 + 完整 id + 用途。唯一（id 唯一）且认得出来是谁的。"""
-    stem = _safe_stem(title, qid, limit=24)
+    stem = _BAD_ATTACH.sub(" ", _safe_stem(title, qid, limit=24))
+    stem = re.sub(r"\s+", " ", stem).strip(" .") or f"题-{qid[:6]}"
     return f"{stem}-{qid}-{kind}{src.suffix.lower() or '.png'}"
 
 
@@ -668,22 +707,8 @@ def export_question(db: Session, q: Question, *, folder: str | None = None) -> P
     fig_name = ans_name = None
     _clean_attach(q.id)
 
-    for url, kind in ((q.figure_image, "fig"), (q.answer_image, "ans")):
-        if not url:
-            continue
-        src = config.CROPS_DIR / Path(url).name
-        if not src.is_file():
-            # 图没了就别写进 md —— 写进去会变成悬空引用，扫描回来还会报一次错
-            continue
-        name = _attach_name(_title_of(q), q.id, kind, src)
-        shutil.copyfile(src, attach_dir() / name)
-        if kind == "fig":
-            fig_name = name
-        else:
-            ans_name = name
-
-    text = render(q, fig_name=fig_name, ans_name=ans_name)
-
+    # 先定下这份 md 写到哪，再拼正文 —— 图片链接是「md 所在目录 → 附件目录」的
+    # 相对路径，得知道自己在第几层子目录才写得对。
     if q.md_path:
         path = resolve(q.md_path)
     else:
@@ -699,6 +724,23 @@ def export_question(db: Session, q: Question, *, folder: str | None = None) -> P
                 break
             n += 1
             path = base / f"{_title_of(q)}-{n}.md"
+    fig_dir = _rel_to_attach(path.parent)
+
+    for url, kind in ((q.figure_image, "fig"), (q.answer_image, "ans")):
+        if not url:
+            continue
+        src = config.CROPS_DIR / Path(url).name
+        if not src.is_file():
+            # 图没了就别写进 md —— 写进去会变成悬空引用，扫描回来还会报一次错
+            continue
+        name = _attach_name(_title_of(q), q.id, kind, src)
+        shutil.copyfile(src, attach_dir() / name)
+        if kind == "fig":
+            fig_name = name
+        else:
+            ans_name = name
+
+    text = render(q, fig_name=fig_name, ans_name=ans_name, fig_dir=fig_dir)
     write_md(path, text)
     q.md_path = rel(path)
     q.md_hash = _digest(text)

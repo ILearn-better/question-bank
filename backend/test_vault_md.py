@@ -430,9 +430,20 @@ def part_e(db, tri: Question) -> None:
     truthy("导出内容带 shike 标记", "shike: question" in md)
     truthy("导出内容带答案", "## 答案" in md)
     truthy("导出内容带题干", "元旦" in md)
-    truthy("导出把图写成了 Obsidian 嵌入", "![[" in md, md[:400])
+    truthy("导出把图写成标准 markdown 图片", "![](<../附件/" in md, md[-300:])
     truthy("附件名认得出是谁的", f"-{tri.id}-fig." in md or "-fig." in md, md[:400])
     truthy("附件文件在附件目录里", any(vault.attach_dir().glob(f"*-{tri.id}-fig.*")))
+
+    # 「导出成 md 看不到图」就出在这里：以前写的是 `![[图.png]]`，只有 Obsidian 认，
+    # Typora / VSCode / 资源管理器预览里全是空链接。标准写法还要能**按路径找到那张图**。
+    refs = vault.parse(md).stem_imgs
+    check("导出的 md 里有一条图片引用", len(refs) == 1, refs)
+    if refs:
+        hit, why = vault._locate(refs[0], out.parent, vault._index_images())
+        truthy("这条引用能解析到附件里的那个文件",
+               hit is not None and hit.parent == vault.attach_dir(), (refs[0], why, hit))
+        falsy("图片引用里没有会截断链接的括号",
+              any(c in Path(refs[0].strip("<>")).name for c in "()[]{}#%&"), refs[0])
 
     r = vault.scan(db)
     falsy("导出后再扫一遍不会当成改动", r["updated"], r["updated"])
@@ -610,7 +621,13 @@ def part_i(db) -> None:
     truthy("模板里有 shike: question 标记", vault.is_question_md(body1), body1[:120])
     truthy("模板里写回了 shike_id", "shike_id:" in body1, body1[:200])
     falsy("图片引用没原样留在正文里", "![](media/" in body1, body1[-200:])
-    truthy("图片变成了 Obsidian 的附件链接", "![[" in body1, body1[-200:])
+    truthy("图片变成了标准 markdown 引用（带相对路径）", "![](<../附件/" in body1, body1[-200:])
+    refs1 = vault.parse(body1).stem_imgs
+    if refs1:
+        hit, why = vault._locate(refs1[0], vault.root() / Path(paths[0]).parent,
+                                 vault._index_images())
+        truthy("这条引用真的指到附件里的文件",
+               hit is not None and hit.is_file(), (refs1[0], why))
 
     qs = [db.get(Question, c["id"]) for c in one["created"] if c.get("id")]
     truthy("两道题都进库了", all(q is not None for q in qs) and len(qs) == 2, len(qs))
