@@ -82,11 +82,11 @@ from typing import Iterable
 from urllib.parse import unquote
 
 import yaml
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from .. import config
-from ..models import Question
+from ..models import Question, QuestionNode
 from . import crops, knowledge
 
 # ---------------------------------------------------------------- 目录布局
@@ -769,7 +769,21 @@ def _apply(db: Session, plan: _Plan) -> str:
         if key in f:
             setattr(q, key, f[key])
     if "knowledge" in f:
-        q.knowledge_points = json.dumps(f["knowledge"], ensure_ascii=False)
+        # 名字 → 知识树节点。这一步以前漏了：只把名字写进字符串，`node_id` 永远是空，
+        # 于是「按知识点筛题」「掌握度统计」都看不见这些题 —— 而它们明明有知识点，
+        # 只是挂不到树上，**不报错**。和批量入库（approve_item）走同一个函数。
+        #
+        # 体系从哪来：md 里不写体系，`resolve_kp` 的**精确同名那一步不限体系**，
+        # 命中后由节点本身带出 curriculum_id。名字写错就退回原样（和以前一样，不更差）。
+        kps, node_id, curr_id = knowledge.resolve_kp(db, f["knowledge"], q.curriculum_id)
+        q.knowledge_points = json.dumps(kps, ensure_ascii=False)
+        if node_id != q.node_id:
+            # 换了节点就把旧记录拆掉，否则一道题会同时挂在两个知识点下
+            db.execute(delete(QuestionNode).where(QuestionNode.question_id == q.id))
+            q.node_id = node_id
+            q.curriculum_id = curr_id or q.curriculum_id
+            if node_id:
+                db.add(QuestionNode(question_id=q.id, node_id=node_id, weight=1.0))
     if "tags" in f:
         q.tags = json.dumps(f["tags"], ensure_ascii=False)
     q.md_path = rel_path

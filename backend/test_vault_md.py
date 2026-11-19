@@ -676,6 +676,66 @@ def part_i(db) -> None:
           db.query(Question).filter(Question.content.like("手工写的一道题%")).count())
 
 
+# ---------------------------------------------------------------- J 知识点挂树
+def part_j(db) -> None:
+    """从 md 入库的题，知识点必须挂到知识树节点上。
+
+    漏掉这步**不报错**：题照常入库、`knowledge_points` 里也有字，只是 `node_id` 空着 ——
+    按知识点筛题筛不到它，掌握度统计也不算它。老师会以为「我明明写了知识点啊」。
+    """
+    print("\n==== J 知识点要挂到知识树上 ====")
+    import json as _json
+
+    from sqlalchemy import select
+
+    from app.models import Node, QuestionNode
+    from app.services import knowledge as kx
+
+    nodes = db.scalars(select(Node).where(Node.level == 2).order_by(Node.id)).all()
+    truthy("测试库里得有知识树节点（靠 seed_all 建）", nodes, len(nodes))
+    if not nodes:
+        return
+    first, second = nodes[0], nodes[-1]
+
+    path = vault.shelf_dir() / "知识点题.md"
+
+    def write_q(kp_name: str) -> None:
+        path.write_text(
+            "---\nshike: question\nqtype: 填空题\ndifficulty: 基础\nscore: 3\n"
+            f"knowledge:\n  - {kp_name}\n---\n\n题干。\n\n## 答案\n\n42\n",
+            encoding="utf-8")
+
+    write_q(first.name)
+    rep = vault.scan(db)
+    created = [x for x in rep["created"] if str(x["path"]).endswith("知识点题.md")]
+    truthy("这道题入库了", created, rep["created"])
+    if not created:
+        return
+    q = db.get(Question, created[0]["id"])
+
+    check("node_id 挂到了节点上", q.node_id == first.id, (q.node_id, first.id))
+    want = kx.node_path(db, first.id)
+    check("knowledge_points 换成了节点的全路径",
+          _json.loads(q.knowledge_points or "[]") == [want],
+          (_json.loads(q.knowledge_points or "[]"), want))
+    check("体系由命中的节点带出来",
+          q.curriculum_id == first.curriculum_id, (q.curriculum_id, first.curriculum_id))
+    check("question_nodes 里有一条挂载记录",
+          db.query(QuestionNode).filter_by(question_id=q.id).count() == 1,
+          db.query(QuestionNode).filter_by(question_id=q.id).count())
+
+    # 改成另一个知识点：节点要跟着换，旧记录**必须拆掉**（否则一题挂两个知识点，
+    # 统计时同一道题被算两次）
+    write_q(second.name)
+    vault.scan(db)
+    db.expire_all()
+    q = db.get(Question, created[0]["id"])
+    check("换了知识点后 node_id 跟着换", q.node_id == second.id, (q.node_id, second.id))
+    check("旧的挂载记录被拆掉了（只剩一条）",
+          db.query(QuestionNode).filter_by(question_id=q.id).count() == 1,
+          db.query(QuestionNode).filter_by(question_id=q.id).count())
+
+
 # ---------------------------------------------------------------- main
 def main() -> int:
     print("临时目录:", TMP)
@@ -705,6 +765,7 @@ def main() -> int:
             part_f(db)
         part_g(db)
         part_i(db)
+        part_j(db)
     finally:
         db.close()
 
