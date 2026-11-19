@@ -15,6 +15,7 @@
   E 导出回写   —— 网页改了不写回文件，下次同步就把改动盖掉
   F 冲突       —— 复制 md 不改 id，后扫到的会抢走题的归属（不报错）
   G 收件箱     —— 子目录认体系；根目录文件不猜体系
+  K 模板       —— 「照这个写」的模板本身被当题入库（还会把 id 写进模板，复制全撞 id）
 
 ⚠️ 全程用临时目录（`SHIKE_DB_PATH` / `SHIKE_DATA_DIR` / `SHIKE_VAULT` 指到 TEMP），
    **必须在 import app.* 之前设置**，否则 engine 已经钉在真库上了。
@@ -737,6 +738,50 @@ def part_j(db) -> None:
 
 
 # ---------------------------------------------------------------- main
+def part_k(db) -> None:
+    """「照这个写」的模板本身**不能入库**。
+
+    模板必须带 `shike: question`（不然它不是题目 md、没法当格式说明），
+    于是扫描会把它当成一道题：一道题干是「（题干写在这里）」、知识点「待填知识点」
+    的废题就进了题库 —— 而且入库时还会把 `shike_id` 写进模板，之后老师照着它
+    复制出来的每一份都带着这个 id，同步时报「这个 id 已经对应另一个文件」。
+    整条链路里不会有任何报错，只有题库里慢慢多出来的废题。
+    """
+    print("\n==== K 模板本身不入库 ====")
+    shelf = vault.shelf_dir()
+
+    tpl = shelf / vault.TEMPLATE_NAME
+    body = ("---\nshike: question\nshike_id: （留空，第一次同步时自动填）\n"
+            "qtype: 选择题\ndifficulty: 基础\nscore: 3\nknowledge:\n  - 待填知识点\n"
+            "---\n\n（题干写在这里）\n\nA．选项一\n\n## 答案\n\nA\n")
+    tpl.write_text(body, encoding="utf-8")
+    # 另存一份（老师会另存成别的名，也还是模板）
+    copy_tpl = shelf / "题目模板.md"
+    copy_tpl.write_text(body, encoding="utf-8")
+    # 一条真题，用来证明「跳过模板」没有顺手把正常题也跳了
+    real = shelf / "导数真题.md"
+    real.write_text("---\nshike: question\nqtype: 选择题\n---\n\n真题干。\n\n## 答案\n\nB\n",
+                    encoding="utf-8")
+
+    rep = vault.scan(db)
+    assert not rep["errors"], rep["errors"]
+    made = [x["path"] for x in rep["created"]]
+    check("真题照常入库", any(str(p).endswith("导数真题.md") for p in made), made)
+    check("模板本身没被入库", not any("题目模板" in str(p) for p in made), made)
+
+    skipped = {s["path"]: s["reason"] for s in rep["skipped"] if "题目模板" in s["path"]}
+    check("模板进了 skipped 且说明原因",
+          len(skipped) == 2 and all("模板" in r for r in skipped.values()), skipped)
+
+    # 关键：模板文件不能被写回 shike_id（那是「复制后全部撞 id」的根源）
+    check("模板文件一个字都没被改", tpl.read_text(encoding="utf-8") == body,
+          tpl.read_text(encoding="utf-8")[:80])
+    check("另存的那份模板也没被改", copy_tpl.read_text(encoding="utf-8") == body)
+
+    n = db.query(Question).filter(Question.md_path.like("%题目模板%")).count()
+    check("库里没有任何题的来源是模板文件", n == 0, n)
+
+
 def main() -> int:
     print("临时目录:", TMP)
     part_a()
@@ -766,6 +811,7 @@ def main() -> int:
         part_g(db)
         part_i(db)
         part_j(db)
+        part_k(db)
     finally:
         db.close()
 

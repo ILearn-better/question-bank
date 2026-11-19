@@ -170,7 +170,7 @@ def seed_template(db: Session = Depends(get_db)):
     已经有模板文件时不覆盖（那是他自己改过的）。
     """
     vault.ensure_dirs()
-    path = vault.shelf_dir() / "题目模板（照这个写）.md"
+    path = vault.shelf_dir() / vault.TEMPLATE_NAME
     existed = path.is_file()
     if not existed:
         vault.write_md(path, TEMPLATE.format(qid="（留空，第一次同步时自动填）"))

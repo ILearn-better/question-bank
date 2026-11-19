@@ -101,6 +101,21 @@ IMG_EXT = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"}
 # `_回收` 是删掉的题（再扫回来等于删不掉）。
 SKIP_DIRS = {".obsidian", ".git", ".trash", TRASH}
 
+# 「照这个写」的模板：它本身带 `shike: question`（不带的话根本不是题目 md、没法当格式说明），
+# 所以扫描必须**按文件名**把它排除掉，否则模板会被当成一道题入库 ——
+# 一道内容是「（题干写在这里）」、知识点「待填知识点」的废题。
+TEMPLATE_NAME = "题目模板（照这个写）.md"
+TEMPLATE_PREFIX = "题目模板"
+
+
+def is_template(path: Path) -> bool:
+    """这份 md 是不是模板本身。
+
+    判据取文件名前缀而不是完整路径：老师会把模板挪进子目录、也可能另存成
+    `题目模板.md`，都还是模板。真正的题目不会叫「题目模板…」这个名。
+    """
+    return path.stem.startswith(TEMPLATE_PREFIX)
+
 
 def root() -> Path:
     return config.VAULT_DIR
@@ -823,6 +838,13 @@ def scan(db: Session, *, dry_run: bool = False) -> dict:
             md = read_md(path)
         except OSError as exc:
             report["errors"].append({"path": rel_path, "error": f"读不了：{exc}"})
+            continue
+        if is_template(path):
+            # 模板本身不入库，但**要报出来**（写进 skipped），否则老师以为它被同步了。
+            report["skipped"].append({
+                "path": rel_path,
+                "reason": "这是「照这个写」的模板本身，跳过；复制一份、改成你的题才会入库",
+            })
             continue
         if not is_question_md(md.text):
             report["skipped"].append({"path": rel_path, "reason": "不是题目 md（没有 shike: question）"})
