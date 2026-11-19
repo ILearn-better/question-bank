@@ -25,7 +25,8 @@ router = APIRouter(prefix="/api/vault", tags=["vault"])
 
 
 class ExportIn(BaseModel):
-    qids: list[str] = Field(default_factory=list, description="要导出的题；空 = 所有还没有 md 来源的题")
+    qids: list[str] = Field(default_factory=list,
+                            description="要导出的题；空 = 还没有 md 文件的（含文件已被删的）")
     limit: int = Field(200, ge=1, le=2000)
 
 
@@ -103,29 +104,35 @@ def scan_vault(dry_run: bool = Query(False, description="只出报告，不落�
 def export_to_vault(payload: ExportIn, db: Session = Depends(get_db)):
     """把题库里的题写成 md。
 
-    不传 qids 时只导出**还没有 md 来源的**题 —— 那是「第一次建立 vault」的动作。
-    已经有来源的题不在这里重写：那些文件老师可能已经在 Obsidian 里改过，
+    不传 qids 时导出「**磁盘上还没有这份文件**」的题 —— 既包括从来没导出过的，
+    也包括文件已经被删掉的（老师删了 `题库/` 想重来一遍，就是这一种）。
+    判据在 `vault.pending_export`：看文件在不在，不看 `md_path` 有没有值。
+
+    已经有文件的题不在这里重写：那些文件老师可能已经在 Obsidian 里改过，
     批量覆盖会把他的改动冲掉。想让库里改动落到文件上，是在网页上改题时自动写回的
     （见 `questions.update_question` → `vault.sync_back`）。
     """
     vault.ensure_dirs()
-    stmt = select(Question)
     if payload.qids:
-        stmt = stmt.where(Question.id.in_(payload.qids))
+        rows = db.scalars(select(Question).where(Question.id.in_(payload.qids))
+                          .limit(payload.limit)).all()
     else:
-        stmt = stmt.where(Question.md_path.is_(None))
-    rows = db.scalars(stmt.limit(payload.limit)).all()
+        rows = vault.pending_export(db, limit=payload.limit)
     if not rows:
         return {"exported": [], "failed": [], "note": "没有需要导出的题"}
 
     exported, failed = [], []
     for q in rows:
+        qid = q.id
         try:
-            path = vault.export_question(db, q)
-            exported.append({"id": q.id, "path": vault.rel(path)})
+            # 每道题一个 savepoint。以前这里 except 里直接 db.rollback()，一道题失败会把
+            # **前面几十道的 md_path 一起回滚**（文件其实已经写好了）→ 下次导出又去重写
+            # 那些文件，把老师在 Obsidian 里改过的正文冲掉。
+            with db.begin_nested():
+                path = vault.export_question(db, q)
+            exported.append({"id": qid, "path": vault.rel(path)})
         except Exception as exc:                   # noqa: BLE001 —— 一道题失败不该中断整批
-            db.rollback()
-            failed.append({"id": q.id, "error": str(exc)})
+            failed.append({"id": qid, "error": str(exc)})
     db.commit()
     return {"exported": exported, "failed": failed,
             "note": "" if len(rows) < payload.limit else f"只导出了前 {payload.limit} 道，再点一次接着导"}

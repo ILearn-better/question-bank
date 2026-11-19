@@ -63,11 +63,24 @@ export default {
       busy.value = 'export';
       exportResult.value = null;
       try {
-        const r = await vaultApi.export([], Number(exportLimit.value) || 200);
-        exportResult.value = r;
-        if (r.exported.length) ok(`导出了 ${r.exported.length} 道题到文件夹`);
-        else if (r.note) ok(r.note);
-        else ok('没有需要导出的题（都已经有 md 文件了）');
+        // 后端按「一批多少道」收口（输入框那个数）。老师点导出就是想都导出来，
+        // 不该为了 256 道题点两下 —— 这里接着要下一批，直到后端说没有了。
+        const limit = Math.max(1, Number(exportLimit.value) || 200);
+        let total = 0;
+        const failed = [];
+        let note = '';
+        for (let round = 0; round < 100; round += 1) {
+          const r = await vaultApi.export([], limit);
+          total += r.exported.length;
+          note = r.note || '';
+          if (r.failed && r.failed.length) failed.push(...r.failed);
+          exportResult.value = { exported: [], failed, total };
+          if (!/再点一次/.test(note)) break;
+        }
+        exportResult.value = { exported: [], failed, total };
+        if (total) ok(`导出了 ${total} 道题到文件夹`);
+        else if (failed.length) ok(`有 ${failed.length} 道没导出来，看下面`);
+        else ok(note || '没有需要导出的题（每道题的文件都还在）');
         await load();
       } catch (e) {
         fail(e.message);
@@ -208,7 +221,7 @@ export default {
         </button>
         <input type="number" min="1" max="2000" v-model="exportLimit"
                style="width:90px" :disabled="!!busy" />
-        <span class="muted small">道（只导出还没有 md 的题）</span>
+        <span class="muted small">道（只导出磁盘上还没有文件的题；文件删了也会重新写出来）</span>
       </div>
       <div class="muted small" style="margin-top:10px;line-height:1.8">
         「预览」不改任何东西；「同步」会按文件内容更新题库，并在你<b>第一次</b>同步某篇时往它的

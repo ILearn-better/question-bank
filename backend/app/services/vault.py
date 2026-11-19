@@ -748,6 +748,52 @@ def export_question(db: Session, q: Question, *, folder: str | None = None) -> P
     return path
 
 
+def _index_qids() -> dict[str, Path]:
+    """vault 里 `shike_id` → 它所在的那份文件。一遍扫完，别每题问一次 `file_of_qid()`。"""
+    out: dict[str, Path] = {}
+    for p in _iter_md():
+        qid = qid_of(p)
+        if qid and qid not in out:
+            out[qid] = p        # 真有两份时取先扫到的；那两份同步会报出来
+    return out
+
+
+def pending_export(db: Session, *, limit: int | None = None) -> list[Question]:
+    """这一刻「导出」该写哪些题。**判据是磁盘上有没有那份文件**，不是 `md_path` 有没有值。
+
+    只按 `md_path IS NULL` 判会漏掉最常见的一种情况：老师把 `题库/` 里的文件全删了
+    想重新导一遍，可库里每道题的 `md_path` 还指着那个已经不存在的路径 —— 于是界面回
+    一句「没有需要导出的题」，而磁盘上其实一张纸都没有。
+
+    文件不在原处还要分两种，处理方式相反：
+      · 被 Obsidian 挪走了（文件还在 vault 里，只是换了目录）→ 把 `md_path` 改到新位置，
+        **一个字都不重写**。那份文件里是老师自己改过的正文，重写等于把改动冲掉。
+      · 真被删了 → 清掉 `md_path`，让它按现在挂的知识点重新落位（多半就是原位）。
+    """
+    rows = db.scalars(select(Question).order_by(Question.created_at)).all()
+    idx: dict[str, Path] | None = None
+    out: list[Question] = []
+    for q in rows:
+        if limit is not None and len(out) >= limit:
+            break
+        if q.md_path:
+            try:
+                here = resolve(q.md_path)
+            except ValueError:
+                here = None
+            if here is not None and here.is_file():
+                continue                        # 文件好好的：不动，那是老师的地盘
+            if idx is None:
+                idx = _index_qids()
+            moved = idx.get(q.id)
+            if moved is not None:
+                q.md_path = rel(moved)          # 只是挪了地方，不是丢了
+                continue
+        q.md_path = None
+        out.append(q)
+    return out
+
+
 def _folder_for(q: Question) -> str:
     """默认按第一个知识点分目录。没有知识点就平铺在 `题库/` 下。"""
     kps = _json_list(q.knowledge_points)

@@ -18,6 +18,8 @@
   K 模板       —— 「照这个写」的模板本身被当题入库（还会把 id 写进模板，复制全撞 id）
   L 重复文件   —— 同一道题在 vault 里变成两份（收件箱搬运 / 导出各有一条路会造），
                   之后每次同步都有一条失败，老师不知道那份副本哪来的
+  M 导出范围   —— 文件被删掉后点「导出」回「没有需要导出的题」：判据只看 md_path
+                  有没有值，而删文件根本不会清它
 
 ⚠️ 全程用临时目录（`SHIKE_DB_PATH` / `SHIKE_DATA_DIR` / `SHIKE_VAULT` 指到 TEMP），
    **必须在 import app.* 之前设置**，否则 engine 已经钉在真库上了。
@@ -868,6 +870,82 @@ def part_l(db) -> None:
     twin.unlink()
 
 
+# ---------------------------------------------------------------- M 导出该写哪些题
+def part_m(db) -> None:
+    """「导出」该写哪些题 —— 判据是**磁盘上有没有那份文件**，不是 `md_path` 有没有值。
+
+    老师的原话：「我把题库文件夹中的题目文件删除后，再点击『把题库里的题导出成 md』
+    显示没有需要导出的题」。删文件**不会**清掉库里的 `md_path`（那是这条链的地基：
+    靠它认回文件、靠它挡住同题两份），于是 `md_path IS NULL` 一条都没有，界面回一句
+    「没有需要导出的题」—— 而磁盘上一张纸都没有。
+
+    反方向也要守住：文件好好在的时候**绝不能**重写，那是老师在 Obsidian 里改过的正文；
+    文件只是被挪了目录（不是删了）也不能重写，只把 `md_path` 改过去。
+    """
+    print("\n==== M 文件被删后还能重新导出 ====")
+    import uuid
+    from datetime import datetime
+
+    from app.routers import vault as vault_router
+
+    shelf = vault.shelf_dir()
+    q = Question(id="mt" + uuid.uuid4().hex[:8], owner_id=config.OWNER_ID,
+                 created_at=datetime.now().isoformat(timespec="seconds"),
+                 tags="[]", knowledge_points="[]",
+                 content="M组待导出测试题干，别和别的题撞名。", answer="A", analysis="",
+                 qtype="选择题")
+    db.add(q)
+    db.flush()
+    path = vault.export_question(db, q)
+    db.commit()
+    truthy("导出后文件在磁盘上", path.is_file(), vault.rel(path))
+
+    # ---- ① 文件好好的：不进待导出名单，一个字都不许重写
+    path.write_text(path.read_text(encoding="utf-8") + "\n\n（老师在 Obsidian 里加的一行）\n",
+                    encoding="utf-8")
+    ids = [x.id for x in vault.pending_export(db)]
+    falsy("文件还在的题不会进待导出名单", q.id in ids, len(ids))
+
+    # ---- ② 删掉文件 → 必须回到名单，并且能重建
+    path.unlink()
+    ids = [x.id for x in vault.pending_export(db)]
+    truthy("文件被删后进待导出名单", q.id in ids, len(ids))
+    db.commit()
+    back = vault.export_question(db, db.get(Question, q.id))
+    db.commit()
+    check("重建回原来的位置", back == path, (vault.rel(back), vault.rel(path)))
+    truthy("题干原样写回来了", "M组待导出测试题干" in back.read_text(encoding="utf-8"))
+
+    # ---- ③ 只是被 Obsidian 挪了目录：改 md_path，绝不重写那份文件
+    moved = shelf / "M组被挪走了.md"
+    back.write_text(back.read_text(encoding="utf-8") + "\n\n（挪走前老师在 Obsidian 里加的一行）\n",
+                    encoding="utf-8")
+    back.rename(moved)
+    db.commit()
+    ids = [x.id for x in vault.pending_export(db)]
+    db.commit()
+    db.refresh(q)
+    falsy("只是挪了地方不算丢", q.id in ids, len(ids))
+    check("md_path 跟着改到新位置", q.md_path == vault.rel(moved), q.md_path)
+    # 老师点一下导出：正常情况下它压根不在名单里，那份文件一个字都不该被动
+    vault_router.export_to_vault(vault_router.ExportIn(limit=1000), db)
+    same = [p for p in shelf.rglob("*.md") if vault.qid_of(p) == q.id]
+    check("挪走的那份没被重写、也没在原位多造一份",
+          same == [moved], [vault.rel(p) for p in same])
+    truthy("那份文件里的老师改动还在",
+           "挪走前老师在 Obsidian 里加的一行" in moved.read_text(encoding="utf-8"))
+
+    # ---- ④ 真删了，走接口：被删的这道必须重新出现在导出结果里
+    moved.unlink()
+    db.commit()
+    res = vault_router.export_to_vault(vault_router.ExportIn(limit=1000), db)
+    truthy("被删的题出现在导出结果里",
+           any(x["id"] == q.id for x in res["exported"]), res["exported"][:3])
+    db.refresh(q)
+    truthy("md_path 重新有值、文件真的在磁盘上",
+           bool(q.md_path) and vault.resolve(q.md_path).is_file(), q.md_path)
+
+
 def main() -> int:
     print("临时目录:", TMP)
     part_a()
@@ -899,6 +977,7 @@ def main() -> int:
         part_j(db)
         part_k(db)
         part_l(db)
+        part_m(db)
     finally:
         db.close()
 
