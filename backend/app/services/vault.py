@@ -82,7 +82,7 @@ from typing import Iterable
 from urllib.parse import unquote
 
 import yaml
-from sqlalchemy import delete, select
+from sqlalchemy import delete, or_, select
 from sqlalchemy.orm import Session
 
 from .. import config
@@ -94,6 +94,7 @@ from . import crops, knowledge
 INBOX = "收件箱"      # 丢进来的卷子/截图/插件转出来的 md，处理后变成题目 md
 SHELF = "题库"        # 题目 md 的落脚处（导出时按知识点分目录）
 ATTACH = "附件"       # 题目用的图片
+TRADE = "讲义"        # 讲义 md（知识 + 题目写在同一个文件里，见「讲义」一节）
 TRASH = "_回收"       # 网页上删题时，md 移到这儿而不是删掉
 
 IMG_EXT = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"}
@@ -106,6 +107,10 @@ SKIP_DIRS = {".obsidian", ".git", ".trash", TRASH}
 # 一道内容是「（题干写在这里）」、知识点「待填知识点」的废题。
 TEMPLATE_NAME = "题目模板（照这个写）.md"
 TEMPLATE_PREFIX = "题目模板"
+# 讲义的模板同样是「照这个写」的示范，同样必须排除 —— 而且更要紧：
+# 讲义模板里带着 2 道示例题，当成真讲义扫一遍就往库里塞两道「（题干写在这里）」。
+LECTURE_TEMPLATE_NAME = "讲义模板（照这个写）.md"
+LECTURE_TEMPLATE_PREFIX = "讲义模板"
 
 
 def is_template(path: Path) -> bool:
@@ -114,7 +119,7 @@ def is_template(path: Path) -> bool:
     判据取文件名前缀而不是完整路径：老师会把模板挪进子目录、也可能另存成
     `题目模板.md`，都还是模板。真正的题目不会叫「题目模板…」这个名。
     """
-    return path.stem.startswith(TEMPLATE_PREFIX)
+    return path.stem.startswith((TEMPLATE_PREFIX, LECTURE_TEMPLATE_PREFIX))
 
 
 def root() -> Path:
@@ -133,9 +138,13 @@ def attach_dir() -> Path:
     return root() / ATTACH
 
 
+def lecture_dir() -> Path:
+    return root() / TRADE
+
+
 def ensure_dirs() -> Path:
-    """建好三个目录。返回 vault 根。**每次写文件前都调**，别指望启动时建一次。"""
-    for d in (root(), shelf_dir(), attach_dir(), inbox_dir()):
+    """建好几个目录。返回 vault 根。**每次写文件前都调**，别指望启动时建一次。"""
+    for d in (root(), shelf_dir(), attach_dir(), inbox_dir(), lecture_dir()):
         d.mkdir(parents=True, exist_ok=True)
     return root()
 
@@ -221,9 +230,13 @@ _FM_RE = re.compile(r"\A---[ \t]*\n(.*?)\n---[ \t]*(?:\n|\Z)", re.S)
 # 便宜的预筛：不解析 YAML 就能判断「这不是题目 md」。
 # 扫描整个 vault 时绝大多数文件都不是题，先过这一关能省掉绝大部分 yaml 解析。
 _MARK_RE = re.compile(r"^shike[ \t]*:[ \t]*question[ \t]*$", re.I | re.M)
+# 讲义（知识 + 题目写在同一个文件里）。三个写法都认：lecture / note / 讲义。
+_LECTURE_RE = re.compile(r"^shike[ \t]*:[ \t]*(?:lecture|note|讲义)[ \t]*$", re.I | re.M)
 
-ANS_HEAD = re.compile(r"^##[ \t]*(?:答案|Answer)[ \t]*$", re.I | re.M)
-SOL_HEAD = re.compile(r"^##[ \t]*(?:解析|详解|Solution|Explanation)[ \t]*$", re.I | re.M)
+# `## 答案` / `## 解析` 是分界。允许二到四级标题：讲义里的题挂在 `## 题目` 下面，
+# 题内再写 `## 答案` 会跟小节标题平级、大纲看起来乱，所以老师自然会写成 `#### 答案`。
+ANS_HEAD = re.compile(r"^#{2,4}[ \t]*(?:答案|Answer)[ \t]*$", re.I | re.M)
+SOL_HEAD = re.compile(r"^#{2,4}[ \t]*(?:解析|详解|Solution|Explanation)[ \t]*$", re.I | re.M)
 
 # Obsidian 的嵌入 `![[图.png]]` / `![[图.png|300]]`，与标准 Markdown `![](路径)`。
 # 两种都认：Obsidian 默认写第一种，但老师从别处粘进来的是第二种。
@@ -256,6 +269,17 @@ def is_question_md(text: str) -> bool:
     """这篇 md 是题目模板吗。判据只有一条：frontmatter 里 `shike: question`。"""
     m = _FM_RE.match(text)
     return bool(m and _MARK_RE.search(m.group(1)))
+
+
+def is_lecture(text: str) -> bool:
+    """这篇 md 是讲义吗（知识 + 题目写在一起）。判据只有一条：`shike: lecture`。
+
+    ⚠️ 这条判据和「正文里有 `## 答案` 就是题」那种嗅探**完全不同**：
+       前者是老师显式写的声明，后者会把老师自己的笔记吸进题库（不可逆）。
+       所以讲义必须写着这一行，写漏了的笔记一律当普通笔记放过。
+    """
+    m = _FM_RE.match(text)
+    return bool(m and _LECTURE_RE.search(m.group(1)))
 
 
 def qid_of(path: Path) -> str:
@@ -697,16 +721,42 @@ def _title_of(q: Question) -> str:
 
 
 # ---------------------------------------------------------------- 导出
+def _attach_pair(q: Question) -> tuple[str | None, str | None]:
+    """把这道题的两张图复制进 `附件/`，返回 (题干图, 答案图) 的**文件名**。
+
+    导出题目 md 和「改题写回讲义那一块」都得走这一步，所以单独拎出来：
+    两处各写一份复制+命名的逻辑，早晚会分叉成「一个地方图叫 xxx-fig.png、
+    另一个叫 yyy-fig.png」，而那种错只有老师打开 Obsidian 才发现。
+    """
+    _clean_attach(q.id)
+    fig_name = ans_name = None
+    title = _title_of(q)
+    for url, kind in ((q.figure_image, "fig"), (q.answer_image, "ans")):
+        if not url:
+            continue
+        src = config.CROPS_DIR / Path(url).name
+        if not src.is_file():
+            # 图没了就别写进 md —— 写进去会变成悬空引用，扫描回来还会报一次错
+            continue
+        name = _attach_name(title, q.id, kind, src)
+        shutil.copyfile(src, attach_dir() / name)
+        if kind == "fig":
+            fig_name = name
+        else:
+            ans_name = name
+    return fig_name, ans_name
+
+
 def export_question(db: Session, q: Question, *, folder: str | None = None) -> Path:
     """把一道题写成 md（已存在就原地重写），返回文件路径。
 
     这个函数**会改用户的文件**：只在两种情况下被调用 —— 用户点了「导出到 vault」，
     或在网页上改了这道题（那时 md 本来就该跟着变，它是正文的真源）。
+
+    ⚠️ 正文住在**讲义**里的题不走这里（`note_path` 有值）。整篇重写会把老师写的
+       知识部分一起冲掉，它们只改讲义里的那一段（见 `_sync_back_note`）。
     """
     ensure_dirs()
-    fig_name = ans_name = None
-    _clean_attach(q.id)
-
     # 先定下这份 md 写到哪，再拼正文 —— 图片链接是「md 所在目录 → 附件目录」的
     # 相对路径，得知道自己在第几层子目录才写得对。
     if q.md_path:
@@ -725,20 +775,7 @@ def export_question(db: Session, q: Question, *, folder: str | None = None) -> P
             n += 1
             path = base / f"{_title_of(q)}-{n}.md"
     fig_dir = _rel_to_attach(path.parent)
-
-    for url, kind in ((q.figure_image, "fig"), (q.answer_image, "ans")):
-        if not url:
-            continue
-        src = config.CROPS_DIR / Path(url).name
-        if not src.is_file():
-            # 图没了就别写进 md —— 写进去会变成悬空引用，扫描回来还会报一次错
-            continue
-        name = _attach_name(_title_of(q), q.id, kind, src)
-        shutil.copyfile(src, attach_dir() / name)
-        if kind == "fig":
-            fig_name = name
-        else:
-            ans_name = name
+    fig_name, ans_name = _attach_pair(q)
 
     text = render(q, fig_name=fig_name, ans_name=ans_name, fig_dir=fig_dir)
     write_md(path, text)
@@ -776,6 +813,17 @@ def pending_export(db: Session, *, limit: int | None = None) -> list[Question]:
     for q in rows:
         if limit is not None and len(out) >= limit:
             break
+        if q.note_path:
+            # 正文住在讲义里（一份讲义好几道题）：不再往 `题库/` 写第二份。
+            # 写了就是同一道题两份正文，之后谁盖谁全看顺序 —— 见模块开头那节。
+            try:
+                here = resolve(q.note_path)
+            except ValueError:
+                here = None
+            if here is not None and here.is_file():
+                continue
+            # 讲义没了（删了/挪出 vault）→ 这道题确实没有文件了，退回普通导出
+            q.note_path = None
         if q.md_path:
             try:
                 here = resolve(q.md_path)
@@ -871,8 +919,12 @@ def _settle_plan(db: Session, plan: _Plan, idx: dict[str, list[Path]], *,
     plan.answer_image = one(plan.parsed.ans_imgs, (plan.existed.answer_image if plan.existed else "") or "", "ans")
 
 
-def _apply(db: Session, plan: _Plan) -> str:
-    """把解析结果写进库。返回题目 id。"""
+def _apply(db: Session, plan: _Plan, *, note: bool = False) -> str:
+    """把解析结果写进库。返回题目 id。
+
+    `note=True` 表示这段正文住在**讲义**里（一份文件好几道题）：那时不写 `md_path`
+    （唯一索引只允许一个文件一道题），改记 `note_path`。
+    """
     now = datetime.now().isoformat(timespec="seconds")
     f = plan.parsed.fields
     q = plan.existed
@@ -880,12 +932,14 @@ def _apply(db: Session, plan: _Plan) -> str:
 
     # 一个 md 文件只能对应一道题（库里是唯一索引）。先查出冲突并给人话，
     # 别等到 flush 时抛 IntegrityError —— 那个报错信息对老师等于天书。
+    # 讲义例外：一份讲义里本来就好几道题，这条判断对它是错的。
     rel_path = rel(plan.path)
-    other = db.scalar(select(Question).where(Question.md_path == rel_path,
-                                             Question.id != (q.id if q else "")))
-    if other is not None:
-        raise ValueError(f"这个文件已经对应另一道题（{other.id}）。"
-                         "是不是复制了一份 md 却没改 shike_id？")
+    if not note:
+        other = db.scalar(select(Question).where(Question.md_path == rel_path,
+                                                 Question.id != (q.id if q else "")))
+        if other is not None:
+            raise ValueError(f"这个文件已经对应另一道题（{other.id}）。"
+                             "是不是复制了一份 md 却没改 shike_id？")
 
     if created:
         q = Question(
@@ -927,7 +981,13 @@ def _apply(db: Session, plan: _Plan) -> str:
                 db.add(QuestionNode(question_id=q.id, node_id=node_id, weight=1.0))
     if "tags" in f:
         q.tags = json.dumps(f["tags"], ensure_ascii=False)
-    q.md_path = rel_path
+    if note:
+        # 讲义里的题：正文在讲义那一段里，不在 `题库/` 下另开一份
+        q.md_path = None
+        q.note_path = rel_path
+    else:
+        q.md_path = rel_path
+        q.note_path = None
     q.md_hash = _digest(plan.text)
     db.flush()
 
@@ -973,6 +1033,7 @@ def scan(db: Session, *, dry_run: bool = False) -> dict:
         "created": [], "updated": [], "unchanged": 0,
         "skipped": [], "errors": [], "warnings": [], "extra_images": [],
         "missing": [],          # 库里有 md_path 但文件不在了
+        "lectures": [],         # 讲义 md：每篇一条（各自带 created/updated）
         "scanned": 0,
     }
     seen_paths: dict[str, str] = {}      # md_path → qid（发现重复时用来报错）
@@ -992,6 +1053,17 @@ def scan(db: Session, *, dry_run: bool = False) -> dict:
                 "path": rel_path,
                 "reason": "这是「照这个写」的模板本身，跳过；复制一份、改成你的题才会入库",
             })
+            continue
+        if is_lecture(md.text):
+            # 讲义：知识部分一个字符都不解析，只收 `## 题目` 之下的题。
+            # 它的报告单独一栏 —— 一篇讲义对应好几道题，塞进 created/updated 会让
+            # 「新增 5 道」分不清是 5 个文件还是 1 篇讲义里的 5 道。
+            try:
+                report["lectures"].append(
+                    import_lecture(db, path, md=md, idx=idx, dry_run=dry_run))
+            except Exception as exc:              # noqa: BLE001 —— 一篇坏讲义不该中断整轮
+                db.rollback()
+                report["errors"].append({"path": rel_path, "error": str(exc)})
             continue
         if not is_question_md(md.text):
             report["skipped"].append({"path": rel_path, "reason": "不是题目 md（没有 shike: question）"})
@@ -1097,12 +1169,15 @@ def scan(db: Session, *, dry_run: bool = False) -> dict:
 
     # 库里有来源、但文件不见了的题：**不自动删题**。老师可能只是临时移走了文件，
     # 或者把 vault 换了个位置。只报出来让他自己决定。
-    for q in db.scalars(select(Question).where(Question.md_path.isnot(None))).all():
+    # 讲义里的题也算：它的来源是那篇讲义，讲义删了它同样「没有文件了」。
+    for q in db.scalars(select(Question).where(
+            or_(Question.md_path.isnot(None), Question.note_path.isnot(None)))).all():
+        src = q.md_path or q.note_path
         try:
-            if not resolve(q.md_path).is_file():
-                report["missing"].append({"id": q.id, "path": q.md_path})
+            if not resolve(src).is_file():
+                report["missing"].append({"id": q.id, "path": src})
         except ValueError:
-            report["missing"].append({"id": q.id, "path": q.md_path})
+            report["missing"].append({"id": q.id, "path": src})
 
     db.commit()
     return report
@@ -1133,9 +1208,13 @@ def _stamp_id(db: Session, path: Path, qid: str) -> None:
 def sync_back(db: Session, q: Question) -> bool:
     """网页上改完题，把改动写回它来源的 md。返回「写了吗」。
 
-    只有 `md_path` 有值的题才写 —— 网页录的题不主动往 vault 里塞东西
+    只有有来源文件的题才写 —— 网页录的题不主动往 vault 里塞东西
     （老师没要求过那些题要变成文件）。文件不见了也跳过，不凭空重建。
+
+    讲义里的题（`note_path`）走另一条：**只重写那一道题的那一段**。
     """
+    if q.note_path:
+        return _sync_back_note(db, q)
     if not q.md_path:
         return False
     try:
@@ -1269,3 +1348,362 @@ def ingest_md(db: Session, path: Path, *, dry_run: bool = False) -> dict:
 
     report["units"] = len(units)
     return report
+
+
+# ---------------------------------------------------------------- 讲义（知识 + 题目）
+#
+# 老师的原话（2026-11-23）：「划分知识和题目部分，知识部分不会被题库识别，能够正常
+# 将题目导入题库……既能够在笔记中显示，也能将其中题目导入题库」。
+#
+# 形如：
+#
+#     ---
+#     shike: lecture
+#     knowledge: [棱柱的结构特征]      ← 可选：整篇的默认知识点
+#     ---
+#
+#     ## 知识点
+#     （讲解、公式、图 —— **永远不扫描**）
+#
+#     ## 题目
+#     ### 题目 1
+#     （题干，可以贴图）
+#     #### 答案
+#     B
+#
+# 三条硬规则，都是为了「知识部分绝不被当成题」：
+#   · 只认 `shike: lecture` —— 显式声明，不靠嗅探。老师自己的笔记没这行就不会被吸进来
+#     （理由同收件箱那段「判据靠位置，不靠内容嗅探」：把笔记当题入库是不可逆的）。
+#   · 只扫 `## 题目` 这个二级标题**之后**的内容；之前的全是知识，一个字符都不解析。
+#   · 题目小节里再遇到一级/二级标题就结束 —— 后面的「小结」「作业」也不会被扫。
+#
+# 每道题靠**三级标题**分隔（`### 题目 1`、`### 例 3`…），标题文字不进题干。
+# 标题下面第一行可以有一条 `<!-- shike_id: xxx -->`：首次导入自动写回，
+# 它就是「这一段对应库里哪道题」的身份（文件名不是身份，见迁移 0040 的说明）。
+# 题内可以写 `#### 答案` / `#### 解析`（也认 `### 答案`：标题级别不比分隔线重要）。
+#
+# ⚠️ 这些题的正文**住在讲义里**，不在 `题库/` 另开一份（`note_path` 而不是 `md_path`）。
+#    两份正文的下场是「谁最后写谁赢」，而老师根本看不出哪份是对的。
+
+_QSECTION = re.compile(r"^##[ \t]*(?:题目|练习|习题|例题|Exercises?|Problems?|Questions?)[ \t]*$",
+                       re.I | re.M)
+_HEADING = re.compile(r"^(#{1,6})[ \t]+([^\n]*?)[ \t]*$")
+# 这几个词打头的标题是「答案/解析」，是**题内的小节**，不是新的一题
+_ANS_WORDS = re.compile(r"^(?:答案|解析|详解|参考答案|answer|solution|explanation|analysis)", re.I)
+# 写明「这一段是哪道题」的注释。放在标题行下面，Obsidian 的阅读视图不显示它。
+_ID_COMMENT = re.compile(r"<!--[ \t]*shike_id[ \t]*:[ \t]*([A-Za-z0-9_\-]+)[ \t]*-->")
+# 讲义里所有的 HTML 注释。**解析一道题之前必须整段去掉**，两个理由：
+#   · Obsidian 阅读视图不显示注释 → 老师会拿它写「这里该配什么图」之类的备注，
+#     而这些字要是进了题干，出卷时就会原样印到卷子上（隐形的备注变可见的乱码）；
+#   · 注释里如果写着 `![](<../附件/图.png>)` 这种示例，会被当成真的图片引用 ——
+#     于是每次同步都报「找不到图片」，而图片其实就在注释里当例子。
+# 题库 md（`parse`）那边不动：那里的正文就是题目本身，一个字符都不该被悄悄吞掉。
+_COMMENT = re.compile(r"<!--.*?-->", re.S)
+
+
+@dataclass
+class LectureBlock:
+    """讲义题目小节里的一段 = 一道题。"""
+    heading: str        # 标题行原文（`### 题目 1`），写回时原样保留
+    body: str = ""      # 标题行之后、下一个分界之前的原文
+    start: int = 0      # body 在全文里的起止（写回时只换这一段）
+    end: int = 0
+    qid: str = ""       # 这段写着哪个 shike_id（没写就是空）
+
+
+def _block_body(raw: str) -> str:
+    """一段的正文：去掉 HTML 注释（含那行身份注释）、收掉首尾空行。
+
+    ⚠️ 块指纹（`md_hash`）一律在**去掉注释之后**算：否则首次导入写回 id 的那一行
+       会让整段「看起来变了」，于是每次同步都更新一遍 —— 和 0040 里
+       「哈希在规范化换行之后算」是同一个道理。
+    """
+    return _COMMENT.sub("", raw or "").strip()
+
+
+def lecture_blocks(text: str) -> tuple[list[LectureBlock], str]:
+    """把讲义切成「一题一段」。返回 (段列表, 切不出来的原因)。
+
+    切不出来不是错误，是要告诉老师**为什么**（报告里会显示）：最多的两种情况是
+    根本没写 `## 题目` 小节，以及写了小节但题目前面没有三级标题。
+    """
+    whole = _norm(text)
+    m = _QSECTION.search(whole)
+    if m is None:
+        return [], ("讲义里没有 `## 题目` 小节。知识写在这之前，题目放在这个二级标题"
+                    "下面，每道题用一个 `### ` 起头")
+    blocks: list[LectureBlock] = []
+    fence = ""
+    cur: LectureBlock | None = None
+
+    def close(end: int) -> None:
+        nonlocal cur
+        if cur is not None:
+            cur.body = whole[cur.start:end]
+            cur.end = end
+            blocks.append(cur)
+            cur = None
+
+    off = m.end()
+    ended = False
+    # 用围栏状态机走，而不是对全文跑一次标题正则：讲义正文里常常有代码块，
+    # 里面的一行 `### xxx` 不该被当成一道题（这种错只有同步完看见怪题才发现）。
+    for line in whole[m.end():].splitlines(keepends=True):
+        start = off
+        off += len(line)
+        bare = line.rstrip("\r\n")
+        s = bare.strip()
+        if s[:3] in ("```", "~~~"):
+            mark = s[:3]
+            if not fence:
+                fence = mark
+            elif fence == mark:
+                fence = ""
+            continue
+        if fence:
+            continue
+        h = _HEADING.match(bare)
+        if h is None:
+            continue
+        level, title = len(h.group(1)), h.group(2).strip()
+        if level <= 2:
+            # 一级/二级标题：题目小节到此为止（后面的「小结」「作业」不算题）
+            close(start)
+            ended = True
+            break
+        if level != 3 or not title or _ANS_WORDS.match(title):
+            continue        # 四级及以下、或答案/解析标题 → 属于当前这一题
+        close(start)
+        cur = LectureBlock(heading=bare, body="", start=off, end=off, qid="")
+    if not ended:
+        close(len(whole))
+
+    for b in blocks:
+        hit = _ID_COMMENT.search(b.body)
+        b.qid = hit.group(1) if hit else ""
+    if not blocks:
+        n = len(_QNUM.findall(whole[m.end():]))
+        hint = f"（题目小节里像是 {n} 道题）" if n >= 2 else ""
+        return [], (f"`## 题目` 下面没有找到以 `### ` 起头的题{hint}。"
+                    "请给每道题加一个三级标题，例如 `### 题目 1`")
+    return blocks, ""
+
+
+def lecture_defaults(text: str) -> dict:
+    """讲义 frontmatter = 整篇的默认字段（知识点、分值、题型…），题块没写就继承。
+
+    直接复用 `parse()` 而不是再写一份 YAML 读取：讲义的 frontmatter 和题目 md 的
+    frontmatter **是同一套键**，两个地方各解析一次迟早会有一边不认某个键。
+    """
+    p = parse(text)
+    return dict(p.fields) if p.ok else {}
+
+
+def _fm_lines(f: dict) -> list[str]:
+    """把 `parse()` 出来的字段写回 frontmatter 行（`render()` 用的是同一套写法）。"""
+    out: list[str] = []
+    for key in ("qtype", "difficulty", "score", "year", "source"):
+        val = f.get(key)
+        if val in (None, ""):
+            continue
+        if key == "score":
+            v = float(val)
+            out.append(f"score: {int(v) if v.is_integer() else v}")
+        elif key == "year":
+            out.append(f"year: {int(val)}")
+        else:
+            out.append(f"{key}: {_yaml_value(val)}")
+    out += _yaml_list("knowledge", f.get("knowledge") or [])
+    out += _yaml_list("tags", f.get("tags") or [])
+    if f.get("render_prefer") in ("text", "image"):
+        out.append(f"render_prefer: {f['render_prefer']}")
+    return out
+
+
+def _block_md(qid: str, body: str, defaults: dict) -> str:
+    """一段正文 + 整篇默认值 → 一份「标准题目 md」，交给 `parse()` 解析。
+
+    为什么要拼成一份带 frontmatter 的 md：这样「怎么解析一道题」**只有一条路**
+    （`parse`）。在讲义这边另写一套「读题干、读答案」的解析，就是给同一种内容
+    留两个出处 —— 有一天 `parse` 改了什么，讲义这边不会跟着改。
+    """
+    head = ["---", "shike: question"]
+    if qid:
+        head.append(f"shike_id: {qid}")
+    head += _fm_lines(defaults)
+    head += ["---", ""]
+    return "\n".join(head) + "\n" + body + "\n"
+
+
+def import_lecture(db: Session, path: Path, *, md: MdFile | None = None,
+                   idx: dict[str, list[Path]] | None = None,
+                   dry_run: bool = False) -> dict:
+    """一篇讲义 → 题库里的若干道题。返回的报告按「段」记，不按文件。
+
+    幂等靠块里那行 `<!-- shike_id: xxx -->`：没有就新建并把 id 写回，有就更新；
+    块内容没变（比块指纹）连 `updated_at` 都不动。
+    """
+    md = md or read_md(path)
+    rel_path = rel(path)
+    report: dict = {"path": rel_path, "created": [], "updated": [], "unchanged": 0,
+                    "skipped": [], "warnings": [], "errors": [], "stamped": 0}
+    blocks, why = lecture_blocks(md.text)
+    if not blocks:
+        report["skipped"].append({"unit": 0, "reason": why})
+        return report
+
+    defaults = lecture_defaults(md.text)
+    if idx is None:
+        idx = _index_images()
+    seen: dict[str, int] = {}          # 本轮已经用过的 id → 第几段
+    stamps: dict[int, str] = {}        # 段号 → 要写回的 id
+    for i, b in enumerate(blocks):
+        no = i + 1
+        body = _block_body(b.body)
+        if not body:
+            report["skipped"].append({"unit": no, "reason": "这一段是空的"})
+            continue
+        parsed = parse(_block_md(b.qid, body, defaults))
+        if not parsed.ok or not parsed.stem.strip():
+            report["skipped"].append({"unit": no,
+                                      "reason": "；".join(parsed.warnings) or "题干是空的"})
+            continue
+
+        existed: Question | None = db.get(Question, b.qid) if b.qid else None
+        if b.qid and existed is None:
+            parsed.warnings.append(f"注释里的 shike_id={b.qid} 在题库里找不到（可能删过），"
+                                   "按新题入库并换上新的 id")
+            b.qid = ""
+        if b.qid and seen.get(b.qid):
+            # 同一篇里两段写着同一个 id（最典型：复制一段当模板忘了删注释）。
+            # 不能两段都更新 —— 那成了「谁最后扫到谁赢」，且另一段的内容会静默消失。
+            report["errors"].append({"unit": no, "error":
+                f"这一段和第 {seen[b.qid]} 段写着同一个 shike_id（{b.qid}）。"
+                f"删掉其中一段那行 `<!-- shike_id: {b.qid} -->`，下次同步会当成新题"})
+            continue
+        if existed is not None and existed.md_path:
+            report["errors"].append({"unit": no, "error":
+                f"shike_id={b.qid} 对应的是题库里的独立文件 {existed.md_path}，不是讲义里的一段。"
+                "一道题只能有一个来源：要么删掉这段的注释当新题，要么删掉那个文件"})
+            continue
+        if existed is not None and existed.note_path and existed.note_path != rel_path:
+            report["errors"].append({"unit": no, "error":
+                f"shike_id={b.qid} 已经属于 {existed.note_path} 里的那一段。"
+                "是不是复制了整篇讲义没删注释？删掉这一段的注释再同步"})
+            continue
+
+        if existed is not None and existed.note_path == rel_path and existed.md_hash == _digest(body):
+            # 这一段自上次同步以来一个字都没改 → 不动库，也别刷新 updated_at
+            report["unchanged"] += 1
+            seen[b.qid] = no
+            continue
+
+        bucket = "created" if existed is None else "updated"
+        plan = _Plan(path=path, existed=existed, parsed=parsed, text=body)
+        try:
+            # dry-run 只判断图在不在、不往截图目录写文件 —— 和题目 md 那条路同一套口径，
+            # 否则「预览」里永远看不到「找不到图片」这种早该发现的事。
+            _settle_plan(db, plan, idx, import_images=not dry_run)
+            if dry_run:
+                report[bucket].append({"unit": no, "title": _safe_stem(parsed.stem, "dryrun", 30),
+                                       "dry": True})
+            else:
+                qid = _apply(db, plan, note=True)
+                db.commit()        # 一段一提交：一段坏了 rollback 不带走前面几段
+        except Exception as exc:                       # noqa: BLE001
+            db.rollback()
+            report["errors"].append({"unit": no, "error": str(exc)})
+            continue
+        if not dry_run:
+            seen[qid] = no
+            if qid != b.qid:
+                stamps[i] = qid
+            report[bucket].append({"unit": no, "id": qid,
+                                   "title": _safe_stem(parsed.stem, qid, 30)})
+        if parsed.warnings:
+            report["warnings"].append({"unit": no, "messages": list(parsed.warnings)})
+        if plan.extra_images:
+            report["warnings"].append({"unit": no, "messages":
+                [f"题干配图目前只能存一张，多出来的没入库：{', '.join(plan.extra_images)}"]})
+
+    if stamps and not dry_run:
+        try:
+            report["stamped"] = _stamp_lecture(path, md, blocks, stamps)
+        except OSError as exc:
+            report["warnings"].append({"unit": 0, "messages": [f"没写回 shike_id：{exc}"]})
+    return report
+
+
+def _stamp_lecture(path: Path, md: MdFile, blocks: list[LectureBlock],
+                   stamps: dict[int, str]) -> int:
+    """把新题的 id 写回讲义里那一段（只加/改一行注释）。返回写了几段。
+
+    ⚠️ 从后往前改：先改后面那几段，前面段的 `start/end` 偏移才不会失效
+       （从前往后改，第一段插一行之后，后面每段的偏移就都错了 —— 会切坏正文）。
+    """
+    text = md.text
+    for i in sorted(stamps, reverse=True):
+        b = blocks[i]
+        note = f"<!-- shike_id: {stamps[i]} -->"
+        old = _ID_COMMENT.search(b.body)
+        if old:                     # 有注释但 id 不对（库里那道题被删过）→ 换值
+            body2 = b.body[:old.start()] + note + b.body[old.end():]
+            text = text[:b.start] + body2 + text[b.end:]
+        else:
+            text = text[:b.start] + note + "\n" + text[b.start:]
+    write_md(path, text, crlf=md.crlf, bom=md.bom)
+    return len(stamps)
+
+
+def render_block(q: Question, *, fig_name: str | None = None, ans_name: str | None = None,
+                 fig_dir: str | None = None) -> str:
+    """讲义里「一道题」那一段（不含 `### 标题`，含那行身份注释）。
+
+    和 `render()` 生成题库 md 用的是同一套正文写法，只有两处不同：带注释、
+    小标题写 `#### 答案` / `#### 解析`（题目小节底下是三级标题起题）。
+    """
+    parts: list[str] = []
+    body = (q.content or "").strip()
+    if body:
+        parts.append(body)
+    if fig_name:
+        parts.append(_img_link(fig_name, fig_dir))
+    text = "\n\n".join(parts)
+    if (q.answer or "").strip():
+        text += "\n\n#### 答案\n\n" + (q.answer or "").strip()
+    if ans_name:
+        text += "\n\n" + _img_link(ans_name, fig_dir)
+    if (q.analysis or "").strip():
+        text += "\n\n#### 解析\n\n" + (q.analysis or "").strip()
+    return f"<!-- shike_id: {q.id} -->\n\n" + text.strip()
+
+
+def _sync_back_note(db: Session, q: Question) -> bool:
+    """网页改了讲义里的一道题 → **只重写那一段**，知识部分和别的题一个字不动。
+
+    整篇重写（`export_question`）对讲义是灾难：它只知道一道题，会把老师的讲解、
+    公式、其他题全冲掉。所以这里按块换，换完把块指纹写回库里。
+    """
+    if not q.note_path:
+        return False
+    try:
+        path = resolve(q.note_path)
+    except ValueError:
+        return False
+    if not path.is_file():
+        return False
+    md = read_md(path)
+    blocks, _why = lecture_blocks(md.text)
+    hit = next((i for i, b in enumerate(blocks) if b.qid == q.id), None)
+    if hit is None:
+        # 讲义里找不到这一段了（老师删了、或者把题拆走了）→ 不凭空插一段回去
+        return False
+    fig_name, ans_name = _attach_pair(q)
+    body = render_block(q, fig_name=fig_name, ans_name=ans_name,
+                        fig_dir=_rel_to_attach(path.parent))
+    b = blocks[hit]
+    text = md.text[:b.start] + "\n" + body + "\n\n" + md.text[b.end:]
+    write_md(path, text, crlf=md.crlf, bom=md.bom)
+    q.md_hash = _digest(_block_body(body))
+    db.flush()
+    return True

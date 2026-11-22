@@ -238,7 +238,10 @@ def update_question(qid: str, payload: QuestionPatch, db: Session = Depends(get_
     #
     # 写失败（文件被 Obsidian 锁着、目录被挪走、没权限）**不能让这次 PATCH 失败**：
     # 库里已经改好了，用户看到的结果是对的；文件那一头记一笔日志、前端下次同步会发现。
-    if q.md_path:
+    #
+    # `note_path`（正文住在讲义里）也要走：那条路只换讲义里的这一段，
+    # 不整篇重写（整篇重写会把老师的知识部分冲掉）。
+    if q.md_path or q.note_path:
         try:
             vault.sync_back(db, q)
             db.commit()
@@ -246,7 +249,7 @@ def update_question(qid: str, payload: QuestionPatch, db: Session = Depends(get_
             db.rollback()
             import logging
             logging.getLogger("shike").warning(
-                "题目 %s 改动写回 md 失败（%s）：%s", qid, q.md_path, exc)
+                "题目 %s 改动写回 md 失败（%s）：%s", qid, q.md_path or q.note_path, exc)
 
     return _serialize(q)
 

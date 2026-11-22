@@ -203,6 +203,14 @@ class Question(Base):
     # 文件里的 `shike_id`，md_path 只是「上次它在哪」，用来发现「被挪走了」。
     md_path: Mapped[str | None] = mapped_column(Text)
     md_hash: Mapped[str | None] = mapped_column(String(16))
+    # ---------------- 正文住在某篇讲义里（迁移 0041）
+    # `note_path` —— 这道题出自哪份**讲义 md**（`shike: lecture`），相对 vault 根。
+    # 和 `md_path` 是互斥的两件事，不能混：
+    #   md_path   一整个文件就是这一道题（`题库/` 下），所以能唯一索引
+    #   note_path 一份讲义里躺着好几道题（同一篇 `## 题目` 小节），**不能**唯一索引
+    # 为什么还要单独一列、而不是共用 md_path：唯一索引会把「一文件多题」判成冲突；
+    # 而且两者「谁是真源」的处理相反 —— md_path 可以整篇重写，note_path 只能改那一块。
+    note_path: Mapped[str | None] = mapped_column(Text)
 
     __table_args__ = (
         Index("idx_questions_curr", "curriculum_id", "node_id"),

@@ -951,11 +951,19 @@ def main() -> int:
     part_a()
     part_b()
 
-    print("\n--- 建库（跑迁移到 0040 + 补体系骨架）---")
+    print("\n--- 建库（跑迁移到最新版本 + 补体系骨架）---")
     info = migrate.run_migrations(verbose=False)
     print("  ", info)
-    check("迁移到 0040",
-          (migrate.current_revision() or "").startswith("0040"), migrate.current_revision())
+    # 别写死版本号：每次加迁移这条就假红一次，而它想守的其实是「列真的加上了」。
+    # 判据改成看 questions 表的列 —— 那才是后面各组测试真的在用的东西。
+    import sqlite3
+    con = sqlite3.connect(str(config.DB_PATH))
+    try:
+        cols = {row[1] for row in con.execute("PRAGMA table_info(questions)")}
+    finally:
+        con.close()
+    check("迁移跑到了最新版本（md_path / md_hash / note_path 三列都在）",
+          {"md_path", "md_hash", "note_path"} <= cols, sorted(cols))
     # 体系由 seed 补（迁移只建表）。收件箱那组要靠子目录名认体系，没有体系测不了。
     from app import seed
     db0 = SessionLocal()

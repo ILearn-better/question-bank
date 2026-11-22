@@ -38,17 +38,23 @@ def vault_status(db: Session = Depends(get_db)):
     前端第一件事就是问这个：老师要拿 `root` 这个路径去 Obsidian 里「打开文件夹作为库」。
     """
     root = vault.root()
-    md_total = md_questions = 0
+    md_total = md_questions = md_lectures = 0
     if root.is_dir():
         for p in vault._iter_md():
             md_total += 1
             try:
-                if vault.is_question_md(vault.read_md(p).text):
-                    md_questions += 1
+                text = vault.read_md(p).text
             except OSError:
                 continue
+            if vault.is_question_md(text):
+                md_questions += 1
+            elif vault.is_lecture(text):
+                md_lectures += 1
     linked = db.scalar(select(func.count()).select_from(Question)
                        .where(Question.md_path.isnot(None))) or 0
+    # 正文住在讲义里的题：它们**不会**被「导出成 md」再写一份到 题库/（见 pending_export）
+    note_linked = db.scalar(select(func.count()).select_from(Question)
+                            .where(Question.note_path.isnot(None))) or 0
     # 「收件箱里还有东西没处理」是老师最容易困惑的一件事：拖进去了却半天没变成题目。
     # 两条路的计数分开报 —— md 是本地解析（几秒），卷子要识别（几分钟），
     # 混成一个数会让人以为 md 卡住了。
@@ -60,10 +66,13 @@ def vault_status(db: Session = Depends(get_db)):
         "writable": _writable(root),
         "md_total": md_total,
         "md_questions": md_questions,
+        "md_lectures": md_lectures,
         "linked": linked,
+        "note_linked": note_linked,
         "inbox_pending": len(docs),
         "inbox_md": len(mds),
-        "dirs": {"shelf": vault.SHELF, "attach": vault.ATTACH, "inbox": vault.INBOX},
+        "dirs": {"shelf": vault.SHELF, "attach": vault.ATTACH, "inbox": vault.INBOX,
+                 "lecture": vault.TRADE},
     }
 
 
@@ -168,9 +177,91 @@ A
 """
 
 
+LECTURE_TEMPLATE = """---
+shike: lecture
+title: 第一讲 空间几何体的结构
+knowledge:
+  - 待填知识点
+tags:
+  - 讲义
+---
+
+<!--
+这是「讲义」模板：一份 md 里既能写讲解，也能放题目。
+
+两条分界线就是两个二级标题：
+  · `## 题目` 之前 —— 知识，**永远不会进题库**，随便写
+  · `## 题目` 之后 —— 题目，每道用一个 `### ` 三级标题起头，同步时逐道进题库
+  · 再出现一级/二级标题（比如下面的 `## 小结`）—— 题目小节到此结束
+
+用法：复制这份文件 → 改文件名 → 写自己的内容 → 题库页点「同步」。
+知识点写在开头 frontmatter 的 knowledge 里，是全篇的默认值（每道题都用它）。
+-->
+
+# 第一讲 空间几何体的结构
+
+## 知识点
+
+### 一、棱柱
+
+棱柱有两个面互相平行，其余各面都是四边形，并且每相邻两个四边形的公共边都互相平行。
+侧面都是平行四边形，侧棱都相等。
+
+### 二、棱锥
+
+底面是多边形，侧面都是有一个公共顶点的三角形。
+
+<!-- 上面这一整段都在 `## 题目` 之前，一个字符都不会被题库读到。 -->
+
+## 题目
+
+### 题目 1
+
+判断：棱柱的侧面一定是平行四边形。（　　）
+
+A．正确　　B．错误
+
+#### 答案
+
+A
+
+#### 解析
+
+棱柱的定义里就写着「其余各面都是四边形，且相邻四边形的公共边互相平行」，
+所以侧面必然是平行四边形。
+
+### 题目 2
+
+一个棱柱共有 10 个顶点，它有多少条棱？
+
+<!--
+题干里有图就把它拖进来，拾课会按位置存到「题干配图」。
+拖进来的图落在 vault 的 附件/ 里，链接长这样（路径是相对这份讲义的）：
+
+    ![](<../附件/图.png>)
+
+（注释里的内容不会被读进题库，这里只是写给老师看的。图片本身要拖到题干的正文里。）
+-->
+
+#### 答案
+
+15
+
+#### 解析
+
+10 个顶点 → 底面是五边形 → 上下两个底面各 5 条边，再加 5 条侧棱，共 15 条。
+
+## 小结
+
+<!-- 又出现二级标题 → 题目小节到此结束。这里写的东西同样不会进题库。 -->
+
+棱柱、棱锥、棱台的区别看「侧棱是否相交于一点」。
+"""
+
+
 @router.post("/seed-template")
 def seed_template(db: Session = Depends(get_db)):
-    """在 `题库/` 下放一份可以照着抄的模板。
+    """在 `题库/` 与 `讲义/` 下各放一份可以照着抄的模板。
 
     这东西的价值不在「生成文件」，在**它本身就是格式说明**：
     老师打开它、复制它、改内容，比读一份文档快得多。
@@ -181,8 +272,16 @@ def seed_template(db: Session = Depends(get_db)):
     existed = path.is_file()
     if not existed:
         vault.write_md(path, TEMPLATE.format(qid="（留空，第一次同步时自动填）"))
+
+    lec = vault.lecture_dir() / vault.LECTURE_TEMPLATE_NAME
+    lec_existed = lec.is_file()
+    if not lec_existed:
+        vault.write_md(lec, LECTURE_TEMPLATE)
     return {"path": vault.rel(path), "existed": existed,
-            "note": "已经有一份了，没覆盖" if existed else "已生成"}
+            "lecture_path": vault.rel(lec), "lecture_existed": lec_existed,
+            "note": ("题目模板与讲义模板都已经有了，没覆盖" if existed and lec_existed
+                     else "已生成" + ("（题目模板没覆盖）" if existed else "")
+                     + ("（讲义模板没覆盖）" if lec_existed else ""))}
 
 
 @router.post("/open")
@@ -201,26 +300,36 @@ def open_vault():
     return {"ok": True, "path": str(root)}
 
 
+# ---------------------------------------------------------------- 来源
 @router.get("/source/{qid}")
 def question_source(qid: str, db: Session = Depends(get_db)):
     """这道题来自哪个 md（给题目详情页显示「在 Obsidian 里打开」用）。
 
+    两种来源都要认：
+      · `md_path`   —— 整个文件就是这道题（`题库/` 下）
+      · `note_path` —— 正文住在某篇讲义里（`讲义/` 下），打开的是讲义、
+                       题在那篇的 `## 题目` 小节里
     返回 `uri` 是 Obsidian 的协议链接。用 `path=` 而不是 `vault=名字`：
     vault 名字是用户在 Obsidian 里自己起的，服务端不知道；绝对路径一定对得上。
     """
     q = db.get(Question, qid)
     if q is None:
         raise HTTPException(404, "题目不存在")
-    if not q.md_path:
-        return {"qid": qid, "md_path": None, "exists": False, "uri": None}
+    src = q.md_path or q.note_path
+    kind = "question" if q.md_path else ("lecture" if q.note_path else None)
+    if not src:
+        return {"qid": qid, "md_path": None, "note_path": None, "kind": None,
+                "exists": False, "uri": None}
     try:
-        full = vault.resolve(q.md_path)
+        full = vault.resolve(src)
         exists = full.is_file()
     except ValueError:
-        return {"qid": qid, "md_path": q.md_path, "exists": False, "uri": None}
+        return {"qid": qid, "md_path": q.md_path, "note_path": q.note_path, "kind": kind,
+                "exists": False, "uri": None}
     from urllib.parse import quote
     uri = "obsidian://open?path=" + quote(str(full), safe="") if exists else None
-    return {"qid": qid, "md_path": q.md_path, "abs": str(full), "exists": exists, "uri": uri}
+    return {"qid": qid, "md_path": q.md_path, "note_path": q.note_path, "kind": kind,
+            "abs": str(full), "exists": exists, "uri": uri}
 
 
 # ---------------------------------------------------------------- 收件箱

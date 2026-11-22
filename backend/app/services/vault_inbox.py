@@ -176,8 +176,9 @@ def _export_task_questions(db: Session, task: AutoTask) -> list[str]:
         if not it.question_id:
             continue
         q = db.get(Question, it.question_id)
-        if q is None or q.md_path:
+        if q is None or q.md_path or q.note_path:
             # 已经有 md 的不重写：那个文件可能已经在 Obsidian 里被改过
+            # （`note_path` 是讲义里的题 —— 更不该在 题库/ 另写一份）
             continue
         try:
             vault.export_question(db, q)
@@ -307,7 +308,18 @@ def _ingest_one(db: Session, path: Path, key: str, *, dry_run: bool = False) -> 
       · 一道都没进去 → `_失败/`。老师加好分隔线再拖回收件箱，就能重新处理。
     """
     try:
-        if vault.is_question_md(vault.read_md(path).text):
+        text = vault.read_md(path).text
+        if vault.is_lecture(text):
+            # 讲义（`shike: lecture`）不是「待拆的卷子」，它是一篇要留着的笔记：
+            #   · 不走 ingest_md —— 那条路按 `---` 切段，会把知识部分也切进题干；
+            #   · 也**不挪走** —— 挪进 `_已处理/` 老师的讲义就找不着了。
+            # 它就留在原处，点「同步」时由 vault.scan 收 `## 题目` 之下的题。
+            return {"file": key, "path": vault.rel(path), "units": 0, "created": [],
+                    "skipped": [{"unit": 0, "reason": "这是讲义（shike: lecture），"
+                                                     "留在原处不用搬；点「同步」就收它里面 `## 题目` 下的题"}],
+                    "warnings": [], "needs_split": False, "moved_to": "",
+                    "note": "讲义由「同步」处理，收件箱不动它"}
+        if vault.is_question_md(text):
             # 已经是标准模板（frontmatter 里有 shike: question）。
             # ⚠️ 这种文件**不能**走 ingest：它会被「同步」和「摄取」各入一遍库 → 一道题变两道。
             #    交给 scan，这里只负责把它从收件箱挪到 题库/。
