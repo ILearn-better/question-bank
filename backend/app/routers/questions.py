@@ -15,7 +15,7 @@ from .. import config
 from ..db import get_db
 from ..models import AnswerBackfill, Node, Question, QuestionNode
 from ..schemas import AnswerBackfillApply, AnswerBackfillIn, AnswerRecheckIn, QuestionIn, QuestionPatch
-from ..services import answer_backfill, crops
+from ..services import answer_backfill, crops, vault
 # 知识点解析已抽到 services/knowledge.py —— 批量入库也要用同一套判断，
 # 与其让两个路由互相 import 私有函数（删文档那次的先例），不如共用一份。
 # 保留 `_` 前缀的局部名，是为了让本文件里原有的调用点一行都不用改。
@@ -229,6 +229,28 @@ def update_question(qid: str, payload: QuestionPatch, db: Session = Depends(get_
 
     db.commit()
     db.refresh(q)
+
+    # 这道题如果来自 vault 里的 md，改动要**写回文件**。
+    #
+    # 不写回会怎样：老师在这儿把答案补上，下次一同步，文件里的旧内容把它覆盖回去 ——
+    # 从用户角度看就是「网页上改了没用」，而且改了两次才发现在打架。
+    # 反过来说，文件是正文的真源，所以这条回写是必须的，不是锦上添花。
+    #
+    # 写失败（文件被 Obsidian 锁着、目录被挪走、没权限）**不能让这次 PATCH 失败**：
+    # 库里已经改好了，用户看到的结果是对的；文件那一头记一笔日志、前端下次同步会发现。
+    #
+    # `note_path`（正文住在讲义里）也要走：那条路只换讲义里的这一段，
+    # 不整篇重写（整篇重写会把老师的知识部分冲掉）。
+    if q.md_path or q.note_path:
+        try:
+            vault.sync_back(db, q)
+            db.commit()
+        except Exception as exc:                       # noqa: BLE001
+            db.rollback()
+            import logging
+            logging.getLogger("shike").warning(
+                "题目 %s 改动写回 md 失败（%s）：%s", qid, q.md_path or q.note_path, exc)
+
     return _serialize(q)
 
 

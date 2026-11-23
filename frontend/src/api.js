@@ -439,6 +439,25 @@ export const gradeApi = {
     api.upload(`/api/homework-grades/${gid}/mark-image`, formData),
 };
 
+/** 题库 vault：磁盘上的题目 md（一个文件夹 = 一批题）。
+ *
+ *  为什么单独一组：它操作的是「你的文件夹」，不是库里某张表。
+ *  扫描是双向同步的唯一入口 —— 老师改完 Obsidian 点一下，改动才进库。 */
+export const vaultApi = {
+  status: () => api.get('/api/vault'),
+  /** dry_run=true 只出报告：不改库、不拷图、不往 md 里写 shike_id。 */
+  scan: (dryRun) => api.post(`/api/vault/scan?dry_run=${dryRun ? 'true' : 'false'}`),
+  /** 不传 qids = 只导出「还没有 md 来源」的题（第一次建 vault 用）。 */
+  export: (qids, limit = 200) => api.post('/api/vault/export', { qids: qids || [], limit }),
+  seedTemplate: () => api.post('/api/vault/seed-template'),
+  openFolder: () => api.post('/api/vault/open'),
+  /** 收件箱：把卷子丢进 `vault/收件箱/<体系>/`，后台自动识别成题目 md。 */
+  inbox: () => api.get('/api/vault/inbox'),
+  inboxRun: () => api.post('/api/vault/inbox/run'),
+  /** 这道题来自哪个 md（题目详情里「在 Obsidian 里打开」用）。 */
+  source: (qid) => api.get(`/api/vault/source/${qid}`),
+};
+
 export const systemApi = {
   info: () => api.get('/api/system/info'),
   backup: () => api.post('/api/system/backup'),

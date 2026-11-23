@@ -47,6 +47,8 @@ export default {
              （不传的话它会走缺省分支，把老师丢到学生页）。口径见 src/backTarget.js。 -->
         <a href="/workbench.html?from=console">批改工作台</a>
         <router-link to="/notes">笔记</router-link>
+        <!-- 题库文件：正文放在磁盘上的那一份（Obsidian 可编辑），点进去能同步回库 -->
+        <router-link to="/vault">题库文件</router-link>
         <router-link to="/settings">设置</router-link>
       </nav>
       <div class="foot">
