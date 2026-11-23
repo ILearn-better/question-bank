@@ -442,8 +442,11 @@ def part_e(db, tri: Question) -> None:
     check("导出的 md 里有一条图片引用", len(refs) == 1, refs)
     if refs:
         hit, why = vault._locate(refs[0], out.parent, vault._index_images())
+        # ⚠️ 必须 resolve 后再比：本机 TEMP 是 8.3 短名（C:\Users\ZHOULI~1\…），
+        #    `_locate` 里做过 resolve，返回的是长名；直接比 Path 会假失败。
         truthy("这条引用能解析到附件里的那个文件",
-               hit is not None and hit.parent == vault.attach_dir(), (refs[0], why, hit))
+               hit is not None and hit.parent.resolve() == vault.attach_dir().resolve(),
+               (refs[0], why, hit))
         falsy("图片引用里没有会截断链接的括号",
               any(c in Path(refs[0].strip("<>")).name for c in "()[]{}#%&"), refs[0])
 
