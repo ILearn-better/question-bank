@@ -6,12 +6,18 @@
 //   · 列表 —— 原来的按天分组，顺着一行行往下看。适合核对某一周的细节。
 // 两份视图读同一份 lessons 数据，切换不重新请求。
 //
-// 月历上的交互（2026-10-11 加拖动调课）：
+// 月历上的交互（2026-10-11 加拖动调课，2026-11-24 加 Ctrl+单击跳学生）：
 //   单击一条课 → 编辑弹窗（改日期/时间/状态、标记完成、**删除**）
 //   双击一条课 → 进入「调课模式」，再按住它拖到目标日期，放开即改日期（Esc 取消）
+//   Ctrl/⌘ + 单击 → 直接进这个学生的信息面板（不弹编辑窗）
 // 为什么调课要「双击解锁」再做拖动：块一旦常驻 draggable，单击时手抖几像素就会被
 // 浏览器当成拖动，弹窗永远打不开。双击解锁后单击绝对可靠。
+//
+// 为什么跳学生是「Ctrl+单击」而不是再挂一个按钮：课块只有两行字那么高，塞任何按钮
+// 都会把「几点、谁」挤掉；而「看看这孩子最近怎么样」是看课表时最常冒出来的念头，
+// 让它贴着学生名字、按一下就过去，比开弹窗再找入口快得多。
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue';
+import { useRouter } from 'vue-router';
 import { lessonsApi } from '../api.js';
 import { lessonsByDate, monthGrid, shiftPeriod, WEEK_HEADS } from '../calendar.js';
 import Modal from '../components/Modal.js';
@@ -43,6 +49,7 @@ export default {
   name: 'Schedule',
   components: { Modal, ScheduleImportDialog },
   setup() {
+    const router = useRouter();
     const period = ref(currentPeriod());
     const lessons = ref([]);
     const monthly = ref(null);
@@ -128,8 +135,29 @@ export default {
     const dragText = computed(() => (dragLesson.value
       ? `${dragLesson.value.student_name} ${hhmm(dragLesson.value.start_at)}` : ''));
 
-    function onItemClick(ls) {
+    /**
+     * 去这个学生的信息面板。
+     *
+     * 带 `from=schedule`：学生详情页据此把「返回」指向课表，而不是学生列表 ——
+     * 从课表点进去又被打回学生列表，等于每次都要重新找一遍路。
+     * 只认正整数 id（和 `backTarget.js` 的 `toId` 一个口径），认不出就什么都不做。
+     */
+    function goStudent(sid) {
+      const id = Number(sid);
+      if (!Number.isInteger(id) || id <= 0) return;
+      router.push({ path: '/students/' + id, query: { from: 'schedule' } });
+    }
+
+    function onItemClick(ls, e) {
       if (dragMode.value) return;          // 调课模式里单击不做别的
+      // Ctrl/⌘ + 左键 → 直接去学生面板。必须**赶在 setTimeout 之前**返回，
+      // 否则 200ms 后编辑弹窗还是会自己冒出来，跳到学生页的同时背后多一个窗。
+      if (e && (e.ctrlKey || e.metaKey)) {
+        clearTimeout(clickTimer);
+        clickTimer = null;
+        goStudent(ls.student_id);
+        return;
+      }
       clearTimeout(clickTimer);
       clickTimer = setTimeout(() => { clickTimer = null; openEdit(ls); }, CLICK_DELAY);
     }
@@ -350,9 +378,9 @@ export default {
                     <div v-for="ls in (byDay.get(c.date) || [])" :key="ls.id"
                          class="cal-item" :class="[STATUS_TAG[ls.status] || 'plain',
                                                    { dragging: dragId === ls.id, armed: dragMode === ls.id }]"
-                         :title="ls.student_name + ' ' + hhmm(ls.start_at) + ' ' + ls.duration_min + '分钟' + (ls.topic ? ' · ' + ls.topic : '') + '（单击编辑，双击后可拖动调课）'"
+                         :title="ls.student_name + ' ' + hhmm(ls.start_at) + ' ' + ls.duration_min + '分钟' + (ls.topic ? ' · ' + ls.topic : '') + '（单击编辑，Ctrl+单击看学生，双击后可拖动调课）'"
                          :draggable="dragMode === ls.id"
-                         @click="onItemClick(ls)"
+                         @click="onItemClick(ls, $event)"
                          @dblclick="onItemDbl(ls)"
                          @dragstart="onDragStart(ls, $event)"
                          @dragend="onDragEnd">
@@ -366,6 +394,7 @@ export default {
             </div>
             <div class="small muted" style="margin-top:10px">
               <b>单击</b>某节课 → 打开弹窗改（编辑、标记完成、删除都在里面）；
+              <b>Ctrl+单击</b>（Mac 上 ⌘+单击）某节课 → 直接进这个学生的信息面板；
               <b>双击</b>某节课 → 进入调课模式，把它拖到目标日期放开，就能改到那天（时间不变，Esc 取消）。
               鼠标移到某天格子上，右下角会出现 ＋ 可以加课。
             </div>
@@ -391,7 +420,7 @@ export default {
                 <span class="time">{{ hhmm(ls.start_at) }}</span>
                 <div style="flex:1; min-width:0">
                   <div class="who">
-                    <router-link :to="'/students/' + ls.student_id">{{ ls.student_name }}</router-link>
+                    <router-link :to="{ path: '/students/' + ls.student_id, query: { from: 'schedule' } }">{{ ls.student_name }}</router-link>
                     <span class="tag" :class="STATUS_TAG[ls.status]" style="margin-left:6px">
                       {{ STATUS_LABEL[ls.status] || ls.status }}
                     </span>
@@ -428,7 +457,7 @@ export default {
             <tbody>
               <tr v-for="r in monthly.students" :key="r.student_id">
                 <td>
-                  <router-link :to="'/students/' + r.student_id">{{ r.student_name }}</router-link>
+                  <router-link :to="{ path: '/students/' + r.student_id, query: { from: 'schedule' } }">{{ r.student_name }}</router-link>
                   <div class="small muted">
                     已上 {{ r.lesson_count }} 节 · {{ (r.billable_minutes / 60).toFixed(1) }} 小时
                     <template v-if="r.pending_lessons">
@@ -463,7 +492,15 @@ export default {
     <Modal v-if="editing" :title="editing.mode === 'create' ? '排课' : '编辑课时'" @close="editing = null">
       <div class="row">
         <div class="field">
-          <label>学生 *</label>
+          <label>
+            学生 *
+            <!-- 编辑弹窗里也留一个入口：改完课顺手就能去看这个孩子的近况。
+                 用 router-link 而不是普通 a + 点击处理：它有真 href，中键/Ctrl+单击
+                 能开新标签、鼠标悬停能看到要跳哪儿，和课块上那个手势是两种场景。 -->
+            <router-link v-if="form.student_id"
+                         :to="{ path: '/students/' + form.student_id, query: { from: 'schedule' } }"
+                         class="small" style="margin-left:6px">看学生面板 →</router-link>
+          </label>
           <select v-model.number="form.student_id" @change="onStudentChange">
             <option :value="null">请选择</option>
             <option v-for="s in state.students" :key="s.id" :value="s.id">

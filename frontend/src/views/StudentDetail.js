@@ -284,6 +284,12 @@ export default {
     const abilityDims = computed(() => (stu.value && stu.value.ability && stu.value.ability.dims) || []);
     const hasAbility = computed(() => abilityDims.value.some((d) => d.latest));
 
+    /* 从课表点进来的（`?from=schedule`）→「返回」指回课表。
+       不这么做的话，老师从课表的某节课点进学生，返回时被丢到学生列表，
+       还得再点一次「课表」、再翻回那个月 —— 跳转省下的时间全还回去了。
+       只认这一个取值，别的一律当「从学生列表来的」（老书签、侧栏、搜索结果都是这个口径）。 */
+    const fromSchedule = computed(() => String(route.query.from || '') === 'schedule');
+
     function openFeedback(item) {
       feedbackLesson.value = {
         id: item.lesson.id,
@@ -417,7 +423,7 @@ export default {
     });
 
     return {
-      stu, timeline, loading, feedbackLesson, pendingCount, abilityDims, hasAbility,
+      stu, timeline, loading, feedbackLesson, pendingCount, abilityDims, hasAbility, fromSchedule,
       openFeedback, onSaved, load, hhmm, money, shortDate, STATUS_LABEL, STATUS_TAG,
       folder, openingFolder, openFolder, fmtBytes,
       hwRadar, homeworkLesson, openHomework, onHomeworkSaved, HW_TAG, onGrade,
@@ -447,7 +453,7 @@ export default {
         <span class="tag" v-else>已结课</span>
         <span class="sub">{{ stu.grade || '' }} {{ (stu.curriculum_names || []).join(' / ') }}</span>
         <div class="spacer"></div>
-        <router-link to="/students" class="btn">返回列表</router-link>
+        <router-link :to="fromSchedule ? '/schedule' : '/students'" class="btn">{{ fromSchedule ? '← 返回课表' : '返回列表' }}</router-link>
       </div>
 
       <div class="grid cols-4">
